@@ -6,6 +6,17 @@ pub fn crate_name() -> &'static str {
     env!("CARGO_PKG_NAME")
 }
 
+pub mod domain {
+    pub mod adapter;
+    pub mod candidate;
+    pub mod events;
+    pub mod session;
+}
+
+pub mod rules {
+    pub mod session_lifecycle;
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
