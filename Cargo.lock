@@ -108,6 +108,11 @@ version = "0.1.0"
 [[package]]
 name = "idiolectd"
 version = "0.1.0"
+dependencies = [
+ "idiolect-application",
+ "idiolect-common",
+ "idiolect-test-support",
+]
 
 [[package]]
 name = "itoa"

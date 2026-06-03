@@ -1,5 +1,7 @@
 //! Crate documentation for the Idiolect workspace.
 
+pub mod daemon;
+
 /// Returns this crate's package name for smoke tests.
 #[must_use]
 pub fn crate_name() -> &'static str {

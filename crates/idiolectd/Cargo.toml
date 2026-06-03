@@ -7,3 +7,8 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+idiolect-application = { path = "../idiolect-application" }
+idiolect-common = { path = "../idiolect-common" }
+idiolect-test-support = { path = "../idiolect-test-support" }
