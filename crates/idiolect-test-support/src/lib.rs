@@ -1,4 +1,6 @@
-//! Crate documentation for the Idiolect workspace.
+//! Test support utilities for Idiolect contract tests.
+
+pub mod fakes;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

@@ -83,10 +83,18 @@ version = "0.1.0"
 [[package]]
 name = "idiolect-ports"
 version = "0.1.0"
+dependencies = [
+ "idiolect-common",
+ "idiolect-core",
+]
 
 [[package]]
 name = "idiolect-test-support"
 version = "0.1.0"
+dependencies = [
+ "idiolect-common",
+ "idiolect-ports",
+]
 
 [[package]]
 name = "idiolect-trainerctl"

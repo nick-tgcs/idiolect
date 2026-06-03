@@ -1,4 +1,14 @@
-//! Crate documentation for the Idiolect workspace.
+//! Port interfaces for adapter boundaries.
+
+pub mod adapter_registry;
+pub mod asr;
+pub mod audio;
+pub mod codec;
+pub mod evaluator;
+pub mod input_method;
+pub mod storage;
+pub mod trainer;
+pub mod vad;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

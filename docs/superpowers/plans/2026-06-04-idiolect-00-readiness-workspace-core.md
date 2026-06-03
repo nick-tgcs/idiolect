@@ -773,6 +773,7 @@ git commit -m "feat: add core session and candidate rules"
 **Model:** `gpt-5.3-codex-spark`  
 **Files:**
 
+- Modify: `Cargo.lock`
 - Modify: `crates/idiolect-ports/Cargo.toml`
 - Modify: `crates/idiolect-ports/src/lib.rs`
 - Create: `crates/idiolect-ports/src/input_method.rs`
@@ -980,7 +981,7 @@ Expected: all pass with zero warnings.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/idiolect-ports crates/idiolect-test-support docs/superpowers/plans/2026-06-04-idiolect-00-readiness-workspace-core.md docs/superpowers/plans/2026-06-04-idiolect-v1-rust-first-implementation.md
+git add Cargo.lock crates/idiolect-ports crates/idiolect-test-support docs/superpowers/plans/2026-06-04-idiolect-00-readiness-workspace-core.md docs/superpowers/plans/2026-06-04-idiolect-v1-rust-first-implementation.md
 git commit -m "feat: add port traits and fake contract harness"
 ```
 
