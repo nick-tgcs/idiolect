@@ -80,6 +80,9 @@ version = "0.1.0"
 [[package]]
 name = "idiolect-integration-tests"
 version = "0.1.0"
+dependencies = [
+ "idiolectd",
+]
 
 [[package]]
 name = "idiolect-ipc"
