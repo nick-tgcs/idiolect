@@ -1436,10 +1436,10 @@ Responsibilities:
 Suggested dependencies:
 
 ```toml
-serde = { version = "1.0.203", features = ["derive"] }
-uuid = { version = "1.8.0", features = ["v4", "serde"] }
-thiserror = "1.0.61"
-time = { version = "0.3.36", features = ["serde", "formatting", "parsing"] }
+serde = { version = "=1.0.203", features = ["derive"] }
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
+thiserror = "=1.0.61"
+time = { version = "=0.3.36", features = ["serde", "formatting", "parsing"] }
 ```
 
 Example types:
@@ -1475,9 +1475,9 @@ Responsibilities:
 Suggested dependencies:
 
 ```toml
-tokio = { version = "1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
-serde = { version = "1.0.203", features = ["derive"] }
-serde_json = "1.0.117"
+tokio = { version = "=1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
 # Pin an exact tracing crate version only after IPC-task verification.
 ```
 
@@ -1694,7 +1694,7 @@ Responsibilities:
 Suggested dependencies:
 
 ```toml
-tokio = { version = "1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "=1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 # Pin exact tracing, tracing-subscriber, clap, and directories versions only after daemon/CLI-task verification.
 ```
 

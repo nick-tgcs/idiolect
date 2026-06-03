@@ -169,6 +169,7 @@ git commit -m "docs: lock rust-first v1 implementation decisions"
 **Files:**
 
 - Create: `Cargo.toml`
+- Create: `Cargo.lock`
 - Create: `rust-toolchain.toml`
 - Create: `.cargo/config.toml`
 - Create: `crates/*/Cargo.toml`
@@ -219,7 +220,7 @@ rust-version = "1.96"
 [workspace.lints.rust]
 warnings = "deny"
 unsafe_code = "forbid"
-rust_2018_idioms = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
 unused_lifetimes = "deny"
 unreachable_pub = "deny"
 
@@ -235,12 +236,12 @@ todo = "deny"
 unimplemented = "deny"
 
 [workspace.dependencies]
-serde = { version = "1.0.203", features = ["derive"] }
-serde_json = "1.0.117"
-thiserror = "1.0.61"
-time = { version = "0.3.36", features = ["serde", "formatting", "parsing"] }
-tokio = { version = "1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
-uuid = { version = "1.8.0", features = ["v4", "serde"] }
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+thiserror = "=1.0.61"
+time = { version = "=0.3.36", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "=1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
 ```
 
 - [ ] **Step 3: Pin the Rust toolchain and Cargo behavior**
@@ -352,7 +353,7 @@ Expected: all commands pass with zero warnings.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Cargo.toml rust-toolchain.toml .cargo/config.toml crates README.md ci/scripts/test-rust.sh
+git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml crates README.md ci/scripts/test-rust.sh
 git commit -m "chore: bootstrap lint-clean rust workspace"
 ```
 

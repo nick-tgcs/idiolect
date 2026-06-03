@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/idiolect-common",
+    "crates/idiolect-core",
+    "crates/idiolect-ports",
+    "crates/idiolect-application",
+    "crates/idiolect-ipc",
+    "crates/idiolect-adapter-memory",
+    "crates/idiolect-adapter-sqlite",
+    "crates/idiolect-adapter-fixture-audio",
+    "crates/idiolect-adapter-fixture-asr",
+    "crates/idiolect-adapter-fixture-codec",
+    "crates/idiolect-trainerctl",
+    "crates/idiolectd",
+    "crates/idiolect-cli",
+    "crates/idiolect-test-support",
+    "crates/idiolect-integration-tests",
+]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.96"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unreachable_pub = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+thiserror = "=1.0.61"
+time = { version = "=0.3.36", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "=1.38.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
