@@ -1,4 +1,8 @@
-//! Crate documentation for the Idiolect workspace.
+//! Application use-case orchestration for Idiolect.
+
+pub mod use_cases {
+    pub mod dictation;
+}
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

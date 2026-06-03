@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ports = { path = "../idiolect-ports" }
+
+[dev-dependencies]
+idiolect-test-support = { path = "../idiolect-test-support" }
+
 [lints]
 workspace = true

@@ -52,6 +52,11 @@ version = "0.1.0"
 [[package]]
 name = "idiolect-application"
 version = "0.1.0"
+dependencies = [
+ "idiolect-common",
+ "idiolect-ports",
+ "idiolect-test-support",
+]
 
 [[package]]
 name = "idiolect-cli"
