@@ -350,7 +350,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: all commands pass with zero warnings.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml crates README.md ci/scripts/test-rust.sh
@@ -363,6 +363,8 @@ git commit -m "chore: bootstrap lint-clean rust workspace"
 **Model:** `gpt-5.3-codex-spark`  
 **Files:**
 
+- Modify: `Cargo.lock`
+- Modify: `crates/idiolect-common/Cargo.toml`
 - Modify: `crates/idiolect-common/src/lib.rs`
 - Create: `crates/idiolect-common/src/ids.rs`
 - Create: `crates/idiolect-common/src/time.rs`
@@ -401,7 +403,7 @@ Run:
 cargo test -p idiolect-common --lib
 ```
 
-Expected: fails because `ImeSessionId` and `UserId` do not exist.
+Expected: fails because `ImeSessionId` and `UserId` do not exist. If the first run fails only because `serde_json` is not linked for tests, add `serde_json.workspace = true` under `[dev-dependencies]` in `crates/idiolect-common/Cargo.toml`, rerun this command, and do not implement IDs until the observed failure is about the missing Idiolect types.
 
 - [ ] **Step 2: Implement IDs**
 
@@ -527,7 +529,7 @@ Expected: all pass with zero warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/idiolect-common
+git add Cargo.lock crates/idiolect-common docs/superpowers/plans/2026-06-04-idiolect-00-readiness-workspace-core.md docs/superpowers/plans/2026-06-04-idiolect-v1-rust-first-implementation.md
 git commit -m "feat: add common ids and protocol dto types"
 ```
 
@@ -541,6 +543,7 @@ git commit -m "feat: add common ids and protocol dto types"
 - Create: `crates/idiolect-core/src/domain/session.rs`
 - Create: `crates/idiolect-core/src/domain/candidate.rs`
 - Create: `crates/idiolect-core/src/domain/events.rs`
+- Create: `crates/idiolect-core/src/domain/adapter.rs`
 - Create: `crates/idiolect-core/src/rules/session_lifecycle.rs`
 
 - [ ] **Step 1: Write failing state transition tests**
@@ -699,7 +702,46 @@ Expected: fails because candidate domain does not exist.
 
 Implement the exact source, quality, and trust-score mappings tested above. Use `f32` for trust score and compare exact constants only for these fixed values.
 
-- [ ] **Step 5: Verify no backend leakage**
+- [ ] **Step 5: Write failing owned contract DTO tests**
+
+In `adapter.rs`, add a failing test for the Idiolect-owned types needed by port contracts:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::{AudioSegment, EncodedAudio, EvaluationReport, TrainingArtifact, TrainingManifest, TranscriptDraft};
+
+    #[test]
+    fn port_contract_types_keep_owned_values() {
+        let audio = AudioSegment::from_mono_samples(16_000, vec![0.0, 0.5]);
+        assert_eq!(audio.sample_rate_hz(), 16_000);
+        assert_eq!(audio.samples_f32_mono(), &[0.0, 0.5]);
+
+        let encoded = EncodedAudio::new("fixture/raw", vec![1, 2, 3]);
+        assert_eq!(encoded.codec(), "fixture/raw");
+        assert_eq!(encoded.bytes(), &[1, 2, 3]);
+
+        assert_eq!(TranscriptDraft::new("restart Traefik").text(), "restart Traefik");
+        assert_eq!(TrainingManifest::new("manifest-digest").digest(), "manifest-digest");
+        assert_eq!(TrainingArtifact::new("artifact-digest").digest(), "artifact-digest");
+        assert_eq!(EvaluationReport::new("report-digest").digest(), "report-digest");
+    }
+}
+```
+
+Run:
+
+```bash
+cargo test -p idiolect-core port_contract_types_keep_owned_values
+```
+
+Expected: fails because these owned contract DTOs do not exist.
+
+- [ ] **Step 6: Implement minimal owned contract DTOs**
+
+Implement the types named in the test in `crates/idiolect-core/src/domain/adapter.rs`. They must own `String`, `Vec<u8>`, or `Vec<f32>` data only and must not mention backend libraries. Export the module from `crates/idiolect-core/src/lib.rs`.
+
+- [ ] **Step 7: Verify no backend leakage**
 
 Run:
 
@@ -709,7 +751,7 @@ rg -n "fcitx|whisper|silero|opus|rusqlite|python|pytorch|peft|burn|candle|onnx" 
 
 Expected: no output.
 
-- [ ] **Step 6: Verify**
+- [ ] **Step 8: Verify**
 
 ```bash
 cargo test -p idiolect-core
@@ -718,7 +760,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: all pass with zero warnings.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add crates/idiolect-core
@@ -731,6 +773,7 @@ git commit -m "feat: add core session and candidate rules"
 **Model:** `gpt-5.3-codex-spark`  
 **Files:**
 
+- Modify: `crates/idiolect-ports/Cargo.toml`
 - Modify: `crates/idiolect-ports/src/lib.rs`
 - Create: `crates/idiolect-ports/src/input_method.rs`
 - Create: `crates/idiolect-ports/src/audio.rs`
@@ -741,6 +784,7 @@ git commit -m "feat: add core session and candidate rules"
 - Create: `crates/idiolect-ports/src/trainer.rs`
 - Create: `crates/idiolect-ports/src/evaluator.rs`
 - Create: `crates/idiolect-ports/src/adapter_registry.rs`
+- Modify: `crates/idiolect-test-support/Cargo.toml`
 - Modify: `crates/idiolect-test-support/src/lib.rs`
 - Create: `crates/idiolect-test-support/src/fakes.rs`
 
@@ -936,7 +980,7 @@ Expected: all pass with zero warnings.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/idiolect-ports crates/idiolect-test-support
+git add crates/idiolect-ports crates/idiolect-test-support docs/superpowers/plans/2026-06-04-idiolect-00-readiness-workspace-core.md docs/superpowers/plans/2026-06-04-idiolect-v1-rust-first-implementation.md
 git commit -m "feat: add port traits and fake contract harness"
 ```
 

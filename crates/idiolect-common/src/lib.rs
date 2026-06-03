@@ -1,4 +1,10 @@
-//! Crate documentation for the Idiolect workspace.
+//! Shared Idiolect types that do not depend on backend libraries.
+
+pub mod config;
+pub mod error;
+pub mod ids;
+pub mod protocol;
+pub mod time;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]
