@@ -256,7 +256,7 @@ git commit -m "ci: add integration gate script"
 - Create: `packaging/debian/usr/share/doc/idiolect/README.md`
 - Create: `ci/scripts/test-packaging.sh`
 
-- [ ] **Step 1: Verify build artifacts exist before packaging script is committed**
+- [x] **Step 1: Verify build artifacts exist before packaging script is committed**
 
 Run:
 
@@ -267,15 +267,15 @@ bash ci/scripts/test-fcitx5.sh
 
 Expected: release Rust artifacts and Fcitx5 build output exist locally. If these commands do not pass, do not create the packaging script.
 
-- [ ] **Step 2: Create Debian control metadata**
+- [x] **Step 2: Create Debian control metadata**
 
 Create `packaging/debian/DEBIAN/control` with package name `idiolect`, version `0.1.0`, architecture `amd64`, and description `Local-first speech-to-text input method for Linux`.
 
-- [ ] **Step 3: Create packaging gate script**
+- [x] **Step 3: Create packaging gate script**
 
 Create `ci/scripts/test-packaging.sh` that builds release artifacts, runs `test-fcitx5.sh`, copies `idiolect-cli`, `idiolectd`, and `libidiolect-fcitx5.so` into `target/package/idiolect-deb`, builds `target/package/idiolect_0.1.0_amd64.deb` with `dpkg-deb --build`, and verifies package contents include all three artifacts with `dpkg-deb --contents`.
 
-- [ ] **Step 4: Run packaging gate**
+- [x] **Step 4: Run packaging gate**
 
 ```bash
 bash ci/scripts/test-packaging.sh
@@ -283,7 +283,7 @@ bash ci/scripts/test-packaging.sh
 
 Expected: PASS and `target/package/idiolect_0.1.0_amd64.deb` exists.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packaging/debian ci/scripts/test-packaging.sh

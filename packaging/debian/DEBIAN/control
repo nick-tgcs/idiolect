@@ -1,0 +1,7 @@
+Package: idiolect
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Idiolect maintainers <maintainers@example.invalid>
+Description: Local-first speech-to-text input method for Linux
