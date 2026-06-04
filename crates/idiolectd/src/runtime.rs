@@ -5,13 +5,16 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use idiolect_adapter_opus::OpusCodec;
 use idiolect_adapter_sqlite::{SqliteMetadataStore, SqliteStorageError};
 use idiolect_adapter_vad::VadAdapter;
 use idiolect_adapter_whisper::WhisperAsr;
 use idiolect_application::use_cases::dictation::{DictationUseCase, DictationUseCaseError};
+use idiolect_common::config::{
+    resolve_xdg_paths, IdiolectConfig, ResolvedConfigPaths, XdgBaseDirs,
+};
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
@@ -138,6 +141,12 @@ pub fn run_from_env() -> i32 {
 pub fn run_cli(args: &[String]) -> Result<String, RuntimeError> {
     match args {
         [version, format] if version == "--version" && format == "--json" => Ok(version_json()),
+        [command, subcommand, format]
+            if command == "config" && subcommand == "print-default" && format == "--json" =>
+        {
+            config_print_default()
+        }
+        [command, rest @ ..] if command == "run" => run_daemon_setup(rest),
         [command, rest @ ..] if command == "fixture-once" => fixture_once(rest),
         [command, rest @ ..] if command == "serve-fixture" => {
             let config = parse_serve_fixture_config(rest)?;
@@ -161,6 +170,84 @@ fn version_json() -> String {
         "protocol_version": PROTOCOL_VERSION,
     })
     .to_string()
+}
+
+fn config_print_default() -> Result<String, RuntimeError> {
+    serde_json::to_string(&IdiolectConfig::default())
+        .map_err(|error| RuntimeError::usage(format!("serialize default config failed: {error}")))
+}
+
+fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
+    let config_path = parse_run_config_path(args)?;
+    let config_text =
+        fs::read_to_string(&config_path).map_err(|error| RuntimeError::io("read config", error))?;
+    let config = IdiolectConfig::from_toml_str(&config_text)
+        .map_err(|error| RuntimeError::usage(format!("config parse failed: {error}")))?;
+    config
+        .validate()
+        .map_err(|error| RuntimeError::usage(format!("config validation failed: {error}")))?;
+
+    let base_dirs = XdgBaseDirs::default();
+    let paths = resolve_xdg_paths(&config, &base_dirs);
+    prepare_configured_paths(&paths)?;
+    if !paths.model_path.is_file() {
+        return Err(RuntimeError::usage(format!(
+            "ASR model path does not exist: {}",
+            paths.model_path.display()
+        )));
+    }
+
+    Ok(json!({
+        "ready": true,
+        "socket_path": paths.socket_path,
+        "database_path": paths.database_path,
+        "model_path": paths.model_path,
+    })
+    .to_string())
+}
+
+fn parse_run_config_path(args: &[String]) -> Result<PathBuf, RuntimeError> {
+    let mut config_path = None;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                config_path = Some(PathBuf::from(flag_value(args, index, "--config")?));
+            }
+            unknown => {
+                return Err(RuntimeError::usage(format!(
+                    "unknown run argument: {unknown}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    required_value(config_path, "--config")
+}
+
+fn prepare_configured_paths(paths: &ResolvedConfigPaths) -> Result<(), RuntimeError> {
+    create_parent_dir("socket parent", &paths.socket_path)?;
+    create_parent_dir("database parent", &paths.database_path)?;
+    create_dir("models whisper", &paths.models_whisper_dir)?;
+    create_dir("audio", &paths.audio_dir)?;
+    create_dir("adapters", &paths.adapters_dir)?;
+    create_dir("manifests", &paths.manifests_dir)?;
+    create_dir("decoded cache", &paths.decoded_cache_dir)?;
+    create_dir("trainer cache", &paths.trainer_cache_dir)
+}
+
+fn create_parent_dir(action: &str, path: &Path) -> Result<(), RuntimeError> {
+    if let Some(parent) = path.parent() {
+        create_dir(action, parent)?;
+    }
+    Ok(())
+}
+
+fn create_dir(action: &str, path: &Path) -> Result<(), RuntimeError> {
+    fs::create_dir_all(path).map_err(|error| RuntimeError::io(action, error))
 }
 
 fn fixture_once(args: &[String]) -> Result<String, RuntimeError> {
