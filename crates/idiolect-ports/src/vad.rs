@@ -1,4 +1,4 @@
-pub use idiolect_core::domain::adapter::AudioSegment;
+pub use crate::audio::AudioSegment;
 
 pub trait VadPort {
     type Error;

@@ -1,4 +1,4 @@
-pub use idiolect_core::domain::adapter::{AudioSegment, EncodedAudio};
+pub use crate::audio::{AudioSegment, EncodedAudio};
 
 pub trait AudioCodecPort {
     type Error;

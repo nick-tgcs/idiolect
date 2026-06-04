@@ -1,4 +1,4 @@
-pub use idiolect_core::domain::adapter::{AudioSegment, TranscriptDraft};
+pub use crate::audio::{AudioSegment, TranscriptDraft, TranscriptMetadata};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct AdapterCapabilities {
