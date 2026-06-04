@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

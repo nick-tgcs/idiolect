@@ -452,6 +452,10 @@ dependencies = [
 [[package]]
 name = "idiolect-cli"
 version = "0.1.0"
+dependencies = [
+ "idiolect-adapter-sqlite",
+ "serde_json",
+]
 
 [[package]]
 name = "idiolect-common"

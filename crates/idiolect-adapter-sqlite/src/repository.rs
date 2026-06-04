@@ -14,6 +14,8 @@ const SESSION_CREATED: &str = "SessionCreated";
 const PREEDIT_CORRECTED: &str = "PreeditCorrected";
 const SESSION_COMMITTED: &str = "SessionCommitted";
 const SESSION_CANCELLED: &str = "SessionCancelled";
+const USER_AGGREGATE_TYPE: &str = "user";
+const USER_DATA_DELETED: &str = "UserDataDeleted";
 const SESSION_STATE_CREATED: &str = "created";
 const SESSION_STATE_COMMITTED: &str = "committed";
 const SESSION_STATE_CANCELLED: &str = "cancelled";
@@ -108,6 +110,12 @@ impl Error for SqliteStorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.source.as_deref()
     }
+}
+
+pub struct PrivacyExportSummary {
+    pub user_id: String,
+    pub training_candidates: i64,
+    pub user_data_deleted_events: i64,
 }
 
 pub struct SqliteMetadataStore {
@@ -230,12 +238,69 @@ impl SqliteMetadataStore {
     }
 
     pub fn training_candidate_count_for_test(&self) -> Result<i64, SqliteStorageError> {
-        let count = backend_result(self.connection.query_row(
-            "SELECT COUNT(*) FROM training_candidates",
-            [],
+        self.training_candidate_count()
+    }
+
+    pub fn privacy_export_summary(
+        &self,
+        user_id: &str,
+    ) -> Result<PrivacyExportSummary, SqliteStorageError> {
+        Ok(PrivacyExportSummary {
+            user_id: user_id.to_owned(),
+            training_candidates: self.training_candidate_count()?,
+            user_data_deleted_events: self.user_data_deleted_event_count(user_id)?,
+        })
+    }
+
+    pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let deletion_count: i64 = backend_result(transaction.query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE aggregate_type = ?1 AND aggregate_id = ?2 AND event_type = ?3",
+            params![USER_AGGREGATE_TYPE, user_id, USER_DATA_DELETED],
             |row| row.get(0),
         ))?;
-        Ok(count)
+
+        backend_result(transaction.execute("DELETE FROM training_candidates", []))?;
+        backend_result(transaction.execute("DELETE FROM ime_edit_events", []))?;
+        backend_result(transaction.execute("DELETE FROM ime_text_sessions", []))?;
+        backend_result(transaction.execute("DELETE FROM correction_memory", []))?;
+        backend_result(
+            transaction.execute("DELETE FROM adapters WHERE user_id = ?1", params![user_id]),
+        )?;
+        backend_result(transaction.execute(
+            "DELETE FROM training_runs WHERE user_id = ?1",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM event_log WHERE aggregate_type = ?1",
+            params![SESSION_AGGREGATE_TYPE],
+        ))?;
+
+        let event_payload = serde_json::json!({ "user": user_id }).to_string();
+        let idempotency_key = format!("user-data-deleted:{user_id}:{}", deletion_count + 1);
+        Self::create_event(
+            &transaction,
+            USER_AGGREGATE_TYPE,
+            user_id,
+            USER_DATA_DELETED,
+            &event_payload,
+            &idempotency_key,
+        )?;
+
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn delete_user_data_for_test(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
+        self.delete_user_data(user_id)
+    }
+
+    pub fn user_data_deleted_event_count_for_test(
+        &self,
+        user_id: &str,
+    ) -> Result<i64, SqliteStorageError> {
+        self.user_data_deleted_event_count(user_id)
     }
 
     pub fn session_state_for_test(
@@ -253,6 +318,25 @@ impl SqliteMetadataStore {
                 .optional(),
         )?;
         state.ok_or_else(|| SqliteStorageError::not_found("ime_text_sessions row", &session_key))
+    }
+
+    fn training_candidate_count(&self) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM training_candidates",
+            [],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_data_deleted_event_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM event_log
+             WHERE aggregate_type = ?1 AND aggregate_id = ?2 AND event_type = ?3",
+            params![USER_AGGREGATE_TYPE, user_id, USER_DATA_DELETED],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
     }
 
     fn applied_migration_checksum(
@@ -326,6 +410,7 @@ impl SqliteMetadataStore {
 
     fn create_event(
         transaction: &Transaction<'_>,
+        aggregate_type: &str,
         aggregate_id: &str,
         event_type: &str,
         event_json: &str,
@@ -342,7 +427,7 @@ impl SqliteMetadataStore {
                 created_by
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                SESSION_AGGREGATE_TYPE,
+                aggregate_type,
                 aggregate_id,
                 event_type,
                 1_i64,
@@ -399,6 +484,7 @@ impl MetadataStorePort for SqliteMetadataStore {
         ))?;
         Self::create_event(
             &transaction,
+            SESSION_AGGREGATE_TYPE,
             &session_key,
             SESSION_CREATED,
             event_payload,
@@ -438,6 +524,7 @@ impl MetadataStorePort for SqliteMetadataStore {
 
         Self::create_event(
             &transaction,
+            SESSION_AGGREGATE_TYPE,
             &session_key,
             PREEDIT_CORRECTED,
             &event_payload,
@@ -476,6 +563,7 @@ impl MetadataStorePort for SqliteMetadataStore {
 
         Self::create_event(
             &transaction,
+            SESSION_AGGREGATE_TYPE,
             &session_key,
             SESSION_COMMITTED,
             committed_text,
@@ -540,6 +628,7 @@ impl MetadataStorePort for SqliteMetadataStore {
 
         Self::create_event(
             &transaction,
+            SESSION_AGGREGATE_TYPE,
             &session_key,
             SESSION_CANCELLED,
             CANCEL_PAYLOAD,

@@ -1,3 +1,3 @@
 fn main() {
-    println!("{}", idiolect_cli::crate_name());
+    std::process::exit(idiolect_cli::run_from_env());
 }

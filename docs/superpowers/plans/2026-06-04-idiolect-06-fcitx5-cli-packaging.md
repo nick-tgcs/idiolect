@@ -153,6 +153,7 @@ git commit -m "feat: add versioned ipc handshake contract"
 **Model:** Gatekeeper-local or `gpt-5.4-mini`, then `gpt-5.3-codex-spark`  
 **Files:**
 
+- Modify: `Cargo.lock`
 - Modify: `crates/idiolect-cli/src/lib.rs`
 - Modify: `crates/idiolect-cli/src/main.rs`
 - Create: `crates/idiolect-cli/tests/cli_privacy.rs`
@@ -161,11 +162,11 @@ git commit -m "feat: add versioned ipc handshake contract"
 - Modify: `crates/idiolect-adapter-sqlite/src/repository.rs`
 - Create: `crates/idiolect-integration-tests/tests/privacy_delete.rs`
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Create `doctor_command_reports_json_status` using `std::process::Command` and `env!("CARGO_BIN_EXE_idiolect-cli")`; it runs `doctor --json` and asserts stdout contains `"storage"` and `"ipc"`. Create `privacy_delete_requires_explicit_confirm_flag`; it runs `privacy delete --user default`, expects non-zero exit, and asserts stderr contains `--confirm-delete`.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-cli --tests
@@ -173,7 +174,7 @@ cargo test -p idiolect-cli --tests
 
 Expected: FAIL because CLI commands are absent.
 
-- [ ] **Step 3: Implement minimal command parser**
+- [x] **Step 3: Implement minimal command parser**
 
 Use `std::env::args` unless a decision record approves an exact pinned CLI parser dependency. Implement:
 
@@ -185,11 +186,11 @@ idiolect-cli privacy delete --user <user> --db <path> --confirm-delete
 
 Privacy delete must refuse to run without `--confirm-delete` and return a non-zero exit code with a clear stderr message.
 
-- [ ] **Step 4: Add storage privacy deletion integration test**
+- [x] **Step 4: Add storage privacy deletion integration test**
 
 Create `privacy_delete_removes_user_materialized_data_and_appends_event`: migrate a temp SQLite DB, create and commit one session, call `delete_user_data_for_test("default")`, assert candidate count is `0`, and assert `UserDataDeleted` event count is `1`.
 
-- [ ] **Step 5: Run green commands and gates**
+- [x] **Step 5: Run green commands and gates**
 
 ```bash
 cargo test -p idiolect-cli --tests
@@ -199,10 +200,10 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
-git add crates/idiolect-cli crates/idiolect-adapter-sqlite crates/idiolect-integration-tests/tests/privacy_delete.rs
+git add Cargo.lock crates/idiolect-cli crates/idiolect-adapter-sqlite crates/idiolect-integration-tests/tests/privacy_delete.rs
 git commit -m "feat: add cli doctor and privacy commands"
 ```
 
