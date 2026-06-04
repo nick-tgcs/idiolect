@@ -298,7 +298,7 @@ git commit -m "build: add debian packaging gate"
 
 - Modify: `README.md`
 
-- [ ] **Step 1: Add release gate documentation**
+- [x] **Step 1: Add release gate documentation**
 
 Add a `V1 Verification Gates` section listing:
 
@@ -313,7 +313,7 @@ bash ci/scripts/test-packaging.sh
 
 The section must state that all warnings are errors and any failing command blocks release.
 
-- [ ] **Step 2: Run all release gates**
+- [x] **Step 2: Run all release gates**
 
 ```bash
 bash ci/scripts/test-rust.sh
@@ -326,7 +326,7 @@ bash ci/scripts/test-packaging.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add README.md
