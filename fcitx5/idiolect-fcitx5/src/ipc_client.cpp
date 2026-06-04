@@ -117,44 +117,12 @@ std::vector<std::string> client_features() {
     return {"preedit", "commit"};
 }
 
-UnixSocketIpcClient::UnixSocketIpcClient(const std::string& socket_path) {
-    socket_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (socket_fd_ < 0) {
-        throw system_error("socket");
-    }
-
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    if (socket_path.size() >= sizeof(address.sun_path)) {
-        ::close(socket_fd_);
-        socket_fd_ = -1;
-        throw std::runtime_error("socket path is too long");
-    }
-    std::strncpy(address.sun_path, socket_path.c_str(), sizeof(address.sun_path) - 1);
-
-    if (::connect(socket_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-        const auto error = system_error("connect");
-        ::close(socket_fd_);
-        socket_fd_ = -1;
-        throw error;
-    }
-
-    send_json_line(
-        "{\"type\":\"ClientHello\",\"payload\":{\"client_name\":\"idiolect-fcitx5\","
-        "\"protocol_version\":1,\"features\":[\"preedit\",\"commit\"]}}\n");
-
-    const std::string server_hello = read_json_line();
-    require_contains(server_hello, "\"type\":\"ServerHello\"", "server should send ServerHello");
-    require_contains(server_hello, "\"protocol_version\":1", "server should accept protocol version 1");
-
-    negotiated_protocol_version_ = client_protocol_version();
-    accepted_features_ = parse_accepted_features(server_hello);
+UnixSocketIpcClient::UnixSocketIpcClient(const std::string& socket_path) : socket_path_(socket_path) {
+    connect_and_negotiate(socket_path_);
 }
 
 UnixSocketIpcClient::~UnixSocketIpcClient() {
-    if (socket_fd_ >= 0) {
-        ::close(socket_fd_);
-    }
+    close_socket();
 }
 
 void UnixSocketIpcClient::start_recording() {
@@ -170,6 +138,11 @@ void UnixSocketIpcClient::cancel_preedit() {
     send_json_line("{\"type\":\"CancelPreedit\"}\n");
 }
 
+void UnixSocketIpcClient::reconnect() {
+    close_socket();
+    connect_and_negotiate(socket_path_);
+}
+
 std::string UnixSocketIpcClient::read_preedit_update() {
     const std::string line = read_json_line();
     require_contains(line, "\"type\":\"PreeditUpdate\"", "server should send PreeditUpdate");
@@ -182,6 +155,45 @@ std::uint16_t UnixSocketIpcClient::negotiated_protocol_version() const {
 
 const std::vector<std::string>& UnixSocketIpcClient::accepted_features() const {
     return accepted_features_;
+}
+
+void UnixSocketIpcClient::connect_and_negotiate(const std::string& socket_path) {
+    socket_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd_ < 0) {
+        throw system_error("socket");
+    }
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (socket_path.size() >= sizeof(address.sun_path)) {
+        close_socket();
+        throw std::runtime_error("socket path is too long");
+    }
+    std::strncpy(address.sun_path, socket_path.c_str(), sizeof(address.sun_path) - 1);
+
+    if (::connect(socket_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const auto error = system_error("connect");
+        close_socket();
+        throw error;
+    }
+
+    send_json_line(
+        "{\"type\":\"ClientHello\",\"payload\":{\"client_name\":\"idiolect-fcitx5\","
+        "\"protocol_version\":1,\"features\":[\"preedit\",\"commit\"]}}\n");
+
+    const std::string server_hello = read_json_line();
+    require_contains(server_hello, "\"type\":\"ServerHello\"", "server should send ServerHello");
+    require_contains(server_hello, "\"protocol_version\":1", "server should accept protocol version 1");
+
+    negotiated_protocol_version_ = client_protocol_version();
+    accepted_features_ = parse_accepted_features(server_hello);
+}
+
+void UnixSocketIpcClient::close_socket() {
+    if (socket_fd_ >= 0) {
+        ::close(socket_fd_);
+        socket_fd_ = -1;
+    }
 }
 
 void UnixSocketIpcClient::send_json_line(const std::string& line) const {

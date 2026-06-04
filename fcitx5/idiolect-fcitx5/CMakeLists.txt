@@ -35,3 +35,11 @@ add_executable(e2e_ipc_bridge_test
 target_link_libraries(e2e_ipc_bridge_test PRIVATE idiolect-fcitx5 Threads::Threads)
 
 add_test(NAME e2e_ipc_bridge_test COMMAND e2e_ipc_bridge_test)
+
+add_executable(disconnect_recovery_test
+    tests/disconnect_recovery_test.cpp
+)
+
+target_link_libraries(disconnect_recovery_test PRIVATE idiolect-fcitx5)
+
+add_test(NAME disconnect_recovery_test COMMAND disconnect_recovery_test)

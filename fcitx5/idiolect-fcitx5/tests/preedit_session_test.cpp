@@ -20,6 +20,10 @@ public:
         messages.emplace_back("cancel");
     }
 
+    void reconnect() override {
+        messages.emplace_back("reconnect");
+    }
+
     std::vector<std::string> messages;
 };
 
@@ -45,6 +49,12 @@ int main() {
     require(ipc_client.messages[0] == "start_recording");
     require(ipc_client.messages[1] == "commit:restart Traefik");
     require(engine.visible_preedit().empty());
+
+    engine.receive_preedit("pending draft");
+    engine.recover_from_daemon_disconnect();
+    require(engine.visible_preedit().empty());
+    require(ipc_client.messages.size() == 3);
+    require(ipc_client.messages[2] == "reconnect");
 
     require(idiolect::fcitx5::client_protocol_version() == 1);
     const auto features = idiolect::fcitx5::client_features();

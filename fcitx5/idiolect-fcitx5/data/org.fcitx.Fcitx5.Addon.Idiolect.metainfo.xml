@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="addon">
+  <id>org.fcitx.Fcitx5.Addon.Idiolect</id>
+  <name>Idiolect</name>
+  <summary>Local speech-to-text input method for Fcitx5</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <description>
+    <p>Idiolect connects the Fcitx5 input method frontend to the local idiolectd daemon.</p>
+  </description>
+  <provides>
+    <binary>idiolectd</binary>
+  </provides>
+</component>
