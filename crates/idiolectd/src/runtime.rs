@@ -24,6 +24,9 @@ use idiolect_ports::codec::AudioCodecPort;
 use idiolect_ports::input_method::InputMethodPort;
 use idiolect_ports::storage::MetadataStorePort;
 use idiolect_ports::vad::VadPort;
+
+use crate::adapters::RuntimeAdapterProfile;
+use crate::run_loop::{RunLoopConfig, RunLoopError};
 use idiolect_test_support::fixtures::speech_and_silence_fixture_16khz_mono;
 use serde_json::json;
 
@@ -104,6 +107,13 @@ impl RuntimeError {
         }
     }
 
+    fn run_loop(error: RunLoopError) -> Self {
+        Self {
+            message: format!("daemon run loop failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
+
     fn dictation(error: DictationUseCaseError<Infallible, SqliteStorageError>) -> Self {
         match error {
             DictationUseCaseError::Input(input) => match input {},
@@ -178,9 +188,9 @@ fn config_print_default() -> Result<String, RuntimeError> {
 }
 
 fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
-    let config_path = parse_run_config_path(args)?;
-    let config_text =
-        fs::read_to_string(&config_path).map_err(|error| RuntimeError::io("read config", error))?;
+    let run_args = parse_run_args(args)?;
+    let config_text = fs::read_to_string(&run_args.config_path)
+        .map_err(|error| RuntimeError::io("read config", error))?;
     let config = IdiolectConfig::from_toml_str(&config_text)
         .map_err(|error| RuntimeError::usage(format!("config parse failed: {error}")))?;
     config
@@ -197,17 +207,45 @@ fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
         )));
     }
 
-    Ok(json!({
-        "ready": true,
-        "socket_path": paths.socket_path,
-        "database_path": paths.database_path,
-        "model_path": paths.model_path,
+    if run_args.check_config {
+        return Ok(json!({
+            "ready": true,
+            "socket_path": paths.socket_path,
+            "database_path": paths.database_path,
+            "model_path": paths.model_path,
+        })
+        .to_string());
+    }
+
+    crate::run_loop::run(RunLoopConfig {
+        socket_path: paths.socket_path,
+        database_path: paths.database_path,
+        audio_root: paths.audio_dir,
+        decoded_cache_root: paths.decoded_cache_dir,
+        user_id: config.user.default_user_id.clone(),
+        shutdown_after_client: run_args.shutdown_after_client,
+        adapter_profile: RuntimeAdapterProfile {
+            audio_input_device: config.audio.input_device.clone(),
+            vad_engine: config.vad.engine.clone(),
+            asr_engine: config.asr.engine.clone(),
+        },
     })
-    .to_string())
+    .map_err(RuntimeError::run_loop)?;
+
+    Ok(json!({"shutdown": true}).to_string())
 }
 
-fn parse_run_config_path(args: &[String]) -> Result<PathBuf, RuntimeError> {
+#[derive(Debug)]
+struct RunArgs {
+    config_path: PathBuf,
+    check_config: bool,
+    shutdown_after_client: bool,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, RuntimeError> {
     let mut config_path = None;
+    let mut check_config = false;
+    let mut shutdown_after_client = false;
     let mut index = 0_usize;
 
     while index < args.len() {
@@ -215,6 +253,12 @@ fn parse_run_config_path(args: &[String]) -> Result<PathBuf, RuntimeError> {
             "--config" => {
                 index += 1;
                 config_path = Some(PathBuf::from(flag_value(args, index, "--config")?));
+            }
+            "--check-config" => {
+                check_config = true;
+            }
+            "--shutdown-after-client" => {
+                shutdown_after_client = true;
             }
             unknown => {
                 return Err(RuntimeError::usage(format!(
@@ -225,7 +269,11 @@ fn parse_run_config_path(args: &[String]) -> Result<PathBuf, RuntimeError> {
         index += 1;
     }
 
-    required_value(config_path, "--config")
+    Ok(RunArgs {
+        config_path: required_value(config_path, "--config")?,
+        check_config,
+        shutdown_after_client,
+    })
 }
 
 fn prepare_configured_paths(paths: &ResolvedConfigPaths) -> Result<(), RuntimeError> {

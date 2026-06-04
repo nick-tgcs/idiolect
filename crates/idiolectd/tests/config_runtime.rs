@@ -31,7 +31,12 @@ fn idiolectd_run_rejects_missing_model_path() {
     let config_path = fixture.write_config("missing private transcript", false);
 
     let output = Command::new(env!("CARGO_BIN_EXE_idiolectd"))
-        .args(["run", "--config", config_path.to_str().expect("utf8 path")])
+        .args([
+            "run",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--check-config",
+        ])
         .output()
         .expect("idiolectd run should execute");
 
@@ -47,7 +52,12 @@ fn idiolectd_run_uses_configured_socket_and_database_paths() {
     let config_path = fixture.write_config("configured private transcript", true);
 
     let output = Command::new(env!("CARGO_BIN_EXE_idiolectd"))
-        .args(["run", "--config", config_path.to_str().expect("utf8 path")])
+        .args([
+            "run",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--check-config",
+        ])
         .output()
         .expect("idiolectd run should execute");
 
@@ -77,7 +87,12 @@ fn idiolectd_run_does_not_log_private_text_by_default() {
     let config_path = fixture.write_config(private_text, true);
 
     let output = Command::new(env!("CARGO_BIN_EXE_idiolectd"))
-        .args(["run", "--config", config_path.to_str().expect("utf8 path")])
+        .args([
+            "run",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--check-config",
+        ])
         .output()
         .expect("idiolectd run should execute");
 

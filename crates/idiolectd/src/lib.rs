@@ -1,7 +1,10 @@
 //! Crate documentation for the Idiolect workspace.
 
 pub mod daemon;
+mod run_loop;
 pub mod runtime;
+
+mod adapters;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]
