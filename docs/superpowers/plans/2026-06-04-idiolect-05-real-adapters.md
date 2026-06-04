@@ -161,7 +161,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/idiolect-adapter-cpal crates/idiolect-integration-tests/tests/real_audio_adapter_contracts.rs
@@ -219,7 +219,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/idiolect-adapter-opus crates/idiolect-integration-tests/tests/real_codec_contracts.rs
@@ -278,7 +278,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/idiolect-adapter-vad crates/idiolect-integration-tests/tests/real_vad_contracts.rs crates/idiolect-test-support/src/fixtures.rs
@@ -344,7 +344,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings and a real Whisper backend exercised by the fixture model.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml crates/idiolect-adapter-whisper crates/idiolect-integration-tests/tests/real_asr_contracts.rs crates/idiolect-test-support tests/fixtures/whisper ci/scripts/fetch-whisper-fixture.sh
@@ -382,7 +382,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/idiolect-integration-tests/tests/real_adapter_contracts.rs

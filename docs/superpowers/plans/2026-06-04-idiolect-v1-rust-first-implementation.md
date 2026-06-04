@@ -10,6 +10,14 @@
 
 ---
 
+## Implementation Status
+
+- Child plans 05 and 06 are complete as of 2026-06-04.
+- The v1 release gates in `README.md` passed locally on 2026-06-04.
+- Earlier child plan checklist files 00-04 and the expanded parent-plan task list predate this finalization pass and were not mass-rewritten.
+
+---
+
 ## Gatekeeper Rules
 
 This project is implemented by bounded sub-agents, but acceptance stays with the gatekeeper. A worker report is evidence, not truth. The gatekeeper must inspect diffs, run commands, and reject work that fails any requirement below.
