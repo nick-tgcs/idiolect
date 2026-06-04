@@ -40,7 +40,35 @@ fn migration_01_creates_materialized_tables() {
             "missing {table}"
         );
     }
-    assert_eq!(store.applied_migration_versions_for_test().unwrap(), [1]);
+    assert_eq!(store.applied_migration_versions_for_test().unwrap(), [1, 2]);
+}
+
+#[test]
+fn migration_02_adds_correction_memory() {
+    let mut store = SqliteMetadataStore::open_in_memory().expect("store should open");
+    store.migrate().expect("migration should apply");
+
+    assert!(store.table_exists_for_test("correction_memory").unwrap());
+    assert_eq!(
+        store.table_columns_for_test("correction_memory").unwrap(),
+        [
+            "id",
+            "raw_text",
+            "corrected_text",
+            "confidence",
+            "occurrence_count",
+            "first_seen_at",
+            "last_seen_at",
+        ]
+    );
+}
+
+#[test]
+fn migration_02_is_recorded_after_01() {
+    let mut store = SqliteMetadataStore::open_in_memory().expect("store should open");
+    store.migrate().expect("migration should apply");
+
+    assert_eq!(store.applied_migration_versions_for_test().unwrap(), [1, 2]);
 }
 
 #[test]
@@ -69,7 +97,7 @@ fn migrate_with_mismatched_checksum_fails_fast() {
         SqliteStorageErrorKind::MigrationChecksumMismatch
     );
     assert!(error.to_string().contains("checksum mismatch"));
-    assert_eq!(store.applied_migration_versions_for_test().unwrap(), [1]);
+    assert_eq!(store.applied_migration_versions_for_test().unwrap(), [1, 2]);
 }
 
 #[test]

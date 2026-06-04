@@ -28,12 +28,20 @@ fn nibble_to_hex(nibble: u8) -> char {
     }
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../migrations/0001_initial.sql"),
-    expected_sha256_hex: "5df0243d62760ef60263c07710fb4bb9d7966d5220e0c4a09629bb9adeb12470",
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../migrations/0001_initial.sql"),
+        expected_sha256_hex: "5df0243d62760ef60263c07710fb4bb9d7966d5220e0c4a09629bb9adeb12470",
+    },
+    Migration {
+        version: 2,
+        name: "correction_memory",
+        sql: include_str!("../migrations/0002_correction_memory.sql"),
+        expected_sha256_hex: "36d0013c7516f39ba8006237ea7aa3ed683c2a1313a506d63c5660472a01b648",
+    },
+];
 
 #[must_use]
 pub fn migrations() -> &'static [Migration] {
