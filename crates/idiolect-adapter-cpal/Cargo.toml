@@ -1,0 +1,11 @@
+[package]
+name = "idiolect-adapter-cpal"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.96"
+
+[dependencies]
+cpal = "=0.17.3"
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ports = { path = "../idiolect-ports" }

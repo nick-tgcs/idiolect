@@ -6,7 +6,7 @@
 
 **Architecture:** Idiolect uses a ports-and-adapters architecture. `idiolect-core` owns pure product rules, `idiolect-ports` owns replaceable boundaries, `idiolect-application` owns use-case orchestration, adapters own third-party integration, and `idiolectd` is the composition root. Python is research-only and is not part of the v1 runtime, required CI, trainer, promotion path, or packaging path.
 
-**Tech Stack:** Rust workspace, Cargo workspace lints, Tokio, Serde, SQLite via a Rust adapter, Unix domain socket JSON Lines IPC, C++ Fcitx5 shim behind protocol boundaries, fixture-first audio/ASR/VAD adapters, later real CPAL/Silero/whisper-rs/Opus adapters after contracts are green.
+**Tech Stack:** Rust workspace, Cargo workspace lints, Tokio, Serde, SQLite via a Rust adapter, Unix domain socket JSON Lines IPC, C++ Fcitx5 shim behind protocol boundaries, fixture-first audio/ASR/VAD adapters, later real CPAL/WebRTC VAD/whisper-rs/Opus adapters after contracts are green.
 
 ---
 
@@ -389,7 +389,7 @@ Rust is pinned to stable `1.96.0`, released 2026-05-28. Rust has no separate LTS
 
 Consequences:
 
-- Core crates never expose Fcitx5, whisper-rs, Silero, Opus, rusqlite, Burn, Candle, ONNX Runtime, PyTorch, PEFT, Python, or other backend-specific types.
+- Core crates never expose Fcitx5, whisper-rs, WebRTC VAD, Opus, rusqlite, Burn, Candle, ONNX Runtime, PyTorch, PEFT, Python, or other backend-specific types.
 - Required contract tests are Rust tests.
 - The Fcitx5 engine remains a thin C++ shim and communicates through versioned IPC.
 - Adapter promotion requires artifact compatibility, metrics, and rollback evidence.
@@ -1017,7 +1017,7 @@ Implement the types named in the test in `crates/idiolect-core/src/domain/adapte
 Run:
 
 ```bash
-rg -n "fcitx|whisper|silero|opus|rusqlite|python|pytorch|peft|burn|candle|onnx" crates/idiolect-core
+rg -n "fcitx|whisper|silero|webrtc|fvad|opus|rusqlite|python|pytorch|peft|burn|candle|onnx" crates/idiolect-core
 ```
 
 Expected: no output.
@@ -1233,7 +1233,7 @@ If a worker needs to change a signature, they must stop and return `NEEDS_CONTEX
 Run:
 
 ```bash
-rg -n "fcitx|whisper|silero|opus|rusqlite|python|pytorch|peft|burn|candle|onnx" crates/idiolect-ports
+rg -n "fcitx|whisper|silero|webrtc|fvad|opus|rusqlite|python|pytorch|peft|burn|candle|onnx" crates/idiolect-ports
 ```
 
 Expected: no output.
@@ -2176,7 +2176,7 @@ The test must prove silence emits no speech segment, fixture speech emits one bo
 
 - [ ] **Step 3: Implement the adapter behind the port**
 
-No ONNX, Silero, or third-party model type may escape the adapter crate public API.
+No ONNX, WebRTC VAD, or third-party model type may escape the adapter crate public API.
 
 - [ ] **Step 4: Verify**
 

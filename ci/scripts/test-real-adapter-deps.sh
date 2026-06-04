@@ -19,3 +19,10 @@ if [ "$found" -eq 0 ]; then
   echo "no version requirements found in cargo manifests" >&2
   exit 1
 fi
+
+dependency_tree="$(cargo tree --workspace --target all --all-features --prefix none)"
+
+if printf '%s\n' "$dependency_tree" | rg -n '^(numpy|pyo3|pyo3-build-config|pyo3-ffi|pyo3-macros|pyo3-macros-backend) v'; then
+  echo "python-related crates are not allowed in v1 required dependency paths" >&2
+  exit 1
+fi

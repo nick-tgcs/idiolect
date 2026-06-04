@@ -1,0 +1,17 @@
+[package]
+name = "idiolect-adapter-whisper"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.96"
+
+[lints]
+workspace = true
+
+[dependencies]
+idiolect-ports = { path = "../idiolect-ports" }
+thiserror = "=1.0.61"
+whisper-rs = "=0.16.0"
+
+[dev-dependencies]
+idiolect-test-support = { path = "../idiolect-test-support" }

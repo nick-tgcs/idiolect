@@ -9,6 +9,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+idiolect-adapter-cpal = { path = "../idiolect-adapter-cpal" }
+idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
+idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }
+idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
+idiolect-test-support = { path = "../idiolect-test-support" }
 idiolect-adapter-fixture-asr = { path = "../idiolect-adapter-fixture-asr" }
 idiolect-adapter-fixture-audio = { path = "../idiolect-adapter-fixture-audio" }
 idiolect-adapter-fixture-codec = { path = "../idiolect-adapter-fixture-codec" }

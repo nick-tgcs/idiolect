@@ -1,0 +1,31 @@
+[package]
+name = "idiolect-adapter-vad"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.96"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[dependencies]
+idiolect-ports = { path = "../idiolect-ports" }
+webrtc-vad = { workspace = true }
+
+[dev-dependencies]
+idiolect-test-support = { path = "../idiolect-test-support" }

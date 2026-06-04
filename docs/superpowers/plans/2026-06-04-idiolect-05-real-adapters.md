@@ -6,7 +6,7 @@
 
 **Architecture:** Real adapters live only in adapter crates. Each adapter has private backend details, public constructors that return Idiolect-owned errors, and port implementations that expose only Idiolect-owned DTOs.
 
-**Tech Stack:** Rust, CPAL, Opus-compatible Rust binding selected by decision record, Rust VAD runtime `fast-vad` selected by decision record, `whisper-rs`, fixture assets for deterministic tests, strict Cargo lint gates.
+**Tech Stack:** Rust, CPAL, Opus-compatible Rust binding selected by decision record, Rust VAD runtime `webrtc-vad` selected by decision record, `whisper-rs`, fixture assets for deterministic tests, strict Cargo lint gates.
 
 ---
 
@@ -21,7 +21,7 @@ compile and contract tests for CPAL audio adapter
 real Opus encode/decode test using sine fixture
 real VAD segmentation test using fixture audio
 real Whisper transcription test using repository-managed fixture model and audio
-backend-leakage CI scripts
+backend-leakage and required-path dependency guard CI scripts
 ```
 
 Forbidden behavior:
@@ -68,7 +68,7 @@ Run current-version lookup commands before manifest edits:
 cargo search cpal --limit 1
 cargo search whisper-rs --limit 1
 cargo search opus --limit 5
-cargo search fast-vad --limit 1
+cargo search webrtc-vad --limit 1
 ```
 
 For each decision record, include exact crate version, selected features, native system dependencies, fixture strategy, port-isolation reason, and rollback path if the dependency blocks zero-warning gates. If a dependency cannot be selected with exact version and test strategy, return `NEEDS_CONTEXT` and do not edit manifests.
@@ -85,7 +85,7 @@ Create `ci/scripts/test-interface-no-backend-leakage.sh`:
 #!/usr/bin/env bash
 set -euo pipefail
 
-if rg -n "\bcpal\b|\bwhisper\b|\bsilero\b|fast-vad|\bopus\b|\bonnx\b|\bort\b|\brusqlite\b|\bpytorch\b|\bpeft\b|\bpython\b" \
+if rg -n "\bcpal\b|\bwhisper\b|\bsilero\b|fast-vad|webrtc-vad|\bwebrtc\b|\bfvad\b|\blibfvad\b|\bopus\b|\bonnx\b|\bort\b|\brusqlite\b|\bpytorch\b|\bpeft\b|\bpython\b" \
   crates/idiolect-core crates/idiolect-ports crates/idiolect-application; then
   echo "backend implementation detail leaked into interface crates" >&2
   exit 1
@@ -120,11 +120,11 @@ git commit -m "chore: add real adapter dependency and leakage gates"
 - Modify: `Cargo.toml`
 - Create: `crates/idiolect-integration-tests/tests/real_audio_adapter_contracts.rs`
 
-- [ ] **Step 1: Write failing adapter tests**
+- [x] **Step 1: Write failing adapter tests**
 
 Create tests `stop_before_start_returns_not_started` and `missing_device_is_reported_as_typed_error`. The missing-device test calls `CpalAudioInput::open_device_by_name("__idiolect_missing_device__")` and expects `CpalAudioInputError::DeviceNotFound`.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-adapter-cpal --lib
@@ -132,7 +132,7 @@ cargo test -p idiolect-adapter-cpal --lib
 
 Expected: FAIL because the crate is absent.
 
-- [ ] **Step 3: Implement CPAL adapter behind private backend trait**
+- [x] **Step 3: Implement CPAL adapter behind private backend trait**
 
 Implementation requirements:
 
@@ -145,11 +145,11 @@ open_default and open_device_by_name are public constructors
 no automated capture test depends on a real default device
 ```
 
-- [ ] **Step 4: Add integration contract test**
+- [x] **Step 4: Add integration contract test**
 
 Create `real_audio_adapter_contracts.rs` with `cpal_missing_named_device_is_deterministic`, asserting the same typed missing-device error through public exports.
 
-- [ ] **Step 5: Run green command and gates**
+- [x] **Step 5: Run green command and gates**
 
 ```bash
 cargo test -p idiolect-adapter-cpal --lib
@@ -179,11 +179,11 @@ git commit -m "feat: add cpal audio adapter boundary"
 - Modify: `Cargo.toml`
 - Create: `crates/idiolect-integration-tests/tests/real_codec_contracts.rs`
 
-- [ ] **Step 1: Write failing codec tests**
+- [x] **Step 1: Write failing codec tests**
 
 Create `opus_codec_round_trips_fixture_metadata`: encode and decode `sine_fixture_16khz_mono()`, assert `encoded.codec_name == "opus"`, decoded sample rate `16000`, one channel, matching duration, and matching sample count.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-adapter-opus --lib
@@ -191,7 +191,7 @@ cargo test -p idiolect-adapter-opus --lib
 
 Expected: FAIL because the crate is absent.
 
-- [ ] **Step 3: Implement codec**
+- [x] **Step 3: Implement codec**
 
 Requirements:
 
@@ -203,11 +203,11 @@ fixture round trip preserves metadata and sample count
 public API exposes no third-party Opus types
 ```
 
-- [ ] **Step 4: Add integration contract**
+- [x] **Step 4: Add integration contract**
 
 Create `real_codec_contracts.rs` with the same round-trip metadata assertion through public crate exports.
 
-- [ ] **Step 5: Run green command and gates**
+- [x] **Step 5: Run green command and gates**
 
 ```bash
 cargo test -p idiolect-adapter-opus --lib
@@ -238,11 +238,11 @@ git commit -m "feat: add opus codec adapter"
 - Create: `crates/idiolect-integration-tests/tests/real_vad_contracts.rs`
 - Modify: `crates/idiolect-test-support/src/fixtures.rs`
 
-- [ ] **Step 1: Write failing VAD tests**
+- [x] **Step 1: Write failing VAD tests**
 
 Create `vad_segments_fixture_into_speech_regions`: load `speech_and_silence_fixture_16khz_mono()`, construct `VadAdapter::new()`, segment the fixture, assert exactly one speech segment, sample rate `16000`, and duration at least `400` ms.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-adapter-vad --lib
@@ -250,23 +250,23 @@ cargo test -p idiolect-adapter-vad --lib
 
 Expected: FAIL because the adapter crate and fixture helper are absent.
 
-- [ ] **Step 3: Implement VAD adapter and fixture**
+- [x] **Step 3: Implement VAD adapter and fixture**
 
 Requirements:
 
 ```text
 VadAdapter implements VadPort
-VadAdapter::new() initializes fast-vad for 16 kHz mono batch detection
+VadAdapter::new() initializes webrtc-vad for 16 kHz mono frame detection
 segment returns deterministic speech slices for the fixture
-public API exposes no ONNX, Silero, ort, or runtime-specific types
+public API exposes no ONNX, Silero, ort, WebRTC, libfvad, FFI, or runtime-specific types
 speech_and_silence_fixture_16khz_mono is pure Rust test-support data
 ```
 
-- [ ] **Step 4: Add integration contract**
+- [x] **Step 4: Add integration contract**
 
 Create `real_vad_contracts.rs` asserting `VadAdapter::new().segment(&speech_and_silence_fixture_16khz_mono())` returns one segment.
 
-- [ ] **Step 5: Run green command and gates**
+- [x] **Step 5: Run green command and gates**
 
 ```bash
 cargo test -p idiolect-adapter-vad --lib
@@ -298,15 +298,15 @@ git commit -m "feat: add vad adapter contract"
 - Create: `tests/fixtures/whisper/README.md`
 - Create: `ci/scripts/fetch-whisper-fixture.sh`
 
-- [ ] **Step 1: Establish fixture model artifact**
+- [x] **Step 1: Establish fixture model artifact**
 
 Create `tests/fixtures/whisper/README.md` with model file name, pinned download URL, SHA-256 digest, license note, and expected transcript for `tests/fixtures/audio/restart_traffic_16khz_mono.wav`. Create `ci/scripts/fetch-whisper-fixture.sh` that downloads the exact model file, verifies SHA-256, and writes it to `tests/fixtures/whisper/`. The normal test command must not perform a network download; the fixture must already be present or the worker returns `NEEDS_CONTEXT` before claiming completion.
 
-- [ ] **Step 2: Write failing Whisper tests**
+- [x] **Step 2: Write failing Whisper tests**
 
 Create tests `whisper_transcribes_fixture_audio` and `whisper_reports_capabilities_without_backend_type_leakage`. The transcription test uses `WhisperAsr::load_fixture_model()`, transcribes `restart_traffic_fixture_16khz_mono()`, asserts the lowercase text contains `restart` and `traffic`, and metadata engine name is `whisper-rs`.
 
-- [ ] **Step 3: Run red command**
+- [x] **Step 3: Run red command**
 
 ```bash
 cargo test -p idiolect-adapter-whisper --lib
@@ -314,7 +314,7 @@ cargo test -p idiolect-adapter-whisper --lib
 
 Expected: FAIL because the crate and fixture model are absent.
 
-- [ ] **Step 4: Implement adapter**
+- [x] **Step 4: Implement adapter**
 
 Requirements:
 
@@ -325,13 +325,14 @@ transcribe converts AudioSegment to backend input privately
 public API exposes no whisper-rs concrete type
 metadata contains engine_name whisper-rs and exact dependency version
 missing model returns typed MissingFixtureModel error
+corrupt model files return typed load errors and never panic
 ```
 
-- [ ] **Step 5: Add integration contract**
+- [x] **Step 5: Add integration contract**
 
 Create `real_asr_contracts.rs` asserting the real Whisper adapter transcribes fixture audio and includes `restart` plus `traffic`.
 
-- [ ] **Step 6: Run green command and gates**
+- [x] **Step 6: Run green command and gates**
 
 ```bash
 cargo test -p idiolect-adapter-whisper --lib
@@ -358,11 +359,11 @@ git commit -m "feat: add whisper asr adapter contract"
 
 - Create: `crates/idiolect-integration-tests/tests/real_adapter_contracts.rs`
 
-- [ ] **Step 1: Write full real adapter matrix test**
+- [x] **Step 1: Write full real adapter matrix test**
 
 Create `real_adapter_matrix_processes_fixture_audio`: load restart-traffic fixture, encode/decode through Opus, segment through VAD, transcribe first segment through Whisper, and assert transcript contains `restart` and `traffic`.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-integration-tests --test real_adapter_contracts
@@ -370,7 +371,7 @@ cargo test -p idiolect-integration-tests --test real_adapter_contracts
 
 Expected: FAIL until all real adapters and fixtures are wired.
 
-- [ ] **Step 3: Run green command and full gates**
+- [x] **Step 3: Run green command and full gates**
 
 ```bash
 cargo test -p idiolect-integration-tests --test real_adapter_contracts
@@ -394,6 +395,7 @@ Reject and rework this child if any condition holds:
 
 ```text
 any real adapter dependency lacks an exact version and decision record
+Python-related crates appear in required dependency paths
 any real adapter exposes backend concrete types in public APIs
 real Whisper or VAD tests are replaced by fake adapter tests
 network is required during cargo test
