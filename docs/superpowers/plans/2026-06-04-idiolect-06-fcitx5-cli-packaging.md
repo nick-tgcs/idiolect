@@ -64,11 +64,11 @@ ctest --test-dir fcitx5/idiolect-fcitx5/build --output-on-failure
 - Create: `fcitx5/idiolect-fcitx5/tests/preedit_session_test.cpp`
 - Create: `ci/scripts/test-fcitx5.sh`
 
-- [ ] **Step 1: Write failing C++ preedit tests**
+- [x] **Step 1: Write failing C++ preedit tests**
 
 Create a C++ test with `FakeIpcClient`, `Engine::start_recording`, `Engine::receive_preedit`, `Engine::commit_preedit`, and `Engine::visible_preedit`. It must assert IPC messages are `start_recording` then `commit:restart Traefik`, and visible preedit is empty after commit.
 
-- [ ] **Step 2: Run red C++ command**
+- [x] **Step 2: Run red C++ command**
 
 ```bash
 cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
@@ -78,15 +78,15 @@ ctest --test-dir fcitx5/idiolect-fcitx5/build --output-on-failure
 
 Expected: FAIL because the project and engine classes are absent.
 
-- [ ] **Step 3: Implement thin shim classes**
+- [x] **Step 3: Implement thin shim classes**
 
 Implement an `IpcClient` abstract interface and `Engine` class. The engine delegates start, cancel, and commit to IPC; it stores visible preedit text; it clears visible preedit on commit and cancel. No ASR, storage, training, privacy, or promotion logic belongs in C++.
 
-- [ ] **Step 4: Create C++ gate script**
+- [x] **Step 4: Create C++ gate script**
 
 Create `ci/scripts/test-fcitx5.sh` containing the CMake configure, build, and ctest commands above.
 
-- [ ] **Step 5: Run green command and commit**
+- [x] **Step 5: Run green command and commit**
 
 ```bash
 bash ci/scripts/test-fcitx5.sh
