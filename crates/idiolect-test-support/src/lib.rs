@@ -1,6 +1,7 @@
 //! Test support utilities for Idiolect contract tests.
 
 pub mod fakes;
+pub mod fixtures;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]
