@@ -1,4 +1,8 @@
-//! Crate documentation for the Idiolect workspace.
+//! IPC protocol DTOs and JSON Lines framing for Idiolect clients.
+
+pub mod framing;
+pub mod handshake;
+pub mod messages;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

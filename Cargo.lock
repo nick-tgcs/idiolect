@@ -481,6 +481,7 @@ dependencies = [
  "idiolect-adapter-vad",
  "idiolect-adapter-whisper",
  "idiolect-common",
+ "idiolect-ipc",
  "idiolect-ports",
  "idiolect-test-support",
  "idiolect-trainerctl",
@@ -490,6 +491,11 @@ dependencies = [
 [[package]]
 name = "idiolect-ipc"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "idiolect-ports"

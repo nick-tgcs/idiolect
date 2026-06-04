@@ -18,6 +18,7 @@ idiolect-adapter-fixture-asr = { path = "../idiolect-adapter-fixture-asr" }
 idiolect-adapter-fixture-audio = { path = "../idiolect-adapter-fixture-audio" }
 idiolect-adapter-fixture-codec = { path = "../idiolect-adapter-fixture-codec" }
 idiolect-common = { path = "../idiolect-common" }
+idiolect-ipc = { path = "../idiolect-ipc" }
 idiolect-trainerctl = { path = "../idiolect-trainerctl" }
 idiolectd = { path = "../idiolectd" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }

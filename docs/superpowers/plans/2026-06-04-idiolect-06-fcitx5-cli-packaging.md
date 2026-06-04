@@ -100,17 +100,24 @@ git commit -m "feat: add fcitx5 thin preedit shim"
 **Model:** `gpt-5.4-mini` or gatekeeper-local  
 **Files:**
 
+- Modify: `Cargo.lock`
+- Modify: `crates/idiolect-ipc/Cargo.toml`
+- Modify: `crates/idiolect-ipc/src/lib.rs`
 - Modify: `crates/idiolect-ipc/src/messages.rs`
 - Modify: `crates/idiolect-ipc/src/framing.rs`
 - Modify: `crates/idiolect-ipc/src/handshake.rs`
+- Modify: `crates/idiolect-integration-tests/Cargo.toml`
+- Modify: `fcitx5/idiolect-fcitx5/src/ipc_client.h`
 - Modify: `fcitx5/idiolect-fcitx5/src/ipc_client.cpp`
+- Modify: `fcitx5/idiolect-fcitx5/tests/preedit_session_test.cpp`
 - Create: `crates/idiolect-integration-tests/tests/ipc_handshake_contract.rs`
+- Create: `crates/idiolect-ipc/tests/framing_contract.rs`
 
-- [ ] **Step 1: Write failing Rust IPC tests**
+- [x] **Step 1: Write failing Rust IPC tests**
 
 Create tests `fcitx5_client_protocol_version_is_accepted` and `unknown_protocol_version_is_rejected`. Version `1` with features `preedit` and `commit` is accepted. Version `99` returns `HandshakeError::UnsupportedProtocolVersion(99)`.
 
-- [ ] **Step 2: Run red command**
+- [x] **Step 2: Run red command**
 
 ```bash
 cargo test -p idiolect-integration-tests --test ipc_handshake_contract
@@ -118,11 +125,11 @@ cargo test -p idiolect-integration-tests --test ipc_handshake_contract
 
 Expected: FAIL because handshake implementation is absent or incomplete.
 
-- [ ] **Step 3: Implement versioned IPC DTOs and framing**
+- [x] **Step 3: Implement versioned IPC DTOs and framing**
 
 Implement JSON Lines framing with message categories `ClientHello`, `ServerHello`, `StartRecording`, `PreeditUpdate`, `CommitPreedit`, `CancelPreedit`, and `Error`. `negotiate_protocol` accepts protocol version `1` only and returns stable feature intersection.
 
-- [ ] **Step 4: Run Rust and C++ green commands**
+- [x] **Step 4: Run Rust and C++ green commands**
 
 ```bash
 cargo test -p idiolect-ipc --lib
@@ -133,10 +140,10 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add crates/idiolect-ipc crates/idiolect-integration-tests/tests/ipc_handshake_contract.rs fcitx5/idiolect-fcitx5/src/ipc_client.cpp
+git add Cargo.lock crates/idiolect-ipc crates/idiolect-integration-tests/Cargo.toml crates/idiolect-integration-tests/tests/ipc_handshake_contract.rs fcitx5/idiolect-fcitx5/src/ipc_client.h fcitx5/idiolect-fcitx5/src/ipc_client.cpp fcitx5/idiolect-fcitx5/tests/preedit_session_test.cpp
 git commit -m "feat: add versioned ipc handshake contract"
 ```
 

@@ -46,5 +46,11 @@ int main() {
     require(ipc_client.messages[1] == "commit:restart Traefik");
     require(engine.visible_preedit().empty());
 
+    require(idiolect::fcitx5::client_protocol_version() == 1);
+    const auto features = idiolect::fcitx5::client_features();
+    require(features.size() == 2);
+    require(features[0] == "preedit");
+    require(features[1] == "commit");
+
     return 0;
 }
