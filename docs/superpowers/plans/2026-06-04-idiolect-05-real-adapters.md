@@ -6,7 +6,7 @@
 
 **Architecture:** Real adapters live only in adapter crates. Each adapter has private backend details, public constructors that return Idiolect-owned errors, and port implementations that expose only Idiolect-owned DTOs.
 
-**Tech Stack:** Rust, CPAL, Opus-compatible Rust binding selected by decision record, Rust VAD runtime selected by decision record, `whisper-rs`, fixture assets for deterministic tests, strict Cargo lint gates.
+**Tech Stack:** Rust, CPAL, Opus-compatible Rust binding selected by decision record, Rust VAD runtime `fast-vad` selected by decision record, `whisper-rs`, fixture assets for deterministic tests, strict Cargo lint gates.
 
 ---
 
@@ -60,7 +60,7 @@ Real adapter fixture rule: if a real backend requires a model or binary fixture,
 - Create: `ci/scripts/test-real-adapter-deps.sh`
 - Create: `ci/scripts/test-interface-no-backend-leakage.sh`
 
-- [ ] **Step 1: Record current dependency choices**
+- [x] **Step 1: Record current dependency choices**
 
 Run current-version lookup commands before manifest edits:
 
@@ -68,16 +68,16 @@ Run current-version lookup commands before manifest edits:
 cargo search cpal --limit 1
 cargo search whisper-rs --limit 1
 cargo search opus --limit 5
-cargo search ort --limit 3
+cargo search fast-vad --limit 1
 ```
 
 For each decision record, include exact crate version, selected features, native system dependencies, fixture strategy, port-isolation reason, and rollback path if the dependency blocks zero-warning gates. If a dependency cannot be selected with exact version and test strategy, return `NEEDS_CONTEXT` and do not edit manifests.
 
-- [ ] **Step 2: Create dependency guard script**
+- [x] **Step 2: Create dependency guard script**
 
-Create `ci/scripts/test-real-adapter-deps.sh` to run `cargo metadata --format-version 1`, parse dependencies, and fail if any dependency requirement is empty, `*`, starts with `^`, or starts with `~`.
+Create `ci/scripts/test-real-adapter-deps.sh` to run `cargo metadata --format-version 1 --no-deps`, enumerate workspace manifest paths, and fail if any manifest `version =` requirement is empty, `*`, starts with `^`, or starts with `~`.
 
-- [ ] **Step 3: Create backend leakage script**
+- [x] **Step 3: Create backend leakage script**
 
 Create `ci/scripts/test-interface-no-backend-leakage.sh`:
 
@@ -85,14 +85,14 @@ Create `ci/scripts/test-interface-no-backend-leakage.sh`:
 #!/usr/bin/env bash
 set -euo pipefail
 
-if rg -n "cpal|whisper|silero|opus|onnx|ort|rusqlite|pytorch|peft|python" \
+if rg -n "\bcpal\b|\bwhisper\b|\bsilero\b|fast-vad|\bopus\b|\bonnx\b|\bort\b|\brusqlite\b|\bpytorch\b|\bpeft\b|\bpython\b" \
   crates/idiolect-core crates/idiolect-ports crates/idiolect-application; then
   echo "backend implementation detail leaked into interface crates" >&2
   exit 1
 fi
 ```
 
-- [ ] **Step 4: Run script gates**
+- [x] **Step 4: Run script gates**
 
 ```bash
 bash ci/scripts/test-real-adapter-deps.sh
@@ -102,7 +102,7 @@ bash ci/scripts/test-rust.sh
 
 Expected: all pass with zero warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/decisions/0004-cpal-audio-adapter.md docs/decisions/0005-opus-codec-adapter.md docs/decisions/0006-vad-adapter.md docs/decisions/0007-whisper-asr-adapter.md ci/scripts/test-real-adapter-deps.sh ci/scripts/test-interface-no-backend-leakage.sh
@@ -236,11 +236,11 @@ git commit -m "feat: add opus codec adapter"
 - Create: `crates/idiolect-adapter-vad/src/lib.rs`
 - Modify: `Cargo.toml`
 - Create: `crates/idiolect-integration-tests/tests/real_vad_contracts.rs`
-- Create: `tests/fixtures/audio/speech_and_silence_16khz_mono.json`
+- Modify: `crates/idiolect-test-support/src/fixtures.rs`
 
 - [ ] **Step 1: Write failing VAD tests**
 
-Create `vad_segments_fixture_into_speech_regions`: load `VadAdapter::load_fixture_model()`, segment `speech_and_silence_fixture_16khz_mono()`, assert exactly one segment, sample rate `16000`, and duration at least `400` ms.
+Create `vad_segments_fixture_into_speech_regions`: load `speech_and_silence_fixture_16khz_mono()`, construct `VadAdapter::new()`, segment the fixture, assert exactly one speech segment, sample rate `16000`, and duration at least `400` ms.
 
 - [ ] **Step 2: Run red command**
 
@@ -248,7 +248,7 @@ Create `vad_segments_fixture_into_speech_regions`: load `VadAdapter::load_fixtur
 cargo test -p idiolect-adapter-vad --lib
 ```
 
-Expected: FAIL because the crate, fixture, and model loader are absent.
+Expected: FAIL because the adapter crate and fixture helper are absent.
 
 - [ ] **Step 3: Implement VAD adapter and fixture**
 
@@ -256,15 +256,15 @@ Requirements:
 
 ```text
 VadAdapter implements VadPort
-load_fixture_model loads only repository-managed fixture data
+VadAdapter::new() initializes fast-vad for 16 kHz mono batch detection
 segment returns deterministic speech slices for the fixture
-public API exposes no ONNX, Silero, or runtime-specific types
+public API exposes no ONNX, Silero, ort, or runtime-specific types
 speech_and_silence_fixture_16khz_mono is pure Rust test-support data
 ```
 
 - [ ] **Step 4: Add integration contract**
 
-Create `real_vad_contracts.rs` asserting `VadAdapter::load_fixture_model().segment(&speech_and_silence_fixture_16khz_mono())` returns one segment.
+Create `real_vad_contracts.rs` asserting `VadAdapter::new().segment(&speech_and_silence_fixture_16khz_mono())` returns one segment.
 
 - [ ] **Step 5: Run green command and gates**
 
@@ -281,7 +281,7 @@ Expected: PASS with zero warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml crates/idiolect-adapter-vad crates/idiolect-integration-tests/tests/real_vad_contracts.rs crates/idiolect-test-support tests/fixtures/audio
+git add Cargo.toml crates/idiolect-adapter-vad crates/idiolect-integration-tests/tests/real_vad_contracts.rs crates/idiolect-test-support/src/fixtures.rs
 git commit -m "feat: add vad adapter contract"
 ```
 
