@@ -118,6 +118,13 @@ pub struct PrivacyExportSummary {
     pub user_data_deleted_events: i64,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ManifestTrainingCandidate {
+    pub id: i64,
+    pub raw_text: String,
+    pub corrected_text: String,
+}
+
 pub struct SqliteMetadataStore {
     connection: Connection,
 }
@@ -250,6 +257,29 @@ impl SqliteMetadataStore {
             training_candidates: self.training_candidate_count()?,
             user_data_deleted_events: self.user_data_deleted_event_count(user_id)?,
         })
+    }
+
+    pub fn training_candidates_for_manifest(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ManifestTrainingCandidate>, SqliteStorageError> {
+        if self.user_data_deleted_event_count(user_id)? > 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = backend_result(
+            self.connection
+                .prepare("SELECT id, raw_text, corrected_text FROM training_candidates"),
+        )?;
+        let rows = backend_result(statement.query_map([], |row| {
+            Ok(ManifestTrainingCandidate {
+                id: row.get(0)?,
+                raw_text: row.get(1)?,
+                corrected_text: row.get(2)?,
+            })
+        }))?;
+        let candidates = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(candidates)
     }
 
     pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
