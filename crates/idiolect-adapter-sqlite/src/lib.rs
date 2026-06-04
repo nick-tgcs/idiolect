@@ -1,4 +1,9 @@
-//! Crate documentation for the Idiolect workspace.
+//! SQLite storage adapter for Idiolect.
+
+pub mod migrations;
+pub mod repository;
+
+pub use repository::{SqliteMetadataStore, SqliteStorageError, SqliteStorageErrorKind};
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

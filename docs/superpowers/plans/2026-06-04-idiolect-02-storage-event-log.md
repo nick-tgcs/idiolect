@@ -229,7 +229,7 @@ pub fn migration_by_version(version: i64) -> Option<&'static Migration>;
 
 Use `include_str!` for `0001_initial.sql`. Compute and paste the exact SHA-256 value after final SQL bytes are in place.
 
-`SqliteMetadataStore::open_in_memory()` opens an in-memory SQLite connection. `migrate()` applies migration 1 in a transaction and records `schema_migrations` only after the migration succeeds. Expose test helpers for `table_exists_for_test`, `table_columns_for_test`, and `applied_migration_versions_for_test`.
+`SqliteMetadataStore::open_in_memory()` opens an in-memory SQLite connection. `migrate()` applies migration 1 in a transaction, records `schema_migrations` only after the migration succeeds, and validates stored checksums before treating any migration as already applied. Expose test helpers for `table_exists_for_test`, `table_columns_for_test`, `applied_migration_versions_for_test`, `schema_migration_rows_for_test`, and `force_schema_checksum_for_test`.
 
 - [ ] **Step 5: Refresh checksum constants and run green command**
 
@@ -302,32 +302,19 @@ git add crates/idiolect-adapter-sqlite
 git commit -m "feat: add correction memory migration"
 ```
 
-## Task 4: Checksum Enforcement And Migration Idempotency
+## Task 4: Migration Runner Verification Checkpoint
 
-**Owner:** Spark worker allowed, gatekeeper reviews immutability behavior  
-**Model:** `gpt-5.3-codex-spark`  
+**Owner:** Gatekeeper-local  
+**Model:** Gatekeeper-local  
 **Files:**
 
-- Modify: `crates/idiolect-adapter-sqlite/src/repository.rs`
-- Modify: `crates/idiolect-adapter-sqlite/tests/repository_contract.rs`
+- No source edits expected. Amend the plan before code if this checkpoint finds a gap.
 
-- [ ] **Step 1: Write failing migration-runner tests**
+- [ ] **Step 1: Re-run strict migration-runner tests**
 
-Add tests `migrate_is_idempotent` and `migrate_with_mismatched_checksum_fails_fast`. The first compares `schema_migration_rows_for_test()` before and after a second `migrate()`. The second changes checksum row `1` through `force_schema_checksum_for_test` and expects an error containing `checksum mismatch`.
+Task 2 owns checksum enforcement and migration idempotency because the child-level immutability rule applies from the first runner implementation. At this checkpoint, verify `repository_contract.rs` already covers `migrate_is_idempotent` and `migrate_with_mismatched_checksum_fails_fast`.
 
-- [ ] **Step 2: Run red command**
-
-```bash
-cargo test -p idiolect-adapter-sqlite --test repository_contract
-```
-
-Expected: FAIL because checksum mismatch behavior is absent.
-
-- [ ] **Step 3: Implement strict runner**
-
-`migrate()` must create `schema_migrations`, read applied rows, apply missing migrations in version order inside transactions, treat matching checksum as no-op, and return `MigrationChecksumMismatch` before schema writes when a stored checksum differs.
-
-- [ ] **Step 4: Run green command and gates**
+- [ ] **Step 2: Run verification commands**
 
 ```bash
 cargo test -p idiolect-adapter-sqlite --test repository_contract
@@ -336,12 +323,9 @@ bash ci/scripts/test-rust.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
-```bash
-git add crates/idiolect-adapter-sqlite/src/repository.rs crates/idiolect-adapter-sqlite/tests/repository_contract.rs
-git commit -m "feat: enforce sqlite migration checksums"
-```
+No commit is expected unless the checkpoint required a plan amendment or a missing test was found and fixed with a fresh red/green cycle.
 
 ## Task 5: Idempotent Repository Writes
 
