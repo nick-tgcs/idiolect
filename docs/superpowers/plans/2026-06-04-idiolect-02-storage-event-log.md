@@ -387,12 +387,13 @@ git commit -m "feat: implement idempotent sqlite metadata writes"
 **Files:**
 
 - Modify: `Cargo.lock`
+- Modify: `crates/idiolect-adapter-sqlite/src/repository.rs`
 - Modify: `crates/idiolect-integration-tests/Cargo.toml`
 - Create: `crates/idiolect-integration-tests/tests/storage_lifecycle.rs`
 
 - [ ] **Step 1: Write failing lifecycle tests**
 
-Create tests `committed_session_writes_event_then_materialized_rows` and `lifecycle_commit_is_replay_consistent_after_restart`. Use a temporary database path from `std::env::temp_dir()`, migrate, create a session, commit, reopen, migrate again, and assert the committed state and one training candidate survive restart.
+Create tests `committed_session_writes_event_then_materialized_rows` and `lifecycle_commit_is_replay_consistent_after_restart`. Use a temporary database path from `std::env::temp_dir()`. Add a minimal SQLite adapter path opener such as `SqliteMetadataStore::open_path` after observing the red test failure; do not add new dependencies. Migrate, create a session, commit, reopen, migrate again, and assert the committed state and one training candidate survive restart.
 
 - [ ] **Step 2: Run red command**
 
@@ -424,7 +425,7 @@ Expected: PASS with zero warnings.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.lock crates/idiolect-integration-tests crates/idiolect-adapter-sqlite
+git add Cargo.lock docs/superpowers/plans/2026-06-04-idiolect-02-storage-event-log.md crates/idiolect-adapter-sqlite/src/repository.rs crates/idiolect-integration-tests
 git commit -m "test: add sqlite storage lifecycle integration coverage"
 ```
 

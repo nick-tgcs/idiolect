@@ -10,3 +10,5 @@ workspace = true
 
 [dependencies]
 idiolectd = { path = "../idiolectd" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-ports = { path = "../idiolect-ports" }

@@ -175,6 +175,8 @@ version = "0.1.0"
 name = "idiolect-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "idiolect-adapter-sqlite",
+ "idiolect-ports",
  "idiolectd",
 ]
 

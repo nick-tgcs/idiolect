@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::storage::MetadataStorePort;
@@ -116,6 +117,11 @@ pub struct SqliteMetadataStore {
 impl SqliteMetadataStore {
     pub fn open_in_memory() -> Result<Self, SqliteStorageError> {
         let connection = backend_result(Connection::open_in_memory())?;
+        Ok(Self { connection })
+    }
+
+    pub fn open_path<P: AsRef<Path>>(path: P) -> Result<Self, SqliteStorageError> {
+        let connection = backend_result(Connection::open(path))?;
         Ok(Self { connection })
     }
 
