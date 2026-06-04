@@ -1,4 +1,6 @@
 use idiolect_adapter_sqlite::{SqliteMetadataStore, SqliteStorageErrorKind};
+use idiolect_common::ids::ImeSessionId;
+use idiolect_ports::storage::MetadataStorePort;
 
 #[test]
 fn migration_01_creates_event_log() {
@@ -109,4 +111,98 @@ fn storage_errors_use_owned_error_kind() {
         .expect_err("invalid table name should fail");
 
     assert_eq!(error.kind(), SqliteStorageErrorKind::Backend);
+}
+
+#[test]
+fn commit_session_is_idempotent_with_same_key() {
+    let mut store = migrated_store();
+    let store_port: &mut dyn MetadataStorePort<Error = _> = &mut store;
+
+    let session_id = store_port
+        .create_session(Some("restart traffic"))
+        .expect("session should be created");
+    store_port
+        .commit_session(session_id, "restart Traefik", "commit-1")
+        .expect("first commit should succeed");
+    store_port
+        .commit_session(session_id, "restart Traefik", "commit-1")
+        .expect("duplicate commit should be idempotent");
+
+    assert_event_count(&store, 2);
+    assert_training_candidate_count(&store, 1);
+    assert_session_state(&store, session_id, "committed");
+}
+
+#[test]
+fn duplicate_idempotency_key_with_different_payload_is_conflict() {
+    let mut store = migrated_store();
+    let store_port: &mut dyn MetadataStorePort<Error = _> = &mut store;
+
+    let session_id = store_port
+        .create_session(Some("restart traffic"))
+        .expect("session should be created");
+    store_port
+        .commit_session(session_id, "restart Traefik", "commit-1")
+        .expect("first commit should succeed");
+
+    let error = store_port
+        .commit_session(session_id, "restart Traffic", "commit-1")
+        .expect_err("conflicting payload should fail");
+
+    assert_eq!(error.kind(), SqliteStorageErrorKind::IdempotencyConflict);
+    assert_event_count(&store, 2);
+    assert_training_candidate_count(&store, 1);
+}
+
+#[test]
+fn cancel_session_after_commit_does_not_change_committed_row() {
+    let mut store = migrated_store();
+    let store_port: &mut dyn MetadataStorePort<Error = _> = &mut store;
+
+    let session_id = store_port
+        .create_session(Some("restart traffic"))
+        .expect("session should be created");
+    store_port
+        .commit_session(session_id, "restart Traefik", "commit-1")
+        .expect("commit should succeed");
+    store_port
+        .cancel_session(session_id, "cancel-1")
+        .expect("cancel should be recorded");
+
+    assert_session_state(&store, session_id, "committed");
+    assert_event_count(&store, 3);
+    assert_training_candidate_count(&store, 1);
+}
+
+#[test]
+fn commit_session_without_created_session_fails_without_writes() {
+    let mut store = migrated_store();
+    let session_id = ImeSessionId::new();
+    let store_port: &mut dyn MetadataStorePort<Error = _> = &mut store;
+
+    let error = store_port
+        .commit_session(session_id, "restart Traefik", "commit-unknown")
+        .expect_err("unknown session commit should fail");
+
+    assert_eq!(error.kind(), SqliteStorageErrorKind::Backend);
+    assert_event_count(&store, 0);
+    assert_training_candidate_count(&store, 0);
+}
+
+fn migrated_store() -> SqliteMetadataStore {
+    let mut store = SqliteMetadataStore::open_in_memory().expect("store should open");
+    store.migrate().expect("migration should apply");
+    store
+}
+
+fn assert_event_count(store: &SqliteMetadataStore, expected: i64) {
+    assert_eq!(store.event_count_for_test().unwrap(), expected);
+}
+
+fn assert_training_candidate_count(store: &SqliteMetadataStore, expected: i64) {
+    assert_eq!(store.training_candidate_count_for_test().unwrap(), expected);
+}
+
+fn assert_session_state(store: &SqliteMetadataStore, session_id: ImeSessionId, expected: &str) {
+    assert_eq!(store.session_state_for_test(session_id).unwrap(), expected);
 }

@@ -333,6 +333,7 @@ No commit is expected unless the checkpoint required a plan amendment or a missi
 **Model:** `gpt-5.3-codex-spark`  
 **Files:**
 
+- Modify: `crates/idiolect-adapter-sqlite/Cargo.toml`
 - Modify: `crates/idiolect-adapter-sqlite/src/repository.rs`
 - Modify: `crates/idiolect-adapter-sqlite/tests/repository_contract.rs`
 
@@ -350,12 +351,14 @@ Expected: FAIL because `MetadataStorePort` is not implemented by `SqliteMetadata
 
 - [ ] **Step 3: Implement repository writes**
 
+Use the existing `ImeSessionId` Rust serialization interface for SQLite row keys by adding `serde_json.workspace = true` to the adapter manifest. Do not use debug formatting for persisted IDs.
+
 Every write occurs in one transaction:
 
 ```text
 create_session writes SessionCreated and inserts ime_text_sessions row
 record_preedit_change writes PreeditCorrected and inserts ime_edit_events row
-commit_session writes SessionCommitted and upserts committed state plus one training_candidates row
+commit_session requires an existing session, writes SessionCommitted, and updates committed state plus one training_candidates row
 cancel_session writes SessionCancelled and sets cancelled state only when session is not committed
 same idempotency key and same payload returns success without extra writes
 different payload for an existing idempotency key returns IdempotencyConflict
@@ -373,7 +376,7 @@ Expected: PASS with zero warnings.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/idiolect-adapter-sqlite/src/repository.rs crates/idiolect-adapter-sqlite/tests/repository_contract.rs
+git add Cargo.lock docs/superpowers/plans/2026-06-04-idiolect-02-storage-event-log.md crates/idiolect-adapter-sqlite/Cargo.toml crates/idiolect-adapter-sqlite/src/repository.rs crates/idiolect-adapter-sqlite/tests/repository_contract.rs
 git commit -m "feat: implement idempotent sqlite metadata writes"
 ```
 

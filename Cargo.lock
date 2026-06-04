@@ -139,6 +139,7 @@ dependencies = [
  "idiolect-common",
  "idiolect-ports",
  "rusqlite",
+ "serde_json",
  "sha2",
 ]
 
