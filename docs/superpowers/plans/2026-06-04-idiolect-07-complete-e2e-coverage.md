@@ -14,18 +14,23 @@
 
 Fresh gates run on 2026-06-04:
 
+- `bash ci/scripts/test-all.sh` passed.
 - `bash ci/scripts/test-rust.sh` passed.
 - `bash ci/scripts/test-fcitx5.sh` passed.
 - `bash ci/scripts/test-integration.sh` passed.
+- `bash ci/scripts/test-e2e.sh` passed.
 - `bash ci/scripts/test-real-adapter-deps.sh` passed.
 - `bash ci/scripts/test-interface-no-backend-leakage.sh` passed.
 - `bash ci/scripts/test-packaging.sh` passed.
+- `bash ci/scripts/test-package-smoke.sh` passed.
+- `bash ci/scripts/test-coverage-map.sh` passed.
+- `bash ci/scripts/test-coverage.sh` passed at or above the 80% line threshold; latest observed line coverage is 84.20%.
 
 Fresh audit results:
 
-- No `#[ignore]`, `#[allow(...)]`, disabled lint, or skipped required test was found in code paths.
-- `cargo-llvm-cov` is not installed, so there is no numeric Rust coverage gate today.
-- Existing tests cover many contracts, but no suite currently drives capture/audio fixture -> VAD -> ASR -> daemon orchestration -> IPC -> Fcitx5 bridge -> preedit -> commit/cancel -> SQLite event/materialized storage -> candidate/training -> classifier/manifest/promotion/privacy from one orchestrated release gate.
+- No `#[ignore]`, `#[allow(...)]`, disabled lint, or skipped required test was found in code paths during the final audit.
+- `cargo-llvm-cov` is installed locally and the numeric Rust coverage gate is active.
+- `ci/scripts/test-e2e.sh` drives fixture dictation, real media adapters, learning manifest/promotion/rollback, privacy deletion/exclusion, and the Fcitx5 IPC bridge.
 
 ## Completion Standard
 

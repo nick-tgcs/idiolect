@@ -10,9 +10,9 @@
 | daemon.startup | idiolectd_version_reports_json |
 | ipc.handshake | fcitx5_client_protocol_version_is_accepted |
 | ipc.lifecycle | fixture_full_stack_commit_records_preedit_commit_storage_and_candidate |
-| fcitx5.preedit | fcitx5_bridge_ipc_preedit_roundtrip |
-| fcitx5.commit | fcitx5_bridge_ipc_commit_roundtrip |
-| fcitx5.cancel | fcitx5_bridge_ipc_cancel_roundtrip |
+| fcitx5.preedit | e2e_ipc_bridge_test |
+| fcitx5.commit | e2e_ipc_bridge_test |
+| fcitx5.cancel | e2e_ipc_bridge_test |
 | storage.event_log | migration_01_creates_event_log |
 | storage.materialized_tables | migration_01_creates_materialized_tables |
 | candidate.capture | fake_dictation_loop_corrects_and_commits_one_session |
@@ -23,5 +23,5 @@
 | privacy.export | privacy_export_reports_json_user |
 | privacy.delete | privacy_delete_removes_user_materialized_data_and_appends_event |
 | privacy.deleted_data_excluded | privacy_delete_removes_training_data_and_future_manifest_excludes_user |
-| package.payload | test_package_payload_verifies_payload |
-| package.smoke | test_package_smoke |
+| package.payload | ci/scripts/test-packaging.sh |
+| package.smoke | ci/scripts/test-package-smoke.sh |

@@ -12,8 +12,8 @@
 
 ## Implementation Status
 
-- Child plans 05 and 06 are complete as of 2026-06-04.
-- The v1 release gates in `README.md` passed locally on 2026-06-04.
+- Child plans 05, 06, and 07 are complete as of 2026-06-04.
+- The v1 release gate `bash ci/scripts/test-all.sh` and direct gates listed in `README.md` passed locally on 2026-06-04.
 - Earlier child plan checklist files 00-04 and the expanded parent-plan task list predate this finalization pass and were not mass-rewritten.
 
 ---
