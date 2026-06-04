@@ -1,5 +1,5 @@
 [package]
-name = "idiolect-ports"
+name = "idiolect-trainer-burn"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-idiolect-common = { path = "../idiolect-common" }
-idiolect-core = { path = "../idiolect-core" }
+burn.workspace = true
+burn-ndarray.workspace = true
+bincode.workspace = true
 idiolect-ml-core = { path = "../idiolect-ml-core" }
+idiolect-ports = { path = "../idiolect-ports" }
+sha2.workspace = true
