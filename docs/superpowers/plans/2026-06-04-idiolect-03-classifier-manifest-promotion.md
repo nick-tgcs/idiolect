@@ -331,6 +331,7 @@ git commit -m "feat: add adapter promotion policy gates"
 **Files:**
 
 - Modify: `crates/idiolect-trainerctl/src/promotion.rs`
+- Modify: `crates/idiolect-trainerctl/src/metrics.rs` for `passing_for_test` and `compatible_for_test` helpers required by the integration test
 - Create: `crates/idiolect-integration-tests/tests/learning_promotion.rs`
 - Modify: `crates/idiolect-integration-tests/Cargo.toml`
   - Add `idiolect-trainerctl = { path = "../idiolect-trainerctl" }` for the integration test only.
@@ -375,7 +376,7 @@ Expected: PASS with zero warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/idiolect-trainerctl crates/idiolect-integration-tests
+git add docs/superpowers/plans/2026-06-04-idiolect-03-classifier-manifest-promotion.md crates/idiolect-trainerctl crates/idiolect-integration-tests
 git commit -m "feat: add learning promotion rollback coverage"
 ```
 
