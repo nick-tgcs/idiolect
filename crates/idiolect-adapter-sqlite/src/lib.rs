@@ -1,8 +1,10 @@
 //! SQLite storage adapter for Idiolect.
 
+pub mod audio_store;
 pub mod migrations;
 pub mod repository;
 
+pub use audio_store::{FileAudioStore, FileAudioStoreError};
 pub use repository::{SqliteMetadataStore, SqliteStorageError, SqliteStorageErrorKind};
 
 /// Returns this crate's package name for smoke tests.

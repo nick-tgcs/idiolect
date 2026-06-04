@@ -6,7 +6,7 @@ fn migration_list_has_initial_migration() {
         .iter()
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
-    assert_eq!(versions, [1, 2]);
+    assert_eq!(versions, [1, 2, 3]);
     assert_eq!(migrations()[0].name, "initial");
     assert_eq!(migrations()[1].name, "correction_memory");
 }

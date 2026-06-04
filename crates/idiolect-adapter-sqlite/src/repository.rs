@@ -20,8 +20,18 @@ const SESSION_STATE_CREATED: &str = "created";
 const SESSION_STATE_COMMITTED: &str = "committed";
 const SESSION_STATE_CANCELLED: &str = "cancelled";
 const TRAINING_SOURCE_ACCEPTED: &str = "accepted_without_edit";
+const TRAINING_STATUS_CAPTURED: &str = "captured";
 const CAPTURE_QUALITY_LIVE: &str = "live";
 const CANCEL_PAYLOAD: &str = "cancelled";
+const DEFAULT_USER_ID: &str = "default";
+const DEFAULT_PLATFORM: &str = "linux";
+const DEFAULT_INPUT_BACKEND: &str = "fcitx5";
+const DEFAULT_AUDIO_CODEC: &str = "opus";
+const DEFAULT_AUDIO_CONTAINER: &str = "ogg";
+const DEFAULT_SAMPLE_RATE_HZ: i64 = 16_000;
+const DEFAULT_CHANNELS: i64 = 1;
+const DEFAULT_STT_MODEL: &str = "unknown";
+const DEFAULT_LANGUAGE: &str = "en";
 
 #[derive(Debug)]
 struct StoredEvent {
@@ -115,7 +125,36 @@ impl Error for SqliteStorageError {
 pub struct PrivacyExportSummary {
     pub user_id: String,
     pub training_candidates: i64,
+    pub correction_memory_entries: i64,
     pub user_data_deleted_events: i64,
+}
+
+pub struct SessionUtteranceLink {
+    pub utterance_id: String,
+    pub user_id: String,
+    pub session_state: String,
+}
+
+pub struct TrainingCandidateLink {
+    pub status: String,
+    pub text_session_count: i64,
+    pub utterance_count: i64,
+}
+
+pub struct PrivateRowCounts {
+    pub utterances: i64,
+    pub text_sessions: i64,
+    pub edit_events: i64,
+    pub training_candidates: i64,
+    pub manifest_items: i64,
+    pub tombstones: i64,
+}
+
+#[derive(Debug)]
+pub struct ForeignKeyReference {
+    pub table: String,
+    pub from_column: String,
+    pub to_column: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -131,12 +170,15 @@ pub struct SqliteMetadataStore {
 
 impl SqliteMetadataStore {
     pub fn open_in_memory() -> Result<Self, SqliteStorageError> {
-        let connection = backend_result(Connection::open_in_memory())?;
-        Ok(Self { connection })
+        Self::from_connection(backend_result(Connection::open_in_memory())?)
     }
 
     pub fn open_path<P: AsRef<Path>>(path: P) -> Result<Self, SqliteStorageError> {
-        let connection = backend_result(Connection::open(path))?;
+        Self::from_connection(backend_result(Connection::open(path))?)
+    }
+
+    fn from_connection(connection: Connection) -> Result<Self, SqliteStorageError> {
+        backend_result(connection.execute_batch("PRAGMA foreign_keys = ON"))?;
         Ok(Self { connection })
     }
 
@@ -201,6 +243,25 @@ impl SqliteMetadataStore {
         Ok(versions)
     }
 
+    pub fn foreign_keys_for_test(
+        &self,
+        table: &str,
+    ) -> Result<Vec<ForeignKeyReference>, SqliteStorageError> {
+        let mut statement = backend_result(
+            self.connection
+                .prepare(&format!("PRAGMA foreign_key_list({table})")),
+        )?;
+        let rows = backend_result(statement.query_map([], |row| {
+            Ok(ForeignKeyReference {
+                table: row.get(2)?,
+                from_column: row.get(3)?,
+                to_column: row.get(4)?,
+            })
+        }))?;
+        let foreign_keys = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(foreign_keys)
+    }
+
     pub fn schema_migration_rows_for_test(
         &self,
     ) -> Result<Vec<(i64, String, String)>, SqliteStorageError> {
@@ -248,13 +309,109 @@ impl SqliteMetadataStore {
         self.training_candidate_count()
     }
 
+    pub fn insert_dangling_training_candidate_for_test(&self) -> Result<(), SqliteStorageError> {
+        backend_result(self.connection.execute(
+            "INSERT INTO training_candidates(
+                session_id,
+                raw_text,
+                corrected_text,
+                source,
+                trust_score,
+                capture_quality,
+                idempotency_key,
+                utterance_id,
+                text_session_id,
+                candidate_transcript,
+                status
+             ) VALUES (
+                'missing-session',
+                'raw',
+                'corrected',
+                'accepted_without_edit',
+                1.0,
+                'live',
+                'dangling-candidate',
+                'missing-utterance',
+                'missing-session',
+                'corrected',
+                'captured'
+             )",
+            [],
+        ))?;
+        Ok(())
+    }
+
+    pub fn session_utterance_link_for_test(
+        &self,
+        session_id: ImeSessionId,
+    ) -> Result<Option<SessionUtteranceLink>, SqliteStorageError> {
+        let session_key = Self::session_key(session_id)?;
+        let link = backend_result(
+            self.connection
+                .query_row(
+                    "SELECT COALESCE(utterance_id, ''), user_id, session_state
+                     FROM ime_text_sessions
+                     WHERE id = ?1",
+                    [&session_key],
+                    |row| {
+                        Ok(SessionUtteranceLink {
+                            utterance_id: row.get(0)?,
+                            user_id: row.get(1)?,
+                            session_state: row.get(2)?,
+                        })
+                    },
+                )
+                .optional(),
+        )?;
+        Ok(link)
+    }
+
+    pub fn training_candidate_links_for_test(
+        &self,
+    ) -> Result<Vec<TrainingCandidateLink>, SqliteStorageError> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT tc.status,
+                    COUNT(DISTINCT s.id),
+                    COUNT(DISTINCT u.id)
+             FROM training_candidates AS tc
+             LEFT JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             LEFT JOIN utterances AS u ON u.id = tc.utterance_id
+             GROUP BY tc.id, tc.status
+             ORDER BY tc.id",
+        ))?;
+        let rows = backend_result(statement.query_map([], |row| {
+            Ok(TrainingCandidateLink {
+                status: row.get(0)?,
+                text_session_count: row.get(1)?,
+                utterance_count: row.get(2)?,
+            })
+        }))?;
+        let links = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(links)
+    }
+
+    pub fn private_row_counts_for_test(
+        &self,
+        user_id: &str,
+    ) -> Result<PrivateRowCounts, SqliteStorageError> {
+        Ok(PrivateRowCounts {
+            utterances: self.user_utterance_count(user_id)?,
+            text_sessions: self.user_text_session_count(user_id)?,
+            edit_events: self.user_edit_event_count(user_id)?,
+            training_candidates: self.user_training_candidate_count(user_id)?,
+            manifest_items: self.user_manifest_item_count(user_id)?,
+            tombstones: self.user_tombstone_count(user_id)?,
+        })
+    }
+
     pub fn privacy_export_summary(
         &self,
         user_id: &str,
     ) -> Result<PrivacyExportSummary, SqliteStorageError> {
         Ok(PrivacyExportSummary {
             user_id: user_id.to_owned(),
-            training_candidates: self.training_candidate_count()?,
+            training_candidates: self.user_training_candidate_count(user_id)?,
+            correction_memory_entries: self.user_correction_memory_count(user_id)?,
             user_data_deleted_events: self.user_data_deleted_event_count(user_id)?,
         })
     }
@@ -267,11 +424,14 @@ impl SqliteMetadataStore {
             return Ok(Vec::new());
         }
 
-        let mut statement = backend_result(
-            self.connection
-                .prepare("SELECT id, raw_text, corrected_text FROM training_candidates"),
-        )?;
-        let rows = backend_result(statement.query_map([], |row| {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT tc.id, tc.raw_text, tc.corrected_text
+             FROM training_candidates AS tc
+             JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             WHERE s.user_id = ?1
+             ORDER BY tc.id",
+        ))?;
+        let rows = backend_result(statement.query_map([user_id], |row| {
             Ok(ManifestTrainingCandidate {
                 id: row.get(0)?,
                 raw_text: row.get(1)?,
@@ -291,20 +451,56 @@ impl SqliteMetadataStore {
             |row| row.get(0),
         ))?;
 
-        backend_result(transaction.execute("DELETE FROM training_candidates", []))?;
-        backend_result(transaction.execute("DELETE FROM ime_edit_events", []))?;
-        backend_result(transaction.execute("DELETE FROM ime_text_sessions", []))?;
-        backend_result(transaction.execute("DELETE FROM correction_memory", []))?;
+        backend_result(transaction.execute(
+            "DELETE FROM manifest_items
+             WHERE user_id = ?1
+                OR manifest_id IN (SELECT id FROM manifests WHERE user_id = ?1)",
+            params![user_id],
+        ))?;
+        backend_result(
+            transaction.execute("DELETE FROM manifests WHERE user_id = ?1", params![user_id]),
+        )?;
+        backend_result(transaction.execute(
+            "DELETE FROM training_candidates
+             WHERE text_session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)
+                OR utterance_id IN (SELECT id FROM utterances WHERE user_id = ?1)",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM ime_edit_events
+             WHERE text_session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)
+                OR session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM event_log
+             WHERE aggregate_type = ?1
+               AND aggregate_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?2)",
+            params![SESSION_AGGREGATE_TYPE, user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM ime_text_sessions WHERE user_id = ?1",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM utterance_audio_files
+             WHERE utterance_id IN (SELECT id FROM utterances WHERE user_id = ?1)",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM utterances WHERE user_id = ?1",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM correction_memory WHERE user_id = ?1",
+            params![user_id],
+        ))?;
         backend_result(
             transaction.execute("DELETE FROM adapters WHERE user_id = ?1", params![user_id]),
         )?;
         backend_result(transaction.execute(
             "DELETE FROM training_runs WHERE user_id = ?1",
             params![user_id],
-        ))?;
-        backend_result(transaction.execute(
-            "DELETE FROM event_log WHERE aggregate_type = ?1",
-            params![SESSION_AGGREGATE_TYPE],
         ))?;
 
         let event_payload = serde_json::json!({ "user": user_id }).to_string();
@@ -354,6 +550,76 @@ impl SqliteMetadataStore {
         let count = backend_result(self.connection.query_row(
             "SELECT COUNT(*) FROM training_candidates",
             [],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_utterance_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM utterances WHERE user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_text_session_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM ime_text_sessions WHERE user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_edit_event_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM ime_edit_events AS e
+             JOIN ime_text_sessions AS s ON s.id = e.text_session_id OR s.id = e.session_id
+             WHERE s.user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_training_candidate_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM training_candidates AS tc
+             LEFT JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             LEFT JOIN utterances AS u ON u.id = tc.utterance_id
+             WHERE s.user_id = ?1 OR u.user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_manifest_item_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM manifest_items WHERE user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_tombstone_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM retention_tombstones WHERE user_id = ?1",
+            [user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count)
+    }
+
+    fn user_correction_memory_count(&self, user_id: &str) -> Result<i64, SqliteStorageError> {
+        let count = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM correction_memory WHERE user_id = ?1",
+            [user_id],
             |row| row.get(0),
         ))?;
         Ok(count)
@@ -496,6 +762,40 @@ impl SqliteMetadataStore {
         )?;
         Ok(raw_text.flatten())
     }
+
+    fn existing_utterance_id(
+        transaction: &Transaction<'_>,
+        session_key: &str,
+    ) -> Result<String, SqliteStorageError> {
+        let utterance_id = backend_result(
+            transaction
+                .query_row(
+                    "SELECT utterance_id FROM ime_text_sessions WHERE id = ?1",
+                    [session_key],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional(),
+        )?
+        .flatten()
+        .ok_or_else(|| SqliteStorageError::not_found("ime_text_sessions row", session_key))?;
+        Ok(utterance_id)
+    }
+
+    fn ensure_default_user(transaction: &Transaction<'_>) -> Result<(), SqliteStorageError> {
+        backend_result(transaction.execute(
+            "INSERT OR IGNORE INTO users(id, display_name) VALUES (?1, ?1)",
+            params![DEFAULT_USER_ID],
+        ))?;
+        Ok(())
+    }
+
+    fn utterance_key(session_key: &str) -> String {
+        format!("utterance:{}", session_key.trim_matches('"'))
+    }
+
+    fn audio_path(utterance_key: &str) -> String {
+        format!("audio/1970/01/01/{DEFAULT_USER_ID}/{utterance_key}.ogg")
+    }
 }
 
 impl MetadataStorePort for SqliteMetadataStore {
@@ -508,9 +808,96 @@ impl MetadataStorePort for SqliteMetadataStore {
         let event_payload = raw_stt_text.unwrap_or("");
         let transaction = backend_result(self.connection.transaction())?;
 
+        let utterance_id = Self::utterance_key(&session_key);
+        let audio_path = Self::audio_path(&utterance_id);
+        Self::ensure_default_user(&transaction)?;
         backend_result(transaction.execute(
-            "INSERT INTO ime_text_sessions(id, raw_stt_text, state) VALUES (?1, ?2, ?3)",
-            params![session_key, raw_stt_text, SESSION_STATE_CREATED],
+            "INSERT INTO utterances(
+                id,
+                user_id,
+                audio_path,
+                audio_codec,
+                audio_container,
+                sample_rate_hz,
+                training_sample_rate_hz,
+                channels,
+                duration_ms,
+                raw_stt_text,
+                stt_model,
+                language
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                utterance_id,
+                DEFAULT_USER_ID,
+                audio_path,
+                DEFAULT_AUDIO_CODEC,
+                DEFAULT_AUDIO_CONTAINER,
+                DEFAULT_SAMPLE_RATE_HZ,
+                DEFAULT_CHANNELS,
+                0_i64,
+                raw_stt_text,
+                DEFAULT_STT_MODEL,
+                DEFAULT_LANGUAGE,
+            ],
+        ))?;
+        backend_result(transaction.execute(
+            "INSERT INTO utterance_audio_files(
+                utterance_id,
+                file_path,
+                codec,
+                container,
+                sample_rate_hz,
+                duration_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                utterance_id,
+                audio_path,
+                DEFAULT_AUDIO_CODEC,
+                DEFAULT_AUDIO_CONTAINER,
+                DEFAULT_SAMPLE_RATE_HZ,
+                0_i64,
+            ],
+        ))?;
+        backend_result(transaction.execute(
+            "INSERT INTO ime_text_sessions(
+                id,
+                raw_stt_text,
+                state,
+                utterance_id,
+                user_id,
+                platform,
+                input_backend,
+                session_state,
+                initial_preedit_text,
+                final_preedit_text,
+                edit_capture_quality,
+                started_at,
+                last_observed_at
+             ) VALUES (
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                ?5,
+                ?6,
+                ?7,
+                ?3,
+                ?2,
+                ?2,
+                ?8,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            params![
+                session_key,
+                raw_stt_text,
+                SESSION_STATE_CREATED,
+                utterance_id,
+                DEFAULT_USER_ID,
+                DEFAULT_PLATFORM,
+                DEFAULT_INPUT_BACKEND,
+                CAPTURE_QUALITY_LIVE,
+            ],
         ))?;
         Self::create_event(
             &transaction,
@@ -561,9 +948,31 @@ impl MetadataStorePort for SqliteMetadataStore {
             &idempotency_key,
         )?;
         backend_result(transaction.execute(
-            "INSERT INTO ime_edit_events(session_id, from_text, to_text, event_index)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO ime_edit_events(
+                session_id,
+                text_session_id,
+                from_text,
+                to_text,
+                event_index,
+                event_type,
+                timestamp_ms
+             ) VALUES (
+                ?1,
+                ?1,
+                ?2,
+                ?3,
+                ?4,
+                'preedit_update',
+                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+             )",
             params![session_key, from_text, to_text, event_index],
+        ))?;
+        backend_result(transaction.execute(
+            "UPDATE ime_text_sessions
+             SET final_preedit_text = ?1,
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2",
+            params![to_text, session_key],
         ))?;
 
         backend_result(transaction.commit())?;
@@ -590,6 +999,7 @@ impl MetadataStorePort for SqliteMetadataStore {
 
         let raw_text = Self::existing_raw_text(&transaction, &session_key)?
             .ok_or_else(|| SqliteStorageError::not_found("ime_text_sessions row", &session_key))?;
+        let utterance_id = Self::existing_utterance_id(&transaction, &session_key)?;
 
         Self::create_event(
             &transaction,
@@ -600,13 +1010,21 @@ impl MetadataStorePort for SqliteMetadataStore {
             idempotency_key,
         )?;
         backend_result(transaction.execute(
-            "INSERT INTO ime_text_sessions(id, raw_stt_text, committed_text, state, committed_at)
-             VALUES (?1, NULL, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(id) DO UPDATE SET
-                committed_text = excluded.committed_text,
-                state = excluded.state,
-                committed_at = excluded.committed_at",
-            params![session_key, committed_text, SESSION_STATE_COMMITTED],
+            "UPDATE ime_text_sessions
+             SET committed_text = ?1,
+                 state = ?2,
+                 session_state = ?2,
+                 committed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 final_preedit_text = ?1,
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?3",
+            params![committed_text, SESSION_STATE_COMMITTED, session_key],
+        ))?;
+        backend_result(transaction.execute(
+            "UPDATE utterances
+             SET raw_stt_text = COALESCE(raw_stt_text, ?1)
+             WHERE id = ?2",
+            params![raw_text, utterance_id],
         ))?;
         backend_result(transaction.execute(
             "INSERT INTO training_candidates(
@@ -616,8 +1034,12 @@ impl MetadataStorePort for SqliteMetadataStore {
                 source,
                 trust_score,
                 capture_quality,
-                idempotency_key
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                idempotency_key,
+                utterance_id,
+                text_session_id,
+                candidate_transcript,
+                status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?1, ?3, ?9)",
             params![
                 session_key,
                 raw_text,
@@ -626,6 +1048,8 @@ impl MetadataStorePort for SqliteMetadataStore {
                 1.0_f64,
                 CAPTURE_QUALITY_LIVE,
                 idempotency_key,
+                utterance_id,
+                TRAINING_STATUS_CAPTURED,
             ],
         ))?;
 
@@ -670,10 +1094,15 @@ impl MetadataStorePort for SqliteMetadataStore {
                     WHEN ?1 THEN state
                     ELSE ?2
                  END,
+                 session_state = CASE state
+                    WHEN ?1 THEN session_state
+                    ELSE ?2
+                 END,
                  cancelled_at = CASE state
                     WHEN ?1 THEN cancelled_at
                     ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 END
+                 END,
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?3",
             params![
                 SESSION_STATE_COMMITTED,

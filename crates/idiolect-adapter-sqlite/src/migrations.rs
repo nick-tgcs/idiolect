@@ -41,6 +41,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0002_correction_memory.sql"),
         expected_sha256_hex: "36d0013c7516f39ba8006237ea7aa3ed683c2a1313a506d63c5660472a01b648",
     },
+    Migration {
+        version: 3,
+        name: "v1_storage",
+        sql: include_str!("../migrations/0003_v1_storage.sql"),
+        expected_sha256_hex: "4ad2369a40ec1849275871a2be3cb8455010c6d7c90d23fd6e049c21092c8e6a",
+    },
 ];
 
 #[must_use]
