@@ -530,9 +530,13 @@ dependencies = [
 name = "idiolectd"
 version = "0.1.0"
 dependencies = [
+ "idiolect-adapter-sqlite",
  "idiolect-application",
  "idiolect-common",
+ "idiolect-ipc",
+ "idiolect-ports",
  "idiolect-test-support",
+ "serde_json",
 ]
 
 [[package]]
