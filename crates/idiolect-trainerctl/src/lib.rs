@@ -6,6 +6,10 @@ pub fn crate_name() -> &'static str {
     env!("CARGO_PKG_NAME")
 }
 
+mod classifier;
+
+pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
+
 #[cfg(test)]
 mod tests {
     #[test]
