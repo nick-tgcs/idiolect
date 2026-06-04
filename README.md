@@ -28,3 +28,19 @@ bash ci/scripts/test-package-smoke.sh
 bash ci/scripts/test-coverage-map.sh
 bash ci/scripts/test-coverage.sh
 ```
+
+## CLI Surface
+
+Current product command groups are wired through `idiolect-cli`. Backed commands execute normally; commands whose backing services are later recovery tasks return nonzero JSON with `code: "not-implemented"`.
+
+```bash
+idiolect-cli doctor --json
+idiolect-cli service status --json
+idiolect-cli models list --json
+idiolect-cli sessions list --json
+idiolect-cli candidates list --json
+idiolect-cli train export-manifest --json
+idiolect-cli adapters list --json
+idiolect-cli privacy export --user default --db path/to/idiolect.sqlite
+idiolect-cli privacy delete-all --user default --confirm-delete --json
+```
