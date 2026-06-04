@@ -119,6 +119,10 @@ dependencies = [
 [[package]]
 name = "idiolect-adapter-fixture-asr"
 version = "0.1.0"
+dependencies = [
+ "idiolect-ports",
+ "idiolect-test-support",
+]
 
 [[package]]
 name = "idiolect-adapter-fixture-audio"
