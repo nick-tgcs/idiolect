@@ -136,6 +136,9 @@ dependencies = [
 [[package]]
 name = "idiolect-adapter-fixture-codec"
 version = "0.1.0"
+dependencies = [
+ "idiolect-ports",
+]
 
 [[package]]
 name = "idiolect-adapter-memory"
