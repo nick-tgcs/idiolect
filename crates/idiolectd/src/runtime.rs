@@ -2,12 +2,17 @@ use std::convert::Infallible;
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use idiolect_adapter_sqlite::{SqliteMetadataStore, SqliteStorageError};
 use idiolect_application::use_cases::dictation::{DictationUseCase, DictationUseCaseError};
 use idiolect_common::ids::ImeSessionId;
-use idiolect_ipc::messages::PROTOCOL_VERSION;
+use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
+use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
+use idiolect_ipc::messages::{ErrorMessage, IpcMessage, PreeditUpdate, PROTOCOL_VERSION};
 use idiolect_ports::input_method::InputMethodPort;
 use idiolect_ports::storage::MetadataStorePort;
 use serde_json::json;
@@ -15,6 +20,7 @@ use serde_json::json;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DaemonMode {
     FixtureOnce,
+    ServeFixture,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +28,13 @@ pub struct DaemonConfig {
     pub db_path: PathBuf,
     pub socket_path: Option<PathBuf>,
     pub mode: DaemonMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixtureServerConfig {
+    pub socket_path: PathBuf,
+    pub db_path: PathBuf,
+    pub transcript: String,
 }
 
 #[derive(Debug)]
@@ -41,6 +54,27 @@ impl RuntimeError {
     fn storage(action: &str, error: SqliteStorageError) -> Self {
         Self {
             message: format!("storage {action} failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn io(action: &str, error: std::io::Error) -> Self {
+        Self {
+            message: format!("io {action} failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn framing(error: FramingError) -> Self {
+        Self {
+            message: format!("ipc framing failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn handshake(error: HandshakeError) -> Self {
+        Self {
+            message: format!("ipc handshake failed: {error}"),
             source: Some(Box::new(error)),
         }
     }
@@ -83,6 +117,11 @@ pub fn run_cli(args: &[String]) -> Result<String, RuntimeError> {
     match args {
         [version, format] if version == "--version" && format == "--json" => Ok(version_json()),
         [command, rest @ ..] if command == "fixture-once" => fixture_once(rest),
+        [command, rest @ ..] if command == "serve-fixture" => {
+            let config = parse_serve_fixture_config(rest)?;
+            serve_fixture(config)?;
+            Ok(json!({"served": true}).to_string())
+        }
         [] => Err(RuntimeError::usage("command is required")),
         [unknown, ..] => Err(RuntimeError::usage(format!("unknown command: {unknown}"))),
     }
@@ -109,15 +148,7 @@ fn fixture_once(args: &[String]) -> Result<String, RuntimeError> {
     let transcript = required_value(flags.transcript, "--transcript")?;
     let final_text = flags.corrected.unwrap_or_else(|| transcript.clone());
 
-    let mut store = SqliteMetadataStore::open_path(&db_path)
-        .map_err(|error| RuntimeError::storage("open", error))?;
-    store
-        .migrate()
-        .map_err(|error| RuntimeError::storage("migrate", error))?;
-
-    let input = RecordingInputMethod;
-    let storage = RuntimeMetadataStore::new(store, transcript.clone());
-    let mut use_case = DictationUseCase::new(input, storage);
+    let mut use_case = dictation_use_case(&db_path, &transcript)?;
 
     let session_id = use_case
         .start_dictation()
@@ -149,6 +180,123 @@ fn fixture_once(args: &[String]) -> Result<String, RuntimeError> {
         "cancelled": flags.cancel,
     })
     .to_string())
+}
+
+pub fn serve_fixture(config: FixtureServerConfig) -> Result<(), RuntimeError> {
+    let _ = fs::remove_file(&config.socket_path);
+    let listener =
+        UnixListener::bind(&config.socket_path).map_err(|error| RuntimeError::io("bind", error))?;
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| RuntimeError::io("accept", error))?;
+    let result = handle_fixture_connection(stream, &config.db_path, &config.transcript);
+    let _ = fs::remove_file(&config.socket_path);
+    result
+}
+
+fn handle_fixture_connection(
+    mut stream: UnixStream,
+    db_path: &PathBuf,
+    transcript: &str,
+) -> Result<(), RuntimeError> {
+    let reader_stream = stream
+        .try_clone()
+        .map_err(|error| RuntimeError::io("clone unix stream", error))?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut use_case = dictation_use_case(db_path, transcript)?;
+    let mut session_id = None;
+    let mut current_text = transcript.to_owned();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| RuntimeError::io("read ipc line", error))?;
+        if read == 0 {
+            return Ok(());
+        }
+
+        match decode_json_line(&line).map_err(RuntimeError::framing)? {
+            IpcMessage::ClientHello(client) => {
+                let response = negotiate_protocol(&client).map_err(RuntimeError::handshake)?;
+                send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
+            }
+            IpcMessage::StartRecording => {
+                let started_session = use_case
+                    .start_dictation()
+                    .map_err(RuntimeError::dictation)?;
+                use_case
+                    .transcript_ready(started_session, transcript)
+                    .map_err(RuntimeError::dictation)?;
+                session_id = Some(started_session);
+                current_text = transcript.to_owned();
+                send_ipc_message(
+                    &mut stream,
+                    &IpcMessage::PreeditUpdate(PreeditUpdate {
+                        text: transcript.to_owned(),
+                    }),
+                )?;
+            }
+            IpcMessage::CommitPreedit(commit) => {
+                let active_session = required_session(session_id)?;
+                if commit.text != current_text {
+                    use_case
+                        .correct_preedit(active_session, &current_text, &commit.text, 0)
+                        .map_err(RuntimeError::dictation)?;
+                    current_text = commit.text.clone();
+                }
+                use_case
+                    .commit(active_session, &commit.text, "fixture-server-commit")
+                    .map_err(RuntimeError::dictation)?;
+            }
+            IpcMessage::CancelPreedit => {
+                let active_session = required_session(session_id)?;
+                use_case
+                    .cancel(active_session, "fixture-server-cancel")
+                    .map_err(RuntimeError::dictation)?;
+            }
+            IpcMessage::ServerHello(_) | IpcMessage::PreeditUpdate(_) | IpcMessage::Error(_) => {
+                send_ipc_message(
+                    &mut stream,
+                    &IpcMessage::Error(ErrorMessage {
+                        code: "unexpected-message".to_owned(),
+                        message: "message is not valid from client".to_owned(),
+                    }),
+                )?;
+            }
+        }
+    }
+}
+
+fn required_session(session_id: Option<ImeSessionId>) -> Result<ImeSessionId, RuntimeError> {
+    session_id.ok_or_else(|| RuntimeError::usage("recording has not started"))
+}
+
+fn send_ipc_message(stream: &mut UnixStream, message: &IpcMessage) -> Result<(), RuntimeError> {
+    let line = encode_json_line(message).map_err(RuntimeError::framing)?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|error| RuntimeError::io("write ipc line", error))?;
+    stream
+        .flush()
+        .map_err(|error| RuntimeError::io("flush ipc line", error))
+}
+
+fn dictation_use_case(
+    db_path: &PathBuf,
+    first_raw_text: &str,
+) -> Result<DictationUseCase<RecordingInputMethod, RuntimeMetadataStore>, RuntimeError> {
+    let mut store = SqliteMetadataStore::open_path(db_path)
+        .map_err(|error| RuntimeError::storage("open", error))?;
+    store
+        .migrate()
+        .map_err(|error| RuntimeError::storage("migrate", error))?;
+
+    Ok(DictationUseCase::new(
+        RecordingInputMethod,
+        RuntimeMetadataStore::new(store, first_raw_text.to_owned()),
+    ))
 }
 
 #[derive(Default)]
@@ -194,6 +342,42 @@ fn parse_fixture_flags(args: &[String]) -> Result<FixtureFlags, RuntimeError> {
     }
 
     Ok(flags)
+}
+
+fn parse_serve_fixture_config(args: &[String]) -> Result<FixtureServerConfig, RuntimeError> {
+    let mut db_path = None;
+    let mut socket_path = None;
+    let mut transcript = None;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                index += 1;
+                db_path = Some(PathBuf::from(flag_value(args, index, "--db")?));
+            }
+            "--socket" => {
+                index += 1;
+                socket_path = Some(PathBuf::from(flag_value(args, index, "--socket")?));
+            }
+            "--transcript" => {
+                index += 1;
+                transcript = Some(flag_value(args, index, "--transcript")?.to_owned());
+            }
+            unknown => {
+                return Err(RuntimeError::usage(format!(
+                    "unknown serve-fixture argument: {unknown}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(FixtureServerConfig {
+        socket_path: required_value(socket_path, "--socket")?,
+        db_path: required_value(db_path, "--db")?,
+        transcript: required_value(transcript, "--transcript")?,
+    })
 }
 
 fn flag_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, RuntimeError> {
