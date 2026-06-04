@@ -16,6 +16,7 @@ Allowed behavior:
 
 ```text
 AudioSegment and EncodedAudio concrete DTO fields if child 00 left them incomplete
+ImeSessionId ordering derives required for typed fixture session tracking
 sine audio fixture
 fixture audio adapter
 fixture ASR adapter
@@ -196,10 +197,13 @@ git commit -m "test: add deterministic audio fixtures"
 
 - Modify: `crates/idiolect-adapter-fixture-audio/Cargo.toml`
 - Create: `crates/idiolect-adapter-fixture-audio/src/lib.rs`
+- Modify: `crates/idiolect-common/src/ids.rs`
 
 - [ ] **Step 1: Write failing adapter tests**
 
 Add tests `fixture_audio_requires_start_before_stop` and `fixture_audio_stop_returns_fixture_segment_after_start`. The first expects `FixtureAudioError::NotStarted`. The second starts capture, stops capture, and asserts `sample_rate_hz == 16000`, `channels == 1`, and sample length `16000`.
+
+Also add a failing `idiolect-common` test proving `ImeSessionId` can be stored in a `BTreeSet<ImeSessionId>` so `FixtureAudio` does not need stringly typed session keys.
 
 - [ ] **Step 2: Run red command**
 

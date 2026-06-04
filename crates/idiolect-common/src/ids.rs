@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ImeSessionId(Uuid);
 
 impl ImeSessionId {
@@ -34,6 +34,8 @@ impl UserId {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{ImeSessionId, UserId};
 
     #[test]
@@ -48,5 +50,14 @@ mod tests {
     #[test]
     fn default_user_id_is_stable() {
         assert_eq!(UserId::default_user().as_str(), "default");
+    }
+
+    #[test]
+    fn ime_session_id_can_be_used_in_ordered_sets() {
+        let id = ImeSessionId::new();
+        let mut session_ids = BTreeSet::new();
+
+        assert!(session_ids.insert(id));
+        assert!(session_ids.contains(&id));
     }
 }
