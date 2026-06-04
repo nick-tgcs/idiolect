@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+  echo "cargo-llvm-cov is required for the Rust coverage gate. Install it with: cargo install cargo-llvm-cov" >&2
+  exit 1
+fi
+
+cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 80
