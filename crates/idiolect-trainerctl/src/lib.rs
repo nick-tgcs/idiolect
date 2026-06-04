@@ -7,6 +7,12 @@ pub fn crate_name() -> &'static str {
 }
 
 mod classifier;
+pub mod manifest;
+
+pub use manifest::{
+    LearningManifestBuilder, Manifest, ManifestBuildError, ManifestBuildInput, ManifestCandidate,
+    ManifestCandidateInput,
+};
 
 pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
 

@@ -203,6 +203,11 @@ dependencies = [
 [[package]]
 name = "idiolect-trainerctl"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "idiolectd"
