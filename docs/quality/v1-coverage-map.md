@@ -1,5 +1,6 @@
-# V1 Process Coverage Map
+# Prototype Baseline Evidence Map
 
+This map records prototype baseline evidence only. It is not master-plan v1 completion evidence, and it does not claim child plans 00-07 satisfy the full master plan.
 | process | automated_test |
 | --- | --- |
 | audio.capture | real_media_full_stack_transcribes_fixture_and_commits_candidate |

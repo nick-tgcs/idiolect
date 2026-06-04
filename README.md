@@ -2,9 +2,13 @@
 
 Rust workspace bootstrap and lint baseline for the Idiolect project.
 
-## V1 Verification Gates
+## Status
 
-All warnings are errors, and any failing command blocks release. Run the full release gate:
+This repository is currently a prototype baseline and not yet Idiolect v1 complete.
+
+## Baseline Verification Gates
+
+All warnings are errors, and any failing command blocks the current baseline. These checks do not prove v1 completion. Run the full baseline gate:
 
 ```bash
 bash ci/scripts/test-all.sh

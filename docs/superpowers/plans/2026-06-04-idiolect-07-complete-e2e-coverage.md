@@ -12,21 +12,9 @@
 
 ## Current Verified Status
 
-Fresh gates run on 2026-06-04:
+Historical gate snapshot logs from 2026-06-04 are retained only as baseline evidence, not as v1 completion proof.
 
-- `bash ci/scripts/test-all.sh` passed.
-- `bash ci/scripts/test-rust.sh` passed.
-- `bash ci/scripts/test-fcitx5.sh` passed.
-- `bash ci/scripts/test-integration.sh` passed.
-- `bash ci/scripts/test-e2e.sh` passed.
-- `bash ci/scripts/test-real-adapter-deps.sh` passed.
-- `bash ci/scripts/test-interface-no-backend-leakage.sh` passed.
-- `bash ci/scripts/test-packaging.sh` passed.
-- `bash ci/scripts/test-package-smoke.sh` passed.
-- `bash ci/scripts/test-coverage-map.sh` passed.
-- `bash ci/scripts/test-coverage.sh` passed at or above the 80% line threshold; latest observed line coverage is 84.20%.
-
-Fresh audit results:
+Audit baseline noted on 2026-06-04:
 
 - No `#[ignore]`, `#[allow(...)]`, disabled lint, or skipped required test was found in code paths during the final audit.
 - `cargo-llvm-cov` is installed locally and the numeric Rust coverage gate is active.
