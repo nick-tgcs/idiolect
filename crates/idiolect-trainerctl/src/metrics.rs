@@ -10,6 +10,22 @@ pub struct EvaluationReport {
 
 impl EvaluationReport {
     #[must_use]
+    pub fn passing_for_test() -> Self {
+        Self::new(
+            "artifact-digest",
+            "manifest-digest",
+            "metric-report-digest",
+            MetricDeltas {
+                personal_wer_delta: -0.02,
+                general_wer_delta: 0.0,
+                hallucination_delta: 0.0,
+                p95_latency_delta_ms: 0,
+                proper_noun_accuracy_delta: 0.0,
+            },
+        )
+    }
+
+    #[must_use]
     pub fn metric_deltas(&self) -> &MetricDeltas {
         &self.metric_deltas
     }
@@ -93,6 +109,19 @@ pub struct ArtifactCompatibility {
 }
 
 impl ArtifactCompatibility {
+    #[must_use]
+    pub fn compatible_for_test() -> Self {
+        Self::new(
+            "artifact-digest",
+            "manifest-digest",
+            "metric-report-digest",
+            "base-model-id",
+            "adapter-format-v1",
+            "runtime-format-v1",
+            true,
+        )
+    }
+
     #[must_use]
     pub fn new(
         artifact_digest: impl Into<String>,

@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+idiolect-trainerctl = { path = "../idiolect-trainerctl" }
 idiolectd = { path = "../idiolectd" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
 idiolect-ports = { path = "../idiolect-ports" }

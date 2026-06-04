@@ -1,4 +1,6 @@
 use crate::{ArtifactCompatibility, EvaluationReport};
+#[cfg(test)]
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromotionDecision {
@@ -72,10 +74,66 @@ pub fn evaluate_promotion(
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct AdapterState {
+    active_adapter_id: Option<String>,
+    rollback_adapter_id: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct InMemoryAdapterRegistry {
+    adapters: HashMap<String, AdapterState>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackError {
+    NoRollbackTarget,
+}
+
+#[cfg(test)]
+impl InMemoryAdapterRegistry {
+    fn register_candidate(&mut self, user_id: &str, adapter_id: impl Into<String>) {
+        let entry = self.adapters.entry(user_id.to_string()).or_default();
+        if entry.active_adapter_id.is_none() {
+            entry.active_adapter_id = Some(adapter_id.into());
+        }
+    }
+    fn promote(&mut self, user_id: &str, adapter_id: impl Into<String>) {
+        let entry = self.adapters.entry(user_id.to_string()).or_default();
+        entry.rollback_adapter_id = entry.active_adapter_id.clone();
+        entry.active_adapter_id = Some(adapter_id.into());
+    }
+    fn rollback(&mut self, user_id: &str) -> Result<(), RollbackError> {
+        let entry = self
+            .adapters
+            .get_mut(user_id)
+            .ok_or(RollbackError::NoRollbackTarget)?;
+
+        let previous = entry
+            .rollback_adapter_id
+            .take()
+            .ok_or(RollbackError::NoRollbackTarget)?;
+
+        entry.active_adapter_id = Some(previous);
+        Ok(())
+    }
+    fn active_adapter_id(&self, user_id: &str) -> Option<&str> {
+        self.adapters
+            .get(user_id)
+            .and_then(|entry| entry.active_adapter_id.as_deref())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{evaluate_promotion, EvaluationReport, PromotionDecision, PromotionPolicy};
+    use super::{
+        evaluate_promotion, EvaluationReport, InMemoryAdapterRegistry, PromotionDecision,
+        PromotionPolicy, RollbackError,
+    };
     use crate::ArtifactCompatibility;
 
     fn report(
@@ -186,5 +244,32 @@ mod tests {
                 reason: "latency_regression"
             }
         ));
+    }
+
+    #[test]
+    fn rollback_restores_previous_active_adapter() {
+        let mut registry = InMemoryAdapterRegistry::default();
+        let user_id = "default";
+
+        registry.register_candidate(user_id, "old-model");
+        registry.promote(user_id, "new-model");
+
+        let rolled_back = registry.rollback(user_id);
+
+        assert!(
+            rolled_back.is_ok(),
+            "rollback should succeed when previous adapter exists"
+        );
+        assert_eq!(registry.active_adapter_id(user_id), Some("old-model"));
+    }
+
+    #[test]
+    fn rollback_without_previous_target_reports_error() {
+        let mut registry = InMemoryAdapterRegistry::default();
+        registry.register_candidate("default", "active-model");
+
+        let rolled_back = registry.rollback("default");
+
+        assert!(matches!(rolled_back, Err(RollbackError::NoRollbackTarget)));
     }
 }
