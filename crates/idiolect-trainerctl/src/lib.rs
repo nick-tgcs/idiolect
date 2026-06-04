@@ -8,11 +8,13 @@ pub fn crate_name() -> &'static str {
 
 mod classifier;
 pub mod manifest;
+mod metrics;
 
 pub use manifest::{
     LearningManifestBuilder, Manifest, ManifestBuildError, ManifestBuildInput, ManifestCandidate,
     ManifestCandidateInput,
 };
+pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas};
 
 pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
 
