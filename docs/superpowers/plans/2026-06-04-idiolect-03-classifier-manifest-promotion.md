@@ -246,6 +246,7 @@ git commit -m "feat: add learning metric and compatibility dto types"
 
 - Create: `crates/idiolect-trainerctl/src/promotion.rs`
 - Modify: `crates/idiolect-trainerctl/src/lib.rs`
+- Modify: `crates/idiolect-trainerctl/src/metrics.rs` only if a constructor or test fixture helper is required for policy tests
 
 - [ ] **Step 1: Write failing promotion tests**
 
@@ -319,7 +320,7 @@ Expected: PASS with zero warnings.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/idiolect-trainerctl/src/promotion.rs crates/idiolect-trainerctl/src/lib.rs
+git add docs/superpowers/plans/2026-06-04-idiolect-03-classifier-manifest-promotion.md crates/idiolect-trainerctl/src/promotion.rs crates/idiolect-trainerctl/src/lib.rs crates/idiolect-trainerctl/src/metrics.rs
 git commit -m "feat: add adapter promotion policy gates"
 ```
 
