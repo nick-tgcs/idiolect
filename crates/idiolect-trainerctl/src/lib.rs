@@ -13,7 +13,8 @@ mod promotion;
 
 pub use manifest::{
     LearningManifestBuilder, Manifest, ManifestBuildError, ManifestBuildInput, ManifestCandidate,
-    ManifestCandidateInput,
+    ManifestCandidateInput, ManifestSplit, ManifestV2, ManifestV2BuildInput,
+    ManifestV2CandidateInput, ManifestV2Item,
 };
 pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas};
 pub use promotion::{

@@ -164,6 +164,20 @@ pub struct ManifestTrainingCandidate {
     pub corrected_text: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ManifestV2TrainingCandidate {
+    pub training_candidate_id: i64,
+    pub user_id: String,
+    pub utterance_id: String,
+    pub text_session_id: String,
+    pub audio_object_key: String,
+    pub audio_digest: String,
+    pub raw_transcript: String,
+    pub corrected_transcript: String,
+    pub source_label: String,
+    pub trust_score_bps: u16,
+}
+
 pub struct SqliteMetadataStore {
     connection: Connection,
 }
@@ -440,6 +454,65 @@ impl SqliteMetadataStore {
         }))?;
         let candidates = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
         Ok(candidates)
+    }
+
+    pub fn training_candidates_for_manifest_v2(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
+        if self.user_data_deleted_event_count(user_id)? > 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT tc.id,
+                    s.user_id,
+                    u.id,
+                    s.id,
+                    u.audio_path,
+                    COALESCE(u.audio_sha256, ''),
+                    COALESCE(u.raw_stt_text, tc.raw_text),
+                    tc.candidate_transcript,
+                    tc.source,
+                    tc.trust_score
+             FROM training_candidates AS tc
+             JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             JOIN utterances AS u ON u.id = tc.utterance_id
+             WHERE s.user_id = ?1
+             ORDER BY tc.id",
+        ))?;
+        let rows = backend_result(statement.query_map([user_id], |row| {
+            let trust_score = row.get::<_, f64>(9)?;
+            Ok(ManifestV2TrainingCandidate {
+                training_candidate_id: row.get(0)?,
+                user_id: row.get(1)?,
+                utterance_id: row.get(2)?,
+                text_session_id: row.get(3)?,
+                audio_object_key: row.get(4)?,
+                audio_digest: row.get(5)?,
+                raw_transcript: row.get(6)?,
+                corrected_transcript: row.get(7)?,
+                source_label: row.get(8)?,
+                trust_score_bps: trust_score_bps(trust_score),
+            })
+        }))?;
+        let candidates = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(candidates)
+    }
+
+    pub fn set_audio_digest_for_test(
+        &self,
+        utterance_id: &str,
+        audio_digest: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let updated = backend_result(self.connection.execute(
+            "UPDATE utterances SET audio_sha256 = ?1 WHERE id = ?2",
+            params![audio_digest, utterance_id],
+        ))?;
+        if updated == 0 {
+            return Err(SqliteStorageError::not_found("utterance", utterance_id));
+        }
+        Ok(())
     }
 
     pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
@@ -1114,6 +1187,11 @@ impl MetadataStorePort for SqliteMetadataStore {
         backend_result(transaction.commit())?;
         Ok(())
     }
+}
+
+fn trust_score_bps(score: f64) -> u16 {
+    let clamped = score.clamp(0.0, 1.0);
+    (clamped * 10_000.0).round() as u16
 }
 
 fn backend_result<T>(result: rusqlite::Result<T>) -> Result<T, SqliteStorageError> {

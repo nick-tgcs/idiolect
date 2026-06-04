@@ -27,6 +27,19 @@ impl ManifestCandidateInput {
     }
 }
 
+pub struct ManifestV2CandidateInput {
+    pub training_candidate_id: String,
+    pub user_id: String,
+    pub utterance_id: String,
+    pub text_session_id: String,
+    pub audio_object_key: String,
+    pub audio_digest: String,
+    pub raw_transcript: String,
+    pub corrected_transcript: String,
+    pub source_label: String,
+    pub label: CandidateLabel,
+}
+
 pub struct ManifestBuildInput {
     user_id: String,
     candidates: Vec<ManifestCandidateInput>,
@@ -37,6 +50,27 @@ impl ManifestBuildInput {
     pub fn new(user_id: impl Into<String>, candidates: Vec<ManifestCandidateInput>) -> Self {
         Self {
             user_id: user_id.into(),
+            candidates,
+        }
+    }
+}
+
+pub struct ManifestV2BuildInput {
+    user_id: String,
+    base_model_id: String,
+    candidates: Vec<ManifestV2CandidateInput>,
+}
+
+impl ManifestV2BuildInput {
+    #[must_use]
+    pub fn new(
+        user_id: impl Into<String>,
+        base_model_id: impl Into<String>,
+        candidates: Vec<ManifestV2CandidateInput>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            base_model_id: base_model_id.into(),
             candidates,
         }
     }
@@ -90,9 +124,123 @@ impl Manifest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestSplit {
+    Train,
+    Validation,
+    Holdout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManifestV2Item {
+    user_id: String,
+    training_candidate_id: String,
+    utterance_id: String,
+    text_session_id: String,
+    audio_object_key: String,
+    audio_digest: String,
+    raw_transcript: String,
+    corrected_transcript: String,
+    split: ManifestSplit,
+    source_label: String,
+    trust_score_bps: u16,
+    base_model_id: String,
+}
+
+impl ManifestV2Item {
+    #[must_use]
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    #[must_use]
+    pub fn training_candidate_id(&self) -> &str {
+        &self.training_candidate_id
+    }
+
+    #[must_use]
+    pub fn utterance_id(&self) -> &str {
+        &self.utterance_id
+    }
+
+    #[must_use]
+    pub fn text_session_id(&self) -> &str {
+        &self.text_session_id
+    }
+
+    #[must_use]
+    pub fn audio_object_key(&self) -> &str {
+        &self.audio_object_key
+    }
+
+    #[must_use]
+    pub fn audio_digest(&self) -> &str {
+        &self.audio_digest
+    }
+
+    #[must_use]
+    pub fn raw_transcript(&self) -> &str {
+        &self.raw_transcript
+    }
+
+    #[must_use]
+    pub fn corrected_transcript(&self) -> &str {
+        &self.corrected_transcript
+    }
+
+    #[must_use]
+    pub fn split(&self) -> ManifestSplit {
+        self.split
+    }
+
+    #[must_use]
+    pub fn source_label(&self) -> &str {
+        &self.source_label
+    }
+
+    #[must_use]
+    pub fn trust_score_bps(&self) -> u16 {
+        self.trust_score_bps
+    }
+
+    #[must_use]
+    pub fn base_model_id(&self) -> &str {
+        &self.base_model_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestV2 {
+    items: Vec<ManifestV2Item>,
+    digest: String,
+}
+
+impl ManifestV2 {
+    #[must_use]
+    pub fn items(&self) -> &[ManifestV2Item] {
+        &self.items
+    }
+
+    #[must_use]
+    pub fn items_for_split(&self, split: ManifestSplit) -> Vec<&ManifestV2Item> {
+        self.items
+            .iter()
+            .filter(|item| item.split == split)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestBuildError {
     EmptyUserId,
+    EmptyBaseModelId,
+    EmptyAudioDigest,
 }
 
 #[derive(Serialize)]
@@ -107,6 +255,13 @@ struct DigestCandidate {
     raw_text: String,
     target_text: String,
     trust_score_bps: u16,
+}
+
+#[derive(Serialize)]
+struct DigestV2Input<'a> {
+    user_id: &'a str,
+    base_model_id: &'a str,
+    items: &'a [ManifestV2Item],
 }
 
 pub struct LearningManifestBuilder;
@@ -159,6 +314,89 @@ impl LearningManifestBuilder {
             candidates,
             digest: sha256_lower_hex(&digest_bytes),
         })
+    }
+
+    pub fn build_v2(input: ManifestV2BuildInput) -> Result<ManifestV2, ManifestBuildError> {
+        if input.user_id.trim().is_empty() {
+            return Err(ManifestBuildError::EmptyUserId);
+        }
+        if input.base_model_id.trim().is_empty() {
+            return Err(ManifestBuildError::EmptyBaseModelId);
+        }
+
+        let mut approved = input
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| match candidate.label {
+                CandidateLabel::Approved { trust_score_bps } => Some((candidate, trust_score_bps)),
+                CandidateLabel::Rejected { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        approved.sort_by(|left, right| {
+            left.0
+                .training_candidate_id
+                .cmp(&right.0.training_candidate_id)
+        });
+
+        let (train_count, validation_count) = split_counts(approved.len());
+        let mut items = Vec::with_capacity(approved.len());
+
+        for (index, (candidate, trust_score_bps)) in approved.into_iter().enumerate() {
+            if candidate.audio_digest.trim().is_empty() {
+                return Err(ManifestBuildError::EmptyAudioDigest);
+            }
+
+            items.push(ManifestV2Item {
+                user_id: candidate.user_id,
+                training_candidate_id: candidate.training_candidate_id,
+                utterance_id: candidate.utterance_id,
+                text_session_id: candidate.text_session_id,
+                audio_object_key: candidate.audio_object_key,
+                audio_digest: candidate.audio_digest,
+                raw_transcript: candidate.raw_transcript,
+                corrected_transcript: candidate.corrected_transcript,
+                split: split_for_index(index, train_count, validation_count),
+                source_label: candidate.source_label,
+                trust_score_bps,
+                base_model_id: input.base_model_id.clone(),
+            });
+        }
+
+        let digest_input = DigestV2Input {
+            user_id: &input.user_id,
+            base_model_id: &input.base_model_id,
+            items: &items,
+        };
+        let digest_bytes = serde_json::to_vec(&digest_input)
+            .expect("manifest v2 digest input contains only infallible JSON values");
+
+        Ok(ManifestV2 {
+            items,
+            digest: sha256_lower_hex(&digest_bytes),
+        })
+    }
+}
+
+fn split_counts(total: usize) -> (usize, usize) {
+    if total < 3 {
+        return (total, 0);
+    }
+
+    let holdout_count = (total / 10).max(1);
+    let validation_count = (total / 10).max(1);
+    let train_count = total
+        .saturating_sub(holdout_count + validation_count)
+        .max(1);
+    (train_count, validation_count)
+}
+
+fn split_for_index(index: usize, train_count: usize, validation_count: usize) -> ManifestSplit {
+    if index < train_count {
+        ManifestSplit::Train
+    } else if index < train_count + validation_count {
+        ManifestSplit::Validation
+    } else {
+        ManifestSplit::Holdout
     }
 }
 
