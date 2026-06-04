@@ -7,3 +7,9 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ports = { path = "../idiolect-ports" }
+rusqlite.workspace = true
+sha2.workspace = true
