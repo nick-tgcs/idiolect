@@ -16,7 +16,10 @@ pub use manifest::{
     ManifestCandidateInput,
 };
 pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas};
-pub use promotion::{evaluate_promotion, PromotionDecision, PromotionPolicy};
+pub use promotion::{
+    evaluate_promotion, AdapterRegistry, AdapterRegistryError, PromotionDecision, PromotionPolicy,
+    RollbackError,
+};
 
 pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
 

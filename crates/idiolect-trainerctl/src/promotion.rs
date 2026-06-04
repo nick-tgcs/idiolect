@@ -1,5 +1,4 @@
 use crate::{ArtifactCompatibility, EvaluationReport};
-#[cfg(test)]
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,39 +72,68 @@ pub fn evaluate_promotion(
     PromotionDecision::Promote
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct AdapterState {
     active_adapter_id: Option<String>,
     rollback_adapter_id: Option<String>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
-struct InMemoryAdapterRegistry {
+pub struct AdapterRegistry {
     adapters: HashMap<String, AdapterState>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RollbackError {
+pub enum AdapterRegistryError {
+    ArtifactIncompatible,
+    ArtifactDigestMismatch,
+    ManifestDigestMismatch,
+    MetricReportDigestMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackError {
     NoRollbackTarget,
 }
 
-#[cfg(test)]
-impl InMemoryAdapterRegistry {
-    fn register_candidate(&mut self, user_id: &str, adapter_id: impl Into<String>) {
+impl AdapterRegistry {
+    pub fn register_active(&mut self, user_id: &str, adapter_id: impl Into<String>) {
         let entry = self.adapters.entry(user_id.to_string()).or_default();
         if entry.active_adapter_id.is_none() {
             entry.active_adapter_id = Some(adapter_id.into());
         }
     }
-    fn promote(&mut self, user_id: &str, adapter_id: impl Into<String>) {
+
+    pub fn promote(
+        &mut self,
+        user_id: &str,
+        adapter_id: impl Into<String>,
+        manifest_digest: &str,
+        report: &EvaluationReport,
+        compatibility: &ArtifactCompatibility,
+    ) -> Result<(), AdapterRegistryError> {
+        if !compatibility.is_compatible() {
+            return Err(AdapterRegistryError::ArtifactIncompatible);
+        }
+        if report.artifact_digest() != compatibility.artifact_digest() {
+            return Err(AdapterRegistryError::ArtifactDigestMismatch);
+        }
+        if manifest_digest != report.manifest_digest()
+            || manifest_digest != compatibility.manifest_digest()
+        {
+            return Err(AdapterRegistryError::ManifestDigestMismatch);
+        }
+        if report.metric_report_digest() != compatibility.metric_report_digest() {
+            return Err(AdapterRegistryError::MetricReportDigestMismatch);
+        }
+
         let entry = self.adapters.entry(user_id.to_string()).or_default();
         entry.rollback_adapter_id = entry.active_adapter_id.clone();
         entry.active_adapter_id = Some(adapter_id.into());
+        Ok(())
     }
-    fn rollback(&mut self, user_id: &str) -> Result<(), RollbackError> {
+
+    pub fn rollback(&mut self, user_id: &str) -> Result<(), RollbackError> {
         let entry = self
             .adapters
             .get_mut(user_id)
@@ -119,7 +147,9 @@ impl InMemoryAdapterRegistry {
         entry.active_adapter_id = Some(previous);
         Ok(())
     }
-    fn active_adapter_id(&self, user_id: &str) -> Option<&str> {
+
+    #[must_use]
+    pub fn active_adapter_id(&self, user_id: &str) -> Option<&str> {
         self.adapters
             .get(user_id)
             .and_then(|entry| entry.active_adapter_id.as_deref())
@@ -131,8 +161,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        evaluate_promotion, EvaluationReport, InMemoryAdapterRegistry, PromotionDecision,
-        PromotionPolicy, RollbackError,
+        evaluate_promotion, AdapterRegistry, EvaluationReport, PromotionDecision, PromotionPolicy,
+        RollbackError,
     };
     use crate::ArtifactCompatibility;
 
@@ -248,11 +278,19 @@ mod tests {
 
     #[test]
     fn rollback_restores_previous_active_adapter() {
-        let mut registry = InMemoryAdapterRegistry::default();
+        let mut registry = AdapterRegistry::default();
         let user_id = "default";
 
-        registry.register_candidate(user_id, "old-model");
-        registry.promote(user_id, "new-model");
+        registry.register_active(user_id, "old-model");
+        registry
+            .promote(
+                user_id,
+                "new-model",
+                "manifest-digest",
+                &report(-0.08, 0.0, 0.0, 0, 0.0),
+                &compatibility(true),
+            )
+            .expect("promotion should record new active adapter");
 
         let rolled_back = registry.rollback(user_id);
 
@@ -265,8 +303,8 @@ mod tests {
 
     #[test]
     fn rollback_without_previous_target_reports_error() {
-        let mut registry = InMemoryAdapterRegistry::default();
-        registry.register_candidate("default", "active-model");
+        let mut registry = AdapterRegistry::default();
+        registry.register_active("default", "active-model");
 
         let rolled_back = registry.rollback("default");
 

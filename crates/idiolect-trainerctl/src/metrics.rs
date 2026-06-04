@@ -72,6 +72,22 @@ pub struct MetricDeltas {
 
 impl MetricDeltas {
     #[must_use]
+    pub fn new(
+        personal_wer_delta: f64,
+        general_wer_delta: f64,
+        hallucination_delta: f64,
+        p95_latency_delta_ms: i32,
+        proper_noun_accuracy_delta: f64,
+    ) -> Self {
+        Self {
+            personal_wer_delta,
+            general_wer_delta,
+            hallucination_delta,
+            p95_latency_delta_ms,
+            proper_noun_accuracy_delta,
+        }
+    }
+
     pub fn personal_wer_delta(&self) -> f64 {
         self.personal_wer_delta
     }
