@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_package(Threads REQUIRED)
+
 add_library(idiolect-fcitx5 SHARED
     src/engine.cpp
     src/ipc_client.cpp
@@ -25,3 +27,11 @@ add_executable(preedit_session_test
 target_link_libraries(preedit_session_test PRIVATE idiolect-fcitx5)
 
 add_test(NAME preedit_session_test COMMAND preedit_session_test)
+
+add_executable(e2e_ipc_bridge_test
+    tests/e2e_ipc_bridge_test.cpp
+)
+
+target_link_libraries(e2e_ipc_bridge_test PRIVATE idiolect-fcitx5 Threads::Threads)
+
+add_test(NAME e2e_ipc_bridge_test COMMAND e2e_ipc_bridge_test)

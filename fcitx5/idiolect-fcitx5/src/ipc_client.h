@@ -18,4 +18,30 @@ public:
     virtual void cancel_preedit() = 0;
 };
 
+class UnixSocketIpcClient final : public IpcClient {
+public:
+    explicit UnixSocketIpcClient(const std::string& socket_path);
+    ~UnixSocketIpcClient() override;
+
+    UnixSocketIpcClient(const UnixSocketIpcClient&) = delete;
+    UnixSocketIpcClient& operator=(const UnixSocketIpcClient&) = delete;
+
+    void start_recording() override;
+    void commit_preedit(const std::string& text) override;
+    void cancel_preedit() override;
+
+    std::string read_preedit_update();
+
+    [[nodiscard]] std::uint16_t negotiated_protocol_version() const;
+    [[nodiscard]] const std::vector<std::string>& accepted_features() const;
+
+private:
+    void send_json_line(const std::string& line) const;
+    std::string read_json_line() const;
+
+    int socket_fd_ = -1;
+    std::uint16_t negotiated_protocol_version_ = 0;
+    std::vector<std::string> accepted_features_;
+};
+
 } // namespace idiolect::fcitx5
