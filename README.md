@@ -13,4 +13,7 @@ bash ci/scripts/test-integration.sh
 bash ci/scripts/test-real-adapter-deps.sh
 bash ci/scripts/test-interface-no-backend-leakage.sh
 bash ci/scripts/test-packaging.sh
+bash ci/scripts/test-coverage-map.sh
 ```
+
+Task 1 adds `bash ci/scripts/test-all.sh`; it is present but not yet the active release gate until remaining tasks are complete.
