@@ -215,7 +215,7 @@ git commit -m "feat: add cli doctor and privacy commands"
 
 - Create: `ci/scripts/test-integration.sh`
 
-- [ ] **Step 1: Create integration gate script**
+- [x] **Step 1: Create integration gate script**
 
 Create `ci/scripts/test-integration.sh`:
 
@@ -229,7 +229,7 @@ cargo test -p idiolect-integration-tests --all-targets --all-features
 cargo test -p idiolect-cli --tests
 ```
 
-- [ ] **Step 2: Run green command**
+- [x] **Step 2: Run green command**
 
 ```bash
 bash ci/scripts/test-integration.sh
@@ -237,7 +237,7 @@ bash ci/scripts/test-integration.sh
 
 Expected: PASS with zero warnings.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ci/scripts/test-integration.sh
