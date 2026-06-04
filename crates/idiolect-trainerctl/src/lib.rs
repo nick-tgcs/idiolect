@@ -9,12 +9,14 @@ pub fn crate_name() -> &'static str {
 mod classifier;
 pub mod manifest;
 mod metrics;
+mod promotion;
 
 pub use manifest::{
     LearningManifestBuilder, Manifest, ManifestBuildError, ManifestBuildInput, ManifestCandidate,
     ManifestCandidateInput,
 };
 pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas};
+pub use promotion::{evaluate_promotion, PromotionDecision, PromotionPolicy};
 
 pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
 
