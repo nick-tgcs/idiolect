@@ -9,7 +9,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }
+idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
 idiolect-application = { path = "../idiolect-application" }
 idiolect-common = { path = "../idiolect-common" }
 idiolect-ipc = { path = "../idiolect-ipc" }

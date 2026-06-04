@@ -1,5 +1,7 @@
 #[path = "support/e2e.rs"]
 mod e2e;
+#[path = "support/e2e_fixture.rs"]
+mod e2e_fixture;
 
 use std::io::BufReader;
 
@@ -8,7 +10,7 @@ use idiolect_ipc::messages::{CommitPreedit, IpcMessage, PreeditUpdate};
 #[test]
 fn fixture_full_stack_commit_records_preedit_commit_storage_and_candidate() {
     let paths = e2e::E2ePaths::new("commit");
-    let server = e2e::spawn_fixture_server(&paths, "restart traffic");
+    let server = e2e_fixture::spawn_fixture_server(&paths, "restart traffic");
     let mut stream = e2e::connect_client(&paths.socket_path);
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
 
@@ -45,7 +47,7 @@ fn fixture_full_stack_commit_records_preedit_commit_storage_and_candidate() {
 #[test]
 fn fixture_full_stack_cancel_clears_preedit_and_records_no_candidate() {
     let paths = e2e::E2ePaths::new("cancel");
-    let server = e2e::spawn_fixture_server(&paths, "open notes");
+    let server = e2e_fixture::spawn_fixture_server(&paths, "open notes");
     let mut stream = e2e::connect_client(&paths.socket_path);
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
 
@@ -77,7 +79,7 @@ fn fixture_full_stack_cancel_clears_preedit_and_records_no_candidate() {
 #[test]
 fn fixture_full_stack_duplicate_commit_is_idempotent() {
     let paths = e2e::E2ePaths::new("duplicate-commit");
-    let server = e2e::spawn_fixture_server(&paths, "restart traffic");
+    let server = e2e_fixture::spawn_fixture_server(&paths, "restart traffic");
     let mut stream = e2e::connect_client(&paths.socket_path);
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
 

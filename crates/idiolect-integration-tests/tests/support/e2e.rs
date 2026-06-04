@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use idiolect_adapter_sqlite::SqliteMetadataStore;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{ClientHello, IpcMessage, FEATURE_COMMIT, FEATURE_PREEDIT};
-use idiolectd::runtime::{serve_fixture, FixtureServerConfig};
 
 pub(crate) struct E2ePaths {
     pub db_path: PathBuf,
@@ -40,20 +39,8 @@ impl E2ePaths {
     }
 }
 
-pub(crate) fn spawn_fixture_server(paths: &E2ePaths, transcript: &str) -> thread::JoinHandle<()> {
-    let config = FixtureServerConfig {
-        socket_path: paths.socket_path.clone(),
-        db_path: paths.db_path.clone(),
-        transcript: transcript.to_owned(),
-    };
-
-    thread::spawn(move || {
-        serve_fixture(config).expect("fixture server should run");
-    })
-}
-
 pub(crate) fn connect_client(socket_path: &Path) -> UnixStream {
-    let deadline_attempts = 50;
+    let deadline_attempts = 500;
     for _ in 0..deadline_attempts {
         match UnixStream::connect(socket_path) {
             Ok(stream) => return stream,

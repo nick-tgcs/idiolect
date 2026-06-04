@@ -7,14 +7,21 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
+use idiolect_adapter_opus::OpusCodec;
 use idiolect_adapter_sqlite::{SqliteMetadataStore, SqliteStorageError};
+use idiolect_adapter_vad::VadAdapter;
+use idiolect_adapter_whisper::WhisperAsr;
 use idiolect_application::use_cases::dictation::{DictationUseCase, DictationUseCaseError};
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{ErrorMessage, IpcMessage, PreeditUpdate, PROTOCOL_VERSION};
+use idiolect_ports::asr::AsrPort;
+use idiolect_ports::codec::AudioCodecPort;
 use idiolect_ports::input_method::InputMethodPort;
 use idiolect_ports::storage::MetadataStorePort;
+use idiolect_ports::vad::VadPort;
+use idiolect_test_support::fixtures::speech_and_silence_fixture_16khz_mono;
 use serde_json::json;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +42,14 @@ pub struct FixtureServerConfig {
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
     pub transcript: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealFixtureServerConfig {
+    pub socket_path: PathBuf,
+    pub db_path: PathBuf,
+    pub audio_fixture_path: PathBuf,
+    pub whisper_model_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -75,6 +90,13 @@ impl RuntimeError {
     fn handshake(error: HandshakeError) -> Self {
         Self {
             message: format!("ipc handshake failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    fn adapter(action: &str, error: impl std::error::Error + 'static) -> Self {
+        Self {
+            message: format!("adapter {action} failed: {error}"),
             source: Some(Box::new(error)),
         }
     }
@@ -120,6 +142,11 @@ pub fn run_cli(args: &[String]) -> Result<String, RuntimeError> {
         [command, rest @ ..] if command == "serve-fixture" => {
             let config = parse_serve_fixture_config(rest)?;
             serve_fixture(config)?;
+            Ok(json!({"served": true}).to_string())
+        }
+        [command, rest @ ..] if command == "serve-real-fixture" => {
+            let config = parse_real_fixture_config(rest)?;
+            serve_real_fixture(config)?;
             Ok(json!({"served": true}).to_string())
         }
         [] => Err(RuntimeError::usage("command is required")),
@@ -192,6 +219,52 @@ pub fn serve_fixture(config: FixtureServerConfig) -> Result<(), RuntimeError> {
     let result = handle_fixture_connection(stream, &config.db_path, &config.transcript);
     let _ = fs::remove_file(&config.socket_path);
     result
+}
+
+pub fn serve_real_fixture(config: RealFixtureServerConfig) -> Result<(), RuntimeError> {
+    let transcript = transcribe_real_fixture(&config)?;
+    serve_fixture(FixtureServerConfig {
+        socket_path: config.socket_path,
+        db_path: config.db_path,
+        transcript,
+    })
+}
+
+fn transcribe_real_fixture(config: &RealFixtureServerConfig) -> Result<String, RuntimeError> {
+    if !config.audio_fixture_path.is_file() {
+        return Err(RuntimeError::usage(format!(
+            "audio fixture does not exist: {}",
+            config.audio_fixture_path.display()
+        )));
+    }
+    if !config.whisper_model_path.is_file() {
+        return Err(RuntimeError::usage(format!(
+            "whisper fixture model does not exist: {}",
+            config.whisper_model_path.display()
+        )));
+    }
+
+    let source = speech_and_silence_fixture_16khz_mono();
+    let codec = OpusCodec::new();
+    let encoded = codec
+        .encode(&source)
+        .map_err(|error| RuntimeError::adapter("opus encode", error))?;
+    let decoded = codec
+        .decode(&encoded)
+        .map_err(|error| RuntimeError::adapter("opus decode", error))?;
+    let mut vad = VadAdapter::new();
+    let segments = vad
+        .segment(&decoded)
+        .map_err(|error| RuntimeError::adapter("vad segment", error))?;
+    let speech = segments
+        .first()
+        .ok_or_else(|| RuntimeError::usage("real fixture produced no speech segment"))?;
+    let whisper = WhisperAsr::load_fixture_model()
+        .map_err(|error| RuntimeError::adapter("whisper load", error))?;
+    let draft = whisper
+        .transcribe(speech)
+        .map_err(|error| RuntimeError::adapter("whisper transcribe", error))?;
+    Ok(draft.text)
 }
 
 fn handle_fixture_connection(
@@ -377,6 +450,50 @@ fn parse_serve_fixture_config(args: &[String]) -> Result<FixtureServerConfig, Ru
         socket_path: required_value(socket_path, "--socket")?,
         db_path: required_value(db_path, "--db")?,
         transcript: required_value(transcript, "--transcript")?,
+    })
+}
+
+fn parse_real_fixture_config(args: &[String]) -> Result<RealFixtureServerConfig, RuntimeError> {
+    let mut db_path = None;
+    let mut socket_path = None;
+    let mut audio_fixture_path = None;
+    let mut whisper_model_path = None;
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                index += 1;
+                db_path = Some(PathBuf::from(flag_value(args, index, "--db")?));
+            }
+            "--socket" => {
+                index += 1;
+                socket_path = Some(PathBuf::from(flag_value(args, index, "--socket")?));
+            }
+            "--audio-fixture" => {
+                index += 1;
+                audio_fixture_path =
+                    Some(PathBuf::from(flag_value(args, index, "--audio-fixture")?));
+            }
+            "--whisper-model" => {
+                index += 1;
+                whisper_model_path =
+                    Some(PathBuf::from(flag_value(args, index, "--whisper-model")?));
+            }
+            unknown => {
+                return Err(RuntimeError::usage(format!(
+                    "unknown serve-real-fixture argument: {unknown}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(RealFixtureServerConfig {
+        socket_path: required_value(socket_path, "--socket")?,
+        db_path: required_value(db_path, "--db")?,
+        audio_fixture_path: required_value(audio_fixture_path, "--audio-fixture")?,
+        whisper_model_path: required_value(whisper_model_path, "--whisper-model")?,
     })
 }
 

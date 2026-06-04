@@ -530,7 +530,10 @@ dependencies = [
 name = "idiolectd"
 version = "0.1.0"
 dependencies = [
+ "idiolect-adapter-opus",
  "idiolect-adapter-sqlite",
+ "idiolect-adapter-vad",
+ "idiolect-adapter-whisper",
  "idiolect-application",
  "idiolect-common",
  "idiolect-ipc",
