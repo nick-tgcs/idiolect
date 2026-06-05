@@ -4,4 +4,7 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: Idiolect maintainers <maintainers@example.invalid>
+Depends: fcitx5, systemd, libc6
 Description: Local-first speech-to-text input method for Linux
+ Idiolect installs a local dictation daemon, command-line tools, and an
+ Fcitx5 input-method engine for privacy-preserving speech-to-text.

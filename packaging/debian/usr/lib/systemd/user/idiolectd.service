@@ -1,0 +1,11 @@
+[Unit]
+Description=Idiolect local speech-to-text daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/idiolectd run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

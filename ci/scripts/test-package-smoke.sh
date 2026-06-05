@@ -52,10 +52,30 @@ rm -rf "${smoke_root}"
 install -d "${smoke_root}"
 dpkg-deb --extract "${package_file}" "${smoke_root}"
 
+"${smoke_root}/usr/bin/idiolect" doctor --json
 "${smoke_root}/usr/bin/idiolect-cli" doctor --json
 "${smoke_root}/usr/bin/idiolectd" --version --json
+trainer_output="$(${smoke_root}/usr/bin/idiolect-train)"
+if [[ "${trainer_output}" != "idiolect-trainerctl" ]]; then
+  echo "Unexpected idiolect-train output: ${trainer_output}" >&2
+  exit 1
+fi
 
 contents="$(dpkg-deb --contents "${package_file}")"
-printf '%s\n' "${contents}" | grep -F './usr/bin/idiolect-cli' >/dev/null
-printf '%s\n' "${contents}" | grep -F './usr/bin/idiolectd' >/dev/null
-printf '%s\n' "${contents}" | grep -F './usr/lib/fcitx5/libidiolect-fcitx5.so' >/dev/null
+required_entries=(
+  './usr/bin/idiolect'
+  './usr/bin/idiolect-cli'
+  './usr/bin/idiolectd'
+  './usr/bin/idiolect-train'
+  './usr/lib/fcitx5/idiolect.so'
+  './usr/lib/systemd/user/idiolectd.service'
+  './usr/share/fcitx5/addon/idiolect.conf'
+  './usr/share/fcitx5/inputmethod/idiolect.conf'
+  './usr/share/metainfo/org.fcitx.Fcitx5.Addon.Idiolect.metainfo.xml'
+  './usr/share/icons/hicolor/scalable/apps/idiolect.svg'
+  './usr/share/idiolect/config.example.toml'
+  './usr/share/doc/idiolect/README.md'
+)
+for entry in "${required_entries[@]}"; do
+  printf '%s\n' "${contents}" | grep -F "${entry}" >/dev/null
+done

@@ -1,0 +1,14 @@
+profile = "balanced"
+privacy_mode = "balanced"
+socket_path = "%t/idiolect/idiolectd.sock"
+database_path = "%h/.local/share/idiolect/idiolect.sqlite"
+audio_root = "%h/.local/share/idiolect/audio"
+decoded_cache_root = "%h/.cache/idiolect/decoded-audio"
+model_path = "%h/.local/share/idiolect/models/ggml-medium.en.bin"
+
+[logging]
+include_private_text = false
+
+[fcitx5]
+addon_name = "idiolect"
+input_method_name = "idiolect"
