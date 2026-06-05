@@ -95,18 +95,27 @@ fn retention_minimal_deletes_audio_after_classification() {
     let audio_ref = store
         .write_source_audio("default", "utt-minimal", &encoded)
         .expect("encoded audio should be written");
+    let cache_ref = store
+        .write_decoded_cache("default", "utt-minimal", &segment)
+        .expect("decoded cache should be written");
 
     assert!(store
         .source_audio_exists_for_test(&audio_ref)
         .expect("source existence should query"));
+    assert!(store
+        .decoded_cache_exists_for_test(&cache_ref)
+        .expect("decoded cache existence should query"));
 
     store
-        .apply_retention(&audio_ref, AudioRetentionMode::Minimal)
-        .expect("minimal retention should delete source audio");
+        .apply_retention(&audio_ref, &cache_ref, AudioRetentionMode::Minimal)
+        .expect("minimal retention should delete source audio and decoded cache");
 
     assert!(!store
         .source_audio_exists_for_test(&audio_ref)
         .expect("source existence should query"));
+    assert!(!store
+        .decoded_cache_exists_for_test(&cache_ref)
+        .expect("decoded cache existence should query"));
 
     cleanup_dir(root);
 }

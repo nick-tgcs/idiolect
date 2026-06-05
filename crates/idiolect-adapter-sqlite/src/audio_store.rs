@@ -302,6 +302,13 @@ impl FileAudioStore {
         Self::read_file(&self.source_path_from_ref(audio_ref)?)
     }
 
+    fn remove_decoded_cache(
+        &self,
+        cache_ref: &DecodedAudioCacheRef,
+    ) -> Result<(), FileAudioStoreError> {
+        Self::remove_file_if_exists(&self.decoded_cache_path_from_ref(cache_ref)?)
+    }
+
     fn remove_file_if_exists(path: &Path) -> Result<(), FileAudioStoreError> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
@@ -490,12 +497,15 @@ impl AudioStorePort for FileAudioStore {
     fn apply_retention(
         &self,
         audio_ref: &AudioObjectRef,
+        cache_ref: &DecodedAudioCacheRef,
         mode: AudioRetentionMode,
     ) -> Result<(), Self::Error> {
+        self.remove_decoded_cache(cache_ref)?;
         match mode {
-            AudioRetentionMode::Minimal => {
+            AudioRetentionMode::Minimal | AudioRetentionMode::StrictPrivate => {
                 Self::remove_file_if_exists(&self.source_path_from_ref(audio_ref)?)
             }
+            AudioRetentionMode::Balanced | AudioRetentionMode::Research => Ok(()),
         }
     }
 }

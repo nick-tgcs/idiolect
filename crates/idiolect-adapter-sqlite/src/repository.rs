@@ -3,9 +3,10 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use idiolect_common::ids::ImeSessionId;
-use idiolect_ports::storage::MetadataStorePort;
+use idiolect_ports::storage::{AudioStorePort, MetadataStorePort};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+use crate::audio_store::{FileAudioStore, FileAudioStoreError};
 use crate::migrations::migrations;
 
 const SESSION_AGGREGATE_TYPE: &str = "ime_text_session";
@@ -112,6 +113,14 @@ impl SqliteStorageError {
             source: None,
         }
     }
+
+    fn audio_delete(error: FileAudioStoreError) -> Self {
+        Self {
+            kind: SqliteStorageErrorKind::Backend,
+            message: format!("audio privacy delete failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
 }
 
 impl Display for SqliteStorageError {
@@ -180,6 +189,14 @@ pub struct ManifestV2TrainingCandidate {
     pub corrected_transcript: String,
     pub source_label: String,
     pub trust_score_bps: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivacyRetentionMode {
+    Minimal,
+    Balanced,
+    Research,
+    StrictPrivate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -598,6 +615,108 @@ impl SqliteMetadataStore {
             best_historical_adapter_id,
             historical_adapter_ids,
         })
+    }
+
+    pub fn insert_manifest_item_for_test(
+        &mut self,
+        user_id: &str,
+        manifest_id: &str,
+        training_candidate_id: i64,
+    ) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        Self::ensure_user(&transaction, user_id)?;
+        backend_result(transaction.execute(
+            "INSERT OR IGNORE INTO manifests(
+                id,
+                user_id,
+                split,
+                manifest_path,
+                status,
+                manifest_digest
+             ) VALUES (?1, ?2, 'train', ?3, 'finalized', ?4)",
+            params![
+                manifest_id,
+                user_id,
+                format!("manifests/{manifest_id}.json"),
+                format!("digest-{manifest_id}"),
+            ],
+        ))?;
+        backend_result(transaction.execute(
+            "INSERT INTO manifest_items(
+                manifest_id,
+                user_id,
+                training_candidate_id,
+                split
+             ) VALUES (?1, ?2, ?3, 'train')",
+            params![manifest_id, user_id, training_candidate_id],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn delete_user_data_with_retention_for_test(
+        &mut self,
+        user_id: &str,
+        audio_store: &FileAudioStore,
+        mode: PrivacyRetentionMode,
+    ) -> Result<(), SqliteStorageError> {
+        match mode {
+            PrivacyRetentionMode::Minimal
+            | PrivacyRetentionMode::Balanced
+            | PrivacyRetentionMode::Research
+            | PrivacyRetentionMode::StrictPrivate => audio_store
+                .privacy_delete_user(user_id)
+                .map_err(SqliteStorageError::audio_delete)?,
+        }
+        self.delete_user_data(user_id)
+    }
+
+    pub fn delete_training_candidate_for_privacy_for_test(
+        &mut self,
+        user_id: &str,
+        training_candidate_id: i64,
+        mode: PrivacyRetentionMode,
+    ) -> Result<(), SqliteStorageError> {
+        if matches!(mode, PrivacyRetentionMode::StrictPrivate) {
+            self.mark_adapters_derived_from_deleted_sample(user_id, training_candidate_id)?;
+        }
+
+        let transaction = backend_result(self.connection.transaction())?;
+        Self::ensure_user(&transaction, user_id)?;
+        backend_result(transaction.execute(
+            "DELETE FROM manifest_items
+             WHERE user_id = ?1 AND training_candidate_id = ?2",
+            params![user_id, training_candidate_id],
+        ))?;
+        let deleted = backend_result(transaction.execute(
+            "DELETE FROM training_candidates
+             WHERE id = ?1
+               AND (
+                   text_session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?2)
+                   OR utterance_id IN (SELECT id FROM utterances WHERE user_id = ?2)
+               )",
+            params![training_candidate_id, user_id],
+        ))?;
+        if deleted != 1 {
+            return Err(SqliteStorageError::not_found(
+                "training candidate",
+                &training_candidate_id.to_string(),
+            ));
+        }
+        backend_result(transaction.execute(
+            "INSERT INTO retention_tombstones(user_id, reason, details)
+             VALUES (?1, 'deleted_training_candidate', ?2)",
+            params![
+                user_id,
+                serde_json::json!({
+                    "training_candidate_id": training_candidate_id,
+                    "mode": format!("{mode:?}"),
+                })
+                .to_string(),
+            ],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
     }
 
     pub fn table_exists_for_test(&self, table: &str) -> Result<bool, SqliteStorageError> {

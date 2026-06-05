@@ -3,6 +3,7 @@
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +55,14 @@ impl CliError {
             exit_code: 2,
         }
     }
+
+    fn io(action: &str, error: std::io::Error) -> Self {
+        Self {
+            message: format!("io {action} failed: {error}"),
+            stdout_json: None,
+            exit_code: 2,
+        }
+    }
 }
 
 impl Display for CliError {
@@ -91,6 +100,7 @@ pub fn execute(args: &[String]) -> Result<String, CliError> {
         [scope, action, rest @ ..] if scope == "privacy" && action == "delete" => {
             privacy_delete(rest)
         }
+        [scope, action, rest @ ..] if scope == "logs" && action == "show" => logs_show(rest),
         [scope, action, ..] if scope == "privacy" && action == "delete-all" => {
             Err(CliError::not_implemented("privacy delete-all"))
         }
@@ -169,7 +179,9 @@ fn doctor(args: &[String]) -> Result<String, CliError> {
         "sqlite_migrations": sqlite_migrations,
         "socket": socket,
         "model_file": model_file,
-        "fcitx5_metadata": fcitx5_metadata,
+        "fcitx5_metadata": fcitx5_metadata.clone(),
+        "audio": { "status": "checked" },
+        "fcitx5": fcitx5_metadata,
         "storage": sqlite_migrations,
         "ipc": socket,
     })
@@ -311,6 +323,69 @@ fn fcitx5_metadata_status(data_dir: &Path) -> serde_json::Value {
     } else {
         json!({"status": "missing", "missing": missing})
     }
+}
+
+fn logs_show(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_logs_flags(args)?;
+    let log_file = required_value(flags.log_file, "--log-file")?;
+    let contents =
+        fs::read_to_string(&log_file).map_err(|error| CliError::io("read log", error))?;
+    let rendered = contents
+        .lines()
+        .map(|line| redact_observability_line(line, flags.include_private))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(if rendered.is_empty() {
+        String::new()
+    } else {
+        format!("{rendered}\n")
+    })
+}
+
+#[derive(Default)]
+struct LogsFlags {
+    log_file: Option<PathBuf>,
+    include_private: bool,
+}
+
+fn parse_logs_flags(args: &[String]) -> Result<LogsFlags, CliError> {
+    let mut flags = LogsFlags::default();
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--log-file" => {
+                index += 1;
+                flags.log_file = Some(PathBuf::from(flag_value(args, index, "--log-file")?));
+            }
+            "--include-private" => flags.include_private = true,
+            unknown => return Err(CliError::usage(format!("unknown logs argument: {unknown}"))),
+        }
+        index += 1;
+    }
+
+    Ok(flags)
+}
+
+fn redact_observability_line(line: &str, include_private: bool) -> String {
+    if include_private {
+        return line.to_owned();
+    }
+
+    for marker in [
+        "transcript=",
+        "raw_transcript=",
+        "corrected_transcript=",
+        "text=",
+        "clipboard=",
+    ] {
+        if let Some(index) = line.find(marker) {
+            let visible_end = index + marker.len();
+            return format!("{}[redacted]", &line[..visible_end]);
+        }
+    }
+
+    line.to_owned()
 }
 
 fn privacy_export(args: &[String]) -> Result<String, CliError> {

@@ -18,6 +18,9 @@ pub struct DecodedAudioCacheRef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioRetentionMode {
     Minimal,
+    Balanced,
+    Research,
+    StrictPrivate,
 }
 
 pub trait AudioStorePort {
@@ -44,6 +47,7 @@ pub trait AudioStorePort {
     fn apply_retention(
         &self,
         audio_ref: &AudioObjectRef,
+        cache_ref: &DecodedAudioCacheRef,
         mode: AudioRetentionMode,
     ) -> Result<(), Self::Error>;
 }

@@ -173,6 +173,32 @@ pub fn run_cli(args: &[String]) -> Result<String, RuntimeError> {
     }
 }
 
+pub fn redact_observability_line(line: &str, include_private: bool) -> String {
+    if include_private {
+        return line.to_owned();
+    }
+
+    for marker in [
+        "transcript=",
+        "raw_transcript=",
+        "corrected_transcript=",
+        "text=",
+        "clipboard=",
+    ] {
+        if let Some(index) = line.find(marker) {
+            let visible_end = index + marker.len();
+            return format!("{}[redacted]", &line[..visible_end]);
+        }
+    }
+
+    line.to_owned()
+}
+
+#[must_use]
+pub fn redact_observability_line_for_test(line: &str, include_private: bool) -> String {
+    redact_observability_line(line, include_private)
+}
+
 fn version_json() -> String {
     json!({
         "name": env!("CARGO_PKG_NAME"),
