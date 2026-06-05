@@ -7,13 +7,21 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 use idiolect_adapter_opus::OpusCodec;
 use idiolect_adapter_sqlite::{SqliteMetadataStore, SqliteStorageError};
 use idiolect_adapter_vad::VadAdapter;
 use idiolect_adapter_whisper::WhisperAsr;
+use idiolect_adapters_desktop_clipboard::ArboardClipboard;
+use idiolect_adapters_desktop_ksni::{KsniTray, TrayCallback};
 use idiolect_application::use_cases::dictation::{DictationUseCase, DictationUseCaseError};
+use idiolect_application::use_cases::history::{ClipboardPort, HistoryUseCase};
+use idiolect_application::use_cases::menu::{MenuUseCase, RecordingState};
 use idiolect_common::config::{
-    resolve_xdg_paths, IdiolectConfig, ResolvedConfigPaths, XdgBaseDirs,
+    resolve_xdg_paths, HistoryConfig, IdiolectConfig, ResolvedConfigPaths, XdgBaseDirs,
 };
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
@@ -22,7 +30,7 @@ use idiolect_ipc::messages::{ErrorMessage, IpcMessage, PreeditUpdate, PROTOCOL_V
 use idiolect_ports::asr::AsrPort;
 use idiolect_ports::codec::AudioCodecPort;
 use idiolect_ports::input_method::InputMethodPort;
-use idiolect_ports::storage::MetadataStorePort;
+use idiolect_ports::storage::{HistoryEntry, MetadataStorePort};
 use idiolect_ports::vad::VadPort;
 
 use crate::adapters::RuntimeAdapterProfile;
@@ -34,6 +42,8 @@ use serde_json::json;
 pub enum DaemonMode {
     FixtureOnce,
     ServeFixture,
+    ServeRealFixture,
+    Run,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,22 +253,75 @@ fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
         .to_string());
     }
 
+    run_daemon_with_tray(config, paths, run_args.shutdown_after_client)
+        .map_err(RuntimeError::run_loop)?;
+
+    Ok(json!({"shutdown": true}).to_string())
+}
+
+fn run_daemon_with_tray(
+    config: IdiolectConfig,
+    paths: ResolvedConfigPaths,
+    shutdown_after_client: bool,
+) -> Result<(), RunLoopError> {
+    // Initialize tray
+    let (tray_callback_tx, tray_callback_rx) = mpsc::channel::<TrayCallback>();
+    let mut tray = KsniTray::new(tray_callback_tx).map_err(|e| RunLoopError::storage("tray init", e))?;
+    
+    // Initialize clipboard
+    let mut clipboard = ArboardClipboard::new().map_err(|e| RunLoopError::storage("clipboard init", e))?;
+    
+    // Open database
+    let mut store = SqliteMetadataStore::open_path(&paths.database_path)
+        .map_err(|error| RunLoopError::storage("open", error))?;
+    store
+        .migrate()
+        .map_err(|error| RunLoopError::storage("migrate", error))?;
+    
+    // Prune history on startup
+    let history_config = config.history.clone();
+    let _ = store.prune_history(history_config.retention_days);
+    
+    // Set initial tray menu
+    let history_entries = store.recent_history(history_config.max_entries).unwrap_or_default();
+    let menu = MenuUseCase::new().get_menu(
+        RecordingState::Idle,
+        &history_entries,
+        &history_config,
+    );
+    tray.set_menu(menu).map_err(|e| RunLoopError::storage("tray menu", e))?;
+    tray.set_icon(TrayIcon::Idle).map_err(|e| RunLoopError::storage("tray icon", e))?;
+    tray.set_tooltip("Idiolect — Ready").map_err(|e| RunLoopError::storage("tray tooltip", e))?;
+    tray.set_status(TrayStatus::Passive).map_err(|e| RunLoopError::storage("tray status", e))?;
+    
+    // Spawn background pruning thread
+    let prune_db_path = paths.database_path.clone();
+    let prune_retention_days = history_config.retention_days;
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(3600)); // 1 hour
+            if let Ok(mut store) = SqliteMetadataStore::open_path(&prune_db_path) {
+                let _ = store.prune_history(prune_retention_days);
+            }
+        }
+    });
+    
+    // Run the main loop with tray callback receiver
     crate::run_loop::run(RunLoopConfig {
         socket_path: paths.socket_path,
         database_path: paths.database_path,
         audio_root: paths.audio_dir,
         decoded_cache_root: paths.decoded_cache_dir,
         user_id: config.user.default_user_id.clone(),
-        shutdown_after_client: run_args.shutdown_after_client,
+        shutdown_after_client,
         adapter_profile: RuntimeAdapterProfile {
             audio_input_device: config.audio.input_device.clone(),
             vad_engine: config.vad.engine.clone(),
             asr_engine: config.asr.engine.clone(),
         },
+        tray_callback_rx: Some(tray_callback_rx),
+        history_config,
     })
-    .map_err(RuntimeError::run_loop)?;
-
-    Ok(json!({"shutdown": true}).to_string())
 }
 
 #[derive(Debug)]
@@ -747,5 +810,17 @@ impl MetadataStorePort for RuntimeMetadataStore {
         idempotency_key: &str,
     ) -> Result<(), Self::Error> {
         self.inner.cancel_session(session_id, idempotency_key)
+    }
+
+    fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error> {
+        self.inner.recent_history(limit)
+    }
+
+    fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
+        self.inner.prune_history(older_than_days)
+    }
+
+    fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
+        self.inner.delete_history_entry(id)
     }
 }

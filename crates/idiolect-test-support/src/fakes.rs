@@ -3,7 +3,7 @@ use std::convert::Infallible;
 
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::input_method::InputMethodPort;
-use idiolect_ports::storage::MetadataStorePort;
+use idiolect_ports::storage::{HistoryEntry, HistoryState, MetadataStorePort};
 
 #[derive(Debug, Default)]
 pub struct FakeInputMethod {
@@ -41,11 +41,22 @@ impl InputMethodPort for FakeInputMethod {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct FakeHistoryEntry {
+    pub id: i64,
+    pub session_id: ImeSessionId,
+    pub text: String,
+    pub state: HistoryState,
+    pub created_at: String,
+}
+
 #[derive(Debug, Default)]
 pub struct FakeMetadataStore {
     events_log: Vec<String>,
     idempotency_keys: HashSet<String>,
     candidate_count: usize,
+    history_entries: Vec<FakeHistoryEntry>,
+    next_history_id: i64,
 }
 
 impl FakeMetadataStore {
@@ -57,6 +68,20 @@ impl FakeMetadataStore {
     #[must_use]
     pub fn training_candidate_count(&self) -> usize {
         self.candidate_count
+    }
+
+    #[must_use]
+    pub fn history_entries(&self) -> Vec<HistoryEntry> {
+        self.history_entries
+            .iter()
+            .map(|e| HistoryEntry {
+                id: e.id,
+                session_id: e.session_id,
+                text: e.text.clone(),
+                state: e.state,
+                created_at: e.created_at.clone(),
+            })
+            .collect()
     }
 }
 
@@ -86,25 +111,73 @@ impl MetadataStorePort for FakeMetadataStore {
 
     fn commit_session(
         &mut self,
-        _session_id: ImeSessionId,
+        session_id: ImeSessionId,
         committed_text: &str,
         idempotency_key: &str,
     ) -> Result<(), Self::Error> {
         if self.idempotency_keys.insert(idempotency_key.to_owned()) {
             self.events_log.push(format!("commit:{committed_text}"));
             self.candidate_count += 1;
+            // Store in history
+            self.next_history_id += 1;
+            self.history_entries.push(FakeHistoryEntry {
+                id: self.next_history_id,
+                session_id,
+                text: committed_text.to_owned(),
+                state: HistoryState::Committed,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            });
         }
         Ok(())
     }
 
     fn cancel_session(
         &mut self,
-        _session_id: ImeSessionId,
+        session_id: ImeSessionId,
         idempotency_key: &str,
     ) -> Result<(), Self::Error> {
         if self.idempotency_keys.insert(idempotency_key.to_owned()) {
             self.events_log.push("cancel".to_owned());
+            // Store in history
+            self.next_history_id += 1;
+            self.history_entries.push(FakeHistoryEntry {
+                id: self.next_history_id,
+                session_id,
+                text: String::new(), // cancelled sessions have empty text
+                state: HistoryState::Cancelled,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            });
         }
+        Ok(())
+    }
+
+    fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error> {
+        let mut entries = self.history_entries.clone();
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let entries: Vec<HistoryEntry> = entries
+            .into_iter()
+            .take(limit as usize)
+            .map(|e| HistoryEntry {
+                id: e.id,
+                session_id: e.session_id,
+                text: e.text,
+                state: e.state,
+                created_at: e.created_at,
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let original_len = self.history_entries.len();
+        self.history_entries.retain(|e| e.created_at >= cutoff_str);
+        Ok((original_len - self.history_entries.len()) as u64)
+    }
+
+    fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
+        self.history_entries.retain(|e| e.id != id);
         Ok(())
     }
 }

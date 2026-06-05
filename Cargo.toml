@@ -22,6 +22,8 @@ members = [
     "crates/idiolect-cli",
     "crates/idiolect-test-support",
     "crates/idiolect-integration-tests",
+    "crates/idiolect-adapters/desktop/ksni",
+    "crates/idiolect-adapters/desktop/clipboard",
 ]
 
 [workspace.package]

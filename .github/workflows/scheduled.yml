@@ -1,0 +1,266 @@
+name: Scheduled Checks
+
+on:
+  schedule:
+    # Run every night at 2 AM UTC
+    - cron: '0 2 * * *'
+    # Run weekly on Sunday at 3 AM UTC for more comprehensive checks
+    - cron: '0 3 * * 0'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # =========================================================================
+  # NIGHTLY: Full test suite with additional checks
+  # =========================================================================
+  nightly-full:
+    name: Nightly Full Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'schedule' && github.event.schedule == '0 2 * * *'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (nightly for additional features)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nightly-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev time
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run ALL tests (including doc tests)
+        run: |
+          cargo test --workspace --all-targets --all-features
+          cargo test --workspace --doc --all-features
+
+      - name: Run coverage with higher threshold
+        run: cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 85
+
+      - name: Run integration tests
+        run: |
+          cargo test -p idiolect-integration-tests --all-targets --all-features
+          cargo test -p idiolect-cli --tests
+
+      - name: Run E2E tests
+        run: |
+          cargo test -p idiolect-integration-tests --test dictation_full_stack_fixture --all-features
+          cargo test -p idiolect-integration-tests --test dictation_full_stack_real_adapters --all-features
+          cargo test -p idiolect-integration-tests --test learning_pipeline_manifest --all-features
+          cargo test -p idiolect-integration-tests --test privacy_e2e --all-features
+          bash ci/scripts/test-fcitx5-integration.sh
+
+      - name: Run failure recovery tests
+        run: bash ci/scripts/test-e2e-failure-recovery.sh
+
+      - name: Fetch Whisper fixture model
+        run: bash ci/scripts/fetch-whisper-fixture.sh
+
+      - name: Run model regression tests
+        run: bash ci/scripts/test-model-regression.sh
+
+      - name: Run performance tests
+        run: bash ci/scripts/test-performance.sh
+
+      - name: Run real adapter dependency check
+        run: bash ci/scripts/test-real-adapter-deps.sh
+
+      - name: Run interface leakage check
+        run: bash ci/scripts/test-interface-no-backend-leakage.sh
+
+      - name: Run packaging tests
+        run: |
+          bash ci/scripts/test-packaging.sh
+          bash ci/scripts/test-package-smoke.sh
+          bash ci/scripts/test-package-lifecycle.sh
+
+      - name: Run coverage map validation
+        run: bash ci/scripts/test-coverage-map.sh
+
+      - name: Run headless E2E tests
+        run: bash ci/scripts/test-e2e-headless.sh
+        env:
+          DISPLAY: ":99"
+
+      - name: Check for security vulnerabilities
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
+      - name: Check for outdated dependencies
+        run: |
+          cargo install cargo-outdated
+          cargo outdated --workspace --depth 1
+
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-report
+          path: |
+            target/llvm-cov/html
+            target/performance/
+            target/package/*.deb
+          retention-days: 30
+
+  # =========================================================================
+  # WEEKLY: Comprehensive checks including dependency updates
+  # =========================================================================
+  weekly-comprehensive:
+    name: Weekly Comprehensive Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: github.event_name == 'schedule' && github.event.schedule == '0 3 * * 0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-weekly-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-weekly-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev time
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run full test suite
+        run: bash ci/scripts/test-all.sh
+
+      - name: Run coverage map validation
+        run: bash ci/scripts/test-coverage-map.sh
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
+      - name: Check for outdated dependencies
+        run: |
+          cargo install cargo-outdated
+          cargo outdated --workspace --depth 1
+
+      - name: Check for unused dependencies
+        run: |
+          cargo install cargo-machete
+          cargo machete
+
+      - name: Check license compliance
+        run: |
+          cargo install cargo-deny
+          cargo deny check licenses
+
+      - name: Generate SBOM
+        run: |
+          cargo install cargo-cyclonedx
+          cargo cyclonedx --workspace --all-features -o target/sbom.xml
+
+      - name: Upload weekly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: |
+            target/llvm-cov/html
+            target/performance/
+            target/package/*.deb
+            target/sbom.xml
+          retention-days: 90
+
+  # =========================================================================
+  # MANUAL DISPATCH: Run specific checks on demand
+  # =========================================================================
+  manual-dispatch:
+    name: Manual Dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-manual-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-manual-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev time
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run full test suite
+        run: bash ci/scripts/test-all.sh
+
+      - name: Run coverage map validation
+        run: bash ci/scripts/test-coverage-map.sh

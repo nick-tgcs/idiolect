@@ -47,6 +47,12 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0003_v1_storage.sql"),
         expected_sha256_hex: "4ad2369a40ec1849275871a2be3cb8455010c6d7c90d23fd6e049c21092c8e6a",
     },
+    Migration {
+        version: 4,
+        name: "text_history",
+        sql: include_str!("../migrations/0004_text_history.sql"),
+        expected_sha256_hex: "1aa2683493ef84e192775c2f513bb25b03a9e4bdeef9cc5b869fc3d0ecd337af",
+    },
 ];
 
 #[must_use]

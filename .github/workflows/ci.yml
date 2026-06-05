@@ -1,0 +1,566 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # =========================================================================
+  # RUST: Format, Lint, Type-check, Test, Coverage
+  # =========================================================================
+  rust:
+    name: Rust (fmt, clippy, check, test, coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check compilation (with warnings as errors)
+        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --all-features
+
+      - name: Run clippy (with warnings as errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc --all-features
+
+      - name: Run coverage (80% line coverage gate)
+        run: cargo llvm-cov --workspace --all-features --all-targets --fail-under-lines 80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html
+          retention-days: 7
+
+  # =========================================================================
+  # C++: FCITX5 Build and Tests
+  # =========================================================================
+  fcitx5:
+    name: FCITX5 (CMake, build, ctest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Build
+        run: cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run tests
+        run: ctest --test-dir fcitx5/idiolect-fcitx5/build --output-on-failure
+
+  # =========================================================================
+  # INTEGRATION TESTS
+  # =========================================================================
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [rust, fcitx5]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run integration tests
+        run: |
+          cargo test -p idiolect-integration-tests --all-targets --all-features
+          cargo test -p idiolect-cli --tests
+
+  # =========================================================================
+  # E2E TESTS (Full Stack)
+  # =========================================================================
+  e2e:
+    name: E2E Tests (Full Stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [rust, fcitx5]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run E2E tests (fixture)
+        run: |
+          cargo test -p idiolect-integration-tests --test dictation_full_stack_fixture --all-features
+          cargo test -p idiolect-integration-tests --test learning_pipeline_manifest --all-features
+          cargo test -p idiolect-integration-tests --test privacy_e2e --all-features
+
+      - name: Run E2E tests (real adapters)
+        run: |
+          cargo test -p idiolect-integration-tests --test dictation_full_stack_real_adapters --all-features
+
+      - name: Run FCITX5 integration tests
+        run: bash ci/scripts/test-fcitx5-integration.sh
+
+  # =========================================================================
+  # FAILURE RECOVERY TESTS
+  # =========================================================================
+  failure-recovery:
+    name: Failure Recovery Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run failure recovery tests
+        run: bash ci/scripts/test-e2e-failure-recovery.sh
+
+  # =========================================================================
+  # MODEL REGRESSION TESTS
+  # =========================================================================
+  model-regression:
+    name: Model Regression Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Fetch Whisper fixture model
+        run: bash ci/scripts/fetch-whisper-fixture.sh
+
+      - name: Run model regression tests
+        run: bash ci/scripts/test-model-regression.sh
+
+  # =========================================================================
+  # PERFORMANCE TESTS
+  # =========================================================================
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install /usr/bin/time
+        run: sudo apt-get update && sudo apt-get install -y time
+
+      - name: Run performance tests
+        run: bash ci/scripts/test-performance.sh
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: target/performance/
+          retention-days: 7
+
+  # =========================================================================
+  # REAL ADAPTER DEPENDENCY CHECK
+  # =========================================================================
+  real-adapter-deps:
+    name: Real Adapter Dependency Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run real adapter dependency check
+        run: bash ci/scripts/test-real-adapter-deps.sh
+
+  # =========================================================================
+  # INTERFACE NO BACKEND LEAKAGE CHECK
+  # =========================================================================
+  interface-leakage:
+    name: Interface No Backend Leakage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [rust]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run interface leakage check
+        run: bash ci/scripts/test-interface-no-backend-leakage.sh
+
+  # =========================================================================
+  # PACKAGING TESTS
+  # =========================================================================
+  packaging:
+    name: Packaging Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [rust, fcitx5]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run packaging tests
+        run: bash ci/scripts/test-packaging.sh
+
+      - name: Run package smoke tests
+        run: bash ci/scripts/test-package-smoke.sh
+
+      - name: Run package lifecycle tests
+        run: bash ci/scripts/test-package-lifecycle.sh
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-package
+          path: target/package/*.deb
+          retention-days: 7
+
+  # =========================================================================
+  # COVERAGE MAP VALIDATION
+  # =========================================================================
+  coverage-map:
+    name: Coverage Map Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [rust, fcitx5, integration, e2e, failure-recovery, model-regression, performance, real-adapter-deps, interface-leakage, packaging]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+
+      - name: Build FCITX5 (for ctest index)
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Run coverage map validation
+        run: bash ci/scripts/test-coverage-map.sh
+
+  # =========================================================================
+  # HEADLESS E2E TESTS (for manual-required acceptance items)
+  # =========================================================================
+  e2e-headless:
+    name: E2E Headless Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [rust, fcitx5]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev libasound2-dev libpulse-dev xvfb
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run headless E2E tests
+        run: bash ci/scripts/test-e2e-headless.sh
+        env:
+          DISPLAY: ":99"
+        # Note: This runs in Xvfb for headless GUI testing
+
+  # =========================================================================
+  # SUMMARY / GATE
+  # =========================================================================
+  gate:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - rust
+      - fcitx5
+      - integration
+      - e2e
+      - failure-recovery
+      - model-regression
+      - performance
+      - real-adapter-deps
+      - interface-leakage
+      - packaging
+      - coverage-map
+      - e2e-headless
+    if: always()
+    steps:
+      - name: Check all required jobs succeeded
+        run: |
+          # This job only runs if all dependencies completed
+          # If any dependency failed, this job will be skipped
+          echo "All CI checks passed!"

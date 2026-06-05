@@ -42,8 +42,9 @@ A history of recent text snippets stored automatically on every commit and cance
 2. The C++ engine shim stays thin — it only handles preedit/commit/cancel IPC as before.
 3. History is populated automatically on every commit and cancel.
 4. History selection reuses the existing `commit_text` path — no new `InputMethodPort` methods needed.
-5. All new storage goes through a new `HistoryPort` trait. No SQLite types leak into ports or application.
-6. The `ksni` tray is an adapter behind a `TrayPort` trait, keeping the daemon's composition root as the only place that knows about `ksni`.
+5. **History queries are a read projection of session data.** Extend `MetadataStorePort` (in `idiolect-ports`) with `recent_history(limit)` and `prune_history(older_than_days)` methods. No new `HistoryPort` trait.
+6. **Desktop integration (tray, clipboard) lives in the adapter layer**, not in `idiolect-ports`. The `ksni` tray adapter and `arboard` clipboard adapter live in `crates/idiolect-adapters/desktop/`. The daemon (`idiolectd`) wires them at the composition root.
+7. `InputMethodPort` is unchanged — history re-insertion reuses `commit_text`.
 
 ## Consequences
 
@@ -51,8 +52,8 @@ A history of recent text snippets stored automatically on every commit and cance
 - Users can recover missed transcriptions from the history submenu.
 - The C++ shim does **not** grow — menu rendering stays in Rust.
 - New IPC messages are **not needed for the menu** — the tray lives in the same process as the daemon.
-- One new SQLite migration (`0003_text_history.sql`).
-- New `HistoryPort` trait in `idiolect-ports` isolates history queries from session metadata. `MetadataStorePort` is unchanged.
-- New `TrayPort` trait in `idiolect-ports` abstracts the system tray, with `ksni` as the adapter.
+- One new SQLite migration (`0004_text_history.sql` — after existing `0003_v1_storage.sql`).
+- `MetadataStorePort` extended with history query methods; no new port trait.
+- Desktop integration adapters (`ksni` tray, `arboard` clipboard) in `idiolect-adapters/desktop/`, wired by `idiolectd`.
 - `InputMethodPort` is unchanged — history re-insertion reuses `commit_text`.
 - Privacy export/delete covers `ime_text_history`.

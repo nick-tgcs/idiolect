@@ -1,0 +1,281 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # =========================================================================
+  # PR SIZE CHECK
+  # =========================================================================
+  pr-size:
+    name: PR Size Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check PR size
+        run: |
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l)
+          LINE_COUNT=$(git diff --stat origin/main...HEAD | tail -1 | awk '{print $1}')
+          
+          echo "Files changed: $FILE_COUNT"
+          echo "Lines changed: $LINE_COUNT"
+          
+          # Warn if PR is too large
+          if [ "$FILE_COUNT" -gt 50 ]; then
+            echo "::warning::PR modifies more than 50 files ($FILE_COUNT). Consider splitting into smaller PRs."
+          fi
+          
+          if [ "$LINE_COUNT" -gt 1000 ]; then
+            echo "::warning::PR modifies more than 1000 lines ($LINE_COUNT). Consider splitting into smaller PRs."
+          fi
+
+  # =========================================================================
+  # CONVENTIONAL COMMITS CHECK
+  # =========================================================================
+  conventional-commits:
+    name: Conventional Commits Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit messages
+        run: |
+          # Check that all commits follow conventional commits format
+          COMMITS=$(git log --format="%s" origin/main...HEAD)
+          echo "$COMMITS" | while IFS= read -r commit; do
+            if ! echo "$commit" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(.+\))?: .+'; then
+              echo "::error::Commit message does not follow conventional commits format: $commit"
+              exit 1
+            fi
+          done
+          echo "All commit messages follow conventional commits format."
+
+  # =========================================================================
+  # RUST: Quick validation (fmt, clippy, check, test)
+  # =========================================================================
+  rust-quick:
+    name: Rust Quick Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pr-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check compilation (with warnings as errors)
+        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --all-features
+
+      - name: Run clippy (with warnings as errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests (quick - no doc tests, no coverage)
+        run: cargo test --workspace --all-targets --all-features
+
+  # =========================================================================
+  # FCITX5: Quick validation
+  # =========================================================================
+  fcitx5-quick:
+    name: FCITX5 Quick Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Build
+        run: cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Run tests
+        run: ctest --test-dir fcitx5/idiolect-fcitx5/build --output-on-failure
+
+  # =========================================================================
+  # INTERFACE LEAKAGE CHECK (fast, important for architecture)
+  # =========================================================================
+  interface-leakage:
+    name: Interface No Backend Leakage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pr-
+
+      - name: Run interface leakage check
+        run: bash ci/scripts/test-interface-no-backend-leakage.sh
+
+  # =========================================================================
+  # REAL ADAPTER DEPENDENCY CHECK (fast, important for architecture)
+  # =========================================================================
+  real-adapter-deps:
+    name: Real Adapter Dependency Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pr-
+
+      - name: Run real adapter dependency check
+        run: bash ci/scripts/test-real-adapter-deps.sh
+
+  # =========================================================================
+  # COVERAGE MAP VALIDATION (ensures docs stay in sync)
+  # =========================================================================
+  coverage-map:
+    name: Coverage Map Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [rust-quick, fcitx5-quick]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pr-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+
+      - name: Build FCITX5 (for ctest index)
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Run coverage map validation
+        run: bash ci/scripts/test-coverage-map.sh
+
+  # =========================================================================
+  # PR VALIDATION SUMMARY
+  # =========================================================================
+  pr-validation-summary:
+    name: PR Validation Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - pr-size
+      - conventional-commits
+      - rust-quick
+      - fcitx5-quick
+      - interface-leakage
+      - real-adapter-deps
+      - coverage-map
+    if: always()
+    steps:
+      - name: Check all required jobs succeeded
+        run: |
+          # Check if any required job failed
+          if [[ "${{ needs.pr-size.result }}" != "success" ]] || \
+             [[ "${{ needs.conventional-commits.result }}" != "success" ]] || \
+             [[ "${{ needs.rust-quick.result }}" != "success" ]] || \
+             [[ "${{ needs.fcitx5-quick.result }}" != "success" ]] || \
+             [[ "${{ needs.interface-leakage.result }}" != "success" ]] || \
+             [[ "${{ needs.real-adapter-deps.result }}" != "success" ]] || \
+             [[ "${{ needs.coverage-map.result }}" != "success" ]]; then
+            echo "::error::One or more PR validation checks failed"
+            exit 1
+          fi
+          echo "All PR validation checks passed!"

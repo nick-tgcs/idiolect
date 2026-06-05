@@ -1,0 +1,41 @@
+# CODEOWNERS
+# These users/groups will be requested for review when someone opens a pull request
+# modifying files they own.
+
+# Global owners (fallback)
+* @nick-tgcs
+
+# CI/CD workflows
+/.github/ @nick-tgcs
+
+# CI scripts
+/ci/scripts/ @nick-tgcs
+
+# Core crates
+/crates/idiolect-core/ @nick-tgcs
+/crates/idiolect-ports/ @nick-tgcs
+/crates/idiolect-application/ @nick-tgcs
+
+# Adapter crates
+/crates/idiolect-adapter-*/ @nick-tgcs
+
+# Integration tests
+/crates/idiolect-integration-tests/ @nick-tgcs
+
+# CLI and daemon
+/crates/idiolect-cli/ @nick-tgcs
+/crates/idiolectd/ @nick-tgcs
+
+# Trainer
+/crates/idiolect-trainerctl/ @nick-tgcs
+/crates/idiolect-trainer-burn/ @nick-tgcs
+/crates/idiolect-ml-core/ @nick-tgcs
+
+# FCITX5
+/fcitx5/ @nick-tgcs
+
+# Packaging
+/packaging/ @nick-tgcs
+
+# Documentation
+/docs/ @nick-tgcs

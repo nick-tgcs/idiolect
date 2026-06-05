@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # =========================================================================
+  # FULL CI (same as main branch CI)
+  # =========================================================================
+  full-ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  # =========================================================================
+  # BUILD RELEASE ARTIFACTS
+  # =========================================================================
+  build-release:
+    name: Build Release Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [full-ci]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build Debian package
+        run: bash ci/scripts/test-packaging.sh
+
+      - name: Verify package
+        run: bash ci/scripts/test-package-smoke.sh && bash ci/scripts/test-package-lifecycle.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            target/release/idiolect
+            target/release/idiolect-cli
+            target/release/idiolectd
+            target/release/idiolect-trainerctl
+            target/package/*.deb
+          retention-days: 30
+
+  # =========================================================================
+  # CREATE GITHUB RELEASE
+  # =========================================================================
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build-release]
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/idiolect
+            release-artifacts/idiolect-cli
+            release-artifacts/idiolectd
+            release-artifacts/idiolect-trainerctl
+            release-artifacts/*.deb
+          generate_release_notes: true
+          draft: false
+          prerelease: false

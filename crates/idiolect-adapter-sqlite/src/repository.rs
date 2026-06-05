@@ -140,6 +140,7 @@ pub struct PrivacyExportSummary {
     pub training_candidates: i64,
     pub correction_memory_entries: i64,
     pub user_data_deleted_events: i64,
+    pub history_entries: i64,
 }
 
 pub struct SessionUtteranceLink {
@@ -917,11 +918,18 @@ impl SqliteMetadataStore {
         &self,
         user_id: &str,
     ) -> Result<PrivacyExportSummary, SqliteStorageError> {
+        let history_count: i64 = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM ime_text_history
+             WHERE session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)",
+            [user_id],
+            |row| row.get(0),
+        ))?;
         Ok(PrivacyExportSummary {
             user_id: user_id.to_owned(),
             training_candidates: self.user_training_candidate_count(user_id)?,
             correction_memory_entries: self.user_correction_memory_count(user_id)?,
             user_data_deleted_events: self.user_data_deleted_event_count(user_id)?,
+            history_entries: history_count,
         })
     }
 
@@ -1061,6 +1069,11 @@ impl SqliteMetadataStore {
         ))?;
         backend_result(transaction.execute(
             "DELETE FROM correction_memory WHERE user_id = ?1",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM ime_text_history
+             WHERE session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)",
             params![user_id],
         ))?;
         backend_result(transaction.execute(
@@ -1828,6 +1841,53 @@ impl MetadataStorePort for SqliteMetadataStore {
         ))?;
 
         backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    // History query methods (read projection of session data)
+    fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT id, session_id, text, state, created_at
+             FROM ime_text_history
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        ))?;
+        let rows = backend_result(statement.query_map([limit], |row| {
+            let state_str: String = row.get(3)?;
+            let state = match state_str.as_str() {
+                "committed" => HistoryState::Committed,
+                "cancelled" => HistoryState::Cancelled,
+                _ => HistoryState::Committed, // default fallback
+            };
+            Ok(HistoryEntry {
+                id: row.get(0)?,
+                session_id: ImeSessionId::from_string(row.get(1)?),
+                text: row.get(2)?,
+                state,
+                created_at: row.get(4)?,
+            })
+        }))?;
+        let entries = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(entries)
+    }
+
+    fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
+        let deleted = backend_result(self.connection.execute(
+            "DELETE FROM ime_text_history
+             WHERE created_at < datetime('now', ?1)",
+            params![format!("-{} days", older_than_days)],
+        ))?;
+        Ok(deleted as u64)
+    }
+
+    fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
+        let deleted = backend_result(self.connection.execute(
+            "DELETE FROM ime_text_history WHERE id = ?1",
+            params![id],
+        ))?;
+        if deleted == 0 {
+            return Err(SqliteStorageError::not_found("history entry", &id.to_string()));
+        }
         Ok(())
     }
 }

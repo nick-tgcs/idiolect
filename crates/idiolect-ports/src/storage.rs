@@ -52,6 +52,22 @@ pub trait AudioStorePort {
     ) -> Result<(), Self::Error>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub session_id: ImeSessionId,
+    pub text: String,
+    pub state: HistoryState,
+    pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HistoryState {
+    #[default]
+    Committed,
+    Cancelled,
+}
+
 pub trait MetadataStorePort {
     type Error;
 
@@ -74,4 +90,53 @@ pub trait MetadataStorePort {
         session_id: ImeSessionId,
         idempotency_key: &str,
     ) -> Result<(), Self::Error>;
+
+    // History query methods (read projection of session data)
+    fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error>;
+    fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error>;
+    fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error>;
+}
+
+// Desktop integration types (tray, clipboard) - kept in ports for use by application layer
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrayIcon {
+    Idle,
+    Recording,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrayStatus {
+    Active,
+    Passive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrayMenuItem {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub kind: TrayMenuItemKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrayMenuItemKind {
+    /// A plain clickable item, optionally with a nested submenu.
+    Standard { submenu: Option<Vec<TrayMenuItem>> },
+    /// A checkable toggle item (e.g. "Mute").
+    Checkable { checked: bool },
+    /// A mutually-exclusive radio group rendered as sibling items.
+    /// The adapter expands this into individual radio items at render time.
+    RadioGroup { options: Vec<String>, selected: usize },
+    /// A visual separator.
+    Separator,
+}
+
+pub trait TrayPort {
+    type Error;
+
+    fn set_icon(&mut self, icon: TrayIcon) -> Result<(), Self::Error>;
+    fn set_tooltip(&mut self, tooltip: &str) -> Result<(), Self::Error>;
+    fn set_menu(&mut self, items: Vec<TrayMenuItem>) -> Result<(), Self::Error>;
+    fn set_status(&mut self, status: TrayStatus) -> Result<(), Self::Error>;
 }

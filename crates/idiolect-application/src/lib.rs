@@ -2,6 +2,8 @@
 
 pub mod use_cases {
     pub mod dictation;
+    pub mod history;
+    pub mod menu;
 }
 
 /// Returns this crate's package name for smoke tests.

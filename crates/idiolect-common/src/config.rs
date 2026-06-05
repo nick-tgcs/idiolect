@@ -24,6 +24,8 @@ pub struct IdiolectConfig {
     #[serde(default)]
     pub privacy: PrivacyConfig,
     #[serde(default)]
+    pub history: HistoryConfig,
+    #[serde(default)]
     pub observability: ObservabilityConfig,
 }
 
@@ -95,6 +97,18 @@ impl IdiolectConfig {
         {
             return Err(ConfigError::ValidationError {
                 field: "observability.private_text_logging".to_owned(),
+            });
+        }
+
+        // Validate history config
+        if ![1, 7, 30].contains(&self.history.retention_days) {
+            return Err(ConfigError::ValidationError {
+                field: "history.retention_days".to_owned(),
+            });
+        }
+        if ![10, 25, 50].contains(&self.history.max_entries) {
+            return Err(ConfigError::ValidationError {
+                field: "history.max_entries".to_owned(),
             });
         }
 
@@ -266,6 +280,23 @@ pub struct PrivacyConfig {
     pub retain_audio: bool,
     #[serde(default)]
     pub private_text_probe: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HistoryConfig {
+    #[serde(default = "default_history_retention_days")]
+    pub retention_days: u32,
+    #[serde(default = "default_history_max_entries")]
+    pub max_entries: u32,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_history_retention_days(),
+            max_entries: default_history_max_entries(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -461,6 +492,14 @@ fn default_training_min_approved_examples() -> u32 {
 
 fn default_training_trainer() -> String {
     "rust-native-lora".to_owned()
+}
+
+fn default_history_retention_days() -> u32 {
+    1
+}
+
+fn default_history_max_entries() -> u32 {
+    10
 }
 
 fn validate_non_empty_string(field: &'static str, value: &str) -> Result<(), ConfigError> {

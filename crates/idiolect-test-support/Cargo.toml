@@ -9,5 +9,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
 idiolect-common = { path = "../idiolect-common" }
 idiolect-ports = { path = "../idiolect-ports" }

@@ -6,6 +6,52 @@ Idiolect is a local-first personalised speech-to-text input method. It runs thro
 
 ---
 
+## Table of Contents
+
+- [Core Architecture](#core-architecture)
+- [Why Idiolect Must Be an Input Method](#why-idiolect-must-be-an-input-method)
+- [System Processes](#system-processes)
+- [Interface Architecture: Ports and Adapters](#interface-architecture-ports-and-adapters)
+  - [Boundary Rule](#boundary-rule)
+  - [Dependency Direction](#dependency-direction)
+- [Proposed Layering](#proposed-layering)
+- [Core Domain Types](#core-domain-types-examples)
+- [Required Ports (Traits)](#required-ports-traits)
+- [Adapter Selection Through Configuration](#adapter-selection-through-configuration)
+- [Contract Tests for Replaceability](#contract-tests-for-replaceability)
+- [Anti-Coupling Checklist](#anti-coupling-checklist)
+- [Architecture Refinements](#architecture-refinements)
+  - [Domain Events](#domain-events)
+  - [Event Log plus Materialised Tables](#event-log-plus-materialised-tables)
+  - [Command and Query Separation](#command-and-query-separation)
+  - [Idempotency and Exactly-Once Session Semantics](#idempotency-and-exactly-once-session-semantics)
+  - [Backpressure and Worker Isolation](#backpressure-and-worker-isolation)
+  - [Capability Negotiation](#capability-negotiation)
+  - [Interface Stability Levels](#interface-stability-levels)
+- [Fcitx5 Engine Design](#fcitx5-engine-design)
+- [Text Session Model](#text-session-model)
+- [Personalisation Strategy](#personalisation-strategy)
+- [Training Pipeline](#training-pipeline)
+- [Repository Structure](#repository-structure)
+- [Binary Names](#binary-names)
+- [Technology Stack](#technology-stack)
+- [Testing Strategy](#testing-strategy)
+  - [Testing Layers](#testing-layers)
+  - [Test Suite Layout](#test-suite-layout)
+  - [Unit Testing](#unit-testing)
+  - [Integration Testing](#integration-testing)
+  - [End-to-End Testing](#end-to-end-testing)
+  - [Test Fixtures](#test-fixtures)
+  - [Model and Evaluation Regression Testing](#model-and-evaluation-regression-testing)
+  - [CI Gates](#ci-gates)
+- [Status](#status)
+  - [Baseline Verification Gates](#baseline-verification-gates)
+- [CLI Surface](#cli-surface)
+- [Core Truths of the Plan](#core-truths-of-the-plan)
+- [Further Reading](#further-reading)
+
+---
+
 ## Core Architecture
 
 ```mermaid
@@ -739,6 +785,305 @@ idiolect-train     # trainer orchestration CLI (optional)
 | Python reference tools | optional research only | never required by v1 product |
 
 **Language Policy:** Rust is the default for product code. Allowed non-Rust: Fcitx5 C++ shim (thin boundary adapter), third-party C/C++ libraries behind Rust adapter crates, Python scripts (research/reference only, not required for v1 operation).
+
+---
+
+## Testing Strategy
+
+Testing is a core product requirement, not an afterthought. Idiolect sits between microphone input, speech recognition, operating-system text composition, local storage, and model adaptation. Bugs can silently corrupt training data, commit wrong text into user applications, or promote a worse personalised model. The test strategy must cover correctness, privacy, data integrity, latency, and regression safety.
+
+### Testing Layers
+
+```text
+unit tests
+  -> integration tests
+  -> component contract tests
+  -> end-to-end tests
+  -> model/evaluation regression tests
+  -> manual exploratory tests
+```
+
+**Testing Principle:** No captured correction should be used for training unless the audio, raw transcript, edit events, committed text, classifier decision, and manifest entry are all internally consistent.
+
+### Test Suite Layout
+
+```text
+tests/
+  fixtures/
+    audio/           # short spoken phrases, silence, noise, clipped speech, long utterance
+    transcripts/     # raw STT, corrected text, semantic rewrite examples
+    ipc/             # valid sessions, malformed messages, reconnect sequences
+    sqlite/          # migrated empty DB, sample populated DB, corrupted DB copy
+    manifests/       # valid train/validation/holdout files, invalid duplicate split files
+    adapters/        # passing, failing, latency-regressing, hallucination-regressing examples
+  integration/
+  e2e/
+  performance/
+  privacy/
+  regression/
+
+crates/
+  idiolect-common/tests/
+  idiolect-ipc/tests/
+  idiolect-audio/tests/
+  idiolect-vad/tests/
+  idiolect-asr/tests/
+  idiolect-codec/tests/
+  idiolect-storage/tests/
+  idiolect-trainerctl/tests/
+  idiolectd/tests/
+
+fcitx5/idiolect-fcitx5/tests/
+  unit/
+  contract/
+  headless/
+```
+
+### Unit Testing
+
+Unit tests isolate a single function, struct, state machine, or algorithm. They must not require a microphone, GPU, real Fcitx5 session, real Whisper model, or user desktop.
+
+| Area | What to test |
+|---|---|
+| `idiolect-common` | ID parsing, timestamp handling, config defaults, enum serialisation, error mapping |
+| `idiolect-ipc` | JSON Lines framing, malformed messages, request/response correlation, streaming events, reconnect behaviour |
+| `idiolect-audio` | sample conversion, channel downmixing, buffer boundaries, resampling metadata, clipping handling |
+| `idiolect-vad` | speech boundary state machine, pre-roll/post-roll logic, max utterance cut-off, silence handling |
+| `idiolect-asr` | runtime wrapper behaviour with mocked recogniser, transcript normalisation, error propagation |
+| `idiolect-codec` | Opus path generation, hash calculation, decode metadata, debug WAV guardrails |
+| `idiolect-storage` | migrations, insert/update invariants, foreign-key behaviour, deletion cascades, transaction rollback |
+| `idiolect-trainerctl` | candidate filtering, split generation, manifest writing, metric import, promotion decision logic |
+| `idiolectd` | daemon state transitions, command handling, service wiring with mocks |
+| Fcitx5 shim | preedit state, edit event ordering, commit/cancel logic, IPC client failure handling |
+| Rust trainer | classifier rules, dataset split, metric calculation, adapter metadata, early-stopping decisions |
+
+**Minimum unit test rules:**
+- All state machines must test every valid transition and every invalid transition
+- All database writes must test success and rollback failure paths
+- All IPC message types must round-trip through serialisation and deserialisation
+- All text edit classification labels must have positive and negative examples
+
+**Example Rust unit tests:**
+```rust
+#[test]
+fn vad_adds_pre_roll_without_negative_start() {
+    // Given a speech boundary near the start of the rolling buffer,
+    // pre-roll should clamp to zero rather than underflow.
+}
+
+#[test]
+fn ime_commit_creates_high_quality_candidate_after_preedit_correction() {
+    // Raw: "restart traffic"
+    // Edited: "restart Traefik"
+    // Commit should create an ime_preedit_correction candidate with trust 1.0.
+}
+```
+
+**Example classifier unit tests:**
+```rust
+#[test]
+fn semantic_rewrite_is_rejected() {
+    let raw = "restart traffic";
+    let final_text = "actually open the deployment notes";
+    let label = classify_edit(raw, final_text);
+    assert_eq!(label, EditClassification::SemanticRewrite);
+}
+```
+
+### Integration Testing
+
+Integration tests verify that two or more real components work together while avoiding a full desktop session where possible.
+
+| Suite | Components under test | Purpose |
+|---|---|---|
+| IPC contract | Fcitx5 IPC client + Rust IPC server | Ensure both sides agree on message schemas and streaming behaviour |
+| daemon-storage | `idiolectd` + SQLite + audio store pathing | Ensure session lifecycle writes consistent rows and files |
+| audio-vad | CPAL abstraction or fixture PCM + VAD | Ensure utterance segmentation is stable on known clips |
+| asr-fixture | ASR wrapper + small fixed model or mocked recogniser | Ensure transcript output is passed into IME session correctly |
+| codec-storage | Opus encode/decode + utterance rows | Ensure stored clips can be recovered for training |
+| classifier-storage | captured sessions + classifier + candidate table | Ensure trust scores and labels persist correctly |
+| manifest-builder | approved candidates + audio files + manifests | Ensure train/validation/holdout manifests are valid |
+| trainer-evaluator | small fixture dataset + Rust trainer/evaluator | Ensure metrics are produced and imported |
+| adapter-promotion | evaluation metrics + adapter registry | Ensure pass/fail/rollback rules are enforced |
+
+**Important integration invariants:**
+- An utterance row must not exist without an audio file unless the transaction is explicitly marked failed
+- An IME committed session must link to exactly one utterance
+- A high-quality correction candidate must link to both `utterance_id` and `text_session_id`
+- A rejected classifier label must never appear in a training manifest
+- A holdout item must never appear in a training split
+- Adapter promotion must be atomic
+- Rollback must restore the previous active adapter
+
+**SQLite integration tests** run against temporary databases with migrations applied from scratch.
+
+**IPC integration tests** use temporary Unix domain sockets with a test `idiolectd` server.
+
+### End-to-End Testing
+
+E2E tests validate the complete user-visible workflow:
+
+```text
+trigger dictation
+capture or inject audio
+transcribe
+show preedit text
+simulate correction
+commit text into focused app
+persist session
+classify candidate
+export manifest
+run evaluation/promotion gate where applicable
+```
+
+| Tier | Environment | Purpose |
+|---|---|---|
+| E2E-lite | no desktop, mocked Fcitx5, mocked ASR | Fast lifecycle test in continuous integration |
+| E2E-headless | nested X11/Wayland session + Fcitx5 + test app | Verify input-method behaviour without a real user desktop |
+| E2E-real-desktop | manual or nightly Linux desktop VM | Verify browser, terminal, GTK, Qt, and Electron apps |
+| E2E-model | real Whisper model + fixture audio | Verify transcription and latency regressions |
+| E2E-training | fixture corrections + trainer + evaluation gate | Verify learning loop without user data |
+
+**Minimum E2E scenarios (20):**
+1. Accept transcript unchanged
+2. Correct one word in preedit and commit
+3. Cancel dictation before commit
+4. Abandon session after transcript appears
+5. Dictate two utterances in the same target app
+6. Dictate into browser text field
+7. Dictate into terminal
+8. Dictate into GTK editor
+9. Dictate into Qt editor
+10. Dictate into Electron app
+11. Daemon crashes after audio capture but before commit
+12. Fcitx5 engine loses IPC connection during preedit
+13. Storage disk becomes unavailable
+14. ASR returns empty transcript
+15. ASR returns low-confidence transcript
+16. Classifier rejects semantic rewrite
+17. Approved correction appears in manifest
+18. Holdout example is excluded from training
+19. Bad adapter is rejected
+20. Previous adapter is restored after rollback
+
+**Target applications for Linux E2E:**
+| App class | Example target |
+|---|---|
+| Browser | Firefox, Chromium |
+| Terminal | GNOME Terminal, Konsole, Alacritty |
+| GTK text editor | gedit or GNOME Text Editor |
+| Qt text editor | Kate or simple Qt test app |
+| Electron | VS Code or simple Electron fixture app |
+| Web text area | local test page with input and textarea fields |
+
+The E2E test harness includes a tiny local test application that records exactly what text was committed.
+
+### Test Fixtures
+
+Fixtures are synthetic, redistributable, and small enough for continuous integration.
+
+| Fixture | Contents |
+|---|---|
+| audio clips | short spoken phrases, silence, noise, clipped speech, long utterance |
+| transcripts | raw STT, corrected text, semantic rewrite examples |
+| IPC logs | valid sessions, malformed messages, reconnect sequences |
+| SQLite snapshots | migrated empty DB, sample populated DB, corrupted DB copy |
+| manifests | valid train/validation/holdout files, invalid duplicate split files |
+| adapter metrics | passing, failing, latency-regressing, hallucination-regressing examples |
+
+**Required phrase fixtures:**
+```text
+restart Traefik
+open Vaultwarden
+deploy the container
+roll back the adapter
+use the Fcitx5 input method
+```
+
+**Correction fixtures:**
+| Raw STT | Final text | Expected label | Trust |
+|---|---|---|---:|
+| restart traffic | restart Traefik | proper_noun_correction | 0.90 |
+| open vault warden | open Vaultwarden | proper_noun_correction | 0.90 |
+| deploy the container | deploy the container | accepted_without_edit | 0.60 |
+| roll back adapter | roll back the adapter | asr_correction | 1.00 |
+| restart traffic | actually open the notes | semantic_rewrite | 0.00 |
+
+**Audio fixture rules:**
+- Do not use private user recordings in the repository
+- Use synthetic or explicitly consented sample audio only
+- Keep large model files out of git
+- Download models through explicit developer command or CI cache
+
+### Model and Evaluation Regression Testing
+
+Model tests detect accuracy, latency, hallucination, deletion, and promotion regressions.
+
+**Regression sets:**
+| Set | Purpose |
+|---|---|
+| personal fixture set | proper nouns and repeated user-style corrections |
+| command set | short operational commands |
+| general speech mini-set | ordinary dictation to prevent overfitting |
+| silence/noise set | hallucination detection |
+| long utterance set | segmentation and timeout behaviour |
+
+**Metrics to track in CI or nightly jobs:**
+```text
+word error rate
+character error rate
+proper noun accuracy
+command exact-match accuracy
+hallucination rate on silence/noise
+deletion rate
+median latency
+p95 latency
+real-time factor
+memory usage
+model load time
+```
+
+**Promotion-gate tests** use fixed metric inputs and real evaluation outputs.
+
+**Promotion must fail if:**
+- Personal holdout WER does not improve enough
+- General regression set materially worsens
+- Proper noun accuracy regresses
+- Command accuracy regresses
+- Hallucination rate increases
+- p95 latency exceeds target
+- Adapter artifact is missing or corrupt
+- Adapter metadata does not match the base model
+
+### CI Gates
+
+All warnings are errors, and any failing command blocks the current baseline. Run the full baseline gate:
+
+```bash
+bash ci/scripts/test-all.sh
+```
+
+Direct gates run by `test-all.sh`:
+
+```bash
+bash ci/scripts/test-rust.sh
+bash ci/scripts/test-fcitx5.sh
+bash ci/scripts/test-integration.sh
+bash ci/scripts/test-e2e.sh
+bash ci/scripts/test-real-adapter-deps.sh
+bash ci/scripts/test-interface-no-backend-leakage.sh
+bash ci/scripts/test-packaging.sh
+bash ci/scripts/test-package-smoke.sh
+bash ci/scripts/test-coverage-map.sh
+bash ci/scripts/test-coverage.sh
+```
+
+Additional CI scripts (from master plan):
+```bash
+bash ci/scripts/test-cpp.sh
+bash ci/scripts/test-e2e-linux.sh
+bash ci/scripts/test-model-regression.sh
+```
 
 ---
 
