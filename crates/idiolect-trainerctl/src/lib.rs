@@ -16,7 +16,7 @@ pub use manifest::{
     ManifestCandidateInput, ManifestSplit, ManifestV2, ManifestV2BuildInput,
     ManifestV2CandidateInput, ManifestV2Item,
 };
-pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas};
+pub use metrics::{ArtifactCompatibility, EvaluationReport, MetricDeltas, MetricDeltasInput};
 pub use promotion::{
     evaluate_promotion, AdapterRegistry, AdapterRegistryError, PromotionDecision, PromotionPolicy,
     RollbackError,

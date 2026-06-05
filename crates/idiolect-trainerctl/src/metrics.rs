@@ -15,13 +15,17 @@ impl EvaluationReport {
             "artifact-digest",
             "manifest-digest",
             "metric-report-digest",
-            MetricDeltas {
+            MetricDeltas::new(MetricDeltasInput {
                 personal_wer_delta: -0.02,
                 general_wer_delta: 0.0,
-                hallucination_delta: 0.0,
-                p95_latency_delta_ms: 0,
+                cer_delta: 0.0,
                 proper_noun_accuracy_delta: 0.0,
-            },
+                command_accuracy_delta: 0.0,
+                hallucination_delta: 0.0,
+                deletion_rate_delta: 0.0,
+                p95_latency_delta_ms: 0,
+                realtime_factor_delta: 0.0,
+            }),
         )
     }
 
@@ -61,33 +65,54 @@ impl EvaluationReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricDeltasInput {
+    pub personal_wer_delta: f64,
+    pub general_wer_delta: f64,
+    pub cer_delta: f64,
+    pub proper_noun_accuracy_delta: f64,
+    pub command_accuracy_delta: f64,
+    pub hallucination_delta: f64,
+    pub deletion_rate_delta: f64,
+    pub p95_latency_delta_ms: i32,
+    pub realtime_factor_delta: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricDeltas {
     personal_wer_delta: f64,
     general_wer_delta: f64,
-    hallucination_delta: f64,
-    p95_latency_delta_ms: i32,
+    #[serde(default)]
+    cer_delta: f64,
+    #[serde(default)]
     proper_noun_accuracy_delta: f64,
+    #[serde(default)]
+    command_accuracy_delta: f64,
+    hallucination_delta: f64,
+    #[serde(default)]
+    deletion_rate_delta: f64,
+    p95_latency_delta_ms: i32,
+    #[serde(default)]
+    realtime_factor_delta: f64,
 }
 
 impl MetricDeltas {
     #[must_use]
-    pub fn new(
-        personal_wer_delta: f64,
-        general_wer_delta: f64,
-        hallucination_delta: f64,
-        p95_latency_delta_ms: i32,
-        proper_noun_accuracy_delta: f64,
-    ) -> Self {
+    pub fn new(input: MetricDeltasInput) -> Self {
         Self {
-            personal_wer_delta,
-            general_wer_delta,
-            hallucination_delta,
-            p95_latency_delta_ms,
-            proper_noun_accuracy_delta,
+            personal_wer_delta: input.personal_wer_delta,
+            general_wer_delta: input.general_wer_delta,
+            cer_delta: input.cer_delta,
+            proper_noun_accuracy_delta: input.proper_noun_accuracy_delta,
+            command_accuracy_delta: input.command_accuracy_delta,
+            hallucination_delta: input.hallucination_delta,
+            deletion_rate_delta: input.deletion_rate_delta,
+            p95_latency_delta_ms: input.p95_latency_delta_ms,
+            realtime_factor_delta: input.realtime_factor_delta,
         }
     }
 
+    #[must_use]
     pub fn personal_wer_delta(&self) -> f64 {
         self.personal_wer_delta
     }
@@ -98,8 +123,28 @@ impl MetricDeltas {
     }
 
     #[must_use]
+    pub fn cer_delta(&self) -> f64 {
+        self.cer_delta
+    }
+
+    #[must_use]
+    pub fn proper_noun_accuracy_delta(&self) -> f64 {
+        self.proper_noun_accuracy_delta
+    }
+
+    #[must_use]
+    pub fn command_accuracy_delta(&self) -> f64 {
+        self.command_accuracy_delta
+    }
+
+    #[must_use]
     pub fn hallucination_delta(&self) -> f64 {
         self.hallucination_delta
+    }
+
+    #[must_use]
+    pub fn deletion_rate_delta(&self) -> f64 {
+        self.deletion_rate_delta
     }
 
     #[must_use]
@@ -108,8 +153,8 @@ impl MetricDeltas {
     }
 
     #[must_use]
-    pub fn proper_noun_accuracy_delta(&self) -> f64 {
-        self.proper_noun_accuracy_delta
+    pub fn realtime_factor_delta(&self) -> f64 {
+        self.realtime_factor_delta
     }
 }
 

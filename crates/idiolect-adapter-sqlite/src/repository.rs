@@ -32,6 +32,10 @@ const DEFAULT_SAMPLE_RATE_HZ: i64 = 16_000;
 const DEFAULT_CHANNELS: i64 = 1;
 const DEFAULT_STT_MODEL: &str = "unknown";
 const DEFAULT_LANGUAGE: &str = "en";
+const ADAPTER_DERIVATION_PROMOTED: &str = "promoted";
+const ADAPTER_DERIVATION_REJECTED_PREFIX: &str = "rejected:";
+const ADAPTER_DERIVATION_ROLLED_BACK: &str = "rolled_back";
+const ADAPTER_DERIVATION_DELETED_SAMPLE: &str = "deleted_training_sample";
 
 #[derive(Debug)]
 struct StoredEvent {
@@ -178,6 +182,157 @@ pub struct ManifestV2TrainingCandidate {
     pub trust_score_bps: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterRegistryStatus {
+    Candidate,
+    Active,
+    Previous,
+    Best,
+    Rejected,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterRegistrationInput {
+    pub user_id: String,
+    pub adapter_id: String,
+    pub artifact_digest: String,
+    pub manifest_digest: String,
+    pub metric_report_digest: String,
+    pub base_model: String,
+    pub adapter_path: String,
+    pub metrics: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterRegistration {
+    user_id: String,
+    adapter_id: String,
+    artifact_digest: String,
+    manifest_digest: String,
+    metric_report_digest: String,
+    base_model: String,
+    adapter_path: String,
+    metrics: String,
+    training_candidate_ids: Vec<i64>,
+}
+
+impl AdapterRegistration {
+    #[must_use]
+    pub fn new(input: AdapterRegistrationInput) -> Self {
+        Self {
+            user_id: input.user_id,
+            adapter_id: input.adapter_id,
+            artifact_digest: input.artifact_digest,
+            manifest_digest: input.manifest_digest,
+            metric_report_digest: input.metric_report_digest,
+            base_model: input.base_model,
+            adapter_path: input.adapter_path,
+            metrics: input.metrics,
+            training_candidate_ids: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_training_candidate_id(mut self, training_candidate_id: i64) -> Self {
+        self.training_candidate_ids.push(training_candidate_id);
+        self
+    }
+
+    fn metrics_json(&self) -> Result<String, SqliteStorageError> {
+        if self.training_candidate_ids.is_empty() {
+            return Ok(self.metrics.clone());
+        }
+
+        let mut metrics = serde_json::from_str::<serde_json::Value>(&self.metrics)
+            .unwrap_or_else(|_| serde_json::json!({ "raw_metrics": self.metrics }));
+        if !metrics.is_object() {
+            metrics = serde_json::json!({ "raw_metrics": self.metrics });
+        }
+        if let Some(object) = metrics.as_object_mut() {
+            object.insert(
+                "training_candidate_ids".to_owned(),
+                serde_json::json!(&self.training_candidate_ids),
+            );
+        }
+        serde_json::to_string(&metrics).map_err(SqliteStorageError::serialization)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterRegistryEntry {
+    adapter_id: String,
+    status: AdapterRegistryStatus,
+    derived_from_deleted_sample: bool,
+}
+
+impl AdapterRegistryEntry {
+    #[must_use]
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+
+    #[must_use]
+    pub fn status(&self) -> AdapterRegistryStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub fn derived_from_deleted_sample(&self) -> bool {
+        self.derived_from_deleted_sample
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterRegistrySnapshot {
+    entries: Vec<AdapterRegistryEntry>,
+    current_active_adapter_id: Option<String>,
+    previous_active_adapter_id: Option<String>,
+    best_historical_adapter_id: Option<String>,
+    historical_adapter_ids: Vec<String>,
+}
+
+impl AdapterRegistrySnapshot {
+    #[must_use]
+    pub fn current_active_adapter_id(&self) -> Option<&str> {
+        self.current_active_adapter_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn previous_active_adapter_id(&self) -> Option<&str> {
+        self.previous_active_adapter_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn best_historical_adapter_id(&self) -> Option<&str> {
+        self.best_historical_adapter_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn historical_adapter_ids(&self) -> &[String] {
+        &self.historical_adapter_ids
+    }
+
+    #[must_use]
+    pub fn entry(&self, adapter_id: &str) -> Option<&AdapterRegistryEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.adapter_id == adapter_id)
+    }
+
+    #[must_use]
+    pub fn status_for(&self, adapter_id: &str) -> Option<AdapterRegistryStatus> {
+        self.entry(adapter_id).map(AdapterRegistryEntry::status)
+    }
+}
+
+struct AdapterRegistryRow {
+    adapter_id: String,
+    active: bool,
+    promoted: bool,
+    metrics: String,
+}
+
 pub struct SqliteMetadataStore {
     connection: Connection,
 }
@@ -222,6 +377,227 @@ impl SqliteMetadataStore {
             backend_result(transaction.commit())?;
         }
         Ok(())
+    }
+
+    pub fn register_adapter_candidate(
+        &mut self,
+        registration: AdapterRegistration,
+    ) -> Result<(), SqliteStorageError> {
+        let metrics = registration.metrics_json()?;
+        let transaction = backend_result(self.connection.transaction())?;
+        Self::ensure_user(&transaction, &registration.user_id)?;
+        backend_result(transaction.execute(
+            "INSERT INTO adapters(
+                id,
+                user_id,
+                artifact_digest,
+                manifest_digest,
+                metric_report_digest,
+                active,
+                base_model,
+                adapter_type,
+                adapter_path,
+                metrics
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 'lora', ?7, ?8)",
+            params![
+                registration.adapter_id,
+                registration.user_id,
+                registration.artifact_digest,
+                registration.manifest_digest,
+                registration.metric_report_digest,
+                registration.base_model,
+                registration.adapter_path,
+                metrics,
+            ],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn promote_adapter(
+        &mut self,
+        user_id: &str,
+        adapter_id: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let current_active = Self::active_adapter_id_in_transaction(&transaction, user_id)?;
+        backend_result(transaction.execute(
+            "UPDATE adapters SET active = 0 WHERE user_id = ?1",
+            params![user_id],
+        ))?;
+        let promoted = backend_result(transaction.execute(
+            "UPDATE adapters
+             SET active = 1,
+                 promoted_at = COALESCE(promoted_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             WHERE user_id = ?1 AND id = ?2",
+            params![user_id, adapter_id],
+        ))?;
+        if promoted != 1 {
+            return Err(SqliteStorageError::not_found("adapter", adapter_id));
+        }
+
+        if let Some(previous_adapter_id) = current_active.filter(|current| current != adapter_id) {
+            Self::record_adapter_derivation(
+                &transaction,
+                user_id,
+                Some(&previous_adapter_id),
+                Some(adapter_id),
+                ADAPTER_DERIVATION_PROMOTED,
+            )?;
+        }
+
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn reject_adapter(
+        &mut self,
+        user_id: &str,
+        adapter_id: &str,
+        reason: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let updated = backend_result(transaction.execute(
+            "UPDATE adapters SET active = 0 WHERE user_id = ?1 AND id = ?2",
+            params![user_id, adapter_id],
+        ))?;
+        if updated != 1 {
+            return Err(SqliteStorageError::not_found("adapter", adapter_id));
+        }
+        let trigger_reason = format!("{ADAPTER_DERIVATION_REJECTED_PREFIX}{reason}");
+        Self::record_adapter_derivation(
+            &transaction,
+            user_id,
+            None,
+            Some(adapter_id),
+            &trigger_reason,
+        )?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn rollback_adapter(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let current = Self::active_adapter_id_in_transaction(&transaction, user_id)?
+            .ok_or_else(|| SqliteStorageError::not_found("active adapter", user_id))?;
+        let previous = Self::previous_adapter_id_in_transaction(&transaction, user_id)?
+            .ok_or_else(|| SqliteStorageError::not_found("rollback adapter", user_id))?;
+
+        backend_result(transaction.execute(
+            "UPDATE adapters SET active = 0 WHERE user_id = ?1 AND id = ?2",
+            params![user_id, current],
+        ))?;
+        backend_result(transaction.execute(
+            "UPDATE adapters SET active = 1 WHERE user_id = ?1 AND id = ?2",
+            params![user_id, previous],
+        ))?;
+        Self::record_adapter_derivation(
+            &transaction,
+            user_id,
+            Some(&previous),
+            Some(&current),
+            ADAPTER_DERIVATION_ROLLED_BACK,
+        )?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn mark_adapters_derived_from_deleted_sample(
+        &mut self,
+        user_id: &str,
+        training_candidate_id: i64,
+    ) -> Result<(), SqliteStorageError> {
+        let rows = self.adapter_registry_rows(user_id)?;
+        let transaction = backend_result(self.connection.transaction())?;
+        for row in rows {
+            if Self::metrics_include_training_candidate(&row.metrics, training_candidate_id) {
+                Self::record_adapter_derivation(
+                    &transaction,
+                    user_id,
+                    None,
+                    Some(&row.adapter_id),
+                    ADAPTER_DERIVATION_DELETED_SAMPLE,
+                )?;
+            }
+        }
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    pub fn adapter_registry_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<AdapterRegistrySnapshot, SqliteStorageError> {
+        let rows = self.adapter_registry_rows(user_id)?;
+        let rejected = self.adapter_ids_with_derivation(
+            user_id,
+            &format!("{ADAPTER_DERIVATION_REJECTED_PREFIX}%"),
+        )?;
+        let rolled_back =
+            self.adapter_ids_with_derivation(user_id, ADAPTER_DERIVATION_ROLLED_BACK)?;
+        let derived_from_deleted_sample =
+            self.adapter_ids_with_derivation(user_id, ADAPTER_DERIVATION_DELETED_SAMPLE)?;
+        let current_active_adapter_id = rows
+            .iter()
+            .find(|row| row.active)
+            .map(|row| row.adapter_id.clone());
+        let historical_adapter_ids = rows
+            .iter()
+            .filter(|row| row.promoted)
+            .map(|row| row.adapter_id.clone())
+            .collect::<Vec<_>>();
+        let previous_active_adapter_id = rows
+            .iter()
+            .rev()
+            .find(|row| {
+                row.promoted
+                    && !row.active
+                    && !rejected.contains(&row.adapter_id)
+                    && !rolled_back.contains(&row.adapter_id)
+            })
+            .map(|row| row.adapter_id.clone());
+        let best_historical_adapter_id = rows
+            .iter()
+            .filter(|row| row.promoted)
+            .filter_map(|row| {
+                Self::personal_wer_delta(&row.metrics).map(|delta| (row.adapter_id.clone(), delta))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(adapter_id, _)| adapter_id)
+            .or_else(|| current_active_adapter_id.clone());
+
+        let entries = rows
+            .into_iter()
+            .map(|row| {
+                let status = if rejected.contains(&row.adapter_id) {
+                    AdapterRegistryStatus::Rejected
+                } else if rolled_back.contains(&row.adapter_id) {
+                    AdapterRegistryStatus::RolledBack
+                } else if current_active_adapter_id.as_deref() == Some(row.adapter_id.as_str()) {
+                    AdapterRegistryStatus::Active
+                } else if previous_active_adapter_id.as_deref() == Some(row.adapter_id.as_str()) {
+                    AdapterRegistryStatus::Previous
+                } else if best_historical_adapter_id.as_deref() == Some(row.adapter_id.as_str()) {
+                    AdapterRegistryStatus::Best
+                } else {
+                    AdapterRegistryStatus::Candidate
+                };
+                AdapterRegistryEntry {
+                    derived_from_deleted_sample: derived_from_deleted_sample
+                        .contains(&row.adapter_id),
+                    adapter_id: row.adapter_id,
+                    status,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AdapterRegistrySnapshot {
+            entries,
+            current_active_adapter_id,
+            previous_active_adapter_id,
+            best_historical_adapter_id,
+            historical_adapter_ids,
+        })
     }
 
     pub fn table_exists_for_test(&self, table: &str) -> Result<bool, SqliteStorageError> {
@@ -568,6 +944,10 @@ impl SqliteMetadataStore {
             "DELETE FROM correction_memory WHERE user_id = ?1",
             params![user_id],
         ))?;
+        backend_result(transaction.execute(
+            "DELETE FROM adapter_derivations WHERE user_id = ?1",
+            params![user_id],
+        ))?;
         backend_result(
             transaction.execute("DELETE FROM adapters WHERE user_id = ?1", params![user_id]),
         )?;
@@ -706,6 +1086,146 @@ impl SqliteMetadataStore {
             |row| row.get(0),
         ))?;
         Ok(count)
+    }
+
+    fn adapter_registry_rows(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<AdapterRegistryRow>, SqliteStorageError> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT id, active, promoted_at IS NOT NULL, COALESCE(metrics, '')
+             FROM adapters
+             WHERE user_id = ?1
+             ORDER BY created_at, id",
+        ))?;
+        let rows = backend_result(statement.query_map(params![user_id], |row| {
+            let active: i64 = row.get(1)?;
+            let promoted: i64 = row.get(2)?;
+            Ok(AdapterRegistryRow {
+                adapter_id: row.get(0)?,
+                active: active != 0,
+                promoted: promoted != 0,
+                metrics: row.get(3)?,
+            })
+        }))?;
+        let rows = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(rows)
+    }
+
+    fn adapter_ids_with_derivation(
+        &self,
+        user_id: &str,
+        trigger_pattern: &str,
+    ) -> Result<Vec<String>, SqliteStorageError> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT DISTINCT COALESCE(to_adapter_id, '')
+             FROM adapter_derivations
+             WHERE user_id = ?1 AND trigger_reason LIKE ?2 AND to_adapter_id IS NOT NULL
+             ORDER BY created_at, id",
+        ))?;
+        let rows = backend_result(
+            statement.query_map(params![user_id, trigger_pattern], |row| {
+                row.get::<_, String>(0)
+            }),
+        )?;
+        let adapter_ids = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
+        Ok(adapter_ids)
+    }
+
+    fn active_adapter_id_in_transaction(
+        transaction: &Transaction<'_>,
+        user_id: &str,
+    ) -> Result<Option<String>, SqliteStorageError> {
+        let adapter_id = backend_result(
+            transaction
+                .query_row(
+                    "SELECT id
+                     FROM adapters
+                     WHERE user_id = ?1 AND active = 1
+                     ORDER BY promoted_at DESC, id DESC
+                     LIMIT 1",
+                    params![user_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional(),
+        )?;
+        Ok(adapter_id)
+    }
+
+    fn previous_adapter_id_in_transaction(
+        transaction: &Transaction<'_>,
+        user_id: &str,
+    ) -> Result<Option<String>, SqliteStorageError> {
+        let adapter_id = backend_result(
+            transaction
+                .query_row(
+                    "SELECT a.id
+                     FROM adapters AS a
+                     WHERE a.user_id = ?1
+                       AND a.active = 0
+                       AND a.promoted_at IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM adapter_derivations AS d
+                           WHERE d.user_id = a.user_id
+                             AND d.to_adapter_id = a.id
+                             AND (d.trigger_reason LIKE ?2 OR d.trigger_reason = ?3)
+                       )
+                     ORDER BY a.promoted_at DESC, a.id DESC
+                     LIMIT 1",
+                    params![
+                        user_id,
+                        format!("{ADAPTER_DERIVATION_REJECTED_PREFIX}%"),
+                        ADAPTER_DERIVATION_ROLLED_BACK,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional(),
+        )?;
+        Ok(adapter_id)
+    }
+
+    fn record_adapter_derivation(
+        transaction: &Transaction<'_>,
+        user_id: &str,
+        from_adapter_id: Option<&str>,
+        to_adapter_id: Option<&str>,
+        trigger_reason: &str,
+    ) -> Result<(), SqliteStorageError> {
+        backend_result(transaction.execute(
+            "INSERT INTO adapter_derivations(
+                user_id,
+                from_adapter_id,
+                to_adapter_id,
+                trigger_reason
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, from_adapter_id, to_adapter_id, trigger_reason],
+        ))?;
+        Ok(())
+    }
+
+    fn personal_wer_delta(metrics: &str) -> Option<f64> {
+        let value = serde_json::from_str::<serde_json::Value>(metrics).ok()?;
+        value
+            .get("wer_personal_delta")
+            .or_else(|| value.get("personal_wer_delta"))
+            .or_else(|| value.get("wer_personal"))
+            .and_then(serde_json::Value::as_f64)
+    }
+
+    fn metrics_include_training_candidate(metrics: &str, training_candidate_id: i64) -> bool {
+        let Some(value) = serde_json::from_str::<serde_json::Value>(metrics).ok() else {
+            return false;
+        };
+        let Some(ids) = value
+            .get("training_candidate_ids")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        ids.iter()
+            .filter_map(serde_json::Value::as_i64)
+            .any(|id| id == training_candidate_id)
     }
 
     fn applied_migration_checksum(
@@ -855,9 +1375,13 @@ impl SqliteMetadataStore {
     }
 
     fn ensure_default_user(transaction: &Transaction<'_>) -> Result<(), SqliteStorageError> {
+        Self::ensure_user(transaction, DEFAULT_USER_ID)
+    }
+
+    fn ensure_user(transaction: &Transaction<'_>, user_id: &str) -> Result<(), SqliteStorageError> {
         backend_result(transaction.execute(
             "INSERT OR IGNORE INTO users(id, display_name) VALUES (?1, ?1)",
-            params![DEFAULT_USER_ID],
+            params![user_id],
         ))?;
         Ok(())
     }

@@ -11,8 +11,11 @@ pub enum PromotionDecision {
 pub struct PromotionPolicy {
     pub max_general_wer_delta: f32,
     pub max_hallucination_delta: f32,
+    pub max_deletion_rate_delta: f32,
     pub max_p95_latency_delta_ms: i32,
+    pub max_realtime_factor_delta: f32,
     pub min_personal_wer_improvement: f32,
+    pub min_command_accuracy_delta: f32,
 }
 
 impl Default for PromotionPolicy {
@@ -20,8 +23,11 @@ impl Default for PromotionPolicy {
         Self {
             max_general_wer_delta: 0.0,
             max_hallucination_delta: 0.0,
+            max_deletion_rate_delta: 0.0,
             max_p95_latency_delta_ms: 0,
+            max_realtime_factor_delta: 0.0,
             min_personal_wer_improvement: -0.01,
+            min_command_accuracy_delta: 0.0,
         }
     }
 }
@@ -51,9 +57,27 @@ pub fn evaluate_promotion(
         };
     }
 
+    if metric_deltas.proper_noun_accuracy_delta() < 0.0 {
+        return PromotionDecision::Reject {
+            reason: "proper_noun_accuracy_regression",
+        };
+    }
+
+    if (metric_deltas.command_accuracy_delta() as f32) < policy.min_command_accuracy_delta {
+        return PromotionDecision::Reject {
+            reason: "command_accuracy_regression",
+        };
+    }
+
     if metric_deltas.hallucination_delta() as f32 > policy.max_hallucination_delta {
         return PromotionDecision::Reject {
             reason: "hallucination_regression",
+        };
+    }
+
+    if metric_deltas.deletion_rate_delta() as f32 > policy.max_deletion_rate_delta {
+        return PromotionDecision::Reject {
+            reason: "deletion_rate_regression",
         };
     }
 
@@ -63,9 +87,9 @@ pub fn evaluate_promotion(
         };
     }
 
-    if metric_deltas.proper_noun_accuracy_delta() < 0.0 {
+    if metric_deltas.realtime_factor_delta() as f32 > policy.max_realtime_factor_delta {
         return PromotionDecision::Reject {
-            reason: "proper_noun_accuracy_regression",
+            reason: "realtime_factor_regression",
         };
     }
 

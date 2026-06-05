@@ -10,7 +10,8 @@ use idiolect_ipc::messages::{CommitPreedit, IpcMessage};
 use idiolect_trainerctl::{
     evaluate_promotion, AdapterRegistry, ArtifactCompatibility, CandidateClassifier,
     CandidateEvidence, EvaluationReport, LearningManifestBuilder, Manifest, ManifestBuildInput,
-    ManifestCandidateInput, MetricDeltas, PromotionDecision, PromotionPolicy, RollbackError,
+    ManifestCandidateInput, MetricDeltas, MetricDeltasInput, PromotionDecision, PromotionPolicy,
+    RollbackError,
 };
 
 #[test]
@@ -199,13 +200,17 @@ fn report_for_manifest(
         "artifact-digest",
         manifest_digest,
         "metric-report-digest",
-        MetricDeltas::new(
+        MetricDeltas::new(MetricDeltasInput {
             personal_wer_delta,
             general_wer_delta,
-            hallucination_delta,
-            p95_latency_delta_ms,
+            cer_delta: 0.0,
             proper_noun_accuracy_delta,
-        ),
+            command_accuracy_delta: 0.0,
+            hallucination_delta,
+            deletion_rate_delta: 0.0,
+            p95_latency_delta_ms,
+            realtime_factor_delta: 0.0,
+        }),
     )
 }
 
