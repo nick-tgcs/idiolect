@@ -282,12 +282,21 @@ pub struct PrivacyConfig {
     pub private_text_probe: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct HistoryConfig {
     #[serde(default = "default_history_retention_days")]
     pub retention_days: u32,
     #[serde(default = "default_history_max_entries")]
     pub max_entries: u32,
+    /// Seconds after which a history entry copied to the clipboard is cleared.
+    /// `0` disables auto-clear.
+    #[serde(default = "default_history_clipboard_auto_clear_secs")]
+    pub clipboard_auto_clear_secs: u64,
+    /// Encrypt history text at rest using the configured key. Defaults to `false`
+    /// so the feature can be rolled out deliberately (a lost key means lost
+    /// history, and toggling it on a populated database requires a fresh store).
+    #[serde(default)]
+    pub encrypt_at_rest: bool,
 }
 
 impl Default for HistoryConfig {
@@ -295,7 +304,25 @@ impl Default for HistoryConfig {
         Self {
             retention_days: default_history_retention_days(),
             max_entries: default_history_max_entries(),
+            clipboard_auto_clear_secs: default_history_clipboard_auto_clear_secs(),
+            encrypt_at_rest: false,
         }
+    }
+}
+
+impl HistoryConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.retention_days == 0 {
+            return Err(ConfigError::ValidationError {
+                field: "history.retention_days".to_owned(),
+            });
+        }
+        if self.max_entries == 0 {
+            return Err(ConfigError::ValidationError {
+                field: "history.max_entries".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -500,6 +527,10 @@ fn default_history_retention_days() -> u32 {
 
 fn default_history_max_entries() -> u32 {
     10
+}
+
+fn default_history_clipboard_auto_clear_secs() -> u64 {
+    30
 }
 
 fn validate_non_empty_string(field: &'static str, value: &str) -> Result<(), ConfigError> {

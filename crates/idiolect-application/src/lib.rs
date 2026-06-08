@@ -3,6 +3,7 @@
 pub mod use_cases {
     pub mod dictation;
     pub mod history;
+    pub mod maintenance;
     pub mod menu;
 }
 

@@ -44,7 +44,7 @@ fn migration_01_creates_materialized_tables() {
     }
     assert_eq!(
         store.applied_migration_versions_for_test().unwrap(),
-        [1, 2, 3]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 
@@ -76,7 +76,7 @@ fn migration_02_is_recorded_after_01() {
 
     assert_eq!(
         store.applied_migration_versions_for_test().unwrap(),
-        [1, 2, 3]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 
@@ -108,7 +108,7 @@ fn migrate_with_mismatched_checksum_fails_fast() {
     assert!(error.to_string().contains("checksum mismatch"));
     assert_eq!(
         store.applied_migration_versions_for_test().unwrap(),
-        [1, 2, 3]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 

@@ -9,6 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+idiolect-adapter-clipboard = { path = "../idiolect-adapters/desktop/clipboard" }
+idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
+idiolect-adapter-ksni = { path = "../idiolect-adapters/desktop/ksni" }
 idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
 idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }
@@ -19,3 +22,4 @@ idiolect-ipc = { path = "../idiolect-ipc" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-test-support = { path = "../idiolect-test-support" }
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

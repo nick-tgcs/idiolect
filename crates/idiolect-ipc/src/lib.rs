@@ -4,6 +4,11 @@ pub mod framing;
 pub mod handshake;
 pub mod messages;
 
+pub use messages::{
+    ClientHello, CommitPreedit, ErrorMessage, HistoryCopy, HistoryCopyResponse, HistoryReinsert,
+    HistoryReinsertResponse, IpcMessage, PreeditUpdate, ServerHello,
+};
+
 /// Returns this crate's package name for smoke tests.
 #[must_use]
 pub fn crate_name() -> &'static str {

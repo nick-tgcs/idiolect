@@ -18,6 +18,18 @@ impl Default for ArboardClipboard {
     }
 }
 
+impl ArboardClipboard {
+    /// Returns the current clipboard text, if any readable text is present.
+    ///
+    /// # Errors
+    /// Returns [`ArboardClipboardError`] if the clipboard cannot be read.
+    pub fn get_text(&mut self) -> Result<String, ArboardClipboardError> {
+        self.clipboard
+            .get_text()
+            .map_err(ArboardClipboardError::Arboard)
+    }
+}
+
 impl ClipboardPort for ArboardClipboard {
     type Error = ArboardClipboardError;
 

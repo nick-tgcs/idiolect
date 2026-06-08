@@ -51,7 +51,19 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "text_history",
         sql: include_str!("../migrations/0004_text_history.sql"),
-        expected_sha256_hex: "1aa2683493ef84e192775c2f513bb25b03a9e4bdeef9cc5b869fc3d0ecd337af",
+        expected_sha256_hex: "998c9de2480e8efe79ebeaa4f55187d574a0d2ed1090927b8259c6c4fa74d1bb",
+    },
+    Migration {
+        version: 5,
+        name: "tray_settings",
+        sql: include_str!("../migrations/0005_tray_settings.sql"),
+        expected_sha256_hex: "e46c34bcd7b206aa74c08c4a925a1f9311a2107247690c2f2e57bb6cdefdd975",
+    },
+    Migration {
+        version: 6,
+        name: "history_app_materialized",
+        sql: include_str!("../migrations/0006_history_app_materialized.sql"),
+        expected_sha256_hex: "32f2b5263f6fcf0161e97f96da6da15f2569b3cae4915c6a1c81280a4eb233fe",
     },
 ];
 

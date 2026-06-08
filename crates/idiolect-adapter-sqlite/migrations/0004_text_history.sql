@@ -13,3 +13,21 @@ CREATE INDEX IF NOT EXISTS ime_text_history_created_at_lookup
     ON ime_text_history(created_at DESC);
 CREATE INDEX IF NOT EXISTS ime_text_history_session_lookup
     ON ime_text_history(session_id);
+
+-- Trigger to populate history on session commit
+CREATE TRIGGER IF NOT EXISTS trg_ime_text_history_on_commit
+AFTER UPDATE OF state ON ime_text_sessions
+WHEN NEW.state = 'committed' AND OLD.state != 'committed'
+BEGIN
+    INSERT INTO ime_text_history (session_id, text, state, created_at)
+    VALUES (NEW.id, NEW.committed_text, 'committed', NEW.committed_at);
+END;
+
+-- Trigger to populate history on session cancel
+CREATE TRIGGER IF NOT EXISTS trg_ime_text_history_on_cancel
+AFTER UPDATE OF state ON ime_text_sessions
+WHEN NEW.state = 'cancelled' AND OLD.state != 'cancelled'
+BEGIN
+    INSERT INTO ime_text_history (session_id, text, state, created_at)
+    VALUES (NEW.id, '', 'cancelled', NEW.cancelled_at);
+END;

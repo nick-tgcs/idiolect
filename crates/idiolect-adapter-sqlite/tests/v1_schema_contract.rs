@@ -75,7 +75,7 @@ fn v1_schema_has_users_utterances_audio_and_session_links() {
     assert_columns_include(&store, "correction_memory", &["user_id"]);
     assert_eq!(
         store.applied_migration_versions_for_test().unwrap(),
-        [1, 2, 3]
+        [1, 2, 3, 4, 5, 6]
     );
 }
 

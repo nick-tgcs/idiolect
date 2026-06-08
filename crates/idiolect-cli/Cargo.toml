@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-application = { path = "../idiolect-application" }
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ipc = { path = "../idiolect-ipc" }
+idiolect-ports = { path = "../idiolect-ports" }
 serde_json = { workspace = true }
 
 [lints]

@@ -57,6 +57,7 @@ pub struct FakeMetadataStore {
     candidate_count: usize,
     history_entries: Vec<FakeHistoryEntry>,
     next_history_id: i64,
+    tray_settings: std::collections::HashMap<String, String>,
 }
 
 impl FakeMetadataStore {
@@ -168,6 +169,20 @@ impl MetadataStorePort for FakeMetadataStore {
         Ok(entries)
     }
 
+    fn get_history_entry(&self, id: i64) -> Result<Option<HistoryEntry>, Self::Error> {
+        Ok(self
+            .history_entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| HistoryEntry {
+                id: entry.id,
+                session_id: entry.session_id,
+                text: entry.text.clone(),
+                state: entry.state,
+                created_at: entry.created_at.clone(),
+            }))
+    }
+
     fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
@@ -179,6 +194,19 @@ impl MetadataStorePort for FakeMetadataStore {
     fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
         self.history_entries.retain(|e| e.id != id);
         Ok(())
+    }
+
+    fn get_tray_setting(&self, key: &str) -> Result<Option<String>, Self::Error> {
+        Ok(self.tray_settings.get(key).cloned())
+    }
+
+    fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error> {
+        self.tray_settings.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error> {
+        Ok(self.tray_settings.clone())
     }
 }
 

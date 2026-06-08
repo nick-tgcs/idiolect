@@ -93,8 +93,14 @@ pub trait MetadataStorePort {
 
     // History query methods (read projection of session data)
     fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error>;
+    fn get_history_entry(&self, id: i64) -> Result<Option<HistoryEntry>, Self::Error>;
     fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error>;
     fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error>;
+
+    // Tray settings persistence
+    fn get_tray_setting(&self, key: &str) -> Result<Option<String>, Self::Error>;
+    fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error>;
+    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error>;
 }
 
 // Desktop integration types (tray, clipboard) - kept in ports for use by application layer

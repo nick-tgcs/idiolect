@@ -1,8 +1,8 @@
 use std::sync::mpsc;
 
-use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus};
-use ksni::menu::{StandardItem, SubMenu, RadioGroup, CheckmarkItem, SeparatorItem};
-use ksni::{Tray, TrayMethods};
+use idiolect_ports::storage::{TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus};
+use ksni::menu::{StandardItem, RadioGroup, CheckmarkItem, MenuItem, RadioItem, SubMenu};
+use ksni::{Tray, ToolTip, blocking::TrayMethods};
 
 /// Commands the tray adapter sends back to the daemon's main thread.
 #[derive(Debug, Clone)]
@@ -33,17 +33,17 @@ impl TrayPort for KsniTray {
             TrayIcon::Recording => "idiolect-recording",
             TrayIcon::Error => "idiolect-error",
         };
-        self.handle.update(|inner| inner.icon = icon_name.to_owned())?;
+        self.handle.update(|inner| inner.icon = icon_name.to_owned());
         Ok(())
     }
 
     fn set_tooltip(&mut self, tooltip: &str) -> Result<(), Self::Error> {
-        self.handle.update(|inner| inner.tooltip = tooltip.to_owned())?;
+        self.handle.update(|inner| inner.tooltip = tooltip.to_owned());
         Ok(())
     }
 
     fn set_menu(&mut self, items: Vec<TrayMenuItem>) -> Result<(), Self::Error> {
-        self.handle.update(|inner| inner.menu_items = items)?;
+        self.handle.update(|inner| inner.menu_items = items);
         Ok(())
     }
 
@@ -52,7 +52,7 @@ impl TrayPort for KsniTray {
             TrayStatus::Active => ksni::Status::Active,
             TrayStatus::Passive => ksni::Status::Passive,
         };
-        self.handle.update(|inner| inner.status = ksni_status)?;
+        self.handle.update(|inner| inner.status = ksni_status);
         Ok(())
     }
 }
@@ -66,65 +66,85 @@ impl KsniTray {
             menu_items: Vec::new(),
             sender,
         };
-        let handle = ksni::blocking::Tray::new(inner)?;
+        let handle = inner.spawn()?;
         Ok(Self { handle })
     }
 }
 
 impl InnerTray {
-    fn map_menu_item(&self, item: &TrayMenuItem, sender: mpsc::Sender<TrayCallback>) -> Box<dyn ksni::menu::MenuItem> {
+    fn map_menu_item(&self, item: &TrayMenuItem, sender: mpsc::Sender<TrayCallback>) -> MenuItem<InnerTray> {
         match &item.kind {
-            TrayMenuItemKind::Standard { submenu } => {
-                let mut standard = StandardItem::new(&item.label);
-                standard.set_enabled(item.enabled);
-                if let Some(sub_items) = submenu {
-                    let submenu_items: Vec<Box<dyn ksni::menu::MenuItem>> = sub_items
-                        .iter()
-                        .map(|sub| self.map_menu_item(sub, sender.clone()))
-                        .collect();
-                    standard.set_submenu(SubMenu::new(submenu_items));
-                } else {
-                    let action_id = item.id.clone();
-                    let s = sender.clone();
-                    standard.on_activate(move || {
-                        let _ = s.send(TrayCallback::Activate(action_id.clone()));
-                    });
-                }
-                Box::new(standard)
+            TrayMenuItemKind::Standard {
+                submenu: Some(sub_items),
+            } => {
+                let submenu = sub_items
+                    .iter()
+                    .map(|sub| self.map_menu_item(sub, sender.clone()))
+                    .collect();
+                MenuItem::SubMenu(SubMenu {
+                    label: item.label.clone(),
+                    enabled: item.enabled,
+                    submenu,
+                    ..Default::default()
+                })
+            }
+            TrayMenuItemKind::Standard { submenu: None } => {
+                let action_id = item.id.clone();
+                let sender = sender.clone();
+                MenuItem::Standard(StandardItem {
+                    label: item.label.clone(),
+                    enabled: item.enabled,
+                    activate: Box::new(move |_this: &mut InnerTray| {
+                        let _ = sender.send(TrayCallback::Activate(action_id.clone()));
+                    }),
+                    ..Default::default()
+                })
             }
             TrayMenuItemKind::Checkable { checked } => {
-                let mut checkable = CheckmarkItem::new(&item.label);
-                checkable.set_enabled(item.enabled);
-                checkable.set_checked(*checked);
                 let action_id = item.id.clone();
-                let s = sender.clone();
-                checkable.on_activate(move || {
-                    let _ = s.send(TrayCallback::Activate(action_id.clone()));
-                });
-                Box::new(checkable)
+                let sender = sender.clone();
+                MenuItem::Checkmark(CheckmarkItem {
+                    label: item.label.clone(),
+                    enabled: item.enabled,
+                    checked: *checked,
+                    activate: Box::new(move |_this: &mut InnerTray| {
+                        let _ = sender.send(TrayCallback::Activate(action_id.clone()));
+                    }),
+                    ..Default::default()
+                })
             }
             TrayMenuItemKind::RadioGroup { options, selected } => {
-                let mut radio_group = RadioGroup::new();
-                for (idx, option) in options.iter().enumerate() {
-                    let mut item = ksni::menu::RadioItem::new(option);
-                    item.set_checked(idx == *selected);
-                    let action_id = format!("{}:{}", item.id, idx);
-                    let s = sender.clone();
-                    item.on_activate(move || {
-                        let _ = s.send(TrayCallback::Activate(action_id.clone()));
-                    });
-                    radio_group.add(item);
-                }
-                Box::new(radio_group)
+                let radio_items = options
+                    .iter()
+                    .map(|option| RadioItem {
+                        label: option.clone(),
+                        enabled: true,
+                        ..Default::default()
+                    })
+                    .collect();
+                // Emit "<group-id>:<index>" (e.g. "settings:retention:1") so the
+                // daemon can identify both which setting changed and the chosen
+                // option index.
+                let group_id = item.id.clone();
+                let sender = sender.clone();
+                MenuItem::RadioGroup(RadioGroup {
+                    selected: *selected,
+                    options: radio_items,
+                    select: Box::new(move |_this: &mut InnerTray, idx: usize| {
+                        let _ = sender.send(TrayCallback::Activate(format!("{group_id}:{idx}")));
+                    }),
+                })
             }
-            TrayMenuItemKind::Separator => {
-                Box::new(SeparatorItem::new())
-            }
+            TrayMenuItemKind::Separator => MenuItem::Separator,
         }
     }
 }
 
 impl Tray for InnerTray {
+    fn id(&self) -> String {
+        "idiolect".to_owned()
+    }
+
     fn icon_name(&self) -> String {
         self.icon.clone()
     }
@@ -133,15 +153,20 @@ impl Tray for InnerTray {
         "Idiolect".to_owned()
     }
 
-    fn tool_tip(&self) -> String {
-        self.tooltip.clone()
+    fn tool_tip(&self) -> ToolTip {
+        ToolTip {
+            icon_name: String::new(),
+            title: "Idiolect".to_owned(),
+            description: self.tooltip.clone(),
+            icon_pixmap: Vec::new(),
+        }
     }
 
     fn status(&self) -> ksni::Status {
         self.status
     }
 
-    fn menu(&self) -> Vec<Box<dyn ksni::menu::MenuItem>> {
+    fn menu(&self) -> Vec<MenuItem<Self>> {
         let sender = self.sender.clone();
         self.menu_items
             .iter()
@@ -154,6 +179,4 @@ impl Tray for InnerTray {
 pub enum KsniTrayError {
     #[error("ksni error: {0}")]
     Ksni(#[from] ksni::Error),
-    #[error("update error: {0}")]
-    Update(#[from] ksni::blocking::UpdateError),
 }

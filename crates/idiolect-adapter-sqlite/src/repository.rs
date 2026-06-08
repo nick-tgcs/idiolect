@@ -2,8 +2,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+use idiolect_adapter_crypto::EncryptionPort;
 use idiolect_common::ids::ImeSessionId;
-use idiolect_ports::storage::{AudioStorePort, MetadataStorePort};
+use idiolect_ports::storage::{AudioStorePort, MetadataStorePort, HistoryEntry, HistoryState};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::audio_store::{FileAudioStore, FileAudioStoreError};
@@ -17,6 +18,12 @@ const SESSION_COMMITTED: &str = "SessionCommitted";
 const SESSION_CANCELLED: &str = "SessionCancelled";
 const USER_AGGREGATE_TYPE: &str = "user";
 const USER_DATA_DELETED: &str = "UserDataDeleted";
+const HISTORY_ENTRY_AGGREGATE: &str = "history_entry";
+const HISTORY_ENTRY_DELETED: &str = "HistoryEntryDeleted";
+const HISTORY_AGGREGATE: &str = "history";
+const HISTORY_PRUNED: &str = "HistoryPruned";
+const TRAY_CONFIG_AGGREGATE: &str = "tray_config";
+const TRAY_CONFIG_CHANGED: &str = "TrayConfigChanged";
 const SESSION_STATE_CREATED: &str = "created";
 const SESSION_STATE_COMMITTED: &str = "committed";
 const SESSION_STATE_CANCELLED: &str = "cancelled";
@@ -55,7 +62,7 @@ pub enum SqliteStorageErrorKind {
 pub struct SqliteStorageError {
     kind: SqliteStorageErrorKind,
     message: String,
-    source: Option<Box<dyn Error + 'static>>,
+    source: Option<Box<dyn Error + Send + Sync + 'static>>,
 }
 
 impl SqliteStorageError {
@@ -121,6 +128,14 @@ impl SqliteStorageError {
             source: Some(Box::new(error)),
         }
     }
+
+    fn crypto(error: idiolect_adapter_crypto::CryptoError) -> Self {
+        Self {
+            kind: SqliteStorageErrorKind::Backend,
+            message: format!("history encryption failed: {error}"),
+            source: Some(Box::new(error)),
+        }
+    }
 }
 
 impl Display for SqliteStorageError {
@@ -131,7 +146,9 @@ impl Display for SqliteStorageError {
 
 impl Error for SqliteStorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_deref()
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
     }
 }
 
@@ -353,6 +370,9 @@ struct AdapterRegistryRow {
 
 pub struct SqliteMetadataStore {
     connection: Connection,
+    /// Optional cipher applied to `ime_text_history.text` at rest. When absent,
+    /// history text is stored and read as plaintext.
+    history_cipher: Option<Box<dyn EncryptionPort + Send + Sync>>,
 }
 
 impl SqliteMetadataStore {
@@ -364,9 +384,58 @@ impl SqliteMetadataStore {
         Self::from_connection(backend_result(Connection::open(path))?)
     }
 
+    /// Enables at-rest encryption of history text using `cipher`. Existing
+    /// plaintext rows remain readable: reads fall back to the raw value when
+    /// decryption fails, so enabling encryption on a populated store is safe.
+    #[must_use]
+    pub fn with_history_cipher(mut self, cipher: Box<dyn EncryptionPort + Send + Sync>) -> Self {
+        self.history_cipher = Some(cipher);
+        self
+    }
+
     fn from_connection(connection: Connection) -> Result<Self, SqliteStorageError> {
         backend_result(connection.execute_batch("PRAGMA foreign_keys = ON"))?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            history_cipher: None,
+        })
+    }
+
+    /// Encrypts history text for storage when a cipher is configured.
+    fn encode_history_text(&self, text: &str) -> Result<String, SqliteStorageError> {
+        match &self.history_cipher {
+            Some(cipher) => cipher.encrypt(text).map_err(SqliteStorageError::crypto),
+            None => Ok(text.to_owned()),
+        }
+    }
+
+    /// Decrypts stored history text when a cipher is configured, falling back to
+    /// the raw value for legacy plaintext rows.
+    fn decode_history_text(&self, stored: String) -> String {
+        match &self.history_cipher {
+            Some(cipher) => cipher.decrypt(&stored).unwrap_or(stored),
+            None => stored,
+        }
+    }
+
+    fn decode_history_entry(&self, mut entry: HistoryEntry) -> HistoryEntry {
+        entry.text = self.decode_history_text(entry.text);
+        entry
+    }
+
+    fn current_session_state(
+        transaction: &Transaction<'_>,
+        session_key: &str,
+    ) -> Result<Option<String>, SqliteStorageError> {
+        backend_result(
+            transaction
+                .query_row(
+                    "SELECT state FROM ime_text_sessions WHERE id = ?1",
+                    [session_key],
+                    |row| row.get(0),
+                )
+                .optional(),
+        )
     }
 
     pub fn migrate(&mut self) -> Result<(), SqliteStorageError> {
@@ -1055,6 +1124,11 @@ impl SqliteMetadataStore {
             params![SESSION_AGGREGATE_TYPE, user_id],
         ))?;
         backend_result(transaction.execute(
+            "DELETE FROM ime_text_history
+             WHERE session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)",
+            params![user_id],
+        ))?;
+        backend_result(transaction.execute(
             "DELETE FROM ime_text_sessions WHERE user_id = ?1",
             params![user_id],
         ))?;
@@ -1069,11 +1143,6 @@ impl SqliteMetadataStore {
         ))?;
         backend_result(transaction.execute(
             "DELETE FROM correction_memory WHERE user_id = ?1",
-            params![user_id],
-        ))?;
-        backend_result(transaction.execute(
-            "DELETE FROM ime_text_history
-             WHERE session_id IN (SELECT id FROM ime_text_sessions WHERE user_id = ?1)",
             params![user_id],
         ))?;
         backend_result(transaction.execute(
@@ -1429,6 +1498,20 @@ impl SqliteMetadataStore {
         Ok(false)
     }
 
+    /// Returns the `id` the next appended event will receive. `event_log.id` is
+    /// `AUTOINCREMENT` and rows are never deleted, so this yields a monotonic,
+    /// collision-free sequence for events that legitimately recur (prune,
+    /// config changes) and thus have no natural idempotency key.
+    fn next_event_sequence(
+        transaction: &Transaction<'_>,
+    ) -> Result<i64, SqliteStorageError> {
+        backend_result(transaction.query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM event_log",
+            [],
+            |row| row.get(0),
+        ))
+    }
+
     fn create_event(
         transaction: &Transaction<'_>,
         aggregate_type: &str,
@@ -1715,6 +1798,9 @@ impl MetadataStorePort for SqliteMetadataStore {
         idempotency_key: &str,
     ) -> Result<(), Self::Error> {
         let session_key = Self::session_key(session_id)?;
+        // Encode before opening the transaction so the cipher's `&self` borrow
+        // does not overlap the transaction's `&mut self.connection` borrow.
+        let history_text = self.encode_history_text(committed_text)?;
         let transaction = backend_result(self.connection.transaction())?;
 
         if Self::is_idempotent_duplicate(
@@ -1729,6 +1815,9 @@ impl MetadataStorePort for SqliteMetadataStore {
         let raw_text = Self::existing_raw_text(&transaction, &session_key)?
             .ok_or_else(|| SqliteStorageError::not_found("ime_text_sessions row", &session_key))?;
         let utterance_id = Self::existing_utterance_id(&transaction, &session_key)?;
+        let was_committed =
+            Self::current_session_state(&transaction, &session_key)?.as_deref()
+                == Some(SESSION_STATE_COMMITTED);
 
         Self::create_event(
             &transaction,
@@ -1782,6 +1871,16 @@ impl MetadataStorePort for SqliteMetadataStore {
             ],
         ))?;
 
+        // Materialize the history projection (previously a SQL trigger) so the
+        // text can be encrypted at rest. Only on the first commit transition.
+        if !was_committed {
+            backend_result(transaction.execute(
+                "INSERT INTO ime_text_history (session_id, text, state, created_at)
+                 VALUES (?1, ?2, 'committed', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![session_key, history_text],
+            ))?;
+        }
+
         backend_result(transaction.commit())?;
         Ok(())
     }
@@ -1792,6 +1891,7 @@ impl MetadataStorePort for SqliteMetadataStore {
         idempotency_key: &str,
     ) -> Result<(), Self::Error> {
         let session_key = Self::session_key(session_id)?;
+        let history_text = self.encode_history_text("")?;
         let transaction = backend_result(self.connection.transaction())?;
 
         if Self::is_idempotent_duplicate(
@@ -1808,6 +1908,14 @@ impl MetadataStorePort for SqliteMetadataStore {
                 &session_key,
             ));
         }
+
+        // A session only transitions to cancelled from a non-terminal state; a
+        // history row is recorded for exactly that transition (matching the
+        // former SQL trigger's semantics).
+        let should_record = !matches!(
+            Self::current_session_state(&transaction, &session_key)?.as_deref(),
+            Some(SESSION_STATE_COMMITTED) | Some(SESSION_STATE_CANCELLED)
+        );
 
         Self::create_event(
             &transaction,
@@ -1840,6 +1948,14 @@ impl MetadataStorePort for SqliteMetadataStore {
             ],
         ))?;
 
+        if should_record {
+            backend_result(transaction.execute(
+                "INSERT INTO ime_text_history (session_id, text, state, created_at)
+                 VALUES (?1, ?2, 'cancelled', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![session_key, history_text],
+            ))?;
+        }
+
         backend_result(transaction.commit())?;
         Ok(())
     }
@@ -1852,43 +1968,114 @@ impl MetadataStorePort for SqliteMetadataStore {
              ORDER BY created_at DESC
              LIMIT ?1",
         ))?;
-        let rows = backend_result(statement.query_map([limit], |row| {
-            let state_str: String = row.get(3)?;
-            let state = match state_str.as_str() {
-                "committed" => HistoryState::Committed,
-                "cancelled" => HistoryState::Cancelled,
-                _ => HistoryState::Committed, // default fallback
-            };
-            Ok(HistoryEntry {
-                id: row.get(0)?,
-                session_id: ImeSessionId::from_string(row.get(1)?),
-                text: row.get(2)?,
-                state,
-                created_at: row.get(4)?,
-            })
-        }))?;
+        let rows = backend_result(statement.query_map([limit], parse_history_row))?;
         let entries = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
-        Ok(entries)
+        Ok(entries
+            .into_iter()
+            .map(|entry| self.decode_history_entry(entry))
+            .collect())
+    }
+
+    fn get_history_entry(&self, id: i64) -> Result<Option<HistoryEntry>, Self::Error> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT id, session_id, text, state, created_at
+             FROM ime_text_history
+             WHERE id = ?1",
+        ))?;
+        let entry = backend_result(
+            statement
+                .query_row(params![id], parse_history_row)
+                .optional(),
+        )?;
+        Ok(entry.map(|entry| self.decode_history_entry(entry)))
     }
 
     fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
-        let deleted = backend_result(self.connection.execute(
+        let transaction = backend_result(self.connection.transaction())?;
+        let deleted = backend_result(transaction.execute(
             "DELETE FROM ime_text_history
-             WHERE created_at < datetime('now', ?1)",
-            params![format!("-{} days", older_than_days)],
+             WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            params![format!("-{older_than_days} days")],
         ))?;
+        if deleted > 0 {
+            let sequence = Self::next_event_sequence(&transaction)?;
+            Self::create_event(
+                &transaction,
+                HISTORY_AGGREGATE,
+                HISTORY_AGGREGATE,
+                HISTORY_PRUNED,
+                &format!("{{\"older_than_days\":{older_than_days},\"deleted_count\":{deleted}}}"),
+                &format!("history-pruned:{sequence}"),
+            )?;
+        }
+        backend_result(transaction.commit())?;
         Ok(deleted as u64)
     }
 
     fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
-        let deleted = backend_result(self.connection.execute(
+        let transaction = backend_result(self.connection.transaction())?;
+        let deleted = backend_result(transaction.execute(
             "DELETE FROM ime_text_history WHERE id = ?1",
             params![id],
         ))?;
         if deleted == 0 {
             return Err(SqliteStorageError::not_found("history entry", &id.to_string()));
         }
+        Self::create_event(
+            &transaction,
+            HISTORY_ENTRY_AGGREGATE,
+            &id.to_string(),
+            HISTORY_ENTRY_DELETED,
+            &format!("{{\"entry_id\":{id}}}"),
+            &format!("history-deleted:{id}"),
+        )?;
+        backend_result(transaction.commit())?;
         Ok(())
+    }
+
+    fn get_tray_setting(&self, key: &str) -> Result<Option<String>, Self::Error> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT value FROM tray_settings WHERE key = ?1",
+        ))?;
+        let value: Option<String> = backend_result(statement.query_row([key], |row| row.get(0)))?;
+        Ok(value)
+    }
+
+    fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error> {
+        let transaction = backend_result(self.connection.transaction())?;
+        backend_result(transaction.execute(
+            "INSERT INTO tray_settings (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
+            params![key, value],
+        ))?;
+        let sequence = Self::next_event_sequence(&transaction)?;
+        let event_json = serde_json::json!({ "key": key, "value": value }).to_string();
+        Self::create_event(
+            &transaction,
+            TRAY_CONFIG_AGGREGATE,
+            key,
+            TRAY_CONFIG_CHANGED,
+            &event_json,
+            &format!("tray-config:{sequence}"),
+        )?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error> {
+        let mut statement = backend_result(self.connection.prepare(
+            "SELECT key, value FROM tray_settings",
+        ))?;
+        let rows = backend_result(statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (key, value) = backend_result(row)?;
+            map.insert(key, value);
+        }
+        Ok(map)
     }
 }
 
@@ -1899,4 +2086,24 @@ fn trust_score_bps(score: f64) -> u16 {
 
 fn backend_result<T>(result: rusqlite::Result<T>) -> Result<T, SqliteStorageError> {
     result.map_err(SqliteStorageError::backend)
+}
+
+/// Parses a `ime_text_history` row selected as `(id, session_id, text, state, created_at)`.
+fn parse_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    let state_str: String = row.get(3)?;
+    let state = match state_str.as_str() {
+        "cancelled" => HistoryState::Cancelled,
+        _ => HistoryState::Committed,
+    };
+    let session_id_str: String = row.get(1)?;
+    let session_id = serde_json::from_str(&session_id_str).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        session_id,
+        text: row.get(2)?,
+        state,
+        created_at: row.get(4)?,
+    })
 }

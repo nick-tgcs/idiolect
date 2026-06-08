@@ -36,6 +36,28 @@ pub struct ErrorMessage {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryReinsert {
+    pub id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryCopy {
+    pub id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryReinsertResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryCopyResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum IpcMessage {
     ClientHello(ClientHello),
@@ -45,6 +67,10 @@ pub enum IpcMessage {
     CommitPreedit(CommitPreedit),
     CancelPreedit,
     Error(ErrorMessage),
+    HistoryReinsert(HistoryReinsert),
+    HistoryCopy(HistoryCopy),
+    HistoryReinsertResponse(HistoryReinsertResponse),
+    HistoryCopyResponse(HistoryCopyResponse),
 }
 
 #[must_use]

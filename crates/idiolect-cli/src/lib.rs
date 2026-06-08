@@ -4,10 +4,15 @@ use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use idiolect_adapter_sqlite::SqliteMetadataStore;
+
+use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
+use idiolect_ipc::messages::{HistoryCopy, HistoryReinsert, IpcMessage};
+use idiolect_ports::storage::MetadataStorePort;
 use serde_json::json;
 
 /// Returns this crate's package name for smoke tests.
@@ -59,6 +64,14 @@ impl CliError {
     fn io(action: &str, error: std::io::Error) -> Self {
         Self {
             message: format!("io {action} failed: {error}"),
+            stdout_json: None,
+            exit_code: 2,
+        }
+    }
+
+    fn framing(action: &str, error: FramingError) -> Self {
+        Self {
+            message: format!("framing {action} failed: {error}"),
             stdout_json: None,
             exit_code: 2,
         }
@@ -152,6 +165,8 @@ pub fn execute(args: &[String]) -> Result<String, CliError> {
         [scope, action, ..] if scope == "adapters" && action == "rollback" => {
             Err(CliError::not_implemented("adapters rollback"))
         }
+        [scope, action, rest @ ..] if scope == "history" => history_command(action, rest),
+        [scope, action, rest @ ..] if scope == "tray" => tray_command(action, rest),
         [] => Err(CliError::usage("command is required")),
         [unknown, ..] => Err(CliError::usage(format!("unknown command: {unknown}"))),
     }
@@ -478,6 +493,356 @@ fn open_store(path: &Path) -> Result<SqliteMetadataStore, CliError> {
         .migrate()
         .map_err(|error| CliError::storage("migrate", error))?;
     Ok(store)
+}
+
+// History command implementation
+fn history_command(action: &str, args: &[String]) -> Result<String, CliError> {
+    match action {
+        "list" => history_list(args),
+        "show" => history_show(args),
+        "delete" => history_delete(args),
+        "prune" => history_prune(args),
+        "reinsert" => history_reinsert(args),
+        "copy" => history_copy(args),
+        _ => Err(CliError::usage(format!("unknown history action: {action}"))),
+    }
+}
+
+#[derive(Default)]
+struct HistoryFlags {
+    limit: Option<u32>,
+    json: bool,
+    id: Option<i64>,
+    confirm_delete: bool,
+    days: Option<u32>,
+    socket: Option<PathBuf>,
+    db: Option<PathBuf>,
+}
+
+fn parse_history_flags(args: &[String]) -> Result<HistoryFlags, CliError> {
+    let mut flags = HistoryFlags::default();
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                index += 1;
+                flags.limit = Some(flag_value(args, index, "--limit")?.parse().map_err(|_| CliError::usage("--limit requires a number"))?);
+            }
+            "--json" => flags.json = true,
+            "--id" => {
+                index += 1;
+                flags.id = Some(flag_value(args, index, "--id")?.parse().map_err(|_| CliError::usage("--id requires a number"))?);
+            }
+            "--confirm-delete" => flags.confirm_delete = true,
+            "--days" => {
+                index += 1;
+                flags.days = Some(flag_value(args, index, "--days")?.parse().map_err(|_| CliError::usage("--days requires a number"))?);
+            }
+            "--socket" => {
+                index += 1;
+                flags.socket = Some(PathBuf::from(flag_value(args, index, "--socket")?));
+            }
+            "--db" => {
+                index += 1;
+                flags.db = Some(PathBuf::from(flag_value(args, index, "--db")?));
+            }
+            unknown => return Err(CliError::usage(format!("unknown history argument: {unknown}"))),
+        }
+        index += 1;
+    }
+
+    Ok(flags)
+}
+
+fn history_list(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    let db = required_value(flags.db, "--db")?;
+    let store = open_store(&db)?;
+    let limit = flags.limit.unwrap_or(10);
+    let entries = store.recent_history(limit).map_err(|e| CliError::storage("list", e))?;
+    
+    if flags.json {
+        Ok(json!({
+            "entries": entries.iter().map(|e| json!({
+                "id": e.id,
+                "session_id": e.session_id,
+                "text": e.text,
+                "state": format!("{:?}", e.state),
+                "created_at": e.created_at,
+            })).collect::<Vec<_>>(),
+        }).to_string())
+    } else {
+        let mut output = String::new();
+        for entry in entries {
+            output.push_str(&format!("{} [{}] {}\n", entry.id, entry.created_at, entry.text));
+        }
+        Ok(output)
+    }
+}
+
+fn history_show(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    let id = required_value(flags.id, "--id")?;
+    let db = required_value(flags.db, "--db")?;
+    let store = open_store(&db)?;
+    let entry = store
+        .get_history_entry(id)
+        .map_err(|e| CliError::storage("show", e))?
+        .ok_or_else(|| CliError::usage("history entry not found"))?;
+
+    if flags.json {
+        Ok(json!({
+            "id": entry.id,
+            "session_id": entry.session_id,
+            "text": entry.text,
+            "state": format!("{:?}", entry.state),
+            "created_at": entry.created_at,
+        }).to_string())
+    } else {
+        Ok(format!("{} [{}] {}\n", entry.id, entry.created_at, entry.text))
+    }
+}
+
+fn history_delete(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    if !flags.confirm_delete {
+        return Err(CliError::usage("history delete requires --confirm-delete"));
+    }
+    let id = required_value(flags.id, "--id")?;
+    let db = required_value(flags.db, "--db")?;
+    let mut store = open_store(&db)?;
+    store.delete_history_entry(id).map_err(|e| CliError::storage("delete", e))?;
+    
+    Ok(json!({
+        "id": id,
+        "deleted": true,
+    }).to_string())
+}
+
+fn history_prune(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    if !flags.confirm_delete {
+        return Err(CliError::usage("history prune requires --confirm-delete"));
+    }
+    let days = required_value(flags.days, "--days")?;
+    let db = required_value(flags.db, "--db")?;
+    let mut store = open_store(&db)?;
+    let count = store.prune_history(days).map_err(|e| CliError::storage("prune", e))?;
+    
+    Ok(json!({
+        "days": days,
+        "deleted_count": count,
+    }).to_string())
+}
+
+fn history_reinsert(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    let id = required_value(flags.id, "--id")?;
+    let socket_path = flags.socket.unwrap_or_else(|| {
+        let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".local").join("run").join("idiolect"));
+        runtime_dir.join("idiolect.sock")
+    });
+    
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| CliError::io("connect", e))?;
+    let message = IpcMessage::HistoryReinsert(HistoryReinsert { id });
+    let line = encode_json_line(&message).map_err(|e| CliError::framing("encode", e))?;
+    stream.write_all(line.as_bytes()).map_err(|e| CliError::io("write", e))?;
+    stream.flush().map_err(|e| CliError::io("flush", e))?;
+    
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| CliError::io("clone", e))?);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| CliError::io("read", e))?;
+    let response = decode_json_line(&line).map_err(|e| CliError::framing("decode", e))?;
+    let response = match response {
+        IpcMessage::HistoryReinsertResponse(r) => r,
+        _ => return Err(CliError::usage("unexpected response type")),
+    };
+    
+    if flags.json {
+        Ok(json!({
+            "id": id,
+            "success": response.success,
+            "error": response.error,
+        }).to_string())
+    } else if response.success {
+        Ok(format!("Reinserted history entry {}\n", id))
+    } else {
+        Err(CliError::usage(response.error.unwrap_or_else(|| "Unknown error".to_owned())))
+    }
+}
+
+fn history_copy(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_history_flags(args)?;
+    let id = required_value(flags.id, "--id")?;
+    let socket_path = flags.socket.unwrap_or_else(|| {
+        let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".local").join("run").join("idiolect"));
+        runtime_dir.join("idiolect.sock")
+    });
+    
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| CliError::io("connect", e))?;
+    let message = IpcMessage::HistoryCopy(HistoryCopy { id });
+    let line = encode_json_line(&message).map_err(|e| CliError::framing("encode", e))?;
+    stream.write_all(line.as_bytes()).map_err(|e| CliError::io("write", e))?;
+    stream.flush().map_err(|e| CliError::io("flush", e))?;
+    
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| CliError::io("clone", e))?);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| CliError::io("read", e))?;
+    let response = decode_json_line(&line).map_err(|e| CliError::framing("decode", e))?;
+    let response = match response {
+        IpcMessage::HistoryCopyResponse(r) => r,
+        _ => return Err(CliError::usage("unexpected response type")),
+    };
+    
+    if flags.json {
+        Ok(json!({
+            "id": id,
+            "success": response.success,
+            "error": response.error,
+        }).to_string())
+    } else if response.success {
+        Ok(format!("Copied history entry {} to clipboard\n", id))
+    } else {
+        Err(CliError::usage(response.error.unwrap_or_else(|| "Unknown error".to_owned())))
+    }
+}
+
+// Tray command implementation
+fn tray_command(action: &str, args: &[String]) -> Result<String, CliError> {
+    match action {
+        "status" => tray_status(args),
+        "config" => tray_config(args),
+        "menu" => tray_menu(args),
+        _ => Err(CliError::usage(format!("unknown tray action: {action}"))),
+    }
+}
+
+#[derive(Default)]
+struct TrayFlags {
+    json: bool,
+    retention_days: Option<u32>,
+    max_entries: Option<u32>,
+    db: Option<PathBuf>,
+}
+
+fn parse_tray_flags(args: &[String]) -> Result<TrayFlags, CliError> {
+    let mut flags = TrayFlags::default();
+    let mut index = 0_usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => flags.json = true,
+            "--retention-days" => {
+                index += 1;
+                flags.retention_days = Some(flag_value(args, index, "--retention-days")?.parse().map_err(|_| CliError::usage("--retention-days requires a number"))?);
+            }
+            "--max-entries" => {
+                index += 1;
+                flags.max_entries = Some(flag_value(args, index, "--max-entries")?.parse().map_err(|_| CliError::usage("--max-entries requires a number"))?);
+            }
+            "--db" => {
+                index += 1;
+                flags.db = Some(PathBuf::from(flag_value(args, index, "--db")?));
+            }
+            unknown => return Err(CliError::usage(format!("unknown tray argument: {unknown}"))),
+        }
+        index += 1;
+    }
+
+    Ok(flags)
+}
+
+fn tray_status(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_tray_flags(args)?;
+    let db = required_value(flags.db, "--db")?;
+    let store = open_store(&db)?;
+    let settings = store.get_all_tray_settings().map_err(|e| CliError::storage("get settings", e))?;
+    
+    let retention = settings.get("retention_days").cloned().unwrap_or_else(|| "1".to_string());
+    let max_entries = settings.get("max_entries").cloned().unwrap_or_else(|| "10".to_string());
+    
+    if flags.json {
+        Ok(json!({
+            "retention_days": retention.parse::<u32>().unwrap_or(1),
+            "max_entries": max_entries.parse::<u32>().unwrap_or(10),
+        }).to_string())
+    } else {
+        Ok(format!("Retention: {} days\nMax Entries: {}\n", retention, max_entries))
+    }
+}
+
+fn tray_config(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_tray_flags(args)?;
+    let db = required_value(flags.db, "--db")?;
+    let mut store = open_store(&db)?;
+    
+    if let Some(days) = flags.retention_days {
+        idiolect_application::use_cases::menu::validate_retention_days(days)
+            .map_err(|error| CliError::usage(error.to_string()))?;
+        store.set_tray_setting("retention_days", &days.to_string()).map_err(|e| CliError::storage("set retention", e))?;
+    }
+
+    if let Some(max) = flags.max_entries {
+        idiolect_application::use_cases::menu::validate_max_entries(max)
+            .map_err(|error| CliError::usage(error.to_string()))?;
+        store.set_tray_setting("max_entries", &max.to_string()).map_err(|e| CliError::storage("set max_entries", e))?;
+    }
+    
+    let settings = store.get_all_tray_settings().map_err(|e| CliError::storage("get settings", e))?;
+    let retention = settings.get("retention_days").cloned().unwrap_or_else(|| "1".to_string());
+    let max_entries = settings.get("max_entries").cloned().unwrap_or_else(|| "10".to_string());
+    
+    if flags.json {
+        Ok(json!({
+            "retention_days": retention.parse::<u32>().unwrap_or(1),
+            "max_entries": max_entries.parse::<u32>().unwrap_or(10),
+        }).to_string())
+    } else {
+        Ok(format!("Updated: Retention: {} days, Max Entries: {}\n", retention, max_entries))
+    }
+}
+
+fn tray_menu(args: &[String]) -> Result<String, CliError> {
+    let flags = parse_tray_flags(args)?;
+    let db = required_value(flags.db, "--db")?;
+    let store = open_store(&db)?;
+    
+    let settings = store.get_all_tray_settings().map_err(|e| CliError::storage("get settings", e))?;
+    let retention = settings.get("retention_days").cloned().unwrap_or_else(|| "1".to_string()).parse::<u32>().unwrap_or(1);
+    let max_entries = settings.get("max_entries").cloned().unwrap_or_else(|| "10".to_string()).parse::<u32>().unwrap_or(10);
+    
+    let history_config = idiolect_common::config::HistoryConfig {
+        retention_days: retention,
+        max_entries,
+        ..idiolect_common::config::HistoryConfig::default()
+    };
+    
+    let entries = store.recent_history(max_entries).map_err(|e| CliError::storage("list", e))?;
+    let menu = idiolect_application::use_cases::menu::MenuUseCase::new().get_menu(
+        idiolect_application::use_cases::menu::RecordingState::Idle,
+        &entries,
+        &history_config,
+    );
+    
+    if flags.json {
+        Ok(json!({
+            "menu": menu.iter().map(|item| json!({
+                "id": item.id,
+                "label": item.label,
+                "enabled": item.enabled,
+                "kind": format!("{:?}", item.kind),
+            })).collect::<Vec<_>>(),
+        }).to_string())
+    } else {
+        let mut output = String::new();
+        for item in menu {
+            output.push_str(&format!("{} ({}): {}\n", item.id, item.enabled, item.label));
+        }
+        Ok(output)
+    }
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ members = [
     "crates/idiolect-integration-tests",
     "crates/idiolect-adapters/desktop/ksni",
     "crates/idiolect-adapters/desktop/clipboard",
+    "crates/idiolect-adapters/crypto",
 ]
 
 [workspace.package]
@@ -66,3 +67,4 @@ toml = "=0.8.23"
 burn = { version = "=0.13.2", default-features = false, features = ["std", "ndarray"] }
 burn-ndarray = { version = "=0.13.2", default-features = false, features = ["std"] }
 bincode = "=2.0.0-rc.3"
+tempfile = "=3.10.1"

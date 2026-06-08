@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 idiolect-common = { path = "../idiolect-common" }
 idiolect-ports = { path = "../idiolect-ports" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [dev-dependencies]
 idiolect-test-support = { path = "../idiolect-test-support" }

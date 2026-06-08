@@ -6,9 +6,11 @@ fn migration_list_has_initial_migration() {
         .iter()
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
-    assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(versions, [1, 2, 3, 4, 5, 6]);
     assert_eq!(migrations()[0].name, "initial");
     assert_eq!(migrations()[1].name, "correction_memory");
+    assert_eq!(migrations()[4].name, "tray_settings");
+    assert_eq!(migrations()[5].name, "history_app_materialized");
 }
 
 #[test]
