@@ -47,15 +47,22 @@ const CORRECTED: &str = "restart Traefik";
 
 #[tokio::test]
 async fn engine_dictates_and_daemon_records_the_session() {
+    // Spawn a private dbus-daemon so the test is fully self-contained (no ambient
+    // session bus / no `dbus-run-session` wrapper needed), like the insert test.
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
     let fixture = Fixture::new("e2e");
     let daemon = fixture.spawn_daemon();
     // Killed on drop, so a panic mid-test never leaks the engine process.
-    let engine = fixture.spawn_engine();
+    let engine = fixture.spawn_engine_on_bus(bus.address());
     wait_for_socket(&fixture.socket_path());
 
-    let conn = zbus::Connection::session()
+    let conn = zbus::connection::Builder::address(bus.address())
+        .expect("valid bus address")
+        .build()
         .await
-        .expect("ambient session bus");
+        .expect("connect to private bus");
 
     let factory = await_factory(&conn).await;
     let engine_path: OwnedObjectPath = factory
@@ -292,6 +299,9 @@ impl Fixture {
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
+        // The in-process daemon shares this test's bus-less environment; skip the
+        // ksni tray so it never blocks on a StatusNotifier registration.
+        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),
@@ -303,15 +313,6 @@ impl Fixture {
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })
-    }
-
-    fn spawn_engine(&self) -> EngineProc {
-        // Engine resolves its socket as $XDG_RUNTIME_DIR/idiolect.sock. Force it
-        // onto the test's session bus via IBUS_ADDRESS (otherwise it would read
-        // the real ibus address file and join the wrong bus).
-        let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
-            .expect("DBUS_SESSION_BUS_ADDRESS set in the test session");
-        self.spawn_engine_on_bus(&session_bus)
     }
 
     /// Spawn the engine joined to a specific bus address (used with a private bus
