@@ -74,11 +74,23 @@ fn install_theme(ctx: &egui::Context) {
 
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(20.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
-        (TextStyle::Small, FontId::new(12.5, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(15.0, FontFamily::Monospace),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.5, FontFamily::Proportional),
+        ),
     ]
     .into();
 
@@ -158,6 +170,14 @@ impl ReviewApp {
 
 impl eframe::App for ReviewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl ReviewApp {
+    /// The per-frame draw, split out of `eframe::App::update` so it can be
+    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
+    fn ui(&mut self, ctx: &egui::Context) {
         self.center(ctx);
         let mut action: Option<bool> = None; // Some(true)=insert, Some(false)=cancel
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -169,30 +189,32 @@ impl eframe::App for ReviewApp {
 
         // Draggable header (the window is frameless) + title and hint.
         egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::none()
-                    .fill(BG)
-                    .inner_margin(egui::Margin {
-                        left: 22.0,
-                        right: 22.0,
-                        top: 16.0,
-                        bottom: 6.0,
-                    }),
-            )
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22.0,
+                right: 22.0,
+                top: 16.0,
+                bottom: 6.0,
+            }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("Review dictation")
-                            .heading()
-                            .strong()
-                            .color(TEXT),
-                    ).selectable(false));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Review dictation")
+                                .heading()
+                                .strong()
+                                .color(TEXT),
+                        )
+                        .selectable(false),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new("Ctrl+Enter to insert  ·  Esc to cancel")
-                                .small()
-                                .color(MUTED),
-                        ).selectable(false));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Ctrl+Enter to insert  ·  Esc to cancel")
+                                    .small()
+                                    .color(MUTED),
+                            )
+                            .selectable(false),
+                        );
                     });
                 });
                 // Dragging anywhere on the header moves the whole window.
@@ -208,20 +230,18 @@ impl eframe::App for ReviewApp {
 
         // Action buttons pinned to the bottom so they are never clipped.
         egui::TopBottomPanel::bottom("actions")
-            .frame(
-                egui::Frame::none()
-                    .fill(BG)
-                    .inner_margin(egui::Margin {
-                        left: 22.0,
-                        right: 22.0,
-                        top: 12.0,
-                        bottom: 16.0,
-                    }),
-            )
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22.0,
+                right: 22.0,
+                top: 12.0,
+                bottom: 16.0,
+            }))
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let insert = egui::Button::new(
-                        egui::RichText::new("Insert").color(egui::Color32::WHITE).strong(),
+                        egui::RichText::new("Insert")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
                     )
                     .fill(ACCENT)
                     .min_size(egui::vec2(104.0, 34.0));
@@ -240,41 +260,114 @@ impl eframe::App for ReviewApp {
 
         // The editable transcript fills the space between, scrolling if long.
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BG)
-                    .inner_margin(egui::Margin {
-                        left: 22.0,
-                        right: 22.0,
-                        top: 2.0,
-                        bottom: 2.0,
-                    }),
-            )
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22.0,
+                right: 22.0,
+                top: 2.0,
+                bottom: 2.0,
+            }))
             .show(ctx, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Edit it however you like — your fix is recorded for training.")
-                            .color(MUTED),
+                        egui::RichText::new(
+                            "Edit it however you like — your fix is recorded for training.",
+                        )
+                        .color(MUTED),
                     )
                     .selectable(false),
                 );
                 ui.add_space(10.0);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    let edit = egui::TextEdit::multiline(&mut self.text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(6)
-                        .font(egui::TextStyle::Body)
-                        .margin(egui::vec2(12.0, 10.0));
-                    let response = ui.add_sized(ui.available_size(), edit);
-                    if !self.focused {
-                        response.request_focus();
-                        self.focused = true;
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let edit = egui::TextEdit::multiline(&mut self.text)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(6)
+                            .font(egui::TextStyle::Body)
+                            .margin(egui::vec2(12.0, 10.0));
+                        let response = ui.add_sized(ui.available_size(), edit);
+                        if !self.focused {
+                            response.request_focus();
+                            self.focused = true;
+                        }
+                    });
             });
 
         if let Some(confirmed) = action {
             self.finish(ctx, confirmed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(text: &str) -> (ReviewApp, Arc<Mutex<Outcome>>) {
+        let outcome = Arc::new(Mutex::new(Outcome::default()));
+        let app = ReviewApp::new(text.to_owned(), Arc::clone(&outcome));
+        (app, outcome)
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            modifiers,
+            ..Default::default()
+        };
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        input
+    }
+
+    fn run(app: &mut ReviewApp, input: egui::RawInput) {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let _ = ctx.run(input, |ctx| app.ui(ctx));
+    }
+
+    #[test]
+    fn renders_a_frame_without_input_and_does_not_confirm() {
+        let (mut app, outcome) = app("hello world");
+        run(&mut app, egui::RawInput::default());
+        assert!(!outcome.lock().unwrap().confirmed);
+    }
+
+    #[test]
+    fn ctrl_enter_confirms_with_the_edited_text() {
+        let (mut app, outcome) = app("deploy traefik");
+        app.text = "deploy traefik and nginx".to_owned(); // user edited the field
+        run(
+            &mut app,
+            key(
+                egui::Key::Enter,
+                egui::Modifiers {
+                    command: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+        );
+        let out = outcome.lock().unwrap();
+        assert!(out.confirmed);
+        assert_eq!(out.text, "deploy traefik and nginx");
+    }
+
+    #[test]
+    fn plain_enter_without_modifier_does_not_confirm() {
+        let (mut app, outcome) = app("text");
+        run(&mut app, key(egui::Key::Enter, egui::Modifiers::default()));
+        assert!(!outcome.lock().unwrap().confirmed);
+    }
+
+    #[test]
+    fn escape_cancels_without_confirming() {
+        let (mut app, outcome) = app("text");
+        run(&mut app, key(egui::Key::Escape, egui::Modifiers::default()));
+        assert!(!outcome.lock().unwrap().confirmed);
     }
 }

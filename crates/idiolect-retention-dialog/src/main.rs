@@ -90,10 +90,19 @@ fn install_theme(ctx: &egui::Context) {
 
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(19.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(19.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(12.5, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.5, FontFamily::Proportional),
+        ),
     ]
     .into();
 
@@ -188,6 +197,14 @@ impl eframe::App for RetentionApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl RetentionApp {
+    /// The per-frame draw, split out of `eframe::App::update` so it can be
+    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
+    fn ui(&mut self, ctx: &egui::Context) {
         self.center(ctx);
         let resolved = self.resolved_days();
 
@@ -218,7 +235,10 @@ impl eframe::App for RetentionApp {
                     )
                     .selectable(false),
                 );
-                if ui.interact(ui.min_rect(), ui.id().with("drag"), egui::Sense::drag()).dragged() {
+                if ui
+                    .interact(ui.min_rect(), ui.id().with("drag"), egui::Sense::drag())
+                    .dragged()
+                {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
             });
@@ -236,7 +256,10 @@ impl eframe::App for RetentionApp {
                         Some(days) => format!("≈ {days} days"),
                         None => "enter a positive number".to_owned(),
                     };
-                    ui.add(egui::Label::new(egui::RichText::new(hint).small().color(MUTED)).selectable(false));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(hint).small().color(MUTED))
+                            .selectable(false),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
@@ -282,5 +305,85 @@ impl eframe::App for RetentionApp {
                     .selectable(false),
                 );
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(amount: &str, unit: Unit) -> (RetentionApp, Arc<Mutex<Outcome>>) {
+        let outcome = Arc::new(Mutex::new(Outcome::default()));
+        let mut app = RetentionApp::new(365, Arc::clone(&outcome));
+        app.amount = amount.to_owned();
+        app.unit = unit;
+        (app, outcome)
+    }
+
+    fn key(key: egui::Key) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        input
+    }
+
+    fn run(app: &mut RetentionApp, input: egui::RawInput) {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let _ = ctx.run(input, |ctx| app.ui(ctx));
+    }
+
+    #[test]
+    fn unit_converts_months_to_days_and_saturates() {
+        assert_eq!(Unit::Days.to_days(7), 7);
+        assert_eq!(Unit::Months.to_days(2), 60);
+        assert_eq!(Unit::Months.to_days(u32::MAX), u32::MAX); // saturating, no overflow
+    }
+
+    #[test]
+    fn resolved_days_accepts_valid_and_rejects_out_of_range() {
+        assert_eq!(app("30", Unit::Days).0.resolved_days(), Some(30));
+        assert_eq!(app("2", Unit::Months).0.resolved_days(), Some(60));
+        assert_eq!(app("0", Unit::Days).0.resolved_days(), None); // zero disallowed
+        assert_eq!(app("  ", Unit::Days).0.resolved_days(), None); // blank
+        assert_eq!(app("abc", Unit::Days).0.resolved_days(), None); // non-numeric
+        assert_eq!(app("999999", Unit::Days).0.resolved_days(), None); // over MAX_DAYS
+    }
+
+    #[test]
+    fn enter_with_valid_amount_confirms_in_days() {
+        let (mut app, outcome) = app("3", Unit::Months);
+        run(&mut app, key(egui::Key::Enter));
+        let out = outcome.lock().unwrap();
+        assert!(out.confirmed);
+        assert_eq!(out.days, 90);
+    }
+
+    #[test]
+    fn enter_with_invalid_amount_does_not_confirm() {
+        let (mut app, outcome) = app("0", Unit::Days);
+        run(&mut app, key(egui::Key::Enter));
+        assert!(!outcome.lock().unwrap().confirmed);
+    }
+
+    #[test]
+    fn escape_cancels_without_confirming() {
+        let (mut app, outcome) = app("30", Unit::Days);
+        run(&mut app, key(egui::Key::Escape));
+        assert!(!outcome.lock().unwrap().confirmed);
+    }
+
+    #[test]
+    fn clear_color_is_transparent() {
+        let (app, _) = app("30", Unit::Days);
+        assert_eq!(
+            eframe::App::clear_color(&app, &egui::Visuals::dark()),
+            [0.0, 0.0, 0.0, 0.0]
+        );
     }
 }
