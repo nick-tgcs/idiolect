@@ -102,6 +102,9 @@ impl Fixture {
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
+        // Headless CI runs several daemons inside one process; skip the ksni tray
+        // so their pid-keyed D-Bus registrations don't collide and reset clients.
+        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),

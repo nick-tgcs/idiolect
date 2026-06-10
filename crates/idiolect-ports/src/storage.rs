@@ -100,7 +100,9 @@ pub trait MetadataStorePort {
     // Tray settings persistence
     fn get_tray_setting(&self, key: &str) -> Result<Option<String>, Self::Error>;
     fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error>;
-    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error>;
+    fn get_all_tray_settings(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, Self::Error>;
 }
 
 // Desktop integration types (tray, clipboard) - kept in ports for use by application layer
@@ -133,7 +135,10 @@ pub enum TrayMenuItemKind {
     Checkable { checked: bool },
     /// A mutually-exclusive radio group rendered as sibling items.
     /// The adapter expands this into individual radio items at render time.
-    RadioGroup { options: Vec<String>, selected: usize },
+    RadioGroup {
+        options: Vec<String>,
+        selected: usize,
+    },
     /// A visual separator.
     Separator,
 }

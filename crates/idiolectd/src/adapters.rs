@@ -4,13 +4,18 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 use idiolect_adapter_cpal::{CpalAudioInput, CpalAudioInputError};
+use idiolect_adapter_translate::CommandTranslator;
 use idiolect_adapter_vad::VadAdapter;
-use idiolect_adapter_whisper::{WhisperAsr, WhisperOptions};
+use idiolect_adapter_whisper::{WhisperAsr, WhisperDecodeTask, WhisperOptions};
+use idiolect_common::config::TranslationConfig;
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::asr::{AdapterCapabilities, AsrPort, TranscriptDraft, TranscriptMetadata};
 use idiolect_ports::audio::{AudioInputPort, AudioSegment};
+use idiolect_ports::translation::{TranslationPort, TranslationRequest};
 use idiolect_ports::vad::VadPort;
-use idiolect_test_support::fixtures::speech_and_silence_fixture_16khz_mono;
+use idiolect_test_support::fixtures::{
+    speech_and_silence_fixture_16khz_mono, speech_pause_speech_fixture_16khz_mono,
+};
 
 /// The reserved device name that yields a deterministic in-memory fixture clip
 /// instead of opening real hardware. Used by tests and CI.
@@ -21,6 +26,12 @@ pub(crate) const FIXTURE_DEVICE: &str = "fixture";
 /// but yields the deterministic fixture clip on stop instead of opening hardware.
 /// Lets tests drive the live capture toggle deterministically in a headless box.
 pub(crate) const FIXTURE_LIVE_DEVICE: &str = "fixture-live";
+
+/// A reserved device name that exercises the *streaming* path: live lifecycle
+/// like [`FIXTURE_LIVE_DEVICE`], but the first mid-capture poll drains a canned
+/// speech–pause–speech clip, so pause-triggered segmentation can be driven
+/// deterministically without hardware.
+pub(crate) const FIXTURE_STREAM_DEVICE: &str = "fixture-stream";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeAdapterProfile {
@@ -91,6 +102,11 @@ pub(crate) enum RuntimeCapture {
     /// Live-lifecycle marker that resolves to the deterministic fixture clip on
     /// stop (see [`FIXTURE_LIVE_DEVICE`]). No hardware is opened.
     FixtureLive,
+    /// Live-lifecycle marker whose first poll drains a canned
+    /// speech–pause–speech clip (see [`FIXTURE_STREAM_DEVICE`]).
+    FixtureStream {
+        drained: bool,
+    },
     Live {
         input: CpalAudioInput,
         session_id: ImeSessionId,
@@ -115,6 +131,9 @@ pub(crate) fn begin_capture(
     if profile.audio_input_device == FIXTURE_LIVE_DEVICE {
         return Ok(RuntimeCapture::FixtureLive);
     }
+    if profile.audio_input_device == FIXTURE_STREAM_DEVICE {
+        return Ok(RuntimeCapture::FixtureStream { drained: false });
+    }
 
     let mut input = if profile.audio_input_device == "default" {
         CpalAudioInput::open_default().map_err(map_cpal_error)?
@@ -122,21 +141,27 @@ pub(crate) fn begin_capture(
         CpalAudioInput::open_device_by_name(&profile.audio_input_device).map_err(map_cpal_error)?
     };
     let session_id = ImeSessionId::new();
-    input
-        .start_capture(session_id)
-        .map_err(map_cpal_error)?;
+    input.start_capture(session_id).map_err(map_cpal_error)?;
     Ok(RuntimeCapture::Live { input, session_id })
 }
 
 /// Stops the recording and returns the captured audio. For the fixture device
 /// this returns the deterministic clip; for a real device it ends the
 /// microphone stream and drains the buffered samples.
-pub(crate) fn finish_capture(
-    capture: RuntimeCapture,
-) -> Result<AudioSegment, RuntimeAdapterError> {
+pub(crate) fn finish_capture(capture: RuntimeCapture) -> Result<AudioSegment, RuntimeAdapterError> {
     match capture {
         RuntimeCapture::Fixture | RuntimeCapture::FixtureLive => {
             Ok(speech_and_silence_fixture_16khz_mono())
+        }
+        RuntimeCapture::FixtureStream { drained } => {
+            // If the streaming pump already drained the clip, only an empty tail
+            // remains; without a pump (translation off) it degrades to a normal
+            // stop-time capture of the whole clip.
+            if drained {
+                Ok(empty_processing_segment())
+            } else {
+                Ok(speech_pause_speech_fixture_16khz_mono())
+            }
         }
         RuntimeCapture::Live {
             mut input,
@@ -148,6 +173,38 @@ pub(crate) fn finish_capture(
             let captured = input.stop_capture(session_id).map_err(map_cpal_error)?;
             Ok(resample_to_16k_mono(captured))
         }
+    }
+}
+
+/// Drains the samples accumulated since the last poll while the capture keeps
+/// running. Live captures return raw audio at the device's native rate (the
+/// streaming pump resamples incrementally); fixture captures return their
+/// deterministic clips.
+pub(crate) fn poll_capture(
+    capture: &mut RuntimeCapture,
+) -> Result<AudioSegment, RuntimeAdapterError> {
+    match capture {
+        RuntimeCapture::Fixture | RuntimeCapture::FixtureLive => Ok(empty_processing_segment()),
+        RuntimeCapture::FixtureStream { drained } => {
+            if *drained {
+                Ok(empty_processing_segment())
+            } else {
+                *drained = true;
+                Ok(speech_pause_speech_fixture_16khz_mono())
+            }
+        }
+        RuntimeCapture::Live { input, session_id } => {
+            input.poll_captured(*session_id).map_err(map_cpal_error)
+        }
+    }
+}
+
+fn empty_processing_segment() -> AudioSegment {
+    AudioSegment {
+        sample_rate_hz: PROCESSING_RATE_HZ,
+        channels: 1,
+        duration_ms: 0,
+        samples_f32_mono: Vec::new(),
     }
 }
 
@@ -181,6 +238,59 @@ fn resample_to_16k_mono(segment: AudioSegment) -> AudioSegment {
     }
 }
 
+/// Incremental counterpart of [`resample_to_16k_mono`] for the streaming pump:
+/// resamples the mic's native rate to 16 kHz chunk by chunk, carrying the
+/// interpolation position across chunk boundaries so the output is identical to
+/// resampling the whole take at once (minus at most one held-back tail sample).
+pub(crate) struct StreamingResampler {
+    src_rate_hz: u32,
+    /// Source samples per output sample (e.g. 3.0 for 48 kHz → 16 kHz).
+    step: f64,
+    /// Fractional read position of the next output sample within `pending`.
+    next_src_pos: f64,
+    pending: Vec<f32>,
+}
+
+impl StreamingResampler {
+    pub(crate) fn new(src_rate_hz: u32) -> Self {
+        Self {
+            src_rate_hz,
+            step: f64::from(src_rate_hz) / f64::from(PROCESSING_RATE_HZ),
+            next_src_pos: 0.0,
+            pending: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, samples: &[f32]) -> Vec<f32> {
+        if self.src_rate_hz == PROCESSING_RATE_HZ {
+            return samples.to_vec();
+        }
+        self.pending.extend_from_slice(samples);
+
+        let mut out = Vec::new();
+        // Interpolation needs the sample after the read position, so the last
+        // pending sample is held back until the next chunk arrives.
+        loop {
+            let base = self.next_src_pos as usize;
+            if base + 1 >= self.pending.len() {
+                break;
+            }
+            let frac = (self.next_src_pos - base as f64) as f32;
+            let a = self.pending[base];
+            let b = self.pending[base + 1];
+            out.push(a + (b - a) * frac);
+            self.next_src_pos += self.step;
+        }
+
+        // Drop fully-consumed source samples, keeping the one the next output
+        // still interpolates from.
+        let consumed = (self.next_src_pos as usize).min(self.pending.len().saturating_sub(1));
+        self.pending.drain(..consumed);
+        self.next_src_pos -= consumed as f64;
+        out
+    }
+}
+
 fn map_cpal_error(error: CpalAudioInputError) -> RuntimeAdapterError {
     RuntimeAdapterError::with_source(
         "audio-unavailable",
@@ -189,20 +299,92 @@ fn map_cpal_error(error: CpalAudioInputError) -> RuntimeAdapterError {
     )
 }
 
-pub(crate) fn transcribe_audio(
+/// Transcribes — and, when translation is enabled, translates — the captured
+/// audio. Routing:
+/// - translation disabled → plain transcription in the configured ASR language;
+/// - target `"en"` with no external command → Whisper's built-in translate task
+///   (any input language → English inside the engine, no extra tooling);
+/// - an external `translation.command` → transcribe in the input language, then
+///   pipe the text through the command for any-pair translation;
+/// - any other target with no command → a typed `translation-unavailable` error
+///   (never a silent fallback to untranslated text).
+pub(crate) fn transcribe_translated(
     profile: &RuntimeAdapterProfile,
+    translation: &TranslationConfig,
     audio: &AudioSegment,
 ) -> Result<TranscriptDraft, RuntimeAdapterError> {
     let speech = speech_audio(profile, audio)?;
 
-    match profile.asr_engine.as_str() {
-        "fixture" => transcribe_with_fixture(&speech),
-        "whisper-rs" => transcribe_with_whisper(profile, &speech),
-        other => Err(RuntimeAdapterError::new(
-            "asr-unavailable",
-            format!("ASR engine '{other}' is not supported by idiolectd run"),
-        )),
+    if !translation.enabled {
+        return match profile.asr_engine.as_str() {
+            "fixture" => transcribe_with_fixture(&speech),
+            "whisper-rs" => {
+                transcribe_with_whisper(profile, &speech, &WhisperDecodeTask::default())
+            }
+            other => Err(unsupported_asr_engine(other)),
+        };
     }
+
+    let translator = CommandTranslator::from_config(&translation.command);
+
+    let draft = match profile.asr_engine.as_str() {
+        // The deterministic fixture engine plays the role of "transcript in the
+        // input language" for tests; the engine-internal translate task is a
+        // no-op for it (its output is already English text).
+        "fixture" => transcribe_with_fixture(&speech)?,
+        "whisper-rs" => {
+            let engine_translates = translator.is_none() && translation.output_language == "en";
+            transcribe_with_whisper(
+                profile,
+                &speech,
+                &WhisperDecodeTask {
+                    language: Some(translation.input_language.clone()),
+                    translate_to_english: engine_translates,
+                },
+            )?
+        }
+        other => return Err(unsupported_asr_engine(other)),
+    };
+
+    let Some(translator) = translator else {
+        return if translation.output_language == "en" {
+            Ok(draft)
+        } else {
+            Err(RuntimeAdapterError::new(
+                "translation-unavailable",
+                format!(
+                    "translating to '{}' needs translation.command (only English works without one)",
+                    translation.output_language
+                ),
+            ))
+        };
+    };
+
+    let translated = translator
+        .translate(&TranslationRequest {
+            text: &draft.text,
+            source_language: &translation.input_language,
+            target_language: &translation.output_language,
+        })
+        .map_err(|error| {
+            RuntimeAdapterError::with_source(
+                "translation-unavailable",
+                format!("translation command failed: {error}"),
+                error,
+            )
+        })?;
+
+    Ok(TranscriptDraft {
+        text: translated,
+        metadata: draft.metadata,
+    })
+}
+
+fn unsupported_asr_engine(engine: &str) -> RuntimeAdapterError {
+    RuntimeAdapterError::new(
+        "asr-unavailable",
+        format!("ASR engine '{engine}' is not supported by idiolectd run"),
+    )
 }
 
 /// Extract the spoken audio for transcription. Recording runs from the user's
@@ -273,9 +455,7 @@ thread_local! {
 /// exists, otherwise the bundled fixture model (so a misconfigured or
 /// undownloaded model degrades to a working — if small — engine instead of
 /// failing dictation outright).
-fn load_whisper_engine(
-    profile: &RuntimeAdapterProfile,
-) -> Result<WhisperAsr, RuntimeAdapterError> {
+fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, RuntimeAdapterError> {
     if profile.whisper_model_path.is_file() {
         let options = WhisperOptions {
             use_gpu: profile.asr_use_gpu,
@@ -316,6 +496,7 @@ fn load_whisper_engine(
 fn transcribe_with_whisper(
     profile: &RuntimeAdapterProfile,
     audio: &AudioSegment,
+    task: &WhisperDecodeTask,
 ) -> Result<TranscriptDraft, RuntimeAdapterError> {
     WHISPER.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -325,7 +506,7 @@ fn transcribe_with_whisper(
 
         slot.as_ref()
             .expect("whisper engine was just initialised")
-            .transcribe(audio)
+            .transcribe_with_task(audio, task)
             .map_err(|error| {
                 RuntimeAdapterError::with_source(
                     "asr-unavailable",
@@ -367,9 +548,11 @@ impl AsrPort for FixtureAsr {
 
 #[cfg(test)]
 mod tests {
+    use idiolect_common::config::TranslationConfig;
+
     use super::{
-        begin_capture, finish_capture, is_live_capture, transcribe_audio, RuntimeAdapterProfile,
-        RuntimeCapture,
+        begin_capture, finish_capture, is_live_capture, transcribe_translated,
+        RuntimeAdapterProfile, RuntimeCapture,
     };
 
     fn fixture_profile() -> RuntimeAdapterProfile {
@@ -384,13 +567,107 @@ mod tests {
         }
     }
 
+    fn fixture_asr_profile() -> RuntimeAdapterProfile {
+        RuntimeAdapterProfile {
+            asr_engine: "fixture".to_owned(),
+            ..fixture_profile()
+        }
+    }
+
+    fn fixture_audio() -> idiolect_ports::audio::AudioSegment {
+        finish_capture(RuntimeCapture::Fixture).expect("fixture capture")
+    }
+
+    /// Writes an executable translator stub honouring the subprocess contract.
+    fn translator_script(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "idiolectd-translate-test-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        path
+    }
+
+    fn translation(input: &str, output: &str, command: &str) -> TranslationConfig {
+        TranslationConfig {
+            enabled: true,
+            input_language: input.to_owned(),
+            output_language: output.to_owned(),
+            command: command.to_owned(),
+        }
+    }
+
+    #[test]
+    fn disabled_translation_is_plain_transcription() {
+        let settings = TranslationConfig::default();
+        let draft = transcribe_translated(&fixture_asr_profile(), &settings, &fixture_audio())
+            .expect("disabled translation should transcribe");
+        assert_eq!(draft.text, "restart traffic");
+    }
+
+    #[test]
+    fn configured_command_translates_the_transcript() {
+        // Any-pair translation: the transcript is piped through the external
+        // translator with the configured language pair.
+        let script = translator_script(
+            "pair",
+            r#"printf '[%s>%s] ' "$1" "$2"; tr '[:lower:]' '[:upper:]'"#,
+        );
+        let settings = translation("sv", "ja", script.to_str().expect("utf8 path"));
+
+        let draft = transcribe_translated(&fixture_asr_profile(), &settings, &fixture_audio())
+            .expect("command translation should succeed");
+
+        assert_eq!(draft.text, "[sv>ja] RESTART TRAFFIC");
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[test]
+    fn english_target_without_command_uses_the_engine_task() {
+        // No external tooling needed for X→English: Whisper's built-in translate
+        // task handles it inside the engine, so this must succeed with an empty
+        // command. (On the en-only fixture model the task is a no-op decode; a
+        // multilingual model is what makes it a real translation.)
+        let settings = translation("auto", "en", "");
+        let draft = transcribe_translated(&fixture_profile(), &settings, &fixture_audio())
+            .expect("en target must work without a command");
+        let text = draft.text.to_lowercase();
+        assert!(text.contains("restart") && text.contains("traffic"));
+    }
+
+    #[test]
+    fn non_english_target_without_command_is_a_typed_error() {
+        let settings = translation("auto", "ja", "");
+        let error = transcribe_translated(&fixture_profile(), &settings, &fixture_audio())
+            .expect_err("ja target without a command must fail");
+        assert_eq!(error.code(), "translation-unavailable");
+    }
+
+    #[test]
+    fn failing_translator_command_is_a_typed_error_not_raw_text() {
+        // A broken translator must never silently fall back to committing the
+        // untranslated transcript — the user asked for language B, not A.
+        let script = translator_script("broken", "exit 9");
+        let settings = translation("sv", "ja", script.to_str().expect("utf8 path"));
+
+        let error = transcribe_translated(&fixture_asr_profile(), &settings, &fixture_audio())
+            .expect_err("broken translator must surface an error");
+
+        assert_eq!(error.code(), "translation-unavailable");
+        let _ = std::fs::remove_file(&script);
+    }
+
     #[test]
     fn real_vad_and_whisper_rs_fixture_profile_transcribes_fixture_audio() {
         let profile = fixture_profile();
 
         let capture = begin_capture(&profile).expect("fixture capture should begin");
         let audio = finish_capture(capture).expect("fixture audio should capture");
-        let draft = transcribe_audio(&profile, &audio).expect("fixture should transcribe");
+        let draft = transcribe_translated(&profile, &TranslationConfig::default(), &audio)
+            .expect("fixture should transcribe");
         let text = draft.text.to_lowercase();
 
         assert!(text.contains("restart"));
@@ -422,5 +699,55 @@ mod tests {
         let audio = finish_capture(RuntimeCapture::Fixture).expect("fixture capture");
         assert!(audio.sample_count() > 0);
         assert_eq!(audio.channels, 1);
+    }
+
+    mod streaming_resampler {
+        use super::super::{resample_to_16k_mono, StreamingResampler};
+        use idiolect_ports::audio::AudioSegment;
+
+        fn sine_48k(samples: usize) -> Vec<f32> {
+            (0..samples)
+                .map(|index| (index as f32 * 0.013).sin())
+                .collect()
+        }
+
+        // Feeding the capture in arbitrary chunks must produce (almost) the same
+        // signal as the one-shot resampler — no boundary artifacts, no drift.
+        #[test]
+        fn chunked_output_matches_one_shot_resampling() {
+            let samples = sine_48k(48_000);
+            let reference = resample_to_16k_mono(AudioSegment {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                duration_ms: 1_000,
+                samples_f32_mono: samples.clone(),
+            });
+
+            let mut resampler = StreamingResampler::new(48_000);
+            let mut streamed = Vec::new();
+            // Deliberately ragged chunk sizes (not multiples of the 3:1 ratio).
+            for chunk in samples.chunks(1_001) {
+                streamed.extend(resampler.push(chunk));
+            }
+
+            // The streaming variant may hold back up to one source sample at the
+            // tail; everything it produced must match the reference closely.
+            assert!(reference.samples_f32_mono.len() - streamed.len() <= 2);
+            for (index, (streamed_sample, reference_sample)) in
+                streamed.iter().zip(&reference.samples_f32_mono).enumerate()
+            {
+                assert!(
+                    (streamed_sample - reference_sample).abs() < 1e-4,
+                    "sample {index} diverged: {streamed_sample} vs {reference_sample}"
+                );
+            }
+        }
+
+        #[test]
+        fn native_rate_passes_through_unchanged() {
+            let mut resampler = StreamingResampler::new(16_000);
+            let chunk = vec![0.5_f32; 160];
+            assert_eq!(resampler.push(&chunk), chunk);
+        }
     }
 }

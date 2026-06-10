@@ -1,8 +1,8 @@
 use std::sync::mpsc;
 
 use idiolect_ports::storage::{TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus};
-use ksni::menu::{StandardItem, RadioGroup, CheckmarkItem, MenuItem, RadioItem, SubMenu};
-use ksni::{Tray, ToolTip, blocking::TrayMethods};
+use ksni::menu::{CheckmarkItem, MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+use ksni::{blocking::TrayMethods, ToolTip, Tray};
 
 mod icons;
 
@@ -69,6 +69,14 @@ impl TrayPort for KsniTray {
 
 impl KsniTray {
     pub fn new(sender: mpsc::Sender<TrayCallback>) -> Result<Self, KsniTrayError> {
+        // Escape hatch for headless/in-process use (notably integration tests that
+        // run several daemons inside one process): registering a StatusNotifierItem
+        // means a D-Bus round-trip on a pid-keyed bus name, which collides and
+        // destabilises sibling in-process daemons on a bare session bus. When set,
+        // run without a tray — the daemon already degrades gracefully to no icon.
+        if std::env::var_os("IDIOLECT_DISABLE_TRAY").is_some() {
+            return Ok(Self { handle: None });
+        }
         let inner = InnerTray {
             icon: TrayIcon::Idle,
             tooltip: "Idiolect — Ready".to_owned(),
@@ -92,7 +100,11 @@ impl KsniTray {
 }
 
 impl InnerTray {
-    fn map_menu_item(&self, item: &TrayMenuItem, sender: mpsc::Sender<TrayCallback>) -> MenuItem<InnerTray> {
+    fn map_menu_item(
+        &self,
+        item: &TrayMenuItem,
+        sender: mpsc::Sender<TrayCallback>,
+    ) -> MenuItem<InnerTray> {
         match &item.kind {
             TrayMenuItemKind::Standard {
                 submenu: Some(sub_items),

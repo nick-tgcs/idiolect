@@ -201,11 +201,14 @@ impl MetadataStorePort for FakeMetadataStore {
     }
 
     fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error> {
-        self.tray_settings.insert(key.to_string(), value.to_string());
+        self.tray_settings
+            .insert(key.to_string(), value.to_string());
         Ok(())
     }
 
-    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error> {
+    fn get_all_tray_settings(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, Self::Error> {
         Ok(self.tray_settings.clone())
     }
 }

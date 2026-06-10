@@ -93,7 +93,14 @@ mod x11 {
         fn active_window(&self) -> Option<WindowId> {
             let reply = self
                 .conn
-                .get_property(false, self.root, self.net_active_window, AtomEnum::WINDOW, 0, 1)
+                .get_property(
+                    false,
+                    self.root,
+                    self.net_active_window,
+                    AtomEnum::WINDOW,
+                    0,
+                    1,
+                )
                 .ok()?
                 .reply()
                 .ok()?;

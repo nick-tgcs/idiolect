@@ -107,6 +107,9 @@ pub struct Session<D, S> {
     surface: S,
     state: State,
     review: Option<Review>,
+    /// The daemon's authoritative mic state, mirrored independently of `state`
+    /// (which may be `Reviewing` while the mic is still open in streaming mode).
+    recording: bool,
 }
 
 impl<D, S> Session<D, S>
@@ -120,6 +123,7 @@ where
             surface,
             state: State::Idle,
             review: None,
+            recording: false,
         }
     }
 
@@ -237,11 +241,20 @@ where
         }
     }
 
-    /// The daemon delivered the transcript: type it straight into the app, tell
+    /// The daemon delivered a transcript: type it straight into the app, tell
     /// the daemon to finalize, and open the correction window.
+    ///
+    /// In streaming (pause-triggered translation) mode the daemon delivers one
+    /// transcript per pause while the mic stays open, so a transcript landing on
+    /// an open correction window is the next snippet, not an anomaly: the
+    /// previous window closes (reporting any in-place fix) and the new snippet
+    /// commits. Once the daemon has announced the mic closed, a stray transcript
+    /// is still ignored.
     pub fn on_transcript(&mut self, text: String) {
-        if self.state != State::Recording {
-            return; // no take in progress; ignore an unsolicited/late transcript
+        match self.state {
+            State::Recording => {}
+            State::Reviewing if self.recording => self.end_review(),
+            _ => return, // no take in progress; ignore an unsolicited/late transcript
         }
         if text.is_empty() {
             self.state = State::Idle;
@@ -258,6 +271,7 @@ where
     /// A `Reviewing` correction window is a local overlay: a stop's `false` is
     /// expected and leaves it open, while a fresh `true` (a new take) closes it.
     pub fn on_recording_status(&mut self, recording: bool) {
+        self.recording = recording;
         match self.state {
             State::Reviewing => {
                 if recording {
@@ -281,6 +295,7 @@ where
     pub fn reset_to_idle(&mut self) {
         self.review = None;
         self.state = State::Idle;
+        self.recording = false;
     }
 
     /// Commit the user's reviewed (possibly edited) text straight into the app
@@ -427,7 +442,10 @@ mod tests {
         let mut s = session();
         dictate(&mut s, "restart traffic");
         assert_eq!(s.surface.committed, ["restart traffic"]);
-        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:restart traffic"]);
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "toggle", "commit:restart traffic"]
+        );
         assert_eq!(s.state(), State::Reviewing);
     }
 
@@ -539,7 +557,10 @@ mod tests {
         // (review mode: the dialog returns the edited text instead of auto-commit)
         s.commit_reviewed("deploy Traefik");
         assert_eq!(s.surface.committed, ["deploy Traefik"]);
-        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:deploy Traefik"]);
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "toggle", "commit:deploy Traefik"]
+        );
         assert_eq!(s.state(), State::Idle);
     }
 
@@ -564,6 +585,63 @@ mod tests {
         assert!(s.on_key(Key::Cancel));
         assert_eq!(s.daemon.events, ["toggle", "cancel"]);
         assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn streaming_snippets_commit_sequentially_while_recording() {
+        // Pause-triggered translation: the daemon delivers one transcript per
+        // pause while the mic stays open. Every snippet must commit — the old
+        // single-shot logic ignored anything after the first because the session
+        // had already moved to Reviewing.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+
+        s.on_transcript("hello world".to_owned());
+        assert_eq!(s.state(), State::Reviewing);
+        s.on_transcript("second snippet".to_owned());
+
+        assert_eq!(s.surface.committed, ["hello world", "second snippet"]);
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "commit:hello world", "commit:second snippet"]
+        );
+        // The newest snippet's correction window is open; the stop's `false`
+        // leaves it open as usual.
+        assert_eq!(s.state(), State::Reviewing);
+        s.on_recording_status(false);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn edit_to_previous_snippet_is_reported_when_the_next_arrives() {
+        // Fixing snippet N in place must still be captured when snippet N+1
+        // displaces its correction window mid-recording.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_transcript("hello wrld".to_owned());
+
+        for _ in 0.."wrld".len() {
+            s.on_key(Key::Backspace);
+        }
+        type_str(&mut s, "world");
+
+        s.on_transcript("next snippet".to_owned());
+        assert_eq!(last_correction(&s), Some("hello world".to_owned()));
+        assert_eq!(s.surface.committed, ["hello wrld", "next snippet"]);
+    }
+
+    #[test]
+    fn late_transcript_after_the_mic_closed_is_still_ignored() {
+        // The streaming acceptance must not weaken the unsolicited-transcript
+        // guard: once the daemon announced the mic closed, a stray transcript
+        // landing on an open review window commits nothing.
+        let mut s = session();
+        dictate(&mut s, "restart traffic"); // ends Reviewing, recording=false
+        s.on_transcript("ghost".to_owned());
+        assert_eq!(s.surface.committed, ["restart traffic"]);
+        assert_eq!(s.state(), State::Reviewing);
     }
 
     #[test]

@@ -1,81 +1,66 @@
-//! The daemon is the single authority for recording state: it pushes
-//! `RecordingStatus` to any client that negotiated the `recording_status` feature
-//! — once right after the handshake and on every recording transition — so the
-//! keyboard, the tray, and the adapter indicator can never disagree. Clients that
-//! do not request the feature see the exact same byte stream as before.
+//! Pause-triggered live translation, end to end through the real daemon:
+//! one recording containing speech–pause–speech must yield one translated
+//! `PreeditUpdate` per pause-delimited snippet *while recording continues*,
+//! not a single transcript on stop.
 //!
-//! The live-capture toggle path (start → stop+transcribe) previously had no
-//! integration coverage because it needs real hardware; these tests drive it
-//! deterministically via the reserved `fixture-live` device.
-//!
-//! Coverage note (tray-menu freshness): the tray menu re-renders history on every
-//! recording publication — including a commit/correction where the recording value
-//! is unchanged (skipping that refresh made the menu lag a take behind, a field
-//! bug). The render itself goes fire-and-forget into the ksni/StatusNotifier GUI,
-//! which has no headless seam, so the end-to-end "menu shows the new entry" cannot
-//! be asserted here. What pins the behaviour instead: `run_loop`'s
-//! `status_push_is_edge_triggered_and_feature_gated` unit test (dedup lives ONLY on
-//! the IPC push; the refresh is unconditional by construction) and
-//! `commit_and_correction_push_no_duplicate_status` below (the wire stays clean).
+//! Driven via the reserved `fixture-stream` device (a canned
+//! speech–pause–speech clip served through the live polling path), the fixture
+//! ASR engine, and an uppercase translator stub honouring the external-command
+//! contract (`<command> <input_lang> <output_lang>`, text on stdin).
 
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
-use idiolect_ipc::messages::{
-    ClientHello, CommitPreedit, IpcMessage, RecordingStatus, ReportCorrection,
-};
+use idiolect_ipc::messages::{ClientHello, CommitPreedit, IpcMessage, RecordingStatus};
 
 #[test]
-fn initial_recording_status_pushed_after_handshake() {
-    let fixture = DaemonFixture::new("initial", "fixture");
+fn each_pause_snippet_is_translated_and_pushed_mid_recording() {
+    let fixture = DaemonFixture::new("snippets");
     let daemon = fixture.spawn_daemon();
     let mut client = DaemonClient::connect(&fixture.socket_path());
 
     client.send_hello_with_status();
-    // Immediately after ServerHello the daemon syncs the authoritative state.
     client.expect_recording_status(false);
 
-    drop(client);
-    assert_daemon_exits_successfully(daemon);
-}
-
-#[test]
-fn live_toggle_pushes_recording_true_then_false_around_the_take() {
-    let fixture = DaemonFixture::new("toggle", "fixture-live");
-    let daemon = fixture.spawn_daemon();
-    let mut client = DaemonClient::connect(&fixture.socket_path());
-
-    client.send_hello_with_status();
-    client.expect_recording_status(false); // initial sync
-
-    // One direction-free intent: the daemon decides this is a start.
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
 
-    // Same intent again: the daemon decides this is a stop → transcribe, then
-    // announces the mic is closed.
-    client.send(IpcMessage::ToggleRecording);
-    client.expect_preedit("restart traffic");
-    client.expect_recording_status(false);
+    // Two pause-delimited snippets arrive while the mic is still recording —
+    // each independently transcribed ("restart traffic") and translated by the
+    // stub ([sv>ja] + uppercase).
+    client.expect_preedit("[sv>ja] RESTART TRAFFIC");
+    client.expect_preedit("[sv>ja] RESTART TRAFFIC");
 
-    // Committing the transcript is a text event, not a recording transition: no
-    // redundant status push follows it.
+    // The engine auto-commits a snippet mid-recording. The mic is still open,
+    // so this must NOT publish a recording=false transition (the engine would
+    // go idle and drop every later snippet).
     client.send(IpcMessage::CommitPreedit(CommitPreedit {
-        text: "restart Traefik".to_owned(),
+        text: "[sv>ja] RESTART TRAFFIC".to_owned(),
     }));
+
+    // Stop: the stream is fully drained (no tail snippet), so the very next
+    // push is the stop's recording=false — anything earlier is the
+    // commit-while-recording bug.
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(false);
+
     drop(client);
     assert_daemon_exits_successfully(daemon);
 }
 
 #[test]
-fn cancel_during_recording_pushes_recording_false() {
-    let fixture = DaemonFixture::new("cancel", "fixture-live");
+fn streaming_translation_to_english_needs_no_command() {
+    // The Whisper-task fast path contract at the daemon boundary: target "en"
+    // with no configured command must still stream snippets (the fixture ASR
+    // stands in for the engine's internal translate task).
+    let fixture = DaemonFixture::new("entarget").with_translation_overrides("auto", "en", None);
     let daemon = fixture.spawn_daemon();
     let mut client = DaemonClient::connect(&fixture.socket_path());
 
@@ -84,9 +69,10 @@ fn cancel_during_recording_pushes_recording_false() {
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
+    client.expect_preedit("restart traffic");
+    client.expect_preedit("restart traffic");
 
-    // Cancel discards the take and releases the mic → recording false.
-    client.send(IpcMessage::CancelPreedit);
+    client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(false);
 
     drop(client);
@@ -94,13 +80,12 @@ fn cancel_during_recording_pushes_recording_false() {
 }
 
 #[test]
-fn commit_and_correction_push_no_duplicate_status() {
-    // The stop already announced `recording: false`; the commit and a follow-up
-    // correction change HISTORY (the tray menu re-renders) but not the recording
-    // value, so neither may emit another RecordingStatus. The next message the
-    // client sees must be the `true` of the next take — anything else is a
-    // duplicate push.
-    let fixture = DaemonFixture::new("nodup", "fixture-live");
+fn review_mode_routes_every_snippet_through_the_review_flag() {
+    // Requirement: output honours the "Review before insert" option — when it is
+    // on, each translated snippet tells the client to open its review dialog
+    // (review=true) instead of committing directly.
+    let fixture = DaemonFixture::new("review");
+    fixture.seed_tray_setting("review_mode", "true");
     let daemon = fixture.spawn_daemon();
     let mut client = DaemonClient::connect(&fixture.socket_path());
 
@@ -109,42 +94,11 @@ fn commit_and_correction_push_no_duplicate_status() {
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
+    client.expect_preedit_with_review("[sv>ja] RESTART TRAFFIC", true);
+    client.expect_preedit_with_review("[sv>ja] RESTART TRAFFIC", true);
+
     client.send(IpcMessage::ToggleRecording);
-    client.expect_preedit("restart traffic");
     client.expect_recording_status(false);
-
-    client.send(IpcMessage::CommitPreedit(CommitPreedit {
-        text: "restart Traefik".to_owned(),
-    }));
-    client.send(IpcMessage::ReportCorrection(ReportCorrection {
-        corrected_text: "restart the Traefik proxy".to_owned(),
-    }));
-
-    // Start the next take: the very next message must be its `true`.
-    client.send(IpcMessage::ToggleRecording);
-    client.expect_recording_status(true);
-
-    client.send(IpcMessage::CancelPreedit);
-    client.expect_recording_status(false);
-    drop(client);
-    assert_daemon_exits_successfully(daemon);
-}
-
-#[test]
-fn client_without_feature_sees_no_recording_status() {
-    // Backward-compat guardrail: a client that does not request the feature gets
-    // the exact pre-existing byte stream (PreeditUpdate only, no RecordingStatus).
-    let fixture = DaemonFixture::new("nofeature", "fixture");
-    let daemon = fixture.spawn_daemon();
-    let mut client = DaemonClient::connect(&fixture.socket_path());
-
-    client.send_hello_legacy();
-    client.send(IpcMessage::StartRecording);
-    // The very next message must be the preedit, never a RecordingStatus.
-    client.expect_preedit("restart traffic");
-    client.send(IpcMessage::CommitPreedit(CommitPreedit {
-        text: "restart Traefik".to_owned(),
-    }));
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
@@ -152,26 +106,59 @@ fn client_without_feature_sees_no_recording_status() {
 
 struct DaemonFixture {
     root: PathBuf,
-    input_device: String,
+    input_language: String,
+    output_language: String,
+    /// `None` writes an uppercase translator stub; `Some("")` means no command.
+    command_override: Option<String>,
 }
 
 impl DaemonFixture {
-    fn new(tag: &str, input_device: &str) -> Self {
+    fn new(tag: &str) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock");
         let root = env::temp_dir().join(format!(
-            "idiolect-daemon-status-{tag}-{}-{}",
+            "idiolect-translation-streaming-{tag}-{}-{}",
             std::process::id(),
             now.as_nanos()
         ));
         fs::create_dir_all(&root).expect("fixture root should be created");
         let fixture = Self {
             root,
-            input_device: input_device.to_owned(),
+            input_language: "sv".to_owned(),
+            output_language: "ja".to_owned(),
+            command_override: None,
         };
-        fixture.write_config();
+        fixture.write_files();
         fixture
+    }
+
+    fn with_translation_overrides(
+        mut self,
+        input: &str,
+        output: &str,
+        command: Option<&str>,
+    ) -> Self {
+        self.input_language = input.to_owned();
+        self.output_language = output.to_owned();
+        self.command_override = Some(command.unwrap_or("").to_owned());
+        self.write_files();
+        self
+    }
+
+    /// Persists a tray-settings override in the daemon's database before it
+    /// starts, standing in for the corresponding tray click.
+    fn seed_tray_setting(&self, key: &str, value: &str) {
+        use idiolect_ports::storage::MetadataStorePort;
+        fs::create_dir_all(self.database_path().parent().expect("db parent"))
+            .expect("db parent should be created");
+        let mut store =
+            idiolect_adapter_sqlite::SqliteMetadataStore::open_path(self.database_path())
+                .expect("seed store should open");
+        store.migrate().expect("seed store should migrate");
+        store
+            .set_tray_setting(key, value)
+            .expect("setting should persist");
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
@@ -191,10 +178,28 @@ impl DaemonFixture {
         })
     }
 
-    fn write_config(&self) {
+    fn translator_command(&self) -> String {
+        match &self.command_override {
+            Some(command) => command.clone(),
+            None => {
+                let path = self.root.join("uppercase-translator.sh");
+                fs::write(
+                    &path,
+                    "#!/bin/sh\nprintf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n",
+                )
+                .expect("translator stub should be written");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                    .expect("translator stub should be executable");
+                path.to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    fn write_files(&self) {
         fs::create_dir_all(self.model_path().parent().expect("model parent"))
             .expect("model parent should be created");
         fs::write(self.model_path(), b"dummy model").expect("dummy model should be written");
+        let command = self.translator_command();
         fs::write(
             self.config_path(),
             format!(
@@ -206,7 +211,7 @@ socket_path = "{socket_path}"
 log_level = "info"
 
 [audio]
-input_device = "{input_device}"
+input_device = "fixture-stream"
 capture_sample_rate = 16000
 processing_sample_rate = 16000
 channels = 1
@@ -241,15 +246,21 @@ auto_train = false
 
 [privacy]
 retain_audio = true
-private_text_probe = "private daemon transcript"
+
+[translation]
+enabled = true
+input_language = "{input_language}"
+output_language = "{output_language}"
+command = "{command}"
 
 [observability]
 log_private_text = false
 "#,
                 socket_path = self.socket_path().display(),
-                input_device = self.input_device,
                 data_dir = self.data_dir().display(),
                 database_path = self.database_path().display(),
+                input_language = self.input_language,
+                output_language = self.output_language,
             ),
         )
         .expect("config should be written");
@@ -295,8 +306,6 @@ impl DaemonClient {
     fn connect(socket_path: &Path) -> Self {
         let stream = connect_client(socket_path);
         let reader_stream = stream.try_clone().expect("client stream should clone");
-        // A generous read timeout so a missing/incorrect push fails the test fast
-        // instead of blocking forever.
         reader_stream
             .set_read_timeout(Some(Duration::from_secs(15)))
             .expect("read timeout should set");
@@ -305,22 +314,14 @@ impl DaemonClient {
     }
 
     fn send_hello_with_status(&mut self) {
-        self.handshake(vec![
-            "preedit".to_owned(),
-            "commit".to_owned(),
-            "recording_status".to_owned(),
-        ]);
-    }
-
-    fn send_hello_legacy(&mut self) {
-        self.handshake(vec!["preedit".to_owned(), "commit".to_owned()]);
-    }
-
-    fn handshake(&mut self, features: Vec<String>) {
         self.send(IpcMessage::ClientHello(ClientHello {
-            client_name: "idiolect-recording-status-test".to_owned(),
+            client_name: "idiolect-translation-streaming-test".to_owned(),
             protocol_version: 1,
-            features,
+            features: vec![
+                "preedit".to_owned(),
+                "commit".to_owned(),
+                "recording_status".to_owned(),
+            ],
         }));
         match self.read() {
             IpcMessage::ServerHello(server) => assert_eq!(server.protocol_version, 1),
@@ -358,7 +359,17 @@ impl DaemonClient {
     fn expect_preedit(&mut self, expected: &str) {
         match self.read() {
             IpcMessage::PreeditUpdate(update) => assert_eq!(update.text, expected),
-            other => panic!("expected PreeditUpdate, got {other:?}"),
+            other => panic!("expected PreeditUpdate({expected:?}), got {other:?}"),
+        }
+    }
+
+    fn expect_preedit_with_review(&mut self, expected: &str, review: bool) {
+        match self.read() {
+            IpcMessage::PreeditUpdate(update) => {
+                assert_eq!(update.text, expected);
+                assert_eq!(update.review, review, "review flag mismatch");
+            }
+            other => panic!("expected PreeditUpdate({expected:?}), got {other:?}"),
         }
     }
 }

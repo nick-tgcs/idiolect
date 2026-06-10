@@ -252,9 +252,20 @@ impl IbusEngine {
 
     async fn focus_out(&self) {
         dbg_edit(&format!("focus_out {}", self.path.as_str()));
+        // Leaving the input context ends post-commit correction tracking: the
+        // session closes its window and reports any in-place fix to the daemon.
+        // Without this call a correction finished by clicking elsewhere was
+        // silently lost (the session logic existed but was never driven).
+        let ops = self.shared.run_session(|session| session.on_focus_out());
+        emit_surface_ops(&self.shared.connection, &self.path, ops).await;
     }
     async fn reset(&self) {
         dbg_edit("reset");
+        // IBus resets the context when the app moves the cursor out from under
+        // us (mouse click, programmatic change) — edits can no longer be
+        // modelled, so close the correction window, reporting what was tracked.
+        let ops = self.shared.run_session(|session| session.on_focus_out());
+        emit_surface_ops(&self.shared.connection, &self.path, ops).await;
     }
     async fn disable(&self) {
         dbg_edit("disable");
@@ -267,7 +278,9 @@ impl IbusEngine {
         // IBUS_CAP_SURROUNDING_TEXT = 1 << 5. If the app supports surrounding
         // text we can read its real content (capturing mouse/selection edits).
         let surrounding = caps & (1 << 5) != 0;
-        dbg_edit(&format!("set_capabilities caps={caps:#x} surrounding_text={surrounding}"));
+        dbg_edit(&format!(
+            "set_capabilities caps={caps:#x} surrounding_text={surrounding}"
+        ));
         if surrounding {
             self.require_surrounding_text().await;
         }
@@ -439,7 +452,11 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
             }
         };
         shared.sync_indicator();
-        let target = shared.active_path.lock().expect("active_path mutex").clone();
+        let target = shared
+            .active_path
+            .lock()
+            .expect("active_path mutex")
+            .clone();
         if let Some(path) = target {
             handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
         }
@@ -495,7 +512,11 @@ fn resolve_ibus_address() -> Option<String> {
     // Prefer the address file matching the current X display (e.g. ":1" ->
     // "unix-1"); otherwise take the most recently written file.
     let want_suffix = std::env::var("DISPLAY").ok().and_then(|display| {
-        let num = display.trim_start_matches(':').split('.').next()?.to_owned();
+        let num = display
+            .trim_start_matches(':')
+            .split('.')
+            .next()?
+            .to_owned();
         Some(format!("unix-{num}"))
     });
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)

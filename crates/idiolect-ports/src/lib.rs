@@ -8,6 +8,7 @@ pub mod evaluator;
 pub mod input_method;
 pub mod storage;
 pub mod trainer;
+pub mod translation;
 pub mod vad;
 
 /// Returns this crate's package name for smoke tests.

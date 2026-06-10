@@ -40,6 +40,20 @@ impl AudioInputPort for FixtureAudio {
             Err(FixtureAudioError::NotStarted)
         }
     }
+
+    fn poll_captured(&mut self, session_id: ImeSessionId) -> Result<AudioSegment, Self::Error> {
+        if !self.started_sessions.contains(&session_id) {
+            return Err(FixtureAudioError::NotStarted);
+        }
+        // The deterministic clip materialises only on stop; mid-capture polls
+        // observe an empty (still-running) stream.
+        Ok(AudioSegment {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            duration_ms: 0,
+            samples_f32_mono: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +75,31 @@ mod tests {
 
         let captured = fixture_audio.stop_capture(session_id);
         assert_eq!(captured, Err(FixtureAudioError::NotStarted));
+    }
+
+    #[test]
+    fn fixture_audio_poll_requires_start_and_is_empty_mid_capture() {
+        let mut fixture_audio = FixtureAudio::new();
+        let session_id = ImeSessionId::new();
+
+        assert_eq!(
+            fixture_audio.poll_captured(session_id),
+            Err(FixtureAudioError::NotStarted)
+        );
+
+        fixture_audio
+            .start_capture(session_id)
+            .expect("fixture audio should start capture");
+        let polled = fixture_audio
+            .poll_captured(session_id)
+            .expect("poll should succeed mid-capture");
+        assert!(polled.samples_f32_mono.is_empty());
+
+        // Polling must not consume the stop-time clip.
+        let segment = fixture_audio
+            .stop_capture(session_id)
+            .expect("stop after poll");
+        assert_eq!(segment.samples_f32_mono.len(), 16_000);
     }
 
     #[test]

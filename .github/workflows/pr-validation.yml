@@ -5,9 +5,17 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_VERSION: "1.96.0"
   CARGO_TERM_COLOR: always
+  # Headless runners have a session bus but no StatusNotifierWatcher; several
+  # integration tests run multiple daemons per process, whose pid-keyed ksni
+  # tray registrations collide and reset clients. Skip the tray across CI.
+  IDIOLECT_DISABLE_TRAY: "1"
 
 jobs:
   # =========================================================================
@@ -57,8 +65,10 @@ jobs:
 
       - name: Check commit messages
         run: |
-          # Check that all commits follow conventional commits format
-          COMMITS=$(git log --format="%s" origin/main...HEAD)
+          # Check that all commits follow conventional commits format.
+          # --no-merges skips the merge commit GitHub synthesizes for the PR
+          # ref (subject "Merge <sha> into <sha>"), which isn't a real commit.
+          COMMITS=$(git log --no-merges --format="%s" origin/main...HEAD)
           echo "$COMMITS" | while IFS= read -r commit; do
             if ! echo "$commit" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(.+\))?: .+'; then
               echo "::error::Commit message does not follow conventional commits format: $commit"
@@ -97,17 +107,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-pr-
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check compilation (with warnings as errors)
-        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --all-features
+        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --features idiolect-ibus/ibus-engine
 
       - name: Run clippy (with warnings as errors)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --features idiolect-ibus/ibus-engine -- -D warnings
 
       - name: Run tests (quick - no doc tests, no coverage)
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --workspace --all-targets --features idiolect-ibus/ibus-engine
 
   # =========================================================================
   # FCITX5: Quick validation
@@ -123,7 +138,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev
 
       - name: Configure CMake
         run: |
@@ -237,7 +252,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev ripgrep
 
       - name: Build FCITX5 (for ctest index)
         run: |

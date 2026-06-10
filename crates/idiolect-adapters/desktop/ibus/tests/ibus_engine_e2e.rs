@@ -5,16 +5,19 @@
 //!
 //! - `engine_inserts_history_text_on_daemon_request` (the history-Insert path)
 //!   drives the engine against a fake-daemon socket AND spawns its **own** private
-//!   `dbus-daemon`, so it is fully self-contained — a normal `#[test]` (no
-//!   `#[ignore]`, no `dbus-run-session`) that runs in the standard flow with
-//!   `cargo test -p idiolect-ibus --features ibus-engine`.
+//!   `dbus-daemon`, so it is fully self-contained and runs in the standard flow
+//!   with `cargo test -p idiolect-ibus --features ibus-engine`.
 //! - `engine_dictates_and_daemon_records_the_session` additionally spawns the real
-//!   daemon with its KSNI tray, which a bare private bus cannot host, so it needs
-//!   an **ambient desktop** session bus and stays an `#[ignore]` manual test (run
-//!   it with `-- --ignored engine_dictates`). It proves the full dictation +
-//!   correction → training-candidate chain.
+//!   daemon (whose KSNI tray is skipped via `IDIOLECT_DISABLE_TRAY` and whose
+//!   clipboard degrades gracefully when there is no display), connecting to a
+//!   session bus. It drives the live toggle path: the `fixture-live` device holds
+//!   the "mic" open between two Super+T presses, so the daemon pushes
+//!   `recording=true` before delivering the transcript — exactly the contract the
+//!   engine's no-optimistic-flip state machine relies on. It proves the full
+//!   dictation + correction → training-candidate chain.
 //!
-//! CI runs the self-contained one via `ci/scripts/test-ibus-e2e.sh` (the `e2e` job).
+//! CI runs both via `ci/scripts/test-ibus-e2e.sh` (the `e2e` job, under
+//! `dbus-run-session`).
 #![cfg(feature = "ibus-engine")]
 
 use std::fs;
@@ -43,17 +46,23 @@ const DRAFT: &str = "restart traffic";
 const CORRECTED: &str = "restart Traefik";
 
 #[tokio::test]
-#[ignore = "needs an ambient desktop session bus + the engine feature"]
 async fn engine_dictates_and_daemon_records_the_session() {
+    // Spawn a private dbus-daemon so the test is fully self-contained (no ambient
+    // session bus / no `dbus-run-session` wrapper needed), like the insert test.
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
     let fixture = Fixture::new("e2e");
     let daemon = fixture.spawn_daemon();
     // Killed on drop, so a panic mid-test never leaks the engine process.
-    let engine = fixture.spawn_engine();
+    let engine = fixture.spawn_engine_on_bus(bus.address());
     wait_for_socket(&fixture.socket_path());
 
-    let conn = zbus::Connection::session()
+    let conn = zbus::connection::Builder::address(bus.address())
+        .expect("valid bus address")
+        .build()
         .await
-        .expect("ambient session bus");
+        .expect("connect to private bus");
 
     let factory = await_factory(&conn).await;
     let engine_path: OwnedObjectPath = factory
@@ -69,8 +78,14 @@ async fn engine_dictates_and_daemon_records_the_session() {
         .await
         .expect("subscribe CommitText");
 
-    // Super+T -> the (fixture) daemon transcribes DRAFT, and the engine commits
-    // it straight into the focused app — no preedit, no Enter.
+    // Super+T -> the daemon opens the fixture-live "mic" and pushes
+    // recording=true (the engine never flips its phase optimistically, so this
+    // push is what arms it to accept the transcript).
+    process_key(&engine_proxy, KEY_T, MOD4).await;
+    // Super+T again -> the daemon stops the take, transcribes the deterministic
+    // clip to DRAFT, and delivers it; the engine commits it straight into the
+    // focused app — no preedit, no Enter. (The socket orders recording=true
+    // before the transcript, so there is no race to wait out.)
     process_key(&engine_proxy, KEY_T, MOD4).await;
     let committed = {
         let msg = next_signal(&mut commit_signals).await;
@@ -78,7 +93,10 @@ async fn engine_dictates_and_daemon_records_the_session() {
         let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
         extract_ibus_text(&text)
     };
-    assert_eq!(committed, DRAFT, "the transcript is committed straight into the app");
+    assert_eq!(
+        committed, DRAFT,
+        "the transcript is committed straight into the app"
+    );
 
     // Fix it in place: backspace "traffic" and retype "Traefik". These pass
     // through to the app, but the engine tracks the tail edit.
@@ -107,7 +125,11 @@ async fn engine_dictates_and_daemon_records_the_session() {
     assert_eq!(store.training_candidate_count_for_test().unwrap(), 1);
     assert_eq!(
         store.latest_training_candidate_for_test().unwrap().unwrap(),
-        (DRAFT.to_owned(), CORRECTED.to_owned(), "accepted_with_edit".to_owned()),
+        (
+            DRAFT.to_owned(),
+            CORRECTED.to_owned(),
+            "accepted_with_edit".to_owned()
+        ),
         "the in-place correction feeds the learning loop"
     );
 }
@@ -141,7 +163,9 @@ async fn engine_inserts_history_text_on_daemon_request() {
     let mut server_writer = stream.try_clone().expect("clone");
     let mut server_reader = BufReader::new(stream);
     let mut hello = String::new();
-    server_reader.read_line(&mut hello).expect("read ClientHello");
+    server_reader
+        .read_line(&mut hello)
+        .expect("read ClientHello");
     assert!(
         matches!(decode_json_line(&hello), Ok(IpcMessage::ClientHello(_))),
         "engine should greet with ClientHello"
@@ -193,7 +217,10 @@ async fn engine_inserts_history_text_on_daemon_request() {
         let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
         extract_ibus_text(&text)
     };
-    assert_eq!(committed, ENTRY, "history entry is typed at the cursor via CommitText");
+    assert_eq!(
+        committed, ENTRY,
+        "history entry is typed at the cursor via CommitText"
+    );
 
     drop(engine);
     drop(conn);
@@ -272,6 +299,9 @@ impl Fixture {
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
+        // The in-process daemon shares this test's bus-less environment; skip the
+        // ksni tray so it never blocks on a StatusNotifier registration.
+        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),
@@ -283,15 +313,6 @@ impl Fixture {
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })
-    }
-
-    fn spawn_engine(&self) -> EngineProc {
-        // Engine resolves its socket as $XDG_RUNTIME_DIR/idiolect.sock. Force it
-        // onto the test's session bus via IBUS_ADDRESS (otherwise it would read
-        // the real ibus address file and join the wrong bus).
-        let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
-            .expect("DBUS_SESSION_BUS_ADDRESS set in the test session");
-        self.spawn_engine_on_bus(&session_bus)
     }
 
     /// Spawn the engine joined to a specific bus address (used with a private bus
@@ -317,7 +338,11 @@ default_user_id = "default"
 socket_path = "{socket}"
 log_level = "info"
 [audio]
-input_device = "fixture"
+# Live-lifecycle fixture: holds the "mic" open between toggles so the daemon
+# pushes recording=true, then yields the deterministic clip on stop. The plain
+# "fixture" device transcribes instantly without ever announcing recording —
+# the engine (correctly) ignores such an unannounced transcript.
+input_device = "fixture-live"
 capture_sample_rate = 16000
 processing_sample_rate = 16000
 channels = 1
@@ -443,7 +468,10 @@ impl PrivateBus {
             .read_line(&mut address)
             .expect("read bus address");
         let address = address.trim().to_owned();
-        assert!(address.starts_with("unix:"), "unexpected bus address {address:?}");
+        assert!(
+            address.starts_with("unix:"),
+            "unexpected bus address {address:?}"
+        );
         Some(Self { child, address })
     }
 

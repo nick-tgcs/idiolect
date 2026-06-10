@@ -38,6 +38,10 @@ trait CaptureBackend {
         &mut self,
         session_id: ImeSessionId,
     ) -> Result<AudioSegment, CpalAudioInputError>;
+    fn poll_captured(
+        &mut self,
+        session_id: ImeSessionId,
+    ) -> Result<AudioSegment, CpalAudioInputError>;
 }
 
 pub struct CpalAudioInput {
@@ -74,6 +78,10 @@ impl AudioInputPort for CpalAudioInput {
 
     fn stop_capture(&mut self, session_id: ImeSessionId) -> Result<AudioSegment, Self::Error> {
         self.backend.stop_capture(session_id)
+    }
+
+    fn poll_captured(&mut self, session_id: ImeSessionId) -> Result<AudioSegment, Self::Error> {
+        self.backend.poll_captured(session_id)
     }
 }
 
@@ -213,14 +221,7 @@ impl RealCaptureBackend {
             CpalAudioInputError::BackendUnavailable("capture configuration was missing".to_owned())
         })?;
 
-        let samples_f32_mono = {
-            let mut guard = self.capture_buffer.lock().map_err(|_| {
-                CpalAudioInputError::BackendUnavailable("capture buffer was poisoned".to_owned())
-            })?;
-            let samples = guard.clone();
-            guard.clear();
-            samples
-        };
+        let samples_f32_mono = drain_capture_buffer(&self.capture_buffer)?;
 
         Ok(AudioSegment {
             sample_rate_hz,
@@ -229,6 +230,36 @@ impl RealCaptureBackend {
             samples_f32_mono,
         })
     }
+
+    fn poll_captured_impl(&mut self) -> Result<AudioSegment, CpalAudioInputError> {
+        if self.stream.is_none() {
+            return Err(CpalAudioInputError::NotStarted);
+        }
+        let sample_rate_hz = self.sample_rate_hz.ok_or_else(|| {
+            CpalAudioInputError::BackendUnavailable("capture configuration was missing".to_owned())
+        })?;
+
+        // Drain what has accumulated; the stream stays open and keeps appending.
+        let samples_f32_mono = drain_capture_buffer(&self.capture_buffer)?;
+
+        Ok(AudioSegment {
+            sample_rate_hz,
+            channels: 1,
+            duration_ms: sample_duration_ms(sample_rate_hz, samples_f32_mono.len()),
+            samples_f32_mono,
+        })
+    }
+}
+
+/// Takes everything currently in the shared capture buffer, leaving it empty
+/// for the stream callback to keep filling.
+fn drain_capture_buffer(
+    capture_buffer: &Arc<Mutex<Vec<f32>>>,
+) -> Result<Vec<f32>, CpalAudioInputError> {
+    let mut guard = capture_buffer.lock().map_err(|_| {
+        CpalAudioInputError::BackendUnavailable("capture buffer was poisoned".to_owned())
+    })?;
+    Ok(std::mem::take(&mut *guard))
 }
 
 impl CaptureBackend for RealCaptureBackend {
@@ -241,6 +272,13 @@ impl CaptureBackend for RealCaptureBackend {
         _session_id: ImeSessionId,
     ) -> Result<AudioSegment, CpalAudioInputError> {
         self.stop_capture_impl()
+    }
+
+    fn poll_captured(
+        &mut self,
+        _session_id: ImeSessionId,
+    ) -> Result<AudioSegment, CpalAudioInputError> {
+        self.poll_captured_impl()
     }
 }
 
@@ -346,6 +384,22 @@ mod tests {
                 Err(CpalAudioInputError::NotStarted)
             }
         }
+
+        fn poll_captured(
+            &mut self,
+            _session_id: ImeSessionId,
+        ) -> Result<AudioSegment, CpalAudioInputError> {
+            if self.started {
+                Ok(AudioSegment {
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    duration_ms: 0,
+                    samples_f32_mono: Vec::new(),
+                })
+            } else {
+                Err(CpalAudioInputError::NotStarted)
+            }
+        }
     }
 
     #[test]
@@ -356,6 +410,35 @@ mod tests {
         assert_eq!(
             audio.stop_capture(session_id),
             Err(CpalAudioInputError::NotStarted)
+        );
+    }
+
+    #[test]
+    fn poll_before_start_returns_not_started() {
+        let mut audio = CpalAudioInput::new_for_test(TestBackend::default());
+        let session_id = ImeSessionId::new();
+
+        assert_eq!(
+            audio.poll_captured(session_id),
+            Err(CpalAudioInputError::NotStarted)
+        );
+    }
+
+    #[test]
+    fn draining_the_capture_buffer_takes_everything_once() {
+        // The streaming contract: each poll takes exactly what accumulated since
+        // the previous one, and the buffer keeps filling in between.
+        let buffer = Arc::new(Mutex::new(vec![0.1_f32, 0.2, 0.3]));
+
+        let first = drain_capture_buffer(&buffer).expect("drain");
+        assert_eq!(first, vec![0.1, 0.2, 0.3]);
+        assert!(drain_capture_buffer(&buffer).expect("drain").is_empty());
+
+        // The stream callback appends more; the next drain sees only the new tail.
+        buffer.lock().expect("lock").extend_from_slice(&[0.4, 0.5]);
+        assert_eq!(
+            drain_capture_buffer(&buffer).expect("drain"),
+            vec![0.4, 0.5]
         );
     }
 

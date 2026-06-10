@@ -8,7 +8,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
-use idiolect_ipc::messages::{ClientHello, IpcMessage, FEATURE_COMMIT, FEATURE_PREEDIT};
+use idiolect_ipc::messages::{
+    ClientHello, HistoryCopy, HistoryReinsert, HistoryReinsertResponse, IpcMessage,
+    RecordingStatus, FEATURE_COMMIT, FEATURE_PREEDIT,
+};
 
 #[test]
 fn idiolectd_run_starts_socket_and_accepts_hello() {
@@ -63,6 +66,103 @@ fn idiolectd_run_shutdown_cleans_socket_file() {
     drop(stream);
     assert_daemon_exits_successfully(&mut daemon);
     assert!(!fixture.socket_path().exists());
+}
+
+#[test]
+fn idiolectd_run_history_reinsert_unknown_id_responds_not_found() {
+    let fixture = RunLoopFixture::new("reinsert-unknown");
+    let mut daemon = fixture.spawn_daemon();
+    let mut stream = connect_client(&fixture.socket_path());
+    let mut reader = BufReader::new(stream.try_clone().expect("client stream should clone"));
+    send_hello(&mut stream, &mut reader);
+
+    send_message(
+        &mut stream,
+        &IpcMessage::HistoryReinsert(HistoryReinsert { id: 999_999 }),
+    );
+    match read_message(&mut reader) {
+        IpcMessage::HistoryReinsertResponse(HistoryReinsertResponse { success, .. }) => {
+            assert!(!success, "an unknown history id must not reinsert");
+        }
+        other => panic!("expected HistoryReinsertResponse, got {other:?}"),
+    }
+
+    drop(reader);
+    drop(stream);
+    assert_daemon_exits_successfully(&mut daemon);
+}
+
+#[test]
+fn idiolectd_run_history_copy_unknown_id_responds_not_found() {
+    let fixture = RunLoopFixture::new("copy-unknown");
+    let mut daemon = fixture.spawn_daemon();
+    let mut stream = connect_client(&fixture.socket_path());
+    let mut reader = BufReader::new(stream.try_clone().expect("client stream should clone"));
+    send_hello(&mut stream, &mut reader);
+
+    send_message(
+        &mut stream,
+        &IpcMessage::HistoryCopy(HistoryCopy { id: 999_999 }),
+    );
+    match read_message(&mut reader) {
+        IpcMessage::HistoryCopyResponse(response) => {
+            assert!(!response.success, "an unknown history id must not copy");
+        }
+        other => panic!("expected HistoryCopyResponse, got {other:?}"),
+    }
+
+    drop(reader);
+    drop(stream);
+    assert_daemon_exits_successfully(&mut daemon);
+}
+
+#[test]
+fn idiolectd_run_rejects_server_only_message_from_client() {
+    let fixture = RunLoopFixture::new("server-only-msg");
+    let mut daemon = fixture.spawn_daemon();
+    let mut stream = connect_client(&fixture.socket_path());
+    let mut reader = BufReader::new(stream.try_clone().expect("client stream should clone"));
+    send_hello(&mut stream, &mut reader);
+
+    // RecordingStatus is a server→client message; the daemon must reject it.
+    send_message(
+        &mut stream,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    match read_message(&mut reader) {
+        IpcMessage::Error(error) => assert_eq!(error.code, "unexpected-message"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    drop(reader);
+    drop(stream);
+    assert_daemon_exits_successfully(&mut daemon);
+}
+
+#[test]
+fn idiolectd_run_rejects_response_message_from_client() {
+    let fixture = RunLoopFixture::new("response-from-client");
+    let mut daemon = fixture.spawn_daemon();
+    let mut stream = connect_client(&fixture.socket_path());
+    let mut reader = BufReader::new(stream.try_clone().expect("client stream should clone"));
+    send_hello(&mut stream, &mut reader);
+
+    // A response variant is only ever sent by the server; from a client it is an error.
+    send_message(
+        &mut stream,
+        &IpcMessage::HistoryReinsertResponse(HistoryReinsertResponse {
+            success: true,
+            error: None,
+        }),
+    );
+    match read_message(&mut reader) {
+        IpcMessage::Error(error) => assert_eq!(error.code, "unexpected-message"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    drop(reader);
+    drop(stream);
+    assert_daemon_exits_successfully(&mut daemon);
 }
 
 struct RunLoopFixture {

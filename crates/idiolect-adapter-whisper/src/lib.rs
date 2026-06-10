@@ -43,6 +43,20 @@ impl Default for WhisperOptions {
     }
 }
 
+/// Per-call decode task. The engine (model + GPU context) is loaded once and
+/// reused, but the task can change between calls — e.g. when the user flips the
+/// tray's translation toggle or picks a different input language mid-session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WhisperDecodeTask {
+    /// Language hint override for this call. `None` uses the engine's configured
+    /// default; `Some("auto")` asks the decoder to detect the language
+    /// (multilingual models only).
+    pub language: Option<String>,
+    /// Run Whisper's built-in translate task: speech in any supported language
+    /// decodes directly to English text. Only meaningful on multilingual models.
+    pub translate_to_english: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("missing Whisper fixture model at {path}")]
 pub struct MissingFixtureModel {
@@ -127,6 +141,7 @@ mod backend {
         pub(crate) fn transcribe(
             &self,
             audio: &AudioSegment,
+            task: &WhisperDecodeTask,
         ) -> Result<TranscriptDraft, WhisperAsrError> {
             let samples = prepare_audio(audio);
             let mut state = self
@@ -139,8 +154,9 @@ mod backend {
                 patience: -1.0,
             });
             params.set_n_threads(self.n_threads);
-            params.set_language(Some(self.language.as_str()));
-            params.set_translate(false);
+            let language = task.language.as_deref().unwrap_or(self.language.as_str());
+            params.set_language(Some(language));
+            params.set_translate(task.translate_to_english);
             params.set_no_timestamps(true);
             params.set_print_special(false);
             params.set_print_progress(false);
@@ -204,6 +220,17 @@ impl WhisperAsr {
         let backend = backend::WhisperBackend::load_model_from_path(model_path.into(), options)?;
         Ok(Self { backend })
     }
+
+    /// Transcribes with an explicit per-call decode task (language override
+    /// and/or Whisper's built-in X→English translate task). The plain
+    /// [`AsrPort::transcribe`] is equivalent to the default task.
+    pub fn transcribe_with_task(
+        &self,
+        audio: &AudioSegment,
+        task: &WhisperDecodeTask,
+    ) -> Result<TranscriptDraft, WhisperAsrError> {
+        self.backend.transcribe(audio, task)
+    }
 }
 
 impl AsrPort for WhisperAsr {
@@ -222,7 +249,8 @@ impl AsrPort for WhisperAsr {
     }
 
     fn transcribe(&self, audio: &AudioSegment) -> Result<TranscriptDraft, Self::Error> {
-        self.backend.transcribe(audio)
+        self.backend
+            .transcribe(audio, &WhisperDecodeTask::default())
     }
 }
 
@@ -246,6 +274,56 @@ mod tests {
         assert_eq!(draft.metadata.engine_version, "0.16.0");
     }
 
+    // NOTE on test depth: asserting an actual cross-language translation needs a
+    // multilingual Whisper model plus a non-English audio fixture; the only model
+    // committed to the repo is the English-only `ggml-tiny.en.bin`, so observable
+    // X→English output is exercised by the gated/manual path, not here. What IS
+    // testable hermetically — and what these tests pin down — is the task
+    // plumbing contract: per-call task selection exists, the default task is
+    // plain transcription, and a task-equivalent call produces the same result
+    // as the legacy `transcribe` entry point.
+    #[test]
+    fn default_decode_task_is_plain_transcription() {
+        let task = super::WhisperDecodeTask::default();
+        assert_eq!(task.language, None, "engine-default language");
+        assert!(!task.translate_to_english);
+    }
+
+    #[test]
+    fn transcribe_with_default_task_matches_legacy_transcribe() {
+        let adapter = WhisperAsr::load_fixture_model().expect("fixture model should be present");
+        let audio = restart_traffic_fixture_16khz_mono();
+
+        let legacy = adapter.transcribe(&audio).expect("legacy transcribe");
+        let via_task = adapter
+            .transcribe_with_task(&audio, &super::WhisperDecodeTask::default())
+            .expect("task transcribe");
+
+        assert_eq!(via_task.text, legacy.text);
+        assert_eq!(via_task.metadata.engine_name, "whisper-rs");
+    }
+
+    #[test]
+    fn per_call_language_override_reaches_the_decoder() {
+        // An explicit per-call "en" hint on the en-only model must decode
+        // normally — proving the override path is wired, not ignored.
+        let adapter = WhisperAsr::load_fixture_model().expect("fixture model should be present");
+        let audio = restart_traffic_fixture_16khz_mono();
+
+        let draft = adapter
+            .transcribe_with_task(
+                &audio,
+                &super::WhisperDecodeTask {
+                    language: Some("en".to_owned()),
+                    translate_to_english: false,
+                },
+            )
+            .expect("override transcribe");
+
+        let text = draft.text.to_lowercase();
+        assert!(text.contains("restart") && text.contains("traffic"));
+    }
+
     #[test]
     fn whisper_reports_typed_error_for_missing_fixture_model() {
         let path = std::env::temp_dir().join(format!(
@@ -254,8 +332,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let result =
-            super::backend::WhisperBackend::load_model_from_path(path, super::WhisperOptions::default());
+        let result = super::backend::WhisperBackend::load_model_from_path(
+            path,
+            super::WhisperOptions::default(),
+        );
 
         assert!(matches!(
             result,

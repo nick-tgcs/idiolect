@@ -38,6 +38,30 @@ pub fn speech_and_silence_fixture_16khz_mono() -> AudioSegment {
     pad_with_silence(&restart_traffic_fixture_16khz_mono(), SILENCE_PADDING_MS)
 }
 
+/// Two utterances separated (and followed) by a clear pause: speech, ≥1.25 s of
+/// silence, the same speech again, ≥1 s of trailing silence. Drives the
+/// pause-triggered segmentation path: a correct segmenter emits exactly two
+/// snippets from this clip, both before the recording stops. The pauses leave
+/// generous headroom over the default 700 ms threshold because the WebRTC VAD's
+/// speech hangover spills ~100 ms of "speech" labels into the silence.
+pub fn speech_pause_speech_fixture_16khz_mono() -> AudioSegment {
+    let utterance = speech_and_silence_fixture_16khz_mono();
+    let gap = vec![0.0_f32; 12_000]; // 750 ms at 16 kHz, on top of the 2×250 ms pads
+
+    let mut samples_f32_mono = utterance.samples_f32_mono.clone();
+    samples_f32_mono.extend_from_slice(&gap);
+    samples_f32_mono.extend_from_slice(&utterance.samples_f32_mono);
+    samples_f32_mono.extend_from_slice(&gap);
+
+    let duration_ms = ((samples_f32_mono.len() as u64) * 1_000 / 16_000) as u32;
+    AudioSegment {
+        sample_rate_hz: 16_000,
+        channels: 1,
+        duration_ms,
+        samples_f32_mono,
+    }
+}
+
 fn pad_with_silence(audio: &AudioSegment, padding_ms: u32) -> AudioSegment {
     let pad_samples = (audio.sample_rate_hz as usize * padding_ms as usize) / 1_000usize;
 
@@ -161,6 +185,20 @@ mod tests {
         assert!(first.duration_ms > 0);
         assert!(!first.samples_f32_mono.is_empty());
         assert_eq!(first.sample_count(), first.samples_f32_mono.len());
+    }
+
+    #[test]
+    fn speech_pause_speech_fixture_doubles_the_utterance_with_gaps() {
+        let utterance = super::speech_and_silence_fixture_16khz_mono();
+        let clip = super::speech_pause_speech_fixture_16khz_mono();
+
+        assert_eq!(clip.sample_rate_hz, 16_000);
+        assert_eq!(clip.channels, 1);
+        assert_eq!(
+            clip.samples_f32_mono.len(),
+            2 * utterance.samples_f32_mono.len() + 2 * 12_000
+        );
+        assert_eq!(clip, super::speech_pause_speech_fixture_16khz_mono());
     }
 
     #[test]
