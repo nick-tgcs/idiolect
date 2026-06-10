@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_VERSION: "1.96.0"
   CARGO_TERM_COLOR: always
@@ -563,7 +567,12 @@ jobs:
     if: always()
     steps:
       - name: Check all required jobs succeeded
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          # This job only runs if all dependencies completed
-          # If any dependency failed, this job will be skipped
+          echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS_JSON" | jq -e 'any(.[]; .result != "success")' > /dev/null; then
+            echo "::error::One or more required jobs did not succeed (failed, cancelled, or skipped)"
+            exit 1
+          fi
           echo "All CI checks passed!"
