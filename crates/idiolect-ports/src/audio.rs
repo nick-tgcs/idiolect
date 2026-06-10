@@ -40,6 +40,13 @@ pub trait AudioInputPort {
 
     fn start_capture(&mut self, session_id: ImeSessionId) -> Result<(), Self::Error>;
     fn stop_capture(&mut self, session_id: ImeSessionId) -> Result<AudioSegment, Self::Error>;
+
+    /// Drains the samples accumulated since the previous poll (or since
+    /// `start_capture`) while the capture keeps running. The streaming seam for
+    /// pause-triggered transcription: the daemon polls mid-recording instead of
+    /// waiting for `stop_capture`. Draining is destructive — a subsequent
+    /// `stop_capture` returns only what arrived after the last poll.
+    fn poll_captured(&mut self, session_id: ImeSessionId) -> Result<AudioSegment, Self::Error>;
 }
 
 #[cfg(test)]

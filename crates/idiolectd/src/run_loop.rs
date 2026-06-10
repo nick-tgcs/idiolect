@@ -14,6 +14,7 @@ use idiolect_adapter_crypto::{
 };
 use idiolect_adapter_ksni::{KsniTray, KsniTrayError, TrayCallback};
 use idiolect_adapter_opus::{OpusCodec, OpusCodecError};
+use idiolect_adapter_vad::{VadAdapter, FRAME_DURATION_MS, FRAME_SAMPLE_COUNT};
 use idiolect_adapter_sqlite::{
     FileAudioStore, FileAudioStoreError, SqliteMetadataStore, SqliteStorageError,
 };
@@ -23,8 +24,12 @@ use idiolect_application::use_cases::menu::{
     validate_training_retention_days, MenuUseCase, RecordingState, MAX_ENTRY_CHOICES,
     RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
 };
-use idiolect_common::config::HistoryConfig;
+use idiolect_application::use_cases::segmentation::{
+    FrameBuffer, SegmenterConfig, UtteranceSegmenter,
+};
+use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
 use idiolect_common::ids::ImeSessionId;
+use idiolect_common::languages::is_supported_language;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
@@ -51,6 +56,11 @@ pub(crate) struct RunLoopConfig {
     /// History defaults from the config file; per-setting overrides persisted in
     /// the `tray_settings` table take precedence at runtime.
     pub(crate) history_config: HistoryConfig,
+    /// Translation defaults from the config file; the tray's translation toggle
+    /// and language pickers persist overrides in `tray_settings`.
+    pub(crate) translation_config: TranslationConfig,
+    /// VAD timing rules; drives the pause-triggered segmenter in streaming mode.
+    pub(crate) vad_config: VadConfig,
 }
 
 #[derive(Debug)]
@@ -212,7 +222,13 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
     let mut clipboard =
         ArboardClipboard::new().map_err(|error| RunLoopError::clipboard("clipboard init", error))?;
 
-    refresh_tray_menu(&mut tray, &store, &config.history_config, RecordingState::Idle)?;
+    refresh_tray_menu(
+        &mut tray,
+        &store,
+        &config.history_config,
+        &config.translation_config,
+        RecordingState::Idle,
+    )?;
     tray.set_icon(TrayIcon::Idle)
         .map_err(|error| RunLoopError::tray("tray icon", error))?;
     tray.set_tooltip("Idiolect — Ready")
@@ -388,6 +404,38 @@ fn effective_history_config(store: &SqliteMetadataStore, defaults: &HistoryConfi
     }
 }
 
+/// Resolves the active translation configuration, layering persisted
+/// `tray_settings` overrides on top of the config-file defaults (the same
+/// layering as [`effective_history_config`]). Language overrides are validated
+/// against the catalogue so a stale or hand-edited value can never push an
+/// unknown code into the pipeline; the external command stays config-file-only.
+fn effective_translation_config(
+    store: &SqliteMetadataStore,
+    defaults: &TranslationConfig,
+) -> TranslationConfig {
+    let settings = store.get_all_tray_settings().unwrap_or_default();
+    let enabled = settings
+        .get("translation_enabled")
+        .map(|value| value == "true")
+        .unwrap_or(defaults.enabled);
+    let input_language = settings
+        .get("translation_input_lang")
+        .filter(|code| *code == "auto" || is_supported_language(code))
+        .cloned()
+        .unwrap_or_else(|| defaults.input_language.clone());
+    let output_language = settings
+        .get("translation_output_lang")
+        .filter(|code| is_supported_language(code))
+        .cloned()
+        .unwrap_or_else(|| defaults.output_language.clone());
+    TranslationConfig {
+        enabled,
+        input_language,
+        output_language,
+        command: defaults.command.clone(),
+    }
+}
+
 /// Whether "review before insert" mode is on (persisted in `tray_settings`).
 /// In this mode the daemon flags each transcript so the client opens its own
 /// review/correction dialog before committing, instead of inserting directly.
@@ -405,13 +453,15 @@ fn refresh_tray_menu(
     tray: &mut KsniTray,
     store: &SqliteMetadataStore,
     defaults: &HistoryConfig,
+    translation_defaults: &TranslationConfig,
     recording_state: RecordingState,
 ) -> Result<(), RunLoopError> {
     let config = effective_history_config(store, defaults);
+    let translation = effective_translation_config(store, translation_defaults);
     let entries = store
         .recent_history(config.max_entries)
         .map_err(|error| RunLoopError::storage("recent history", error))?;
-    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &config);
+    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &config, &translation);
     menu.push(idiolect_ports::storage::TrayMenuItem {
         id: "review_mode".to_owned(),
         label: "Review before insert".to_owned(),
@@ -450,6 +500,9 @@ fn handle_connection(
     let mut active_session: Option<ActiveSession> = None;
     // Set only while a real microphone recording is in progress (live devices).
     let mut live_capture: Option<crate::adapters::RuntimeCapture> = None;
+    // Set alongside `live_capture` while translation is enabled: the streaming
+    // pipeline that turns pauses into translated snippets mid-recording.
+    let mut live_stream: Option<LiveStreamState> = None;
     // The authoritative recording-state publisher. Re-armed at handshake once we
     // know whether the client negotiated `recording_status`.
     let mut status_tx = RecordingStatusTx::new(false);
@@ -469,10 +522,25 @@ fn handle_connection(
                 config,
                 &mut active_session,
                 &mut live_capture,
+                &mut live_stream,
                 &mut status_tx,
                 &retention_dialog,
             )?;
         }
+
+        // While a streaming take is live, every loop tick (the 150 ms read
+        // timeout guarantees one even with a silent client) pumps the mic
+        // through the segmenter and delivers any pause-completed snippets.
+        pump_live_stream(
+            &mut stream,
+            store,
+            &audio_store,
+            &codec,
+            config,
+            &mut active_session,
+            &mut live_capture,
+            &mut live_stream,
+        )?;
 
         match reader.read_line(&mut line) {
             // A clean EOF (0) or an abrupt reset are both just the peer going away —
@@ -529,6 +597,7 @@ fn handle_connection(
                             config,
                             &mut active_session,
                             &mut live_capture,
+                            &mut live_stream,
                             &mut status_tx,
                         )?;
                     } else {
@@ -539,6 +608,7 @@ fn handle_connection(
                             config,
                             &mut active_session,
                             &mut live_capture,
+                            &mut live_stream,
                             &mut status_tx,
                         )?;
                     }
@@ -566,13 +636,20 @@ fn handle_connection(
                         config,
                         &mut active_session,
                         &mut live_capture,
+                        &mut live_stream,
                         &mut status_tx,
                     )?;
                 }
             }
             IpcMessage::CommitPreedit(commit) => {
                 commit_active_session(store, &mut active_session, commit)?;
-                status_tx.set(&mut stream, tray, store, &config.history_config, false)?;
+                // A commit is a text event; the authoritative recording state is
+                // whether the mic is still open. In streaming mode the engine
+                // commits each snippet MID-recording — publishing a hardcoded
+                // `false` here would flip the tray idle and tell the engine the
+                // take ended, making it drop every later snippet.
+                let recording = live_capture.is_some();
+                status_tx.set(&mut stream, tray, store, config, recording)?;
             }
             IpcMessage::ReportCorrection(correction) => {
                 // The user fixed the auto-committed text in place: amend the
@@ -588,15 +665,16 @@ fn handle_connection(
                             )
                             .map_err(|error| RunLoopError::storage("amend correction", error))?;
                         active.current_text = correction.corrected_text.clone();
-                        status_tx.refresh_tray(tray, store, &config.history_config)?;
+                        status_tx.refresh_tray(tray, store, config)?;
                     }
                 }
             }
             IpcMessage::CancelPreedit => {
                 drop_live_capture(&mut live_capture);
+                live_stream = None;
                 cancel_uncommitted_active_session(store, &mut active_session, "daemon-cancel")?;
                 active_session = None;
-                status_tx.set(&mut stream, tray, store, &config.history_config, false)?;
+                status_tx.set(&mut stream, tray, store, config, false)?;
             }
             IpcMessage::HistoryReinsert(message) => {
                 let response = reinsert_entry(
@@ -741,6 +819,67 @@ struct ActiveSession {
     finalized: bool,
 }
 
+/// Per-recording streaming state for pause-triggered translation: incremental
+/// resampling, frame re-chunking, frame-level VAD, and the utterance segmenter.
+/// Created on start when translation is enabled; the pump feeds it every loop
+/// tick and each finished snippet is transcribed/translated immediately.
+struct LiveStreamState {
+    /// Built lazily from the first non-empty poll, which reports the device's
+    /// real capture rate (the config value is advisory; hardware decides).
+    resampler: Option<crate::adapters::StreamingResampler>,
+    frames: FrameBuffer,
+    vad: VadAdapter,
+    segmenter: UtteranceSegmenter,
+}
+
+impl LiveStreamState {
+    fn new(vad_config: &VadConfig) -> Self {
+        Self {
+            resampler: None,
+            frames: FrameBuffer::new(),
+            vad: VadAdapter::new(),
+            segmenter: UtteranceSegmenter::new(SegmenterConfig {
+                sample_rate_hz: 16_000,
+                frame_ms: FRAME_DURATION_MS as u32,
+                min_speech_ms: vad_config.min_speech_ms,
+                pre_roll_ms: vad_config.pre_roll_ms,
+                post_roll_ms: vad_config.post_roll_ms,
+                max_utterance_ms: vad_config.max_utterance_ms,
+            }),
+        }
+    }
+
+    /// Pushes one drained capture chunk through resample → frame → VAD →
+    /// segmenter; returns the snippets (16 kHz mono samples) completed by it.
+    fn ingest(&mut self, drained: &AudioSegment) -> Vec<Vec<f32>> {
+        if drained.samples_f32_mono.is_empty() {
+            return Vec::new();
+        }
+        let resampler = self.resampler.get_or_insert_with(|| {
+            crate::adapters::StreamingResampler::new(drained.sample_rate_hz)
+        });
+        let resampled = resampler.push(&drained.samples_f32_mono);
+
+        let mut snippets = Vec::new();
+        for frame in self.frames.push(&resampled, FRAME_SAMPLE_COUNT) {
+            // A frame the detector rejects is treated as silence: losing one
+            // 30 ms verdict must never abort the whole take.
+            let is_speech = self.vad.is_speech_frame(&frame).unwrap_or(false);
+            if let Some(snippet) = self.segmenter.push_frame(&frame, is_speech) {
+                snippets.push(snippet.samples_f32_mono);
+            }
+        }
+        snippets
+    }
+
+    /// Recovers the un-paused tail utterance when recording stops.
+    fn flush(&mut self) -> Option<Vec<f32>> {
+        self.segmenter
+            .flush()
+            .map(|snippet| snippet.samples_f32_mono)
+    }
+}
+
 enum StartSessionOutcome {
     Started(ActiveSession),
     Recoverable(RuntimeAdapterError),
@@ -777,7 +916,12 @@ fn materialize_session(
     let decoded = codec
         .decode(&encoded)
         .map_err(|error| RunLoopError::codec("decode audio", error))?;
-    let draft = match crate::adapters::transcribe_audio(&config.adapter_profile, &decoded) {
+    let translation = effective_translation_config(store, &config.translation_config);
+    let draft = match crate::adapters::transcribe_translated(
+        &config.adapter_profile,
+        &translation,
+        &decoded,
+    ) {
         Ok(draft) => draft,
         Err(error) => return Ok(StartSessionOutcome::Recoverable(error)),
     };
@@ -863,7 +1007,7 @@ impl RecordingStatusTx {
         stream: &mut UnixStream,
         tray: &mut KsniTray,
         store: &SqliteMetadataStore,
-        defaults: &HistoryConfig,
+        config: &RunLoopConfig,
         recording: bool,
     ) -> Result<(), RunLoopError> {
         let state = if recording {
@@ -871,7 +1015,7 @@ impl RecordingStatusTx {
         } else {
             RecordingState::Idle
         };
-        update_tray_recording_state(tray, store, defaults, state)?;
+        update_tray_recording_state(tray, store, config, state)?;
         if self.should_push(recording) {
             send_ipc_message(
                 stream,
@@ -888,20 +1032,24 @@ impl RecordingStatusTx {
         &self,
         tray: &mut KsniTray,
         store: &SqliteMetadataStore,
-        defaults: &HistoryConfig,
+        config: &RunLoopConfig,
     ) -> Result<(), RunLoopError> {
         let state = if self.last {
             RecordingState::Recording
         } else {
             RecordingState::Idle
         };
-        update_tray_recording_state(tray, store, defaults, state)
+        update_tray_recording_state(tray, store, config, state)
     }
 }
 
 /// Begins a live microphone recording. Emits nothing on success (the transcript
 /// arrives on stop); reports an `Error` to the client if the device is
 /// unavailable. The tray switches to the recording indicator.
+///
+/// When translation is enabled (config default or tray override), the take runs
+/// in streaming mode: a [`LiveStreamState`] is armed and the pump delivers a
+/// translated snippet at every pause instead of one transcript on stop.
 #[allow(clippy::too_many_arguments)]
 fn start_live_capture(
     stream: &mut UnixStream,
@@ -910,13 +1058,18 @@ fn start_live_capture(
     config: &RunLoopConfig,
     active_session: &mut Option<ActiveSession>,
     live_capture: &mut Option<crate::adapters::RuntimeCapture>,
+    live_stream: &mut Option<LiveStreamState>,
     status_tx: &mut RecordingStatusTx,
 ) -> Result<(), RunLoopError> {
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match crate::adapters::begin_capture(&config.adapter_profile) {
         Ok(capture) => {
             *live_capture = Some(capture);
-            status_tx.set(stream, tray, store, &config.history_config, true)?;
+            let translation = effective_translation_config(store, &config.translation_config);
+            *live_stream = translation
+                .enabled
+                .then(|| LiveStreamState::new(&config.vad_config));
+            status_tx.set(stream, tray, store, config, true)?;
         }
         Err(error) => {
             send_ipc_message(
@@ -931,9 +1084,95 @@ fn start_live_capture(
     Ok(())
 }
 
+/// One pump tick of the streaming pipeline: drains whatever audio accumulated
+/// since the last tick, advances the segmenter, and transcribes/translates and
+/// delivers every snippet a pause just completed. A no-op outside streaming
+/// takes. Poll failures are logged, never fatal — one bad tick must not end a
+/// recording the user is mid-sentence in.
+#[allow(clippy::too_many_arguments)]
+fn pump_live_stream(
+    stream: &mut UnixStream,
+    store: &mut SqliteMetadataStore,
+    audio_store: &FileAudioStore,
+    codec: &OpusCodec,
+    config: &RunLoopConfig,
+    active_session: &mut Option<ActiveSession>,
+    live_capture: &mut Option<crate::adapters::RuntimeCapture>,
+    live_stream: &mut Option<LiveStreamState>,
+) -> Result<(), RunLoopError> {
+    let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
+        return Ok(());
+    };
+    let drained = match crate::adapters::poll_capture(capture) {
+        Ok(segment) => segment,
+        Err(error) => {
+            eprintln!("live stream poll failed: {error}");
+            return Ok(());
+        }
+    };
+    for snippet in state.ingest(&drained) {
+        deliver_snippet(
+            stream,
+            store,
+            audio_store,
+            codec,
+            config,
+            active_session,
+            snippet,
+        )?;
+    }
+    Ok(())
+}
+
+/// Transcribes/translates one pause-completed snippet, persists it as its own
+/// session, and pushes it to the client as a `PreeditUpdate` (carrying the
+/// review flag, so "review before insert" routes each snippet through the
+/// client's dialog exactly like a stop-time transcript). A snippet that fails
+/// to transcribe is logged and skipped — the take continues.
+fn deliver_snippet(
+    stream: &mut UnixStream,
+    store: &mut SqliteMetadataStore,
+    audio_store: &FileAudioStore,
+    codec: &OpusCodec,
+    config: &RunLoopConfig,
+    active_session: &mut Option<ActiveSession>,
+    samples_f32_mono: Vec<f32>,
+) -> Result<(), RunLoopError> {
+    let duration_ms = (samples_f32_mono.len() as u64 * 1_000 / 16_000) as u32;
+    let segment = AudioSegment {
+        sample_rate_hz: 16_000,
+        channels: 1,
+        duration_ms,
+        samples_f32_mono,
+    };
+
+    // The previous snippet is normally committed by the engine well before the
+    // next pause completes (the pause threshold dwarfs the loop tick); if it
+    // never was, close it out before it is displaced.
+    cancel_uncommitted_active_session(store, active_session, "daemon-snippet-advance")?;
+    match materialize_session(store, audio_store, codec, config, segment)? {
+        StartSessionOutcome::Started(session) => {
+            let text = session.current_text.clone();
+            let review = review_mode_enabled(store);
+            *active_session = Some(session);
+            send_ipc_message(
+                stream,
+                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review }),
+            )?;
+        }
+        StartSessionOutcome::Recoverable(error) => {
+            eprintln!("snippet transcription failed: {error}");
+        }
+    }
+    Ok(())
+}
+
 /// Stops the live recording, transcribes the captured audio, and sends the
 /// resulting preedit to the client. The tray stays in the recording state while
 /// the preedit is pending (commit/cancel returns it to idle).
+///
+/// In streaming mode the snippets were already delivered while recording; the
+/// stop only recovers the tail the user spoke after the last pause.
 #[allow(clippy::too_many_arguments)]
 fn stop_live_and_transcribe(
     stream: &mut UnixStream,
@@ -944,11 +1183,47 @@ fn stop_live_and_transcribe(
     config: &RunLoopConfig,
     active_session: &mut Option<ActiveSession>,
     live_capture: &mut Option<crate::adapters::RuntimeCapture>,
+    live_stream: &mut Option<LiveStreamState>,
     status_tx: &mut RecordingStatusTx,
 ) -> Result<(), RunLoopError> {
     let Some(capture) = live_capture.take() else {
         return Ok(());
     };
+
+    if let Some(mut state) = live_stream.take() {
+        // Streaming stop: drain the final capture chunk, flush the segmenter's
+        // tail, and deliver whatever utterances remain. The whole take was
+        // already consumed snippet by snippet — there is no batch transcription.
+        match crate::adapters::finish_capture(capture) {
+            Ok(tail) => {
+                let mut snippets = state.ingest(&tail);
+                snippets.extend(state.flush());
+                for snippet in snippets {
+                    deliver_snippet(
+                        stream,
+                        store,
+                        audio_store,
+                        codec,
+                        config,
+                        active_session,
+                        snippet,
+                    )?;
+                }
+            }
+            Err(error) => {
+                send_ipc_message(
+                    stream,
+                    &IpcMessage::Error(ErrorMessage {
+                        code: error.code().to_owned(),
+                        message: error.to_string(),
+                    }),
+                )?;
+            }
+        }
+        status_tx.set(stream, tray, store, config, false)?;
+        return Ok(());
+    }
+
     let segment = match crate::adapters::finish_capture(capture) {
         Ok(segment) => segment,
         Err(error) => {
@@ -959,7 +1234,7 @@ fn stop_live_and_transcribe(
                     message: error.to_string(),
                 }),
             )?;
-            status_tx.set(stream, tray, store, &config.history_config, false)?;
+            status_tx.set(stream, tray, store, config, false)?;
             return Ok(());
         }
     };
@@ -975,7 +1250,7 @@ fn stop_live_and_transcribe(
             )?;
             // The mic is closed once the take stops, so the authoritative state is
             // "not recording" even while the preedit is pending review/commit.
-            status_tx.set(stream, tray, store, &config.history_config, false)?;
+            status_tx.set(stream, tray, store, config, false)?;
         }
         StartSessionOutcome::Recoverable(error) => {
             send_ipc_message(
@@ -985,7 +1260,7 @@ fn stop_live_and_transcribe(
                     message: error.to_string(),
                 }),
             )?;
-            status_tx.set(stream, tray, store, &config.history_config, false)?;
+            status_tx.set(stream, tray, store, config, false)?;
         }
     }
     Ok(())
@@ -1016,7 +1291,7 @@ fn start_fixture_oneshot(
             )?;
             // A fixture one-shot captures and transcribes instantly, so the mic is
             // never held open: the authoritative state stays "not recording".
-            status_tx.set(stream, tray, store, &config.history_config, false)?;
+            status_tx.set(stream, tray, store, config, false)?;
         }
         StartSessionOutcome::Recoverable(error) => {
             send_ipc_message(
@@ -1136,6 +1411,7 @@ fn handle_tray_action(
     config: &RunLoopConfig,
     active_session: &mut Option<ActiveSession>,
     live_capture: &mut Option<crate::adapters::RuntimeCapture>,
+    live_stream: &mut Option<LiveStreamState>,
     status_tx: &mut RecordingStatusTx,
     retention_dialog: &dyn RetentionDialog,
 ) -> Result<(), RunLoopError> {
@@ -1151,6 +1427,7 @@ fn handle_tray_action(
                         config,
                         active_session,
                         live_capture,
+                        live_stream,
                         status_tx,
                     )?;
                 }
@@ -1178,15 +1455,17 @@ fn handle_tray_action(
                     config,
                     active_session,
                     live_capture,
+                    live_stream,
                     status_tx,
                 )?;
             }
         }
         "cancel" => {
             drop_live_capture(live_capture);
+            *live_stream = None;
             cancel_uncommitted_active_session(store, active_session, "tray-cancel")?;
             *active_session = None;
-            status_tx.set(stream, tray, store, &config.history_config, false)?;
+            status_tx.set(stream, tray, store, config, false)?;
         }
         // "Insert" must land where the cursor is, so it goes through the active
         // IME front-end (the connected engine on `stream`) which types it into
@@ -1200,7 +1479,7 @@ fn handle_tray_action(
             tray,
             clipboard,
             store,
-            &config.history_config,
+            config,
             retention_dialog,
         )?,
     }
@@ -1235,6 +1514,44 @@ fn set_training_retention(store: &mut SqliteMetadataStore, days: u32) -> Result<
         .map_err(|error| RunLoopError::storage("set training_retention_days", error))
 }
 
+/// Applies a `translation:*` tray activation: the enable toggle or an
+/// input/output language pick, persisted as `tray_settings` overrides. Returns
+/// whether the action was a translation action (so the caller refreshes the
+/// menu). Index parsing is total; an out-of-range index is logged and ignored.
+fn apply_translation_tray_action(
+    store: &mut SqliteMetadataStore,
+    defaults: &TranslationConfig,
+    action: &str,
+) -> Result<bool, RunLoopError> {
+    if action == "translation:enabled" {
+        let enabled = effective_translation_config(store, defaults).enabled;
+        let next = if enabled { "false" } else { "true" };
+        store
+            .set_tray_setting("translation_enabled", next)
+            .map_err(|error| RunLoopError::storage("set translation_enabled", error))?;
+        return Ok(true);
+    }
+    if let Some(index) = parse_index_suffix(action, "translation:input:") {
+        match idiolect_application::use_cases::menu::translation_input_language_for_index(index) {
+            Some(code) => store
+                .set_tray_setting("translation_input_lang", code)
+                .map_err(|error| RunLoopError::storage("set translation_input_lang", error))?,
+            None => eprintln!("tray translation input index out of range: {index}"),
+        }
+        return Ok(true);
+    }
+    if let Some(index) = parse_index_suffix(action, "translation:output:") {
+        match idiolect_application::use_cases::menu::translation_output_language_for_index(index) {
+            Some(code) => store
+                .set_tray_setting("translation_output_lang", code)
+                .map_err(|error| RunLoopError::storage("set translation_output_lang", error))?,
+            None => eprintln!("tray translation output index out of range: {index}"),
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Handles an activated tray menu item. Parsing is total — a malformed action id
 /// is logged and ignored rather than panicking the daemon.
 fn handle_tray_callback(
@@ -1242,24 +1559,30 @@ fn handle_tray_callback(
     tray: &mut KsniTray,
     clipboard: &mut ArboardClipboard,
     store: &mut SqliteMetadataStore,
-    defaults: &HistoryConfig,
+    config: &RunLoopConfig,
     retention_dialog: &dyn RetentionDialog,
 ) -> Result<(), RunLoopError> {
     let TrayCallback::Activate(action) = callback;
+    let defaults = &config.history_config;
+    let translation_defaults = &config.translation_config;
 
     if action == "review_mode" {
         let next = if review_mode_enabled(store) { "false" } else { "true" };
         store
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
-        refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?;
+        refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+    } else if apply_translation_tray_action(store, translation_defaults, &action)? {
+        refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
     } else if let Some(id) = parse_id_suffix(&action, "insert:") {
         let _ = reinsert_entry(store, clipboard, id, defaults.clipboard_auto_clear_secs)?;
     } else if let Some(id) = parse_id_suffix(&action, "copy:") {
         let _ = copy_entry(store, clipboard, id, defaults.clipboard_auto_clear_secs)?;
     } else if let Some(id) = parse_id_suffix(&action, "delete:") {
         match store.delete_history_entry(id) {
-            Ok(()) => refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?,
+            Ok(()) => {
+                refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+            }
             Err(error) => eprintln!("tray delete of entry {id} failed: {error}"),
         }
     } else if let Some(index) = parse_index_suffix(&action, "settings:retention:") {
@@ -1267,7 +1590,7 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("retention_days", &days.to_string())
                 .map_err(|error| RunLoopError::storage("set retention_days", error))?;
-            refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?;
+            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
         } else {
             eprintln!("tray retention index out of range: {index}");
         }
@@ -1276,7 +1599,7 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("max_entries", &max.to_string())
                 .map_err(|error| RunLoopError::storage("set max_entries", error))?;
-            refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?;
+            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
         } else {
             eprintln!("tray max_entries index out of range: {index}");
         }
@@ -1288,7 +1611,13 @@ fn handle_tray_callback(
             match validate_training_retention_days(days) {
                 Ok(()) => {
                     set_training_retention(store, days)?;
-                    refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?;
+                    refresh_tray_menu(
+                        tray,
+                        store,
+                        defaults,
+                        translation_defaults,
+                        RecordingState::Idle,
+                    )?;
                 }
                 Err(error) => eprintln!("custom training retention rejected: {error}"),
             }
@@ -1297,7 +1626,7 @@ fn handle_tray_callback(
         // A preset; the appended "(custom)" marker has no preset and is a no-op.
         if let Some((_, days)) = TRAINING_RETENTION_CHOICES.get(index) {
             set_training_retention(store, *days)?;
-            refresh_tray_menu(tray, store, defaults, RecordingState::Idle)?;
+            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
         }
     } else {
         // start_recording / stop_recording / cancel originate from the IME client
@@ -1319,10 +1648,16 @@ fn parse_index_suffix(action: &str, prefix: &str) -> Option<usize> {
 fn update_tray_recording_state(
     tray: &mut KsniTray,
     store: &SqliteMetadataStore,
-    defaults: &HistoryConfig,
+    config: &RunLoopConfig,
     state: RecordingState,
 ) -> Result<(), RunLoopError> {
-    refresh_tray_menu(tray, store, defaults, state)?;
+    refresh_tray_menu(
+        tray,
+        store,
+        &config.history_config,
+        &config.translation_config,
+        state,
+    )?;
     let recording = matches!(state, RecordingState::Recording);
     tray.set_icon(if recording {
         TrayIcon::Recording
@@ -1537,6 +1872,193 @@ mod tests {
             prune_training_data_once(&db, &audio, &decoded, 0);
 
             let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    mod live_stream_state {
+        use idiolect_common::config::VadConfig;
+        use idiolect_test_support::fixtures::speech_pause_speech_fixture_16khz_mono;
+
+        use crate::run_loop::LiveStreamState;
+
+        // The streaming pipeline glue (resample → frame → VAD → segmenter) on
+        // the canned speech–pause–speech clip: exactly two utterances, both
+        // completed by their pauses (no flush needed).
+        #[test]
+        fn speech_pause_speech_yields_two_snippets() {
+            let mut state = LiveStreamState::new(&VadConfig::default());
+            let clip = speech_pause_speech_fixture_16khz_mono();
+
+            let snippets = state.ingest(&clip);
+
+            assert_eq!(snippets.len(), 2, "one snippet per pause");
+            for snippet in &snippets {
+                // Each snippet must carry at least the spoken clip (~1s).
+                assert!(snippet.len() > 16_000 / 2, "snippet too short: {}", snippet.len());
+            }
+            assert!(state.flush().is_none(), "no tail after the final pause");
+        }
+
+        // Ragged chunk delivery (like real 150 ms polls) must produce the same
+        // outcome as one big drain.
+        #[test]
+        fn chunked_ingest_matches_one_shot() {
+            let mut state = LiveStreamState::new(&VadConfig::default());
+            let clip = speech_pause_speech_fixture_16khz_mono();
+
+            let mut snippets = Vec::new();
+            for chunk in clip.samples_f32_mono.chunks(2_400) {
+                let segment = idiolect_ports::audio::AudioSegment {
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    duration_ms: (chunk.len() / 16) as u32,
+                    samples_f32_mono: chunk.to_vec(),
+                };
+                snippets.extend(state.ingest(&segment));
+            }
+
+            assert_eq!(snippets.len(), 2);
+        }
+    }
+
+    mod translation_tray_actions {
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_common::config::TranslationConfig;
+        use idiolect_common::languages::LANGUAGES;
+
+        use crate::run_loop::{apply_translation_tray_action, effective_translation_config};
+
+        fn store() -> SqliteMetadataStore {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+        }
+
+        // The tray click itself goes through a StatusNotifier host (a GUI
+        // boundary with no headless seam); this is the action logic it drives.
+        #[test]
+        fn toggle_flips_and_persists_translation_enabled() {
+            let mut store = store();
+            let defaults = TranslationConfig::default(); // disabled
+
+            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
+                .expect("toggle"));
+            assert!(effective_translation_config(&store, &defaults).enabled);
+
+            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
+                .expect("toggle"));
+            assert!(!effective_translation_config(&store, &defaults).enabled);
+        }
+
+        #[test]
+        fn language_picks_map_indices_to_codes() {
+            let mut store = store();
+            let defaults = TranslationConfig::default();
+
+            // Input index 0 is "Auto detect"; the rest follow the catalogue.
+            let swedish = LANGUAGES.iter().position(|(code, _)| *code == "sv").expect("sv");
+            assert!(apply_translation_tray_action(
+                &mut store,
+                &defaults,
+                &format!("translation:input:{}", swedish + 1),
+            )
+            .expect("input pick"));
+            let japanese = LANGUAGES.iter().position(|(code, _)| *code == "ja").expect("ja");
+            assert!(apply_translation_tray_action(
+                &mut store,
+                &defaults,
+                &format!("translation:output:{japanese}"),
+            )
+            .expect("output pick"));
+
+            let effective = effective_translation_config(&store, &defaults);
+            assert_eq!(effective.input_language, "sv");
+            assert_eq!(effective.output_language, "ja");
+
+            // Back to auto-detect via index 0.
+            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:input:0")
+                .expect("auto pick"));
+            assert_eq!(
+                effective_translation_config(&store, &defaults).input_language,
+                "auto"
+            );
+        }
+
+        #[test]
+        fn out_of_range_and_foreign_actions_are_safe() {
+            let mut store = store();
+            let defaults = TranslationConfig::default();
+
+            // Out-of-range indices are consumed (they ARE translation actions)
+            // but change nothing.
+            let oob = format!("translation:output:{}", LANGUAGES.len());
+            assert!(apply_translation_tray_action(&mut store, &defaults, &oob).expect("oob"));
+            assert_eq!(
+                effective_translation_config(&store, &defaults).output_language,
+                "en"
+            );
+
+            // Non-translation actions are left for the other handlers.
+            assert!(!apply_translation_tray_action(&mut store, &defaults, "review_mode")
+                .expect("foreign"));
+            assert!(!apply_translation_tray_action(&mut store, &defaults, "delete:3")
+                .expect("foreign"));
+        }
+    }
+
+    mod translation_settings {
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_common::config::TranslationConfig;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::effective_translation_config;
+
+        // Mirrors the history-config layering: the config file provides defaults,
+        // and per-setting tray overrides persisted in `tray_settings` win at
+        // runtime. The tray click itself is a GUI boundary; this is the logic it
+        // drives.
+        #[test]
+        fn tray_overrides_layer_over_config_defaults() {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let defaults = TranslationConfig {
+                enabled: false,
+                input_language: "auto".to_owned(),
+                output_language: "en".to_owned(),
+                command: "/usr/bin/my-translator".to_owned(),
+            };
+
+            // No overrides → exactly the defaults.
+            let effective = effective_translation_config(&store, &defaults);
+            assert_eq!(effective, defaults);
+
+            // The user flips translation on and picks Swedish → Japanese in the tray.
+            store.set_tray_setting("translation_enabled", "true").expect("set");
+            store.set_tray_setting("translation_input_lang", "sv").expect("set");
+            store.set_tray_setting("translation_output_lang", "ja").expect("set");
+
+            let effective = effective_translation_config(&store, &defaults);
+            assert!(effective.enabled);
+            assert_eq!(effective.input_language, "sv");
+            assert_eq!(effective.output_language, "ja");
+            // The command is config-file-only (a path, not a menu choice).
+            assert_eq!(effective.command, "/usr/bin/my-translator");
+        }
+
+        #[test]
+        fn corrupt_overrides_fall_back_to_defaults() {
+            // A hand-edited or stale setting must never poison the pipeline with
+            // an unknown language code.
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let defaults = TranslationConfig::default();
+
+            store.set_tray_setting("translation_input_lang", "klingon").expect("set");
+            store.set_tray_setting("translation_output_lang", "auto").expect("set");
+
+            let effective = effective_translation_config(&store, &defaults);
+            assert_eq!(effective.input_language, "auto", "unknown input -> default");
+            assert_eq!(effective.output_language, "en", "auto is invalid as output -> default");
         }
     }
 

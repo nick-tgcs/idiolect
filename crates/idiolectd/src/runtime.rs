@@ -274,6 +274,8 @@ fn run_daemon_with_tray(
             asr_threads: config.asr.threads,
         },
         history_config: config.history.clone(),
+        translation_config: config.translation.clone(),
+        vad_config: config.vad.clone(),
     })
 }
 

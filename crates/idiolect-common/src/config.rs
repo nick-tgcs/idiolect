@@ -26,6 +26,8 @@ pub struct IdiolectConfig {
     #[serde(default)]
     pub history: HistoryConfig,
     #[serde(default)]
+    pub translation: TranslationConfig,
+    #[serde(default)]
     pub observability: ObservabilityConfig,
 }
 
@@ -118,6 +120,8 @@ impl IdiolectConfig {
                 field: "history.training_retention_days".to_owned(),
             });
         }
+
+        self.translation.validate()?;
 
         Ok(())
     }
@@ -340,6 +344,60 @@ impl HistoryConfig {
     }
 }
 
+/// Pause-triggered live translation: when enabled, each VAD-detected speech
+/// snippet is translated from `input_language` to `output_language` as the user
+/// pauses, instead of plain same-language dictation. These are the config-file
+/// defaults; per-setting tray overrides persisted in `tray_settings` take
+/// precedence at runtime (same layering as [`HistoryConfig`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TranslationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Source language code, or `"auto"` to let the ASR engine detect it.
+    #[serde(default = "default_translation_input_language")]
+    pub input_language: String,
+    /// Target language code. Must be a concrete language (never `"auto"`).
+    /// `"en"` runs on Whisper's built-in translate task with no extra tooling;
+    /// any other target needs `command`.
+    #[serde(default = "default_translation_output_language")]
+    pub output_language: String,
+    /// External translator invoked as `<command> <input_lang> <output_lang>`
+    /// with the source text on stdin and the translation expected on stdout
+    /// (exit 0). Empty means "not configured": targets other than English are
+    /// then rejected at runtime with a clear error.
+    #[serde(default)]
+    pub command: String,
+}
+
+impl Default for TranslationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            input_language: default_translation_input_language(),
+            output_language: default_translation_output_language(),
+            command: String::new(),
+        }
+    }
+}
+
+impl TranslationConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.input_language != "auto"
+            && !crate::languages::is_supported_language(&self.input_language)
+        {
+            return Err(ConfigError::ValidationError {
+                field: "translation.input_language".to_owned(),
+            });
+        }
+        if !crate::languages::is_supported_language(&self.output_language) {
+            return Err(ConfigError::ValidationError {
+                field: "translation.output_language".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ObservabilityConfig {
     #[serde(default)]
@@ -550,6 +608,14 @@ pub const MAX_TRAINING_RETENTION_DAYS: u32 = 36_500;
 
 fn default_history_max_entries() -> u32 {
     10
+}
+
+fn default_translation_input_language() -> String {
+    "auto".to_owned()
+}
+
+fn default_translation_output_language() -> String {
+    "en".to_owned()
 }
 
 fn default_history_clipboard_auto_clear_secs() -> u64 {

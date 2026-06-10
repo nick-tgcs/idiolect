@@ -20,6 +20,7 @@ idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
 idiolect-adapter-ksni = { path = "../idiolect-adapters/desktop/ksni" }
 idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-adapter-translate = { path = "../idiolect-adapter-translate" }
 idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }
 idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
 idiolect-application = { path = "../idiolect-application" }

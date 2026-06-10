@@ -13,6 +13,7 @@ members = [
     "crates/idiolect-adapter-fixture-codec",
     "crates/idiolect-adapter-cpal",
     "crates/idiolect-adapter-opus",
+    "crates/idiolect-adapter-translate",
     "crates/idiolect-adapter-vad",
     "crates/idiolect-adapter-whisper",
     "crates/idiolect-trainerctl",

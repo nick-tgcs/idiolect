@@ -825,6 +825,7 @@ fn tray_menu(args: &[String]) -> Result<String, CliError> {
         idiolect_application::use_cases::menu::RecordingState::Idle,
         &entries,
         &history_config,
+        &idiolect_common::config::TranslationConfig::default(),
     );
     
     if flags.json {

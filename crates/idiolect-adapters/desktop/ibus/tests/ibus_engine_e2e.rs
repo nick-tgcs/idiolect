@@ -9,10 +9,14 @@
 //!   `#[ignore]`, no `dbus-run-session`) that runs in the standard flow with
 //!   `cargo test -p idiolect-ibus --features ibus-engine`.
 //! - `engine_dictates_and_daemon_records_the_session` additionally spawns the real
-//!   daemon with its KSNI tray, which a bare private bus cannot host, so it needs
-//!   an **ambient desktop** session bus and stays an `#[ignore]` manual test (run
-//!   it with `-- --ignored engine_dictates`). It proves the full dictation +
-//!   correction → training-candidate chain.
+//!   daemon (whose KSNI tray needs a session bus to attempt registration — it
+//!   degrades gracefully when no StatusNotifier host answers), so it needs an
+//!   **ambient session bus** and stays an `#[ignore]` manual test (run it with
+//!   `-- --ignored engine_dictates`). It drives the live toggle path: the
+//!   `fixture-live` device holds the "mic" open between two Super+T presses, so
+//!   the daemon pushes `recording=true` before delivering the transcript —
+//!   exactly the contract the engine's no-optimistic-flip state machine relies
+//!   on. It proves the full dictation + correction → training-candidate chain.
 //!
 //! CI runs the self-contained one via `ci/scripts/test-ibus-e2e.sh` (the `e2e` job).
 #![cfg(feature = "ibus-engine")]
@@ -43,7 +47,7 @@ const DRAFT: &str = "restart traffic";
 const CORRECTED: &str = "restart Traefik";
 
 #[tokio::test]
-#[ignore = "needs an ambient desktop session bus + the engine feature"]
+#[ignore = "needs an ambient session bus + the engine feature"]
 async fn engine_dictates_and_daemon_records_the_session() {
     let fixture = Fixture::new("e2e");
     let daemon = fixture.spawn_daemon();
@@ -69,8 +73,14 @@ async fn engine_dictates_and_daemon_records_the_session() {
         .await
         .expect("subscribe CommitText");
 
-    // Super+T -> the (fixture) daemon transcribes DRAFT, and the engine commits
-    // it straight into the focused app — no preedit, no Enter.
+    // Super+T -> the daemon opens the fixture-live "mic" and pushes
+    // recording=true (the engine never flips its phase optimistically, so this
+    // push is what arms it to accept the transcript).
+    process_key(&engine_proxy, KEY_T, MOD4).await;
+    // Super+T again -> the daemon stops the take, transcribes the deterministic
+    // clip to DRAFT, and delivers it; the engine commits it straight into the
+    // focused app — no preedit, no Enter. (The socket orders recording=true
+    // before the transcript, so there is no race to wait out.)
     process_key(&engine_proxy, KEY_T, MOD4).await;
     let committed = {
         let msg = next_signal(&mut commit_signals).await;
@@ -317,7 +327,11 @@ default_user_id = "default"
 socket_path = "{socket}"
 log_level = "info"
 [audio]
-input_device = "fixture"
+# Live-lifecycle fixture: holds the "mic" open between toggles so the daemon
+# pushes recording=true, then yields the deterministic clip on stop. The plain
+# "fixture" device transcribes instantly without ever announcing recording —
+# the engine (correctly) ignores such an unannounced transcript.
+input_device = "fixture-live"
 capture_sample_rate = 16000
 processing_sample_rate = 16000
 channels = 1

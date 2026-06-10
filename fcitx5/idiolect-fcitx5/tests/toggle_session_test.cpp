@@ -56,9 +56,13 @@ int main() {
         engine.toggle(); // stop intent — still no optimistic flip
         require(engine.state() == RecordingState::Recording);
 
+        // The transcript commits, but the phase is the daemon's to end: only its
+        // recording=false push (which always follows the stop-time transcript)
+        // returns the engine to Idle. Forcing Idle here was the streaming bug —
+        // it made the engine drop every pause-snippet after the first.
         engine.on_transcript("restart traffic"); // daemon: transcript
-        require(engine.state() == RecordingState::Idle);
-        engine.on_recording_status(false); // daemon: mic closed (no-op now)
+        require(engine.state() == RecordingState::Recording);
+        engine.on_recording_status(false); // daemon: mic closed
         require(engine.state() == RecordingState::Idle);
 
         require(committer.committed.size() == 1);
@@ -68,6 +72,35 @@ int main() {
         require(ipc.messages[0] == "toggle_recording");
         require(ipc.messages[1] == "toggle_recording");
         require(ipc.messages[2] == "commit:restart traffic");
+    }
+
+    // Streaming (pause-triggered translation): the daemon delivers one
+    // transcript per pause while the mic stays open. Every snippet must commit,
+    // and the phase stays Recording throughout the take.
+    {
+        FakeIpcClient ipc;
+        FakeCommitter committer;
+        Engine engine(ipc, committer);
+
+        engine.toggle();
+        engine.on_recording_status(true);
+
+        engine.on_transcript("first snippet");
+        require(engine.state() == RecordingState::Recording);
+        engine.on_transcript("second snippet");
+        require(engine.state() == RecordingState::Recording);
+
+        engine.toggle(); // stop intent
+        engine.on_recording_status(false);
+        require(engine.state() == RecordingState::Idle);
+
+        require(committer.committed.size() == 2);
+        require(committer.committed[0] == "first snippet");
+        require(committer.committed[1] == "second snippet");
+        require(ipc.messages.size() == 4);
+        require(ipc.messages[1] == "commit:first snippet");
+        require(ipc.messages[2] == "commit:second snippet");
+        require(ipc.messages[3] == "toggle_recording");
     }
 
     // RecordingStatus is the single source of truth for the phase.

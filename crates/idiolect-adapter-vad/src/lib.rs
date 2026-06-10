@@ -8,8 +8,10 @@ use webrtc_vad::{SampleRate, Vad, VadMode};
 
 const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
 const TARGET_CHANNELS: u16 = 1;
-const FRAME_DURATION_MS: usize = 30;
-const FRAME_SAMPLE_COUNT: usize = (TARGET_SAMPLE_RATE_HZ as usize * FRAME_DURATION_MS) / 1_000;
+/// Frame size the detector operates on; streaming callers must push frames of
+/// exactly [`FRAME_SAMPLE_COUNT`] samples.
+pub const FRAME_DURATION_MS: usize = 30;
+pub const FRAME_SAMPLE_COUNT: usize = (TARGET_SAMPLE_RATE_HZ as usize * FRAME_DURATION_MS) / 1_000;
 const MAX_MERGE_GAP_MS: usize = 300;
 const MAX_MERGE_GAP_FRAMES: usize = MAX_MERGE_GAP_MS / FRAME_DURATION_MS;
 
@@ -60,6 +62,22 @@ impl VadAdapter {
 impl Default for VadAdapter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl VadAdapter {
+    /// Labels one live frame (exactly [`FRAME_SAMPLE_COUNT`] 16 kHz mono
+    /// samples) as speech or silence. The incremental seam for pause-triggered
+    /// segmentation: unlike [`VadPort::segment`], the detector keeps its state
+    /// across calls so it can be fed a stream frame by frame.
+    pub fn is_speech_frame(&mut self, frame: &[f32]) -> Result<bool, VadAdapterError> {
+        if frame.len() != FRAME_SAMPLE_COUNT {
+            return Err(VadAdapterError::BackendFrameRejected);
+        }
+        let samples = samples_to_i16(frame);
+        self.detector
+            .is_voice_segment(&samples)
+            .map_err(|()| VadAdapterError::BackendFrameRejected)
     }
 }
 
@@ -229,5 +247,39 @@ mod tests {
     #[test]
     fn crate_name_is_available() {
         assert!(!super::crate_name().is_empty());
+    }
+
+    mod frame_vad {
+        use super::super::{VadAdapter, VadAdapterError, FRAME_SAMPLE_COUNT};
+        use idiolect_test_support::fixtures::speech_and_silence_fixture_16khz_mono;
+
+        // The streaming pump labels live 30 ms frames one at a time; this is the
+        // incremental seam the batch `segment()` cannot provide.
+        #[test]
+        fn labels_silence_and_speech_frames_in_the_fixture() {
+            let mut adapter = VadAdapter::new();
+            let fixture = speech_and_silence_fixture_16khz_mono();
+            let frames: Vec<&[f32]> = fixture
+                .samples_f32_mono
+                .chunks_exact(FRAME_SAMPLE_COUNT)
+                .collect();
+
+            let labels: Vec<bool> = frames
+                .iter()
+                .map(|frame| adapter.is_speech_frame(frame).expect("frame should label"))
+                .collect();
+
+            // The fixture is 250 ms silence + speech + 250 ms silence: the very
+            // first frame is silent and at least one mid-clip frame is speech.
+            assert!(!labels[0], "leading silence must label false");
+            assert!(labels.iter().any(|&label| label), "speech must label true");
+        }
+
+        #[test]
+        fn rejects_a_wrongly_sized_frame() {
+            let mut adapter = VadAdapter::new();
+            let result = adapter.is_speech_frame(&vec![0.0; FRAME_SAMPLE_COUNT - 1]);
+            assert_eq!(result, Err(VadAdapterError::BackendFrameRejected));
+        }
     }
 }

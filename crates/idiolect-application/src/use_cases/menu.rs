@@ -1,4 +1,5 @@
-use idiolect_common::config::HistoryConfig;
+use idiolect_common::config::{HistoryConfig, TranslationConfig};
+use idiolect_common::languages::LANGUAGES;
 use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayMenuItem, TrayMenuItemKind};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -99,6 +100,51 @@ fn training_retention_radio(current_days: u32) -> (Vec<String>, usize) {
             (options, selected)
         }
     }
+}
+
+/// Maps a `translation:input:N` menu index back to a language code: index 0 is
+/// the "Auto detect" entry, the rest follow the catalogue order.
+#[must_use]
+pub fn translation_input_language_for_index(index: usize) -> Option<&'static str> {
+    if index == 0 {
+        return Some("auto");
+    }
+    LANGUAGES.get(index - 1).map(|(code, _)| *code)
+}
+
+/// Maps a `translation:output:N` menu index back to a language code. Outputs
+/// have no auto-detect entry — the target must be a concrete language.
+#[must_use]
+pub fn translation_output_language_for_index(index: usize) -> Option<&'static str> {
+    LANGUAGES.get(index).map(|(code, _)| *code)
+}
+
+/// The "Speak in" radio options plus the selected index for the current code.
+/// An unknown stored code falls back to "Auto detect" rather than panicking.
+fn translation_input_radio(current: &str) -> (Vec<String>, usize) {
+    let mut options = Vec::with_capacity(LANGUAGES.len() + 1);
+    options.push("Auto detect".to_owned());
+    options.extend(LANGUAGES.iter().map(|(_, name)| (*name).to_owned()));
+    let selected = if current == "auto" {
+        0
+    } else {
+        LANGUAGES
+            .iter()
+            .position(|(code, _)| *code == current)
+            .map_or(0, |position| position + 1)
+    };
+    (options, selected)
+}
+
+/// The "Translate to" radio options plus the selected index. An unknown stored
+/// code falls back to English (the engine-internal translation target).
+fn translation_output_radio(current: &str) -> (Vec<String>, usize) {
+    let options: Vec<String> = LANGUAGES.iter().map(|(_, name)| (*name).to_owned()).collect();
+    let selected = LANGUAGES
+        .iter()
+        .position(|(code, _)| *code == current)
+        .unwrap_or(0);
+    (options, selected)
 }
 
 const REDACTED: &str = "[redacted]";
@@ -212,6 +258,7 @@ impl MenuUseCase {
         recording_state: RecordingState,
         history: &[HistoryEntry],
         config: &HistoryConfig,
+        translation: &TranslationConfig,
     ) -> Vec<TrayMenuItem> {
         let mut items = Vec::new();
 
@@ -314,6 +361,48 @@ impl MenuUseCase {
             enabled: !history_items.is_empty(),
             kind: TrayMenuItemKind::Standard {
                 submenu: Some(history_items),
+            },
+        });
+
+        // Translation: the toggle plus "any language in, any language out"
+        // pickers (the full Whisper catalogue, auto-detect on the input side).
+        let (input_options, input_selected) =
+            translation_input_radio(&translation.input_language);
+        let (output_options, output_selected) =
+            translation_output_radio(&translation.output_language);
+        items.push(TrayMenuItem {
+            id: "translation".to_owned(),
+            label: "Translation".to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::Standard {
+                submenu: Some(vec![
+                    TrayMenuItem {
+                        id: "translation:enabled".to_owned(),
+                        label: "Translate while dictating".to_owned(),
+                        enabled: true,
+                        kind: TrayMenuItemKind::Checkable {
+                            checked: translation.enabled,
+                        },
+                    },
+                    TrayMenuItem {
+                        id: "translation:input".to_owned(),
+                        label: "Speak in".to_owned(),
+                        enabled: true,
+                        kind: TrayMenuItemKind::RadioGroup {
+                            options: input_options,
+                            selected: input_selected,
+                        },
+                    },
+                    TrayMenuItem {
+                        id: "translation:output".to_owned(),
+                        label: "Translate to".to_owned(),
+                        enabled: true,
+                        kind: TrayMenuItemKind::RadioGroup {
+                            options: output_options,
+                            selected: output_selected,
+                        },
+                    },
+                ]),
             },
         });
 
@@ -482,7 +571,7 @@ mod tests {
         // labels themselves must convey what Stop vs Cancel do: Stop transcribes and
         // inserts the text; Cancel throws the audio away.
         let config = HistoryConfig::default();
-        let menu = MenuUseCase::new().get_menu(RecordingState::Recording, &[], &config);
+        let menu = MenuUseCase::new().get_menu(RecordingState::Recording, &[], &config, &Default::default());
 
         assert_eq!(child(&menu, "start_recording").label, "Start Recording");
         assert_eq!(child(&menu, "stop_recording").label, "Stop & Insert");
@@ -497,7 +586,7 @@ mod tests {
             ..HistoryConfig::default()
         };
         let history = vec![entry(1, "hello world", HistoryState::Committed)];
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &config);
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &config, &Default::default());
 
         let settings = submenu(child(&menu, "settings"));
         // Tray-history retention now lives under the "Tray history" group.
@@ -514,7 +603,7 @@ mod tests {
             training_retention_days: 365, // "1 year" -> index 4
             ..HistoryConfig::default()
         };
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config);
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config, &Default::default());
 
         let settings = submenu(child(&menu, "settings"));
         let training = submenu(child(settings, "settings:training_data"));
@@ -531,7 +620,7 @@ mod tests {
             training_retention_days: 540, // not a preset
             ..HistoryConfig::default()
         };
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config);
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config, &Default::default());
 
         let settings = submenu(child(&menu, "settings"));
         let training = submenu(child(settings, "settings:training_data"));
@@ -547,6 +636,91 @@ mod tests {
         assert!(validate_training_retention_days(3650).is_ok()); // preset
         assert!(validate_training_retention_days(36_500).is_ok()); // cap
         assert!(validate_training_retention_days(36_501).is_err());
+    }
+
+    mod translation_menu {
+        use super::super::{
+            translation_input_language_for_index, translation_output_language_for_index,
+            MenuUseCase, RecordingState,
+        };
+        use super::{child, radio_selected, submenu};
+        use idiolect_common::config::{HistoryConfig, TranslationConfig};
+        use idiolect_common::languages::LANGUAGES;
+        use idiolect_ports::storage::TrayMenuItemKind;
+
+        fn menu_with(translation: &TranslationConfig) -> Vec<idiolect_ports::storage::TrayMenuItem> {
+            MenuUseCase::new().get_menu(
+                RecordingState::Idle,
+                &[],
+                &HistoryConfig::default(),
+                translation,
+            )
+        }
+
+        #[test]
+        fn translation_submenu_offers_toggle_and_every_language_both_ways() {
+            let translation = TranslationConfig {
+                enabled: true,
+                input_language: "sv".to_owned(),
+                output_language: "ja".to_owned(),
+                command: String::new(),
+            };
+            let menu = menu_with(&translation);
+
+            let root = submenu(child(&menu, "translation"));
+            match &child(root, "translation:enabled").kind {
+                TrayMenuItemKind::Checkable { checked } => assert!(*checked),
+                other => panic!("toggle should be checkable, got {other:?}"),
+            }
+
+            // Input: "Auto detect" plus the full catalogue ("any" language in).
+            let (input_selected, input_options) = radio_selected(child(root, "translation:input"));
+            assert_eq!(input_options.len(), LANGUAGES.len() + 1);
+            assert_eq!(input_options[0], "Auto detect");
+            assert_eq!(input_options[input_selected], "Swedish");
+
+            // Output: the full catalogue ("any" language out; no auto).
+            let (output_selected, output_options) =
+                radio_selected(child(root, "translation:output"));
+            assert_eq!(output_options.len(), LANGUAGES.len());
+            assert_eq!(output_options[output_selected], "Japanese");
+        }
+
+        #[test]
+        fn toggle_renders_unchecked_and_auto_selected_by_default() {
+            let menu = menu_with(&TranslationConfig::default());
+            let root = submenu(child(&menu, "translation"));
+            match &child(root, "translation:enabled").kind {
+                TrayMenuItemKind::Checkable { checked } => assert!(!*checked),
+                other => panic!("toggle should be checkable, got {other:?}"),
+            }
+            let (input_selected, _) = radio_selected(child(root, "translation:input"));
+            assert_eq!(input_selected, 0, "auto-detect by default");
+            let (output_selected, output_options) =
+                radio_selected(child(root, "translation:output"));
+            assert_eq!(output_options[output_selected], "English");
+        }
+
+        #[test]
+        fn menu_indices_map_back_to_language_codes() {
+            // The activation callback resolves "translation:input:N" /
+            // "translation:output:N" through these helpers — they must mirror
+            // the option order exactly.
+            assert_eq!(translation_input_language_for_index(0), Some("auto"));
+            assert_eq!(translation_input_language_for_index(1), Some(LANGUAGES[0].0));
+            assert_eq!(
+                translation_input_language_for_index(LANGUAGES.len()),
+                Some(LANGUAGES[LANGUAGES.len() - 1].0)
+            );
+            assert_eq!(translation_input_language_for_index(LANGUAGES.len() + 1), None);
+
+            assert_eq!(translation_output_language_for_index(0), Some(LANGUAGES[0].0));
+            assert_eq!(
+                translation_output_language_for_index(LANGUAGES.len() - 1),
+                Some(LANGUAGES[LANGUAGES.len() - 1].0)
+            );
+            assert_eq!(translation_output_language_for_index(LANGUAGES.len()), None);
+        }
     }
 
     #[test]
@@ -575,7 +749,7 @@ mod tests {
     fn cancelled_entries_render_as_cancelled_label() {
         let config = HistoryConfig::default();
         let history = vec![entry(1, "", HistoryState::Cancelled)];
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &config);
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &config, &Default::default());
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")

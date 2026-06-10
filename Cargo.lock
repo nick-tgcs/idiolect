@@ -2503,6 +2503,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "idiolect-adapter-translate"
+version = "0.1.0"
+dependencies = [
+ "idiolect-ports",
+ "thiserror 1.0.61",
+]
+
+[[package]]
 name = "idiolect-adapter-vad"
 version = "0.1.0"
 dependencies = [
@@ -2683,6 +2691,7 @@ dependencies = [
  "idiolect-adapter-ksni",
  "idiolect-adapter-opus",
  "idiolect-adapter-sqlite",
+ "idiolect-adapter-translate",
  "idiolect-adapter-vad",
  "idiolect-adapter-whisper",
  "idiolect-application",

@@ -597,6 +597,23 @@ max_entries             = 10    # one of 10, 25, 50
 clipboard_auto_clear_secs = 30  # 0 disables
 encrypt_at_rest         = false
 
+[translation]
+# Pause-triggered live translation: when enabled, each VAD-detected pause emits
+# the snippet spoken since the previous pause, transcribed and translated
+# immediately (instead of one transcript when recording stops). The tray's
+# "Translation" menu toggles this and picks the language pair at runtime
+# (persisted overrides; this section provides the defaults).
+enabled         = false
+input_language  = "auto"   # any Whisper language code, or "auto" to detect
+output_language = "en"     # any Whisper language code (never "auto")
+# External translator for non-English targets, invoked as:
+#   <command> <input_language> <output_language>
+# with the source text on stdin and the translation expected on stdout (exit 0).
+# Empty (the default) means only "en" works as the target, served by Whisper's
+# built-in translate task (requires a multilingual model, e.g. "whisper-medium",
+# not an "-en" English-only one).
+command = ""
+
 [observability]
 # all private-text logging flags must stay false (validation rejects true)
 log_raw_transcripts       = false

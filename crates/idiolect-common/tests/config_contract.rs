@@ -41,6 +41,12 @@ auto_train = false
 
 [privacy]
 
+[translation]
+enabled = false
+input_language = "auto"
+output_language = "en"
+command = ""
+
 [observability]
 log_raw_transcripts = false
 log_corrected_transcripts = false
@@ -86,6 +92,80 @@ fn config_defaults_match_master_plan() {
     assert!(!config.observability.log_raw_transcripts);
     assert!(!config.observability.log_corrected_transcripts);
     assert!(!config.observability.log_surrounding_app_text);
+
+    assert!(!config.translation.enabled);
+    assert_eq!(config.translation.input_language, "auto");
+    assert_eq!(config.translation.output_language, "en");
+    assert_eq!(config.translation.command, "");
+}
+
+#[test]
+fn translation_section_defaults_when_omitted() {
+    // A config without `[translation]` (every pre-translation install) must keep
+    // parsing, with translation off and an any-language-to-English default.
+    let config = IdiolectConfig::from_toml_str("[user]\ndefault_user_id = \"default\"\n")
+        .expect("minimal config must parse");
+    assert!(!config.translation.enabled);
+    assert_eq!(config.translation.input_language, "auto");
+    assert_eq!(config.translation.output_language, "en");
+    assert_eq!(config.translation.command, "");
+}
+
+#[test]
+fn translation_accepts_any_known_language_pair() {
+    let mut config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
+    config.translation.enabled = true;
+
+    // "Any language" means the whole Whisper set, in either direction, plus
+    // auto-detection on input only.
+    for (input, output) in [("auto", "en"), ("sv", "en"), ("en", "ja"), ("de", "fr")] {
+        config.translation.input_language = input.to_owned();
+        config.translation.output_language = output.to_owned();
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{input} -> {output} should validate: {e}"));
+    }
+}
+
+#[test]
+fn translation_rejects_unknown_languages_and_auto_output() {
+    let mut config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
+    config.translation.enabled = true;
+
+    config.translation.input_language = "klingon".to_owned();
+    config.translation.output_language = "en".to_owned();
+    let error = config.validate().expect_err("unknown input language must be rejected");
+    assert!(format!("{error}").contains("translation.input_language"));
+
+    config.translation.input_language = "auto".to_owned();
+    config.translation.output_language = "klingon".to_owned();
+    let error = config.validate().expect_err("unknown output language must be rejected");
+    assert!(format!("{error}").contains("translation.output_language"));
+
+    // "auto" only makes sense as an input: the output must be a concrete language.
+    config.translation.output_language = "auto".to_owned();
+    let error = config.validate().expect_err("auto output must be rejected");
+    assert!(format!("{error}").contains("translation.output_language"));
+}
+
+#[test]
+fn language_catalogue_covers_the_whisper_set_with_display_names() {
+    use idiolect_common::languages::{is_supported_language, language_name, LANGUAGES};
+
+    // The catalogue is what both config validation and the tray menus offer, so
+    // it must cover the full Whisper language set ("any language").
+    assert!(LANGUAGES.len() >= 99, "expected the full Whisper set, got {}", LANGUAGES.len());
+    for (code, name) in LANGUAGES {
+        assert!(!code.is_empty() && !name.is_empty());
+        assert!(is_supported_language(code), "{code} should be supported");
+    }
+    assert_eq!(language_name("en"), Some("English"));
+    assert_eq!(language_name("sv"), Some("Swedish"));
+    assert_eq!(language_name("ja"), Some("Japanese"));
+    assert_eq!(language_name("klingon"), None);
+    assert!(!is_supported_language("auto"), "auto is a hint, not a language");
 }
 
 #[test]

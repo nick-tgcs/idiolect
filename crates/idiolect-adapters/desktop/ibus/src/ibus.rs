@@ -252,9 +252,20 @@ impl IbusEngine {
 
     async fn focus_out(&self) {
         dbg_edit(&format!("focus_out {}", self.path.as_str()));
+        // Leaving the input context ends post-commit correction tracking: the
+        // session closes its window and reports any in-place fix to the daemon.
+        // Without this call a correction finished by clicking elsewhere was
+        // silently lost (the session logic existed but was never driven).
+        let ops = self.shared.run_session(|session| session.on_focus_out());
+        emit_surface_ops(&self.shared.connection, &self.path, ops).await;
     }
     async fn reset(&self) {
         dbg_edit("reset");
+        // IBus resets the context when the app moves the cursor out from under
+        // us (mouse click, programmatic change) — edits can no longer be
+        // modelled, so close the correction window, reporting what was tracked.
+        let ops = self.shared.run_session(|session| session.on_focus_out());
+        emit_surface_ops(&self.shared.connection, &self.path, ops).await;
     }
     async fn disable(&self) {
         dbg_edit("disable");
