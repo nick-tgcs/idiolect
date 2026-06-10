@@ -139,18 +139,14 @@ pub(crate) fn begin_capture(
         CpalAudioInput::open_device_by_name(&profile.audio_input_device).map_err(map_cpal_error)?
     };
     let session_id = ImeSessionId::new();
-    input
-        .start_capture(session_id)
-        .map_err(map_cpal_error)?;
+    input.start_capture(session_id).map_err(map_cpal_error)?;
     Ok(RuntimeCapture::Live { input, session_id })
 }
 
 /// Stops the recording and returns the captured audio. For the fixture device
 /// this returns the deterministic clip; for a real device it ends the
 /// microphone stream and drains the buffered samples.
-pub(crate) fn finish_capture(
-    capture: RuntimeCapture,
-) -> Result<AudioSegment, RuntimeAdapterError> {
+pub(crate) fn finish_capture(capture: RuntimeCapture) -> Result<AudioSegment, RuntimeAdapterError> {
     match capture {
         RuntimeCapture::Fixture | RuntimeCapture::FixtureLive => {
             Ok(speech_and_silence_fixture_16khz_mono())
@@ -457,9 +453,7 @@ thread_local! {
 /// exists, otherwise the bundled fixture model (so a misconfigured or
 /// undownloaded model degrades to a working — if small — engine instead of
 /// failing dictation outright).
-fn load_whisper_engine(
-    profile: &RuntimeAdapterProfile,
-) -> Result<WhisperAsr, RuntimeAdapterError> {
+fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, RuntimeAdapterError> {
     if profile.whisper_model_path.is_file() {
         let options = WhisperOptions {
             use_gpu: profile.asr_use_gpu,

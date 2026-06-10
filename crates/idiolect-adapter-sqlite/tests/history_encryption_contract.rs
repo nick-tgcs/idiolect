@@ -26,7 +26,10 @@ fn history_text_is_encrypted_at_rest_and_round_trips() {
     commit_secret(&mut store, "launch code 1234");
 
     // Same key: the plaintext round-trips.
-    assert_eq!(store.recent_history(10).unwrap()[0].text, "launch code 1234");
+    assert_eq!(
+        store.recent_history(10).unwrap()[0].text,
+        "launch code 1234"
+    );
 
     // No cipher: the raw column is what is stored at rest — it must not be the
     // plaintext, proving the value is encrypted on disk.
@@ -51,7 +54,10 @@ fn wrong_key_does_not_reveal_plaintext() {
     let wrong = SqliteMetadataStore::open_path(&db)
         .unwrap()
         .with_history_cipher(cipher(9));
-    assert_ne!(wrong.recent_history(10).unwrap()[0].text, "launch code 1234");
+    assert_ne!(
+        wrong.recent_history(10).unwrap()[0].text,
+        "launch code 1234"
+    );
 }
 
 #[test]
@@ -64,5 +70,8 @@ fn plaintext_store_is_unaffected_by_encryption_path() {
     store.migrate().unwrap();
     commit_secret(&mut store, "plain text entry");
 
-    assert_eq!(store.recent_history(10).unwrap()[0].text, "plain text entry");
+    assert_eq!(
+        store.recent_history(10).unwrap()[0].text,
+        "plain text entry"
+    );
 }

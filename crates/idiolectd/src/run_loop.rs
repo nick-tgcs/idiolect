@@ -150,9 +150,10 @@ fn build_history_cipher(
     if !config.encrypt_at_rest {
         return Ok(None);
     }
-    let key_path = database_path
-        .parent()
-        .map_or_else(|| PathBuf::from("history.key"), |parent| parent.join("history.key"));
+    let key_path = database_path.parent().map_or_else(
+        || PathBuf::from("history.key"),
+        |parent| parent.join("history.key"),
+    );
     let key = FileKey::new(key_path)
         .load_or_create_key()
         .map_err(|error| RunLoopError::crypto("key load", error))?;
@@ -219,8 +220,8 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
     let (tray_callback_tx, tray_callback_rx) = mpsc::channel::<TrayCallback>();
     let mut tray =
         KsniTray::new(tray_callback_tx).map_err(|error| RunLoopError::tray("tray init", error))?;
-    let mut clipboard =
-        ArboardClipboard::new().map_err(|error| RunLoopError::clipboard("clipboard init", error))?;
+    let mut clipboard = ArboardClipboard::new()
+        .map_err(|error| RunLoopError::clipboard("clipboard init", error))?;
 
     refresh_tray_menu(
         &mut tray,
@@ -258,15 +259,20 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
         })
         .map_err(|error| RunLoopError::io("spawn maintenance thread", error))?;
 
-    let result = (|| {
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .map_err(|error| RunLoopError::io("accept client", error))?;
-            handle_connection(stream, &config, &mut tray, &mut clipboard, &mut store, &tray_callback_rx)?;
-            if config.shutdown_after_client {
-                return Ok(());
-            }
+    let result = (|| loop {
+        let (stream, _) = listener
+            .accept()
+            .map_err(|error| RunLoopError::io("accept client", error))?;
+        handle_connection(
+            stream,
+            &config,
+            &mut tray,
+            &mut clipboard,
+            &mut store,
+            &tray_callback_rx,
+        )?;
+        if config.shutdown_after_client {
+            return Ok(());
         }
     })();
 
@@ -310,7 +316,8 @@ fn run_maintenance(
         // History pruning runs through the tested use case; training-data pruning
         // needs the audio store (not part of the metadata port), so it runs as a
         // sibling loop on its own connection. Both honour the same shutdown.
-        let history = MaintenanceUseCase::new(store, config, shutdown_rx.clone()).run_pruning_loop();
+        let history =
+            MaintenanceUseCase::new(store, config, shutdown_rx.clone()).run_pruning_loop();
         let training = run_training_prune_loop(
             &database_path,
             &audio_root,
@@ -381,7 +388,10 @@ fn prune_training_data_once(
 /// Resolves the active history configuration, layering persisted `tray_settings`
 /// overrides on top of the config-file defaults. The `tray_settings` table is the
 /// single source of truth at runtime.
-fn effective_history_config(store: &SqliteMetadataStore, defaults: &HistoryConfig) -> HistoryConfig {
+fn effective_history_config(
+    store: &SqliteMetadataStore,
+    defaults: &HistoryConfig,
+) -> HistoryConfig {
     let settings = store.get_all_tray_settings().unwrap_or_default();
     let retention_days = settings
         .get("retention_days")
@@ -1567,7 +1577,11 @@ fn handle_tray_callback(
     let translation_defaults = &config.translation_config;
 
     if action == "review_mode" {
-        let next = if review_mode_enabled(store) { "false" } else { "true" };
+        let next = if review_mode_enabled(store) {
+            "false"
+        } else {
+            "true"
+        };
         store
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
@@ -1638,11 +1652,15 @@ fn handle_tray_callback(
 }
 
 fn parse_id_suffix(action: &str, prefix: &str) -> Option<i64> {
-    action.strip_prefix(prefix).and_then(|rest| rest.parse().ok())
+    action
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.parse().ok())
 }
 
 fn parse_index_suffix(action: &str, prefix: &str) -> Option<usize> {
-    action.strip_prefix(prefix).and_then(|rest| rest.parse().ok())
+    action
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.parse().ok())
 }
 
 fn update_tray_recording_state(
@@ -1702,8 +1720,8 @@ mod tests {
     use std::io::{Error, ErrorKind};
 
     use super::{
-        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix, should_clear_clipboard,
-        RecordingStatusTx,
+        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix,
+        should_clear_clipboard, RecordingStatusTx,
     };
 
     #[test]
@@ -1733,7 +1751,10 @@ mod tests {
         let mut tx = RecordingStatusTx::new(true);
         assert!(!tx.should_push(false), "initial false is not a transition");
         assert!(tx.should_push(true), "idle -> recording pushes");
-        assert!(!tx.should_push(true), "repeated recording does not push again");
+        assert!(
+            !tx.should_push(true),
+            "repeated recording does not push again"
+        );
         assert!(tx.should_push(false), "recording -> idle pushes");
         assert!(!tx.should_push(false), "commit after stop must not re-push");
 
@@ -1762,8 +1783,14 @@ mod tests {
         assert_eq!(parse_id_suffix("delete:42", "delete:"), Some(42));
         assert_eq!(parse_id_suffix("delete:nan", "delete:"), None);
         assert_eq!(parse_id_suffix("copy:1", "delete:"), None);
-        assert_eq!(parse_index_suffix("settings:retention:2", "settings:retention:"), Some(2));
-        assert_eq!(parse_index_suffix("settings:retention:x", "settings:retention:"), None);
+        assert_eq!(
+            parse_index_suffix("settings:retention:2", "settings:retention:"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_index_suffix("settings:retention:x", "settings:retention:"),
+            None
+        );
     }
 
     mod insert_via_ime {
@@ -1782,7 +1809,9 @@ mod tests {
             let mut store = SqliteMetadataStore::open_in_memory().expect("store");
             store.migrate().expect("migrate");
             let session = store.create_session(Some(text)).expect("create");
-            store.commit_session(session, text, "commit-1").expect("commit");
+            store
+                .commit_session(session, text, "commit-1")
+                .expect("commit");
             let id = store
                 .recent_history(10)
                 .expect("recent")
@@ -1808,7 +1837,10 @@ mod tests {
             let mut reader = BufReader::new(engine_side);
             let mut line = String::new();
             reader.read_line(&mut line).expect("read");
-            assert!(!line.is_empty(), "Insert must send a message, not type nothing");
+            assert!(
+                !line.is_empty(),
+                "Insert must send a message, not type nothing"
+            );
             match idiolect_ipc::framing::decode_json_line(&line).expect("decode") {
                 IpcMessage::InsertText(insert) => {
                     assert_eq!(insert.text, "Deploy traefik and nginx");

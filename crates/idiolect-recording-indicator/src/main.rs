@@ -22,7 +22,19 @@ const MIC_RIGHT: f32 = 12.0;
 
 fn caret_to_window(x: f32, y: f32) -> egui::Pos2 {
     // Window is WIN×WIN with the mic at its centre (WIN/2, WIN/2).
-    egui::pos2((x + MIC_RIGHT - WIN / 2.0).max(0.0), (y - WIN / 2.0).max(0.0))
+    egui::pos2(
+        (x + MIC_RIGHT - WIN / 2.0).max(0.0),
+        (y - WIN / 2.0).max(0.0),
+    )
+}
+
+/// Parse a `"x y"` caret line streamed on stdin into screen coordinates.
+/// Returns `None` for malformed lines so the reader thread can skip them.
+fn parse_caret(line: &str) -> Option<(f32, f32)> {
+    let mut parts = line.split_whitespace();
+    let x = parts.next()?.parse::<f32>().ok()?;
+    let y = parts.next()?.parse::<f32>().ok()?;
+    Some((x, y))
 }
 
 fn main() -> eframe::Result<()> {
@@ -38,11 +50,7 @@ fn main() -> eframe::Result<()> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            let mut parts = line.split_whitespace();
-            if let (Some(nx), Some(ny)) = (
-                parts.next().and_then(|s| s.parse::<f32>().ok()),
-                parts.next().and_then(|s| s.parse::<f32>().ok()),
-            ) {
+            if let Some((nx, ny)) = parse_caret(&line) {
                 *reader_caret.lock().expect("caret mutex") = (nx, ny);
             }
         }
@@ -79,10 +87,20 @@ impl eframe::App for Indicator {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl Indicator {
+    /// The per-frame draw, split out of `eframe::App::update` so it can be
+    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
+    fn ui(&mut self, ctx: &egui::Context) {
         ctx.request_repaint(); // keep animating + tracking the caret
 
         let (cx, cy) = *self.caret.lock().expect("caret mutex");
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(caret_to_window(cx, cy)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(caret_to_window(
+            cx, cy,
+        )));
 
         let t = ctx.input(|i| i.time) as f32;
 
@@ -129,9 +147,66 @@ impl eframe::App for Indicator {
                     stroke,
                 );
                 painter.line_segment(
-                    [center + egui::vec2(-2.5, 8.0), center + egui::vec2(2.5, 8.0)],
+                    [
+                        center + egui::vec2(-2.5, 8.0),
+                        center + egui::vec2(2.5, 8.0),
+                    ],
                     stroke,
                 );
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caret_to_window_offsets_right_and_clamps_to_zero() {
+        // Mic centre sits MIC_RIGHT past the caret, window centred on it.
+        let p = caret_to_window(400.0, 400.0);
+        assert_eq!(p.x, 400.0 + MIC_RIGHT - WIN / 2.0);
+        assert_eq!(p.y, 400.0 - WIN / 2.0);
+        // Near the screen edge the position is clamped, never negative.
+        let edge = caret_to_window(0.0, 0.0);
+        assert_eq!(edge, egui::pos2(0.0, 0.0));
+    }
+
+    #[test]
+    fn parse_caret_reads_valid_lines_and_rejects_junk() {
+        assert_eq!(parse_caret("120 340"), Some((120.0, 340.0)));
+        assert_eq!(parse_caret("  12.5   7  "), Some((12.5, 7.0)));
+        assert_eq!(parse_caret(""), None);
+        assert_eq!(parse_caret("100"), None);
+        assert_eq!(parse_caret("left right"), None);
+    }
+
+    #[test]
+    fn ui_draws_a_frame_and_tracks_the_caret_headlessly() {
+        let caret = Arc::new(Mutex::new((250.0, 150.0)));
+        let mut indicator = Indicator {
+            caret: Arc::clone(&caret),
+        };
+        let ctx = egui::Context::default();
+        // Running a frame must not panic and must move the window to the caret.
+        let output = ctx.run(egui::RawInput::default(), |ctx| indicator.ui(ctx));
+        let moved_to_caret = output.viewport_output.values().any(|vp| {
+            vp.commands.iter().any(|cmd| {
+                matches!(cmd, egui::ViewportCommand::OuterPosition(p)
+                    if *p == caret_to_window(250.0, 150.0))
+            })
+        });
+        assert!(moved_to_caret, "indicator should reposition onto the caret");
+    }
+
+    #[test]
+    fn clear_color_is_fully_transparent() {
+        let indicator = Indicator {
+            caret: Arc::new(Mutex::new((0.0, 0.0))),
+        };
+        assert_eq!(
+            eframe::App::clear_color(&indicator, &egui::Visuals::dark()),
+            [0.0, 0.0, 0.0, 0.0]
+        );
     }
 }

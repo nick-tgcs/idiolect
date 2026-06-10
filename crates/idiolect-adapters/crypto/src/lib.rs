@@ -115,9 +115,7 @@ impl InMemoryKey {
     /// Generates a fresh random key.
     #[must_use]
     pub fn generate() -> Self {
-        Self {
-            key: random_key(),
-        }
+        Self { key: random_key() }
     }
 }
 

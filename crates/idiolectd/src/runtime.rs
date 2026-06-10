@@ -510,7 +510,12 @@ fn handle_fixture_connection(
                 let active_session = required_session(session_id)?;
                 if correction.corrected_text != current_text {
                     use_case
-                        .correct_preedit(active_session, &current_text, &correction.corrected_text, 1)
+                        .correct_preedit(
+                            active_session,
+                            &current_text,
+                            &correction.corrected_text,
+                            1,
+                        )
                         .map_err(RuntimeError::dictation)?;
                     current_text = correction.corrected_text.clone();
                 }
@@ -521,7 +526,10 @@ fn handle_fixture_connection(
                     .cancel(active_session, "fixture-server-cancel")
                     .map_err(RuntimeError::dictation)?;
             }
-            IpcMessage::HistoryReinsert(_) | IpcMessage::HistoryCopy(_) | IpcMessage::HistoryReinsertResponse(_) | IpcMessage::HistoryCopyResponse(_) => {
+            IpcMessage::HistoryReinsert(_)
+            | IpcMessage::HistoryCopy(_)
+            | IpcMessage::HistoryReinsertResponse(_)
+            | IpcMessage::HistoryCopyResponse(_) => {
                 send_ipc_message(
                     &mut stream,
                     &IpcMessage::Error(ErrorMessage {
@@ -817,7 +825,9 @@ impl MetadataStorePort for RuntimeMetadataStore {
         self.inner.set_tray_setting(key, value)
     }
 
-    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error> {
+    fn get_all_tray_settings(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, Self::Error> {
         self.inner.get_all_tray_settings()
     }
 }

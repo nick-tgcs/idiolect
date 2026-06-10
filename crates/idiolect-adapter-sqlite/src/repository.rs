@@ -4,7 +4,7 @@ use std::path::Path;
 
 use idiolect_adapter_crypto::EncryptionPort;
 use idiolect_common::ids::ImeSessionId;
-use idiolect_ports::storage::{AudioStorePort, MetadataStorePort, HistoryEntry, HistoryState};
+use idiolect_ports::storage::{AudioStorePort, HistoryEntry, HistoryState, MetadataStorePort};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::audio_store::{FileAudioStore, FileAudioStoreError};
@@ -1658,9 +1658,7 @@ impl SqliteMetadataStore {
     /// `AUTOINCREMENT` and rows are never deleted, so this yields a monotonic,
     /// collision-free sequence for events that legitimately recur (prune,
     /// config changes) and thus have no natural idempotency key.
-    fn next_event_sequence(
-        transaction: &Transaction<'_>,
-    ) -> Result<i64, SqliteStorageError> {
+    fn next_event_sequence(transaction: &Transaction<'_>) -> Result<i64, SqliteStorageError> {
         backend_result(transaction.query_row(
             "SELECT COALESCE(MAX(id), 0) + 1 FROM event_log",
             [],
@@ -1971,9 +1969,8 @@ impl MetadataStorePort for SqliteMetadataStore {
         let raw_text = Self::existing_raw_text(&transaction, &session_key)?
             .ok_or_else(|| SqliteStorageError::not_found("ime_text_sessions row", &session_key))?;
         let utterance_id = Self::existing_utterance_id(&transaction, &session_key)?;
-        let was_committed =
-            Self::current_session_state(&transaction, &session_key)?.as_deref()
-                == Some(SESSION_STATE_COMMITTED);
+        let was_committed = Self::current_session_state(&transaction, &session_key)?.as_deref()
+            == Some(SESSION_STATE_COMMITTED);
 
         Self::create_event(
             &transaction,
@@ -2177,12 +2174,14 @@ impl MetadataStorePort for SqliteMetadataStore {
 
     fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
         let transaction = backend_result(self.connection.transaction())?;
-        let deleted = backend_result(transaction.execute(
-            "DELETE FROM ime_text_history WHERE id = ?1",
-            params![id],
-        ))?;
+        let deleted = backend_result(
+            transaction.execute("DELETE FROM ime_text_history WHERE id = ?1", params![id]),
+        )?;
         if deleted == 0 {
-            return Err(SqliteStorageError::not_found("history entry", &id.to_string()));
+            return Err(SqliteStorageError::not_found(
+                "history entry",
+                &id.to_string(),
+            ));
         }
         Self::create_event(
             &transaction,
@@ -2197,9 +2196,10 @@ impl MetadataStorePort for SqliteMetadataStore {
     }
 
     fn get_tray_setting(&self, key: &str) -> Result<Option<String>, Self::Error> {
-        let mut statement = backend_result(self.connection.prepare(
-            "SELECT value FROM tray_settings WHERE key = ?1",
-        ))?;
+        let mut statement = backend_result(
+            self.connection
+                .prepare("SELECT value FROM tray_settings WHERE key = ?1"),
+        )?;
         let value: Option<String> = backend_result(statement.query_row([key], |row| row.get(0)))?;
         Ok(value)
     }
@@ -2226,10 +2226,13 @@ impl MetadataStorePort for SqliteMetadataStore {
         Ok(())
     }
 
-    fn get_all_tray_settings(&self) -> Result<std::collections::HashMap<String, String>, Self::Error> {
-        let mut statement = backend_result(self.connection.prepare(
-            "SELECT key, value FROM tray_settings",
-        ))?;
+    fn get_all_tray_settings(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, Self::Error> {
+        let mut statement = backend_result(
+            self.connection
+                .prepare("SELECT key, value FROM tray_settings"),
+        )?;
         let rows = backend_result(statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }))?;

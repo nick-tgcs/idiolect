@@ -192,7 +192,11 @@ mod tests {
         let focus = RecordingFocus::new(Some(42));
         let dialog = SubprocessReviewDialog::with_focus("cat", Box::new(focus.clone()));
         assert_eq!(dialog.review("hello world").as_deref(), Some("hello world"));
-        assert_eq!(focus.restored(), vec![42], "focus handed back to the original window");
+        assert_eq!(
+            focus.restored(),
+            vec![42],
+            "focus handed back to the original window"
+        );
     }
 
     #[test]

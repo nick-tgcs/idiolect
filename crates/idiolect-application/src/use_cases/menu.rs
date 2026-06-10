@@ -408,7 +408,11 @@ impl MenuUseCase {
 
         // Settings submenu: two distinct retention concepts, kept visually
         // separate — the short tray-history list vs the long training-data corpus.
-        let retention_options = vec!["1 day".to_owned(), "7 days".to_owned(), "30 days".to_owned()];
+        let retention_options = vec![
+            "1 day".to_owned(),
+            "7 days".to_owned(),
+            "30 days".to_owned(),
+        ];
         let retention_selected = match config.retention_days {
             1 => 0,
             7 => 1,
@@ -611,7 +615,10 @@ mod tests {
         assert_eq!(options.len(), 8, "the eight presets, no custom marker");
         assert_eq!(options[selected], "1 year");
         // The free-form custom entry point is present.
-        assert_eq!(child(training, "settings:training_retention_custom").label, "Custom…");
+        assert_eq!(
+            child(training, "settings:training_retention_custom").label,
+            "Custom…"
+        );
     }
 
     #[test]
@@ -733,8 +740,14 @@ mod tests {
             "email me at [redacted] please"
         );
         // Contiguous and dash-separated card numbers are single tokens.
-        assert_eq!(mask_sensitive("card 4111-1111-1111-1111 ok"), "card [redacted] ok");
-        assert_eq!(mask_sensitive("card 4111111111111111 ok"), "card [redacted] ok");
+        assert_eq!(
+            mask_sensitive("card 4111-1111-1111-1111 ok"),
+            "card [redacted] ok"
+        );
+        assert_eq!(
+            mask_sensitive("card 4111111111111111 ok"),
+            "card [redacted] ok"
+        );
     }
 
     #[test]

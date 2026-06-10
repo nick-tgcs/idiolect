@@ -50,9 +50,10 @@ fn history_list_respects_limit() {
     let db = db.to_str().unwrap();
     seed(db, &["one", "two", "three"]);
 
-    let output =
-        idiolect_cli::execute(&argv(&["history", "list", "--db", db, "--limit", "1", "--json"]))
-            .unwrap();
+    let output = idiolect_cli::execute(&argv(&[
+        "history", "list", "--db", db, "--limit", "1", "--json",
+    ]))
+    .unwrap();
     let value: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["entries"].as_array().unwrap().len(), 1);
 }
@@ -143,8 +144,7 @@ fn history_prune_requires_confirmation() {
     let db = db.to_str().unwrap();
     seed(db, &["alpha"]);
 
-    let refused =
-        idiolect_cli::execute(&argv(&["history", "prune", "--days", "30", "--db", db]));
+    let refused = idiolect_cli::execute(&argv(&["history", "prune", "--days", "30", "--db", db]));
     assert!(refused.is_err());
 }
 

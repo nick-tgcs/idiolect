@@ -442,7 +442,10 @@ mod tests {
         let mut s = session();
         dictate(&mut s, "restart traffic");
         assert_eq!(s.surface.committed, ["restart traffic"]);
-        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:restart traffic"]);
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "toggle", "commit:restart traffic"]
+        );
         assert_eq!(s.state(), State::Reviewing);
     }
 
@@ -554,7 +557,10 @@ mod tests {
         // (review mode: the dialog returns the edited text instead of auto-commit)
         s.commit_reviewed("deploy Traefik");
         assert_eq!(s.surface.committed, ["deploy Traefik"]);
-        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:deploy Traefik"]);
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "toggle", "commit:deploy Traefik"]
+        );
         assert_eq!(s.state(), State::Idle);
     }
 

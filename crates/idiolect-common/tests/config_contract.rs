@@ -192,8 +192,12 @@ fn training_retention_accepts_presets_zero_and_custom_but_rejects_absurd_values(
 
     // Beyond the sanity cap is rejected (guards against a fat-fingered custom value).
     config.history.training_retention_days = 36_501;
-    let error = config.validate().expect_err("absurd retention must be rejected");
-    assert!(format!("{error}").to_lowercase().contains("training_retention_days"));
+    let error = config
+        .validate()
+        .expect_err("absurd retention must be rejected");
+    assert!(format!("{error}")
+        .to_lowercase()
+        .contains("training_retention_days"));
 }
 
 #[test]

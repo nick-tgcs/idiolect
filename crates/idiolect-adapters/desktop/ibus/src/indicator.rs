@@ -95,7 +95,10 @@ mod tests {
         assert!(indicator.state.lock().unwrap().is_some(), "spawned");
         // Showing again repositions via stdin rather than respawning.
         indicator.show(40, 50);
-        assert!(indicator.state.lock().unwrap().is_some(), "still one process");
+        assert!(
+            indicator.state.lock().unwrap().is_some(),
+            "still one process"
+        );
         indicator.hide();
         assert!(indicator.state.lock().unwrap().is_none(), "killed");
         indicator.hide(); // no-op

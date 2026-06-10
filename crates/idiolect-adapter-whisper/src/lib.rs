@@ -331,8 +331,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let result =
-            super::backend::WhisperBackend::load_model_from_path(path, super::WhisperOptions::default());
+        let result = super::backend::WhisperBackend::load_model_from_path(
+            path,
+            super::WhisperOptions::default(),
+        );
 
         assert!(matches!(
             result,
