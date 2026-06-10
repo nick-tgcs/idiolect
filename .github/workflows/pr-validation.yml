@@ -61,8 +61,10 @@ jobs:
 
       - name: Check commit messages
         run: |
-          # Check that all commits follow conventional commits format
-          COMMITS=$(git log --format="%s" origin/main...HEAD)
+          # Check that all commits follow conventional commits format.
+          # --no-merges skips the merge commit GitHub synthesizes for the PR
+          # ref (subject "Merge <sha> into <sha>"), which isn't a real commit.
+          COMMITS=$(git log --no-merges --format="%s" origin/main...HEAD)
           echo "$COMMITS" | while IFS= read -r commit; do
             if ! echo "$commit" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(.+\))?: .+'; then
               echo "::error::Commit message does not follow conventional commits format: $commit"
@@ -127,7 +129,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev
 
       - name: Configure CMake
         run: |
@@ -241,7 +243,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev
 
       - name: Build FCITX5 (for ctest index)
         run: |
