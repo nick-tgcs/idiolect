@@ -508,15 +508,18 @@ fn handle_connection(
     let codec = OpusCodec::new();
     // Out-of-process dialog for the "Custom…" retention entry; discovered once.
     let retention_dialog = SubprocessRetentionDialog::discover();
-    let mut active_session: Option<ActiveSession> = None;
-    // Set only while a real microphone recording is in progress (live devices).
-    let mut live_capture: Option<crate::adapters::RuntimeCapture> = None;
-    // Set alongside `live_capture` while translation is enabled: the streaming
-    // pipeline that turns pauses into translated snippets mid-recording.
-    let mut live_stream: Option<LiveStreamState> = None;
-    // The authoritative recording-state publisher. Re-armed at handshake once we
-    // know whether the client negotiated `recording_status`.
-    let mut status_tx = RecordingStatusTx::new(false);
+    // Per-connection state bundled into `Live`:
+    //  - active_session: the in-flight dictation, if any.
+    //  - live_capture: set only while a real microphone recording is in progress.
+    //  - live_stream: set alongside live.live_capture while translation streams snippets.
+    //  - status_tx: the authoritative recording-state publisher, re-armed at
+    //    handshake once we know whether the client negotiated `recording_status`.
+    let mut live = Live {
+        active_session: None,
+        live_capture: None,
+        live_stream: None,
+        status_tx: RecordingStatusTx::new(false),
+    };
     let mut line = String::new();
 
     loop {
@@ -527,14 +530,13 @@ fn handle_connection(
                 &mut stream,
                 tray,
                 clipboard,
-                store,
-                &audio_store,
-                &codec,
-                config,
-                &mut active_session,
-                &mut live_capture,
-                &mut live_stream,
-                &mut status_tx,
+                Ctx {
+                    store: &mut *store,
+                    audio_store: &audio_store,
+                    codec: &codec,
+                    config,
+                },
+                &mut live,
                 &retention_dialog,
             )?;
         }
@@ -544,13 +546,13 @@ fn handle_connection(
         // through the segmenter and delivers any pause-completed snippets.
         pump_live_stream(
             &mut stream,
-            store,
-            &audio_store,
-            &codec,
-            config,
-            &mut active_session,
-            &mut live_capture,
-            &mut live_stream,
+            Ctx {
+                store: &mut *store,
+                audio_store: &audio_store,
+                codec: &codec,
+                config,
+            },
+            &mut live,
         )?;
 
         match reader.read_line(&mut line) {
@@ -560,8 +562,12 @@ fn handle_connection(
             // the next client. Crashing the daemon on a client reset would let any
             // engine restart take the whole daemon down.
             Ok(0) => {
-                drop_live_capture(&mut live_capture);
-                cancel_uncommitted_active_session(store, &mut active_session, "daemon-disconnect")?;
+                drop_live_capture(&mut live.live_capture);
+                cancel_uncommitted_active_session(
+                    store,
+                    &mut live.active_session,
+                    "daemon-disconnect",
+                )?;
                 return Ok(());
             }
             Ok(_) => {}
@@ -569,8 +575,12 @@ fn handle_connection(
             // Any partial bytes already read stay buffered in `line`.
             Err(error) if is_read_timeout(&error) => {}
             Err(error) if is_disconnect(&error) => {
-                drop_live_capture(&mut live_capture);
-                cancel_uncommitted_active_session(store, &mut active_session, "daemon-disconnect")?;
+                drop_live_capture(&mut live.live_capture);
+                cancel_uncommitted_active_session(
+                    store,
+                    &mut live.active_session,
+                    "daemon-disconnect",
+                )?;
                 return Ok(());
             }
             Err(error) => return Err(RunLoopError::io("read ipc line", error)),
@@ -592,81 +602,82 @@ fn handle_connection(
                     .iter()
                     .any(|feature| feature == FEATURE_RECORDING_STATUS);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
-                status_tx = RecordingStatusTx::new(wants_status);
-                status_tx.sync_initial(&mut stream)?;
+                live.status_tx = RecordingStatusTx::new(wants_status);
+                live.status_tx.sync_initial(&mut stream)?;
             }
             IpcMessage::StartRecording | IpcMessage::ToggleRecording => {
                 if crate::adapters::is_live_capture(&config.adapter_profile) {
                     // Toggle: the same key starts, then stops and transcribes.
-                    if live_capture.is_some() {
+                    if live.live_capture.is_some() {
                         stop_live_and_transcribe(
                             &mut stream,
                             tray,
-                            store,
-                            &audio_store,
-                            &codec,
-                            config,
-                            &mut active_session,
-                            &mut live_capture,
-                            &mut live_stream,
-                            &mut status_tx,
+                            Ctx {
+                                store: &mut *store,
+                                audio_store: &audio_store,
+                                codec: &codec,
+                                config,
+                            },
+                            &mut live,
                         )?;
                     } else {
                         start_live_capture(
                             &mut stream,
                             tray,
-                            store,
-                            config,
-                            &mut active_session,
-                            &mut live_capture,
-                            &mut live_stream,
-                            &mut status_tx,
+                            Ctx {
+                                store: &mut *store,
+                                audio_store: &audio_store,
+                                codec: &codec,
+                                config,
+                            },
+                            &mut live,
                         )?;
                     }
                 } else {
                     start_fixture_oneshot(
                         &mut stream,
                         tray,
-                        store,
-                        &audio_store,
-                        &codec,
-                        config,
-                        &mut active_session,
-                        &mut status_tx,
+                        Ctx {
+                            store: &mut *store,
+                            audio_store: &audio_store,
+                            codec: &codec,
+                            config,
+                        },
+                        &mut live,
                     )?;
                 }
             }
             IpcMessage::StopRecording => {
-                if live_capture.is_some() {
+                if live.live_capture.is_some() {
                     stop_live_and_transcribe(
                         &mut stream,
                         tray,
-                        store,
-                        &audio_store,
-                        &codec,
-                        config,
-                        &mut active_session,
-                        &mut live_capture,
-                        &mut live_stream,
-                        &mut status_tx,
+                        Ctx {
+                            store: &mut *store,
+                            audio_store: &audio_store,
+                            codec: &codec,
+                            config,
+                        },
+                        &mut live,
                     )?;
                 }
             }
             IpcMessage::CommitPreedit(commit) => {
-                commit_active_session(store, &mut active_session, commit)?;
+                commit_active_session(store, &mut live.active_session, commit)?;
                 // A commit is a text event; the authoritative recording state is
                 // whether the mic is still open. In streaming mode the engine
                 // commits each snippet MID-recording — publishing a hardcoded
                 // `false` here would flip the tray idle and tell the engine the
                 // take ended, making it drop every later snippet.
-                let recording = live_capture.is_some();
-                status_tx.set(&mut stream, tray, store, config, recording)?;
+                let recording = live.live_capture.is_some();
+                live.status_tx
+                    .set(&mut stream, tray, store, config, recording)?;
             }
             IpcMessage::ReportCorrection(correction) => {
                 // The user fixed the auto-committed text in place: amend the
                 // just-committed session with the corrected form, and re-render the
                 // tray so the history entry shows the corrected text immediately.
-                if let Some(active) = active_session.as_mut() {
+                if let Some(active) = live.active_session.as_mut() {
                     if active.finalized {
                         store
                             .amend_correction(
@@ -676,16 +687,21 @@ fn handle_connection(
                             )
                             .map_err(|error| RunLoopError::storage("amend correction", error))?;
                         active.current_text = correction.corrected_text.clone();
-                        status_tx.refresh_tray(tray, store, config)?;
+                        live.status_tx.refresh_tray(tray, store, config)?;
                     }
                 }
             }
             IpcMessage::CancelPreedit => {
-                drop_live_capture(&mut live_capture);
-                live_stream = None;
-                cancel_uncommitted_active_session(store, &mut active_session, "daemon-cancel")?;
-                active_session = None;
-                status_tx.set(&mut stream, tray, store, config, false)?;
+                drop_live_capture(&mut live.live_capture);
+                live.live_stream = None;
+                cancel_uncommitted_active_session(
+                    store,
+                    &mut live.active_session,
+                    "daemon-cancel",
+                )?;
+                live.active_session = None;
+                live.status_tx
+                    .set(&mut stream, tray, store, config, false)?;
             }
             IpcMessage::HistoryReinsert(message) => {
                 let response = reinsert_entry(
@@ -1061,17 +1077,50 @@ impl RecordingStatusTx {
 /// When translation is enabled (config default or tray override), the take runs
 /// in streaming mode: a [`LiveStreamState`] is armed and the pump delivers a
 /// translated snippet at every pause instead of one transcript on stop.
-#[allow(clippy::too_many_arguments)]
+/// Per-connection mutable state, bundled so the live-capture handlers stay under
+/// the argument-count lint without threading many `&mut` params individually.
+struct Live {
+    active_session: Option<ActiveSession>,
+    live_capture: Option<crate::adapters::RuntimeCapture>,
+    live_stream: Option<LiveStreamState>,
+    status_tx: RecordingStatusTx,
+}
+
+/// The long-lived store, codecs, and config a connection's handlers share.
+/// Passed by value with reborrowed refs so callers keep using the originals.
+struct Ctx<'a> {
+    store: &'a mut SqliteMetadataStore,
+    audio_store: &'a FileAudioStore,
+    codec: &'a OpusCodec,
+    config: &'a RunLoopConfig,
+}
+
+impl Ctx<'_> {
+    /// A fresh `Ctx` borrowing the same data, so a handler can pass it on to a
+    /// nested handler and keep using its own afterwards.
+    fn reborrow(&mut self) -> Ctx<'_> {
+        Ctx {
+            store: &mut *self.store,
+            audio_store: self.audio_store,
+            codec: self.codec,
+            config: self.config,
+        }
+    }
+}
+
 fn start_live_capture(
     stream: &mut UnixStream,
     tray: &mut KsniTray,
-    store: &mut SqliteMetadataStore,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    live_capture: &mut Option<crate::adapters::RuntimeCapture>,
-    live_stream: &mut Option<LiveStreamState>,
-    status_tx: &mut RecordingStatusTx,
+    ctx: Ctx<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
+    let Ctx { store, config, .. } = ctx;
+    let Live {
+        active_session,
+        live_capture,
+        live_stream,
+        status_tx,
+    } = live;
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match crate::adapters::begin_capture(&config.adapter_profile) {
         Ok(capture) => {
@@ -1100,17 +1149,23 @@ fn start_live_capture(
 /// delivers every snippet a pause just completed. A no-op outside streaming
 /// takes. Poll failures are logged, never fatal — one bad tick must not end a
 /// recording the user is mid-sentence in.
-#[allow(clippy::too_many_arguments)]
 fn pump_live_stream(
     stream: &mut UnixStream,
-    store: &mut SqliteMetadataStore,
-    audio_store: &FileAudioStore,
-    codec: &OpusCodec,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    live_capture: &mut Option<crate::adapters::RuntimeCapture>,
-    live_stream: &mut Option<LiveStreamState>,
+    ctx: Ctx<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
+    let Ctx {
+        store,
+        audio_store,
+        codec,
+        config,
+    } = ctx;
+    let Live {
+        active_session,
+        live_capture,
+        live_stream,
+        ..
+    } = live;
     let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
         return Ok(());
     };
@@ -1184,19 +1239,24 @@ fn deliver_snippet(
 ///
 /// In streaming mode the snippets were already delivered while recording; the
 /// stop only recovers the tail the user spoke after the last pause.
-#[allow(clippy::too_many_arguments)]
 fn stop_live_and_transcribe(
     stream: &mut UnixStream,
     tray: &mut KsniTray,
-    store: &mut SqliteMetadataStore,
-    audio_store: &FileAudioStore,
-    codec: &OpusCodec,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    live_capture: &mut Option<crate::adapters::RuntimeCapture>,
-    live_stream: &mut Option<LiveStreamState>,
-    status_tx: &mut RecordingStatusTx,
+    ctx: Ctx<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
+    let Ctx {
+        store,
+        audio_store,
+        codec,
+        config,
+    } = ctx;
+    let Live {
+        active_session,
+        live_capture,
+        live_stream,
+        status_tx,
+    } = live;
     let Some(capture) = live_capture.take() else {
         return Ok(());
     };
@@ -1279,17 +1339,23 @@ fn stop_live_and_transcribe(
 
 /// One-shot fixture dictation triggered by `StartRecording` on the fixture
 /// device: capture + transcribe + preedit in a single step (unchanged behaviour).
-#[allow(clippy::too_many_arguments)]
 fn start_fixture_oneshot(
     stream: &mut UnixStream,
     tray: &mut KsniTray,
-    store: &mut SqliteMetadataStore,
-    audio_store: &FileAudioStore,
-    codec: &OpusCodec,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    status_tx: &mut RecordingStatusTx,
+    ctx: Ctx<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
+    let Ctx {
+        store,
+        audio_store,
+        codec,
+        config,
+    } = ctx;
+    let Live {
+        active_session,
+        status_tx,
+        ..
+    } = live;
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match start_fixture_session(store, audio_store, codec, config)? {
         StartSessionOutcome::Started(session) => {
@@ -1410,87 +1476,52 @@ fn send_ipc_message(stream: &mut UnixStream, message: &IpcMessage) -> Result<(),
 /// Routes a tray activation. Recording controls (start/stop/cancel) need access
 /// to the live capture and the IPC stream, so they are handled here; everything
 /// else (history, settings) is delegated to [`handle_tray_callback`].
-#[allow(clippy::too_many_arguments)]
 fn handle_tray_action(
     callback: TrayCallback,
     stream: &mut UnixStream,
     tray: &mut KsniTray,
     clipboard: &mut ArboardClipboard,
-    store: &mut SqliteMetadataStore,
-    audio_store: &FileAudioStore,
-    codec: &OpusCodec,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    live_capture: &mut Option<crate::adapters::RuntimeCapture>,
-    live_stream: &mut Option<LiveStreamState>,
-    status_tx: &mut RecordingStatusTx,
+    mut ctx: Ctx<'_>,
+    live: &mut Live,
     retention_dialog: &dyn RetentionDialog,
 ) -> Result<(), RunLoopError> {
     let TrayCallback::Activate(action) = callback;
     match action.as_str() {
         "start_recording" => {
-            if crate::adapters::is_live_capture(&config.adapter_profile) {
-                if live_capture.is_none() {
-                    start_live_capture(
-                        stream,
-                        tray,
-                        store,
-                        config,
-                        active_session,
-                        live_capture,
-                        live_stream,
-                        status_tx,
-                    )?;
+            if crate::adapters::is_live_capture(&ctx.config.adapter_profile) {
+                if live.live_capture.is_none() {
+                    start_live_capture(stream, tray, ctx.reborrow(), live)?;
                 }
             } else {
-                start_fixture_oneshot(
-                    stream,
-                    tray,
-                    store,
-                    audio_store,
-                    codec,
-                    config,
-                    active_session,
-                    status_tx,
-                )?;
+                start_fixture_oneshot(stream, tray, ctx.reborrow(), live)?;
             }
         }
         "stop_recording" => {
-            if live_capture.is_some() {
-                stop_live_and_transcribe(
-                    stream,
-                    tray,
-                    store,
-                    audio_store,
-                    codec,
-                    config,
-                    active_session,
-                    live_capture,
-                    live_stream,
-                    status_tx,
-                )?;
+            if live.live_capture.is_some() {
+                stop_live_and_transcribe(stream, tray, ctx.reborrow(), live)?;
             }
         }
         "cancel" => {
-            drop_live_capture(live_capture);
-            *live_stream = None;
-            cancel_uncommitted_active_session(store, active_session, "tray-cancel")?;
-            *active_session = None;
-            status_tx.set(stream, tray, store, config, false)?;
+            drop_live_capture(&mut live.live_capture);
+            live.live_stream = None;
+            cancel_uncommitted_active_session(ctx.store, &mut live.active_session, "tray-cancel")?;
+            live.active_session = None;
+            live.status_tx
+                .set(stream, tray, ctx.store, ctx.config, false)?;
         }
         // "Insert" must land where the cursor is, so it goes through the active
         // IME front-end (the connected engine on `stream`) which types it into
         // the focused app — unlike "Copy", which only stages the clipboard.
         action if parse_id_suffix(action, "insert:").is_some() => {
             let id = parse_id_suffix(action, "insert:").expect("checked by guard");
-            insert_entry_via_ime(stream, store, id)?;
+            insert_entry_via_ime(stream, ctx.store, id)?;
         }
         _ => handle_tray_callback(
             TrayCallback::Activate(action),
             tray,
             clipboard,
-            store,
-            config,
+            ctx.store,
+            ctx.config,
             retention_dialog,
         )?,
     }

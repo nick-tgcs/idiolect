@@ -5,20 +5,19 @@
 //!
 //! - `engine_inserts_history_text_on_daemon_request` (the history-Insert path)
 //!   drives the engine against a fake-daemon socket AND spawns its **own** private
-//!   `dbus-daemon`, so it is fully self-contained — a normal `#[test]` (no
-//!   `#[ignore]`, no `dbus-run-session`) that runs in the standard flow with
-//!   `cargo test -p idiolect-ibus --features ibus-engine`.
+//!   `dbus-daemon`, so it is fully self-contained and runs in the standard flow
+//!   with `cargo test -p idiolect-ibus --features ibus-engine`.
 //! - `engine_dictates_and_daemon_records_the_session` additionally spawns the real
-//!   daemon (whose KSNI tray needs a session bus to attempt registration — it
-//!   degrades gracefully when no StatusNotifier host answers), so it needs an
-//!   **ambient session bus** and stays an `#[ignore]` manual test (run it with
-//!   `-- --ignored engine_dictates`). It drives the live toggle path: the
-//!   `fixture-live` device holds the "mic" open between two Super+T presses, so
-//!   the daemon pushes `recording=true` before delivering the transcript —
-//!   exactly the contract the engine's no-optimistic-flip state machine relies
-//!   on. It proves the full dictation + correction → training-candidate chain.
+//!   daemon (whose KSNI tray is skipped via `IDIOLECT_DISABLE_TRAY` and whose
+//!   clipboard degrades gracefully when there is no display), connecting to a
+//!   session bus. It drives the live toggle path: the `fixture-live` device holds
+//!   the "mic" open between two Super+T presses, so the daemon pushes
+//!   `recording=true` before delivering the transcript — exactly the contract the
+//!   engine's no-optimistic-flip state machine relies on. It proves the full
+//!   dictation + correction → training-candidate chain.
 //!
-//! CI runs the self-contained one via `ci/scripts/test-ibus-e2e.sh` (the `e2e` job).
+//! CI runs both via `ci/scripts/test-ibus-e2e.sh` (the `e2e` job, under
+//! `dbus-run-session`).
 #![cfg(feature = "ibus-engine")]
 
 use std::fs;
@@ -47,7 +46,6 @@ const DRAFT: &str = "restart traffic";
 const CORRECTED: &str = "restart Traefik";
 
 #[tokio::test]
-#[ignore = "needs an ambient session bus + the engine feature"]
 async fn engine_dictates_and_daemon_records_the_session() {
     let fixture = Fixture::new("e2e");
     let daemon = fixture.spawn_daemon();
