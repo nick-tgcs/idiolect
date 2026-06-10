@@ -69,6 +69,14 @@ impl TrayPort for KsniTray {
 
 impl KsniTray {
     pub fn new(sender: mpsc::Sender<TrayCallback>) -> Result<Self, KsniTrayError> {
+        // Escape hatch for headless/in-process use (notably integration tests that
+        // run several daemons inside one process): registering a StatusNotifierItem
+        // means a D-Bus round-trip on a pid-keyed bus name, which collides and
+        // destabilises sibling in-process daemons on a bare session bus. When set,
+        // run without a tray — the daemon already degrades gracefully to no icon.
+        if std::env::var_os("IDIOLECT_DISABLE_TRAY").is_some() {
+            return Ok(Self { handle: None });
+        }
         let inner = InnerTray {
             icon: TrayIcon::Idle,
             tooltip: "Idiolect — Ready".to_owned(),

@@ -32,7 +32,6 @@ use idiolect_ipc::messages::{
 };
 
 #[test]
-#[ignore = "needs an ambient desktop session; the in-process daemon's ksni/D-Bus tray init makes RecordingStatus push timing flaky on headless CI (run with --ignored)"]
 fn initial_recording_status_pushed_after_handshake() {
     let fixture = DaemonFixture::new("initial", "fixture");
     let daemon = fixture.spawn_daemon();
@@ -47,7 +46,6 @@ fn initial_recording_status_pushed_after_handshake() {
 }
 
 #[test]
-#[ignore = "needs an ambient desktop session; the in-process daemon's ksni/D-Bus tray init makes RecordingStatus push timing flaky on headless CI (run with --ignored)"]
 fn live_toggle_pushes_recording_true_then_false_around_the_take() {
     let fixture = DaemonFixture::new("toggle", "fixture-live");
     let daemon = fixture.spawn_daemon();
@@ -76,7 +74,6 @@ fn live_toggle_pushes_recording_true_then_false_around_the_take() {
 }
 
 #[test]
-#[ignore = "needs an ambient desktop session; the in-process daemon's ksni/D-Bus tray init makes RecordingStatus push timing flaky on headless CI (run with --ignored)"]
 fn cancel_during_recording_pushes_recording_false() {
     let fixture = DaemonFixture::new("cancel", "fixture-live");
     let daemon = fixture.spawn_daemon();
@@ -97,7 +94,6 @@ fn cancel_during_recording_pushes_recording_false() {
 }
 
 #[test]
-#[ignore = "needs an ambient desktop session; the in-process daemon's ksni/D-Bus tray init makes RecordingStatus push timing flaky on headless CI (run with --ignored)"]
 fn commit_and_correction_push_no_duplicate_status() {
     // The stop already announced `recording: false`; the commit and a follow-up
     // correction change HISTORY (the tray menu re-renders) but not the recording
@@ -135,7 +131,6 @@ fn commit_and_correction_push_no_duplicate_status() {
 }
 
 #[test]
-#[ignore = "needs an ambient desktop session; the in-process daemon's ksni/D-Bus tray init makes RecordingStatus push timing flaky on headless CI (run with --ignored)"]
 fn client_without_feature_sees_no_recording_status() {
     // Backward-compat guardrail: a client that does not request the feature gets
     // the exact pre-existing byte stream (PreeditUpdate only, no RecordingStatus).
@@ -180,6 +175,9 @@ impl DaemonFixture {
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
+        // Headless CI runs several daemons inside one process; skip the ksni tray
+        // so their pid-keyed D-Bus registrations don't collide and reset clients.
+        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),

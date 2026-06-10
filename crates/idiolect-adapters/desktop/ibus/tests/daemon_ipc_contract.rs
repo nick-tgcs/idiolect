@@ -13,13 +13,7 @@ use idiolect_ibus::ipc::{self, DaemonReader, DaemonSender};
 use idiolect_ibus::session::DaemonClient;
 use idiolect_ipc::IpcMessage;
 
-// Ignored on headless CI: these spawn the daemon in-process, and without an
-// ambient StatusNotifierWatcher the in-thread ksni/D-Bus tray init blocks the
-// serve loop past the client connect window (passes on a real desktop session;
-// run with `--ignored`). The corrected-commit / cancel learning behaviour is
-// covered headlessly by `daemon_run_lifecycle` against a subprocess daemon.
 #[test]
-#[ignore = "needs an ambient desktop session (StatusNotifierWatcher) for the in-process daemon's tray init"]
 fn ibus_ipc_client_records_a_correction_as_training_candidate() {
     let fixture = Fixture::new("correction");
     let daemon = fixture.spawn_daemon();
@@ -48,7 +42,6 @@ fn ibus_ipc_client_records_a_correction_as_training_candidate() {
 }
 
 #[test]
-#[ignore = "needs an ambient desktop session (StatusNotifierWatcher) for the in-process daemon's tray init"]
 fn ibus_ipc_client_cancel_records_nothing() {
     let fixture = Fixture::new("cancel");
     let daemon = fixture.spawn_daemon();
@@ -109,6 +102,9 @@ impl Fixture {
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
+        // Headless CI runs several daemons inside one process; skip the ksni tray
+        // so their pid-keyed D-Bus registrations don't collide and reset clients.
+        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),
