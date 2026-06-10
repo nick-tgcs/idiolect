@@ -302,6 +302,7 @@ trap 'rm -f "$tmp_file"' EXIT
 
 mkdir -p "$dest_dir"
 curl -fL --retry 3 --retry-delay 2 --output "$tmp_file" "$url"
-printf '%s  %s\n' "$sha256" "$tmp_file" | sha256sum -c -
+# whisper.cpp publishes SHA-1 checksums (40 hex chars), so verify with sha1sum.
+printf '%s  %s\n' "$sha256" "$tmp_file" | sha1sum -c -
 mv "$tmp_file" "$dest_dir/$file_name"
 trap - EXIT
