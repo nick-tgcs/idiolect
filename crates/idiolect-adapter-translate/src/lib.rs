@@ -82,11 +82,12 @@ impl TranslationPort for CommandTranslator {
         }
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
-            .map_err(|error| CommandTranslatorError::SpawnFailed {
-                message: error.to_string(),
-            })?;
+        let output =
+            child
+                .wait_with_output()
+                .map_err(|error| CommandTranslatorError::SpawnFailed {
+                    message: error.to_string(),
+                })?;
 
         if !output.status.success() {
             return Err(CommandTranslatorError::CommandFailed {
@@ -164,7 +165,8 @@ mod tests {
         let translator =
             CommandTranslator::from_config(path.to_str().expect("utf8 path")).expect("configured");
 
-        let translated = translate_retrying(&translator, &request("hej världen")).expect("translate");
+        let translated =
+            translate_retrying(&translator, &request("hej världen")).expect("translate");
 
         assert_eq!(translated, "sv:en:hej världen");
         let _ = std::fs::remove_file(&path);
@@ -176,7 +178,10 @@ mod tests {
         let translator =
             CommandTranslator::from_config(path.to_str().expect("utf8 path")).expect("configured");
 
-        assert_eq!(translate_retrying(&translator, &request("hello")).expect("translate"), "hello");
+        assert_eq!(
+            translate_retrying(&translator, &request("hello")).expect("translate"),
+            "hello"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

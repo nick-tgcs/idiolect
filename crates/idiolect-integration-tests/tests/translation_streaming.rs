@@ -152,12 +152,13 @@ impl DaemonFixture {
         use idiolect_ports::storage::MetadataStorePort;
         fs::create_dir_all(self.database_path().parent().expect("db parent"))
             .expect("db parent should be created");
-        let mut store = idiolect_adapter_sqlite::SqliteMetadataStore::open_path(
-            self.database_path(),
-        )
-        .expect("seed store should open");
+        let mut store =
+            idiolect_adapter_sqlite::SqliteMetadataStore::open_path(self.database_path())
+                .expect("seed store should open");
         store.migrate().expect("seed store should migrate");
-        store.set_tray_setting(key, value).expect("setting should persist");
+        store
+            .set_tray_setting(key, value)
+            .expect("setting should persist");
     }
 
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {

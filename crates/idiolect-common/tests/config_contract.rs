@@ -136,12 +136,16 @@ fn translation_rejects_unknown_languages_and_auto_output() {
 
     config.translation.input_language = "klingon".to_owned();
     config.translation.output_language = "en".to_owned();
-    let error = config.validate().expect_err("unknown input language must be rejected");
+    let error = config
+        .validate()
+        .expect_err("unknown input language must be rejected");
     assert!(format!("{error}").contains("translation.input_language"));
 
     config.translation.input_language = "auto".to_owned();
     config.translation.output_language = "klingon".to_owned();
-    let error = config.validate().expect_err("unknown output language must be rejected");
+    let error = config
+        .validate()
+        .expect_err("unknown output language must be rejected");
     assert!(format!("{error}").contains("translation.output_language"));
 
     // "auto" only makes sense as an input: the output must be a concrete language.
@@ -156,7 +160,11 @@ fn language_catalogue_covers_the_whisper_set_with_display_names() {
 
     // The catalogue is what both config validation and the tray menus offer, so
     // it must cover the full Whisper language set ("any language").
-    assert!(LANGUAGES.len() >= 99, "expected the full Whisper set, got {}", LANGUAGES.len());
+    assert!(
+        LANGUAGES.len() >= 99,
+        "expected the full Whisper set, got {}",
+        LANGUAGES.len()
+    );
     for (code, name) in LANGUAGES {
         assert!(!code.is_empty() && !name.is_empty());
         assert!(is_supported_language(code), "{code} should be supported");
@@ -165,7 +173,10 @@ fn language_catalogue_covers_the_whisper_set_with_display_names() {
     assert_eq!(language_name("sv"), Some("Swedish"));
     assert_eq!(language_name("ja"), Some("Japanese"));
     assert_eq!(language_name("klingon"), None);
-    assert!(!is_supported_language("auto"), "auto is a hint, not a language");
+    assert!(
+        !is_supported_language("auto"),
+        "auto is a hint, not a language"
+    );
 }
 
 #[test]

@@ -104,7 +104,9 @@ pub(crate) enum RuntimeCapture {
     FixtureLive,
     /// Live-lifecycle marker whose first poll drains a canned
     /// speech–pause–speech clip (see [`FIXTURE_STREAM_DEVICE`]).
-    FixtureStream { drained: bool },
+    FixtureStream {
+        drained: bool,
+    },
     Live {
         input: CpalAudioInput,
         session_id: ImeSessionId,
@@ -610,7 +612,10 @@ mod tests {
     fn configured_command_translates_the_transcript() {
         // Any-pair translation: the transcript is piped through the external
         // translator with the configured language pair.
-        let script = translator_script("pair", r#"printf '[%s>%s] ' "$1" "$2"; tr '[:lower:]' '[:upper:]'"#);
+        let script = translator_script(
+            "pair",
+            r#"printf '[%s>%s] ' "$1" "$2"; tr '[:lower:]' '[:upper:]'"#,
+        );
         let settings = translation("sv", "ja", script.to_str().expect("utf8 path"));
 
         let draft = transcribe_translated(&fixture_asr_profile(), &settings, &fixture_audio())

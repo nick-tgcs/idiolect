@@ -436,7 +436,10 @@ mod tests {
 
         // The stream callback appends more; the next drain sees only the new tail.
         buffer.lock().expect("lock").extend_from_slice(&[0.4, 0.5]);
-        assert_eq!(drain_capture_buffer(&buffer).expect("drain"), vec![0.4, 0.5]);
+        assert_eq!(
+            drain_capture_buffer(&buffer).expect("drain"),
+            vec![0.4, 0.5]
+        );
     }
 
     #[test]

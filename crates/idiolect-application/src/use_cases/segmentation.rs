@@ -244,7 +244,10 @@ mod tests {
         for index in 0..count {
             let emitted = segmenter.push_frame(&frame(value), is_speech);
             if index + 1 < count {
-                assert!(emitted.is_none(), "snippet emitted mid-run at frame {index}");
+                assert!(
+                    emitted.is_none(),
+                    "snippet emitted mid-run at frame {index}"
+                );
             }
             last = emitted;
         }
@@ -265,8 +268,15 @@ mod tests {
 
         // pre-roll (2) + speech (4) + trailing silence (3) = 9 frames.
         assert_eq!(snippet.samples_f32_mono.len(), 9 * 10);
-        assert!(snippet.samples_f32_mono.starts_with(&[0.1; 20]), "pre-roll retained");
-        assert_eq!(&snippet.samples_f32_mono[20..60], &[0.9; 40], "speech retained");
+        assert!(
+            snippet.samples_f32_mono.starts_with(&[0.1; 20]),
+            "pre-roll retained"
+        );
+        assert_eq!(
+            &snippet.samples_f32_mono[20..60],
+            &[0.9; 40],
+            "speech retained"
+        );
         assert!(!segmenter.is_speaking(), "back to idle after the pause");
     }
 
@@ -353,7 +363,10 @@ mod tests {
     fn frame_buffer_rechunks_with_remainder_carry() {
         let mut buffer = FrameBuffer::new();
 
-        assert!(buffer.push(&[1.0; 7], 10).is_empty(), "incomplete frame waits");
+        assert!(
+            buffer.push(&[1.0; 7], 10).is_empty(),
+            "incomplete frame waits"
+        );
         let frames = buffer.push(&[2.0; 18], 10);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0][..7], [1.0; 7][..]);

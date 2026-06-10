@@ -14,10 +14,10 @@ use idiolect_adapter_crypto::{
 };
 use idiolect_adapter_ksni::{KsniTray, KsniTrayError, TrayCallback};
 use idiolect_adapter_opus::{OpusCodec, OpusCodecError};
-use idiolect_adapter_vad::{VadAdapter, FRAME_DURATION_MS, FRAME_SAMPLE_COUNT};
 use idiolect_adapter_sqlite::{
     FileAudioStore, FileAudioStoreError, SqliteMetadataStore, SqliteStorageError,
 };
+use idiolect_adapter_vad::{VadAdapter, FRAME_DURATION_MS, FRAME_SAMPLE_COUNT};
 use idiolect_application::use_cases::history::ClipboardPort;
 use idiolect_application::use_cases::maintenance::{MaintenanceUseCase, DEFAULT_PRUNE_INTERVAL};
 use idiolect_application::use_cases::menu::{
@@ -1585,9 +1585,21 @@ fn handle_tray_callback(
         store
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
-        refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+        refresh_tray_menu(
+            tray,
+            store,
+            defaults,
+            translation_defaults,
+            RecordingState::Idle,
+        )?;
     } else if apply_translation_tray_action(store, translation_defaults, &action)? {
-        refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+        refresh_tray_menu(
+            tray,
+            store,
+            defaults,
+            translation_defaults,
+            RecordingState::Idle,
+        )?;
     } else if let Some(id) = parse_id_suffix(&action, "insert:") {
         let _ = reinsert_entry(store, clipboard, id, defaults.clipboard_auto_clear_secs)?;
     } else if let Some(id) = parse_id_suffix(&action, "copy:") {
@@ -1595,7 +1607,13 @@ fn handle_tray_callback(
     } else if let Some(id) = parse_id_suffix(&action, "delete:") {
         match store.delete_history_entry(id) {
             Ok(()) => {
-                refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+                refresh_tray_menu(
+                    tray,
+                    store,
+                    defaults,
+                    translation_defaults,
+                    RecordingState::Idle,
+                )?;
             }
             Err(error) => eprintln!("tray delete of entry {id} failed: {error}"),
         }
@@ -1604,7 +1622,13 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("retention_days", &days.to_string())
                 .map_err(|error| RunLoopError::storage("set retention_days", error))?;
-            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+            refresh_tray_menu(
+                tray,
+                store,
+                defaults,
+                translation_defaults,
+                RecordingState::Idle,
+            )?;
         } else {
             eprintln!("tray retention index out of range: {index}");
         }
@@ -1613,7 +1637,13 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("max_entries", &max.to_string())
                 .map_err(|error| RunLoopError::storage("set max_entries", error))?;
-            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+            refresh_tray_menu(
+                tray,
+                store,
+                defaults,
+                translation_defaults,
+                RecordingState::Idle,
+            )?;
         } else {
             eprintln!("tray max_entries index out of range: {index}");
         }
@@ -1640,7 +1670,13 @@ fn handle_tray_callback(
         // A preset; the appended "(custom)" marker has no preset and is a no-op.
         if let Some((_, days)) = TRAINING_RETENTION_CHOICES.get(index) {
             set_training_retention(store, *days)?;
-            refresh_tray_menu(tray, store, defaults, translation_defaults, RecordingState::Idle)?;
+            refresh_tray_menu(
+                tray,
+                store,
+                defaults,
+                translation_defaults,
+                RecordingState::Idle,
+            )?;
         }
     } else {
         // start_recording / stop_recording / cancel originate from the IME client
@@ -1926,7 +1962,11 @@ mod tests {
             assert_eq!(snippets.len(), 2, "one snippet per pause");
             for snippet in &snippets {
                 // Each snippet must carry at least the spoken clip (~1s).
-                assert!(snippet.len() > 16_000 / 2, "snippet too short: {}", snippet.len());
+                assert!(
+                    snippet.len() > 16_000 / 2,
+                    "snippet too short: {}",
+                    snippet.len()
+                );
             }
             assert!(state.flush().is_none(), "no tail after the final pause");
         }
@@ -1973,12 +2013,16 @@ mod tests {
             let mut store = store();
             let defaults = TranslationConfig::default(); // disabled
 
-            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
-                .expect("toggle"));
+            assert!(
+                apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
+                    .expect("toggle")
+            );
             assert!(effective_translation_config(&store, &defaults).enabled);
 
-            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
-                .expect("toggle"));
+            assert!(
+                apply_translation_tray_action(&mut store, &defaults, "translation:enabled")
+                    .expect("toggle")
+            );
             assert!(!effective_translation_config(&store, &defaults).enabled);
         }
 
@@ -1988,14 +2032,20 @@ mod tests {
             let defaults = TranslationConfig::default();
 
             // Input index 0 is "Auto detect"; the rest follow the catalogue.
-            let swedish = LANGUAGES.iter().position(|(code, _)| *code == "sv").expect("sv");
+            let swedish = LANGUAGES
+                .iter()
+                .position(|(code, _)| *code == "sv")
+                .expect("sv");
             assert!(apply_translation_tray_action(
                 &mut store,
                 &defaults,
                 &format!("translation:input:{}", swedish + 1),
             )
             .expect("input pick"));
-            let japanese = LANGUAGES.iter().position(|(code, _)| *code == "ja").expect("ja");
+            let japanese = LANGUAGES
+                .iter()
+                .position(|(code, _)| *code == "ja")
+                .expect("ja");
             assert!(apply_translation_tray_action(
                 &mut store,
                 &defaults,
@@ -2008,8 +2058,10 @@ mod tests {
             assert_eq!(effective.output_language, "ja");
 
             // Back to auto-detect via index 0.
-            assert!(apply_translation_tray_action(&mut store, &defaults, "translation:input:0")
-                .expect("auto pick"));
+            assert!(
+                apply_translation_tray_action(&mut store, &defaults, "translation:input:0")
+                    .expect("auto pick")
+            );
             assert_eq!(
                 effective_translation_config(&store, &defaults).input_language,
                 "auto"
@@ -2031,10 +2083,13 @@ mod tests {
             );
 
             // Non-translation actions are left for the other handlers.
-            assert!(!apply_translation_tray_action(&mut store, &defaults, "review_mode")
-                .expect("foreign"));
-            assert!(!apply_translation_tray_action(&mut store, &defaults, "delete:3")
-                .expect("foreign"));
+            assert!(
+                !apply_translation_tray_action(&mut store, &defaults, "review_mode")
+                    .expect("foreign")
+            );
+            assert!(
+                !apply_translation_tray_action(&mut store, &defaults, "delete:3").expect("foreign")
+            );
         }
     }
 
@@ -2065,9 +2120,15 @@ mod tests {
             assert_eq!(effective, defaults);
 
             // The user flips translation on and picks Swedish → Japanese in the tray.
-            store.set_tray_setting("translation_enabled", "true").expect("set");
-            store.set_tray_setting("translation_input_lang", "sv").expect("set");
-            store.set_tray_setting("translation_output_lang", "ja").expect("set");
+            store
+                .set_tray_setting("translation_enabled", "true")
+                .expect("set");
+            store
+                .set_tray_setting("translation_input_lang", "sv")
+                .expect("set");
+            store
+                .set_tray_setting("translation_output_lang", "ja")
+                .expect("set");
 
             let effective = effective_translation_config(&store, &defaults);
             assert!(effective.enabled);
@@ -2085,12 +2146,19 @@ mod tests {
             store.migrate().expect("migrate");
             let defaults = TranslationConfig::default();
 
-            store.set_tray_setting("translation_input_lang", "klingon").expect("set");
-            store.set_tray_setting("translation_output_lang", "auto").expect("set");
+            store
+                .set_tray_setting("translation_input_lang", "klingon")
+                .expect("set");
+            store
+                .set_tray_setting("translation_output_lang", "auto")
+                .expect("set");
 
             let effective = effective_translation_config(&store, &defaults);
             assert_eq!(effective.input_language, "auto", "unknown input -> default");
-            assert_eq!(effective.output_language, "en", "auto is invalid as output -> default");
+            assert_eq!(
+                effective.output_language, "en",
+                "auto is invalid as output -> default"
+            );
         }
     }
 

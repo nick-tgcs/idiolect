@@ -249,7 +249,8 @@ impl AsrPort for WhisperAsr {
     }
 
     fn transcribe(&self, audio: &AudioSegment) -> Result<TranscriptDraft, Self::Error> {
-        self.backend.transcribe(audio, &WhisperDecodeTask::default())
+        self.backend
+            .transcribe(audio, &WhisperDecodeTask::default())
     }
 }
 
