@@ -16,12 +16,28 @@ pub const RETENTION_DAY_CHOICES: [u32; 3] = [1, 7, 30];
 /// Allowed max-entry choices surfaced in the tray settings menu.
 pub const MAX_ENTRY_CHOICES: [u32; 3] = [10, 25, 50];
 
+/// Training-data retention presets shown in the tray, as `(label, days)`. The
+/// user may also pick a free-form value via the "Custom…" item, so these are
+/// conveniences, not the full set of valid values.
+pub const TRAINING_RETENTION_CHOICES: [(&str, u32); 8] = [
+    ("1 month", 30),
+    ("3 months", 90),
+    ("6 months", 180),
+    ("9 months", 270),
+    ("1 year", 365),
+    ("2 years", 730),
+    ("4 years", 1460),
+    ("10 years", 3650),
+];
+
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum MenuUseCaseError {
     #[error("invalid retention days: {0} (must be 1, 7, or 30)")]
     InvalidRetentionDays(u32),
     #[error("invalid max entries: {0} (must be 10, 25, or 50)")]
     InvalidMaxEntries(u32),
+    #[error("invalid training retention days: {0} (must be 0..={max})", max = idiolect_common::config::MAX_TRAINING_RETENTION_DAYS)]
+    InvalidTrainingRetentionDays(u32),
 }
 
 /// Validates a retention-day value against the allowed tray choices.
@@ -45,6 +61,43 @@ pub fn validate_max_entries(max: u32) -> Result<(), MenuUseCaseError> {
         Ok(())
     } else {
         Err(MenuUseCaseError::InvalidMaxEntries(max))
+    }
+}
+
+/// Validates a training-data retention value. Unlike the tray-history settings
+/// this is free-form (presets + custom): any value from `0` (keep forever) up to
+/// the sanity cap is accepted.
+///
+/// # Errors
+/// Returns [`MenuUseCaseError::InvalidTrainingRetentionDays`] if `days` exceeds
+/// [`idiolect_common::config::MAX_TRAINING_RETENTION_DAYS`].
+pub fn validate_training_retention_days(days: u32) -> Result<(), MenuUseCaseError> {
+    if days <= idiolect_common::config::MAX_TRAINING_RETENTION_DAYS {
+        Ok(())
+    } else {
+        Err(MenuUseCaseError::InvalidTrainingRetentionDays(days))
+    }
+}
+
+/// The radio options + selected index for the training-retention menu. When the
+/// current value isn't one of the presets (a custom value), an extra
+/// "N days (custom)" option is appended and selected so the menu always shows the
+/// active choice.
+fn training_retention_radio(current_days: u32) -> (Vec<String>, usize) {
+    let mut options: Vec<String> = TRAINING_RETENTION_CHOICES
+        .iter()
+        .map(|(label, _)| (*label).to_owned())
+        .collect();
+    match TRAINING_RETENTION_CHOICES
+        .iter()
+        .position(|(_, days)| *days == current_days)
+    {
+        Some(index) => (options, index),
+        None => {
+            options.push(format!("{current_days} days (custom)"));
+            let selected = options.len() - 1;
+            (options, selected)
+        }
     }
 }
 
@@ -173,7 +226,7 @@ impl MenuUseCase {
                 });
                 items.push(TrayMenuItem {
                     id: "stop_recording".to_owned(),
-                    label: "Stop Recording".to_owned(),
+                    label: "Stop & Insert".to_owned(),
                     enabled: false,
                     kind: TrayMenuItemKind::Standard { submenu: None },
                 });
@@ -187,7 +240,7 @@ impl MenuUseCase {
                 });
                 items.push(TrayMenuItem {
                     id: "stop_recording".to_owned(),
-                    label: "Stop Recording".to_owned(),
+                    label: "Stop & Insert".to_owned(),
                     enabled: true,
                     kind: TrayMenuItemKind::Standard { submenu: None },
                 });
@@ -197,7 +250,7 @@ impl MenuUseCase {
         // Cancel
         items.push(TrayMenuItem {
             id: "cancel".to_owned(),
-            label: "Cancel".to_owned(),
+            label: "Cancel (discard)".to_owned(),
             enabled: matches!(recording_state, RecordingState::Recording),
             kind: TrayMenuItemKind::Standard { submenu: None },
         });
@@ -264,7 +317,8 @@ impl MenuUseCase {
             },
         });
 
-        // Settings submenu
+        // Settings submenu: two distinct retention concepts, kept visually
+        // separate — the short tray-history list vs the long training-data corpus.
         let retention_options = vec!["1 day".to_owned(), "7 days".to_owned(), "30 days".to_owned()];
         let retention_selected = match config.retention_days {
             1 => 0,
@@ -281,15 +335,16 @@ impl MenuUseCase {
             _ => 0,
         };
 
-        items.push(TrayMenuItem {
-            id: "settings".to_owned(),
-            label: "Settings".to_owned(),
+        // "Tray history": how long / how many recent dictations the menu shows.
+        let tray_history = TrayMenuItem {
+            id: "settings:tray_history".to_owned(),
+            label: "Tray history".to_owned(),
             enabled: true,
             kind: TrayMenuItemKind::Standard {
                 submenu: Some(vec![
                     TrayMenuItem {
                         id: "settings:retention".to_owned(),
-                        label: "Retention".to_owned(),
+                        label: "Show last".to_owned(),
                         enabled: true,
                         kind: TrayMenuItemKind::RadioGroup {
                             options: retention_options,
@@ -298,7 +353,7 @@ impl MenuUseCase {
                     },
                     TrayMenuItem {
                         id: "settings:max_entries".to_owned(),
-                        label: "Max Entries".to_owned(),
+                        label: "Max items".to_owned(),
                         enabled: true,
                         kind: TrayMenuItemKind::RadioGroup {
                             options: max_entries_options,
@@ -306,6 +361,44 @@ impl MenuUseCase {
                         },
                     },
                 ]),
+            },
+        };
+
+        // "Training data kept for": how long captured audio + transcripts are
+        // retained for learning. Presets plus a free-form "Custom…" entry.
+        let (training_options, training_selected) =
+            training_retention_radio(config.training_retention_days);
+        let training_data = TrayMenuItem {
+            id: "settings:training_data".to_owned(),
+            label: "Training data kept for".to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::Standard {
+                submenu: Some(vec![
+                    TrayMenuItem {
+                        id: "settings:training_retention".to_owned(),
+                        label: "Keep for".to_owned(),
+                        enabled: true,
+                        kind: TrayMenuItemKind::RadioGroup {
+                            options: training_options,
+                            selected: training_selected,
+                        },
+                    },
+                    TrayMenuItem {
+                        id: "settings:training_retention_custom".to_owned(),
+                        label: "Custom…".to_owned(),
+                        enabled: true,
+                        kind: TrayMenuItemKind::Standard { submenu: None },
+                    },
+                ]),
+            },
+        };
+
+        items.push(TrayMenuItem {
+            id: "settings".to_owned(),
+            label: "Settings".to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::Standard {
+                submenu: Some(vec![tray_history, training_data]),
             },
         });
 
@@ -323,11 +416,33 @@ impl Default for MenuUseCase {
 mod tests {
     use super::{
         mask_sensitive, truncate_for_menu, validate_max_entries, validate_retention_days,
-        MenuUseCase, RecordingState, MENU_PREVIEW_MAX_CHARS,
+        validate_training_retention_days, MenuUseCase, RecordingState, MENU_PREVIEW_MAX_CHARS,
     };
     use idiolect_common::config::HistoryConfig;
     use idiolect_common::ids::ImeSessionId;
-    use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayMenuItemKind};
+    use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayMenuItem, TrayMenuItemKind};
+
+    /// Find a child item by id within a Standard submenu.
+    fn child<'a>(items: &'a [TrayMenuItem], id: &str) -> &'a TrayMenuItem {
+        items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap_or_else(|| panic!("missing menu item {id}"))
+    }
+
+    fn submenu(item: &TrayMenuItem) -> &[TrayMenuItem] {
+        match &item.kind {
+            TrayMenuItemKind::Standard { submenu: Some(sub) } => sub,
+            _ => panic!("{} should have a submenu", item.id),
+        }
+    }
+
+    fn radio_selected(item: &TrayMenuItem) -> (usize, &[String]) {
+        match &item.kind {
+            TrayMenuItemKind::RadioGroup { selected, options } => (*selected, options),
+            _ => panic!("{} should be a radio group", item.id),
+        }
+    }
 
     fn entry(id: i64, text: &str, state: HistoryState) -> HistoryEntry {
         HistoryEntry {
@@ -362,6 +477,19 @@ mod tests {
     }
 
     #[test]
+    fn recording_controls_have_self_documenting_labels() {
+        // Per-item tray tooltips are not supported by the DBusMenu protocol, so the
+        // labels themselves must convey what Stop vs Cancel do: Stop transcribes and
+        // inserts the text; Cancel throws the audio away.
+        let config = HistoryConfig::default();
+        let menu = MenuUseCase::new().get_menu(RecordingState::Recording, &[], &config);
+
+        assert_eq!(child(&menu, "start_recording").label, "Start Recording");
+        assert_eq!(child(&menu, "stop_recording").label, "Stop & Insert");
+        assert_eq!(child(&menu, "cancel").label, "Cancel (discard)");
+    }
+
+    #[test]
     fn menu_reflects_retention_selection_and_history() {
         let config = HistoryConfig {
             retention_days: 30,
@@ -371,21 +499,54 @@ mod tests {
         let history = vec![entry(1, "hello world", HistoryState::Committed)];
         let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &config);
 
-        let settings = menu
-            .iter()
-            .find(|item| item.id == "settings")
-            .expect("settings present");
-        let TrayMenuItemKind::Standard { submenu: Some(sub) } = &settings.kind else {
-            panic!("settings should have a submenu");
+        let settings = submenu(child(&menu, "settings"));
+        // Tray-history retention now lives under the "Tray history" group.
+        let tray_history = submenu(child(settings, "settings:tray_history"));
+        let (selected, _) = radio_selected(child(tray_history, "settings:retention"));
+        assert_eq!(selected, 2, "30 days -> index 2");
+        let (max_selected, _) = radio_selected(child(tray_history, "settings:max_entries"));
+        assert_eq!(max_selected, 1, "25 entries -> index 1");
+    }
+
+    #[test]
+    fn training_retention_radio_selects_the_matching_preset() {
+        let config = HistoryConfig {
+            training_retention_days: 365, // "1 year" -> index 4
+            ..HistoryConfig::default()
         };
-        let retention = sub
-            .iter()
-            .find(|item| item.id == "settings:retention")
-            .expect("retention present");
-        let TrayMenuItemKind::RadioGroup { selected, .. } = &retention.kind else {
-            panic!("retention should be a radio group");
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config);
+
+        let settings = submenu(child(&menu, "settings"));
+        let training = submenu(child(settings, "settings:training_data"));
+        let (selected, options) = radio_selected(child(training, "settings:training_retention"));
+        assert_eq!(options.len(), 8, "the eight presets, no custom marker");
+        assert_eq!(options[selected], "1 year");
+        // The free-form custom entry point is present.
+        assert_eq!(child(training, "settings:training_retention_custom").label, "Custom…");
+    }
+
+    #[test]
+    fn training_retention_radio_shows_a_custom_value_as_selected() {
+        let config = HistoryConfig {
+            training_retention_days: 540, // not a preset
+            ..HistoryConfig::default()
         };
-        assert_eq!(*selected, 2); // 30 days -> index 2
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config);
+
+        let settings = submenu(child(&menu, "settings"));
+        let training = submenu(child(settings, "settings:training_data"));
+        let (selected, options) = radio_selected(child(training, "settings:training_retention"));
+        assert_eq!(options.len(), 9, "presets + the custom marker");
+        assert_eq!(options[selected], "540 days (custom)");
+    }
+
+    #[test]
+    fn training_retention_validation_allows_custom_and_zero_but_caps_absurd_values() {
+        assert!(validate_training_retention_days(0).is_ok()); // keep forever
+        assert!(validate_training_retention_days(540).is_ok()); // custom
+        assert!(validate_training_retention_days(3650).is_ok()); // preset
+        assert!(validate_training_retention_days(36_500).is_ok()); // cap
+        assert!(validate_training_retention_days(36_501).is_err());
     }
 
     #[test]

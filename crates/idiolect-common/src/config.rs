@@ -111,6 +111,13 @@ impl IdiolectConfig {
                 field: "history.max_entries".to_owned(),
             });
         }
+        // Training-data retention is free-form (presets + custom): any value from 0
+        // (keep forever) up to the sanity cap is allowed.
+        if self.history.training_retention_days > MAX_TRAINING_RETENTION_DAYS {
+            return Err(ConfigError::ValidationError {
+                field: "history.training_retention_days".to_owned(),
+            });
+        }
 
         Ok(())
     }
@@ -288,6 +295,12 @@ pub struct HistoryConfig {
     pub retention_days: u32,
     #[serde(default = "default_history_max_entries")]
     pub max_entries: u32,
+    /// How long captured training data (audio + transcript + correction) is kept
+    /// before the background prune purges it. Distinct from `retention_days`,
+    /// which only bounds the tray's recent-history list. `0` disables the prune
+    /// (keep forever). Defaults to one year.
+    #[serde(default = "default_training_retention_days")]
+    pub training_retention_days: u32,
     /// Seconds after which a history entry copied to the clipboard is cleared.
     /// `0` disables auto-clear.
     #[serde(default = "default_history_clipboard_auto_clear_secs")]
@@ -304,6 +317,7 @@ impl Default for HistoryConfig {
         Self {
             retention_days: default_history_retention_days(),
             max_entries: default_history_max_entries(),
+            training_retention_days: default_training_retention_days(),
             clipboard_auto_clear_secs: default_history_clipboard_auto_clear_secs(),
             encrypt_at_rest: false,
         }
@@ -524,6 +538,15 @@ fn default_training_trainer() -> String {
 fn default_history_retention_days() -> u32 {
     1
 }
+
+/// One year, in days — the default training-data retention window.
+fn default_training_retention_days() -> u32 {
+    365
+}
+
+/// Upper bound for training-data retention (~100 years); guards against typos in
+/// a custom value while leaving any realistic choice valid.
+pub const MAX_TRAINING_RETENTION_DAYS: u32 = 36_500;
 
 fn default_history_max_entries() -> u32 {
     10

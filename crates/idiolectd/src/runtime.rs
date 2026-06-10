@@ -268,6 +268,10 @@ fn run_daemon_with_tray(
             audio_input_device: config.audio.input_device.clone(),
             vad_engine: config.vad.engine.clone(),
             asr_engine: config.asr.engine.clone(),
+            whisper_model_path: paths.model_path.clone(),
+            asr_use_gpu: config.asr.use_gpu,
+            asr_language: config.asr.language.clone(),
+            asr_threads: config.asr.threads,
         },
         history_config: config.history.clone(),
     })
@@ -468,7 +472,7 @@ fn handle_fixture_connection(
                 let response = negotiate_protocol(&client).map_err(RuntimeError::handshake)?;
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
             }
-            IpcMessage::StartRecording => {
+            IpcMessage::StartRecording | IpcMessage::ToggleRecording => {
                 let started_session = use_case
                     .start_dictation()
                     .map_err(RuntimeError::dictation)?;
@@ -481,9 +485,13 @@ fn handle_fixture_connection(
                     &mut stream,
                     &IpcMessage::PreeditUpdate(PreeditUpdate {
                         text: transcript.to_owned(),
+                        review: false,
                     }),
                 )?;
             }
+            // The fixture server transcribes immediately on StartRecording, so an
+            // explicit stop is a no-op here (the real run loop honours it).
+            IpcMessage::StopRecording => {}
             IpcMessage::CommitPreedit(commit) => {
                 let active_session = required_session(session_id)?;
                 if commit.text != current_text {
@@ -495,6 +503,15 @@ fn handle_fixture_connection(
                 use_case
                     .commit(active_session, &commit.text, "fixture-server-commit")
                     .map_err(RuntimeError::dictation)?;
+            }
+            IpcMessage::ReportCorrection(correction) => {
+                let active_session = required_session(session_id)?;
+                if correction.corrected_text != current_text {
+                    use_case
+                        .correct_preedit(active_session, &current_text, &correction.corrected_text, 1)
+                        .map_err(RuntimeError::dictation)?;
+                    current_text = correction.corrected_text.clone();
+                }
             }
             IpcMessage::CancelPreedit => {
                 let active_session = required_session(session_id)?;
@@ -511,7 +528,11 @@ fn handle_fixture_connection(
                     }),
                 )?;
             }
-            IpcMessage::ServerHello(_) | IpcMessage::PreeditUpdate(_) | IpcMessage::Error(_) => {
+            IpcMessage::ServerHello(_)
+            | IpcMessage::RecordingStatus(_)
+            | IpcMessage::PreeditUpdate(_)
+            | IpcMessage::InsertText(_)
+            | IpcMessage::Error(_) => {
                 send_ipc_message(
                     &mut stream,
                     &IpcMessage::Error(ErrorMessage {

@@ -1,0 +1,581 @@
+//! IBus engine glue (zbus). Exposes `org.freedesktop.IBus.Factory` +
+//! `org.freedesktop.IBus.Engine` on the IBus bus, drives the [`Session`] from
+//! `ProcessKeyEvent`, and emits `CommitText`/`UpdatePreeditText` to type into
+//! the focused app. Feature-gated (`ibus-engine`).
+//!
+//! The daemon connection is established ONCE at process startup and shared by
+//! all engine instances. `CreateEngine` must be instant — doing a blocking
+//! connect inside that async DBus handler makes ibus's `SetGlobalEngine` time
+//! out (and the daemon serves one connection at a time, so per-instance
+//! connects would also deadlock).
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use idiolect_ipc::IpcMessage;
+use zbus::zvariant::{Array, Dict, OwnedObjectPath, Signature, StructureBuilder, Value};
+use zbus::{interface, Connection};
+
+use crate::ipc::{self, DaemonReader, DaemonSender};
+use crate::session::{Key, Session, Surface};
+
+const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
+const FACTORY_PATH: &str = "/org/freedesktop/IBus/Factory";
+const TRIGGER_PATH: &str = "/org/idiolect/Trigger";
+const BUS_NAME: &str = "org.freedesktop.IBus.Idiolect";
+
+// IBus keyvals / modifier masks.
+const KEY_ESCAPE: u32 = 0xff1b;
+const KEY_BACKSPACE: u32 = 0xff08;
+const KEY_DELETE: u32 = 0xffff;
+const KEY_HOME: u32 = 0xff50;
+const KEY_LEFT: u32 = 0xff51;
+const KEY_RIGHT: u32 = 0xff53;
+const KEY_END: u32 = 0xff57;
+const RELEASE_MASK: u32 = 1 << 30;
+const MOD4_MASK: u32 = 1 << 6; // Super on most layouts
+const SUPER_MASK: u32 = 1 << 26;
+
+/// Buffers the surface effects produced by a `Session` call so the async DBus
+/// layer can emit them as IBus signals afterwards.
+#[derive(Default)]
+pub struct PendingSurface {
+    ops: Vec<SurfaceOp>,
+}
+
+impl PendingSurface {
+    fn take_ops(&mut self) -> Vec<SurfaceOp> {
+        std::mem::take(&mut self.ops)
+    }
+}
+
+enum SurfaceOp {
+    Commit { text: String },
+}
+
+impl Surface for PendingSurface {
+    fn commit_text(&mut self, text: &str) {
+        self.ops.push(SurfaceOp::Commit {
+            text: text.to_owned(),
+        });
+    }
+}
+
+/// Process-wide shared state: the single daemon connection (via the session) and
+/// the path of the currently focused engine instance (where signals are sent).
+struct Shared {
+    session: Mutex<Session<DaemonSender, PendingSurface>>,
+    active_path: Mutex<Option<OwnedObjectPath>>,
+    /// Review dialog used in "review before insert" mode. Behind a trait so the
+    /// GUI toolkit is swappable; runs out-of-process so it never blocks the IME.
+    dialog: Box<dyn crate::review::ReviewDialog>,
+    /// "Voice is live" overlay shown next to the caret while recording.
+    indicator: Box<dyn crate::indicator::RecordingIndicator>,
+    /// Latest known caret position (screen pixels) from `set_cursor_location`,
+    /// so the indicator can appear right where the user is dictating.
+    caret: Mutex<(i32, i32)>,
+    connection: Connection,
+}
+
+type SharedRef = Arc<Shared>;
+
+impl Shared {
+    fn set_active(&self, path: &OwnedObjectPath) {
+        *self.active_path.lock().expect("active_path mutex") = Some(path.clone());
+    }
+
+    /// Run a session operation and return the resulting surface ops (lock held
+    /// only briefly; never nested with `active_path`).
+    fn run_session<F: FnOnce(&mut Session<DaemonSender, PendingSurface>)>(
+        &self,
+        f: F,
+    ) -> Vec<SurfaceOp> {
+        let mut session = self.session.lock().expect("session mutex");
+        f(&mut session);
+        session.surface_mut().take_ops()
+    }
+
+    /// Show or hide the recording indicator to match the session state — call
+    /// after any state-changing session operation.
+    fn sync_indicator(&self) {
+        let recording = matches!(
+            self.session.lock().expect("session mutex").state(),
+            crate::session::State::Recording
+        );
+        if recording {
+            let (x, y) = *self.caret.lock().expect("caret mutex");
+            self.indicator.show(x, y);
+        } else {
+            self.indicator.hide();
+        }
+    }
+}
+
+/// Classify a raw IBus key into the session's [`Key`]. Returns `None` for key
+/// releases (ignored).
+/// Live-trace of the engine event/correction path to `/tmp/idiolect-edit.log`
+/// (ibus swallows the engine's stderr). Compiled in only with the `trace`
+/// feature; a no-op otherwise, so production builds do no logging.
+#[cfg(feature = "trace")]
+pub(crate) fn dbg_edit(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/idiolect-edit.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+#[cfg(not(feature = "trace"))]
+#[inline(always)]
+pub(crate) fn dbg_edit(_msg: &str) {}
+
+fn classify(keyval: u32, state: u32) -> Option<Key> {
+    if state & RELEASE_MASK != 0 {
+        return None;
+    }
+    let is_super = state & (MOD4_MASK | SUPER_MASK) != 0;
+    if is_super && (keyval == 0x74 || keyval == 0x54) {
+        return Some(Key::Trigger); // Super+T (normally grabbed by the compositor)
+    }
+    Some(match keyval {
+        KEY_ESCAPE => Key::Cancel,
+        KEY_BACKSPACE => Key::Backspace,
+        KEY_DELETE => Key::Delete,
+        KEY_LEFT => Key::Left,
+        KEY_RIGHT => Key::Right,
+        KEY_HOME => Key::Home,
+        KEY_END => Key::End,
+        // Printable ASCII and Unicode keyvals become characters so the
+        // post-commit correction window can track in-place edits.
+        0x20..=0x7e => Key::Char(keyval as u8 as char),
+        kv if kv >= 0x0100_0000 => char::from_u32(kv - 0x0100_0000)
+            .map(Key::Char)
+            .unwrap_or(Key::Passthrough),
+        _ => Key::Passthrough,
+    })
+}
+
+/// Build an `IBusText` D-Bus value: `(sa{sv}sv)` = name, attachments, text,
+/// attribute-list. The nested `IBusAttrList` is `(sa{sv}av)` with no attributes.
+fn sv_dict() -> Value<'static> {
+    Value::from(Dict::new(&Signature::Str, &Signature::Variant))
+}
+
+fn ibus_text(text: &str) -> Value<'static> {
+    let attr_list = StructureBuilder::new()
+        .append_field(Value::from("IBusAttrList"))
+        .append_field(sv_dict())
+        .append_field(Value::from(Array::new(&Signature::Variant)))
+        .build()
+        .expect("IBusAttrList structure is well-formed");
+    let ibus_text = StructureBuilder::new()
+        .append_field(Value::from("IBusText"))
+        .append_field(sv_dict())
+        .append_field(Value::from(text.to_owned()))
+        .append_field(Value::from(attr_list))
+        .build()
+        .expect("IBusText structure is well-formed");
+    Value::from(ibus_text)
+}
+
+/// Pull the text out of an inbound IBusText value (the `(sa{sv}sv)` structure,
+/// possibly wrapped in a variant). Returns empty string if the shape is
+/// unexpected.
+fn ibus_text_str(value: &Value<'_>) -> String {
+    match value {
+        Value::Value(inner) => ibus_text_str(inner),
+        Value::Structure(s) => match s.fields().get(2) {
+            Some(Value::Str(s)) => s.as_str().to_owned(),
+            _ => String::new(),
+        },
+        Value::Str(s) => s.as_str().to_owned(),
+        _ => String::new(),
+    }
+}
+
+async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
+    for SurfaceOp::Commit { text } in ops {
+        let result = conn
+            .emit_signal(
+                None::<&str>,
+                engine_path,
+                ENGINE_IFACE,
+                "CommitText",
+                &(ibus_text(&text),),
+            )
+            .await;
+        if let Err(error) = result {
+            eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+        }
+    }
+}
+
+/// A per-input-context engine object. All instances share one daemon connection.
+pub struct IbusEngine {
+    shared: SharedRef,
+    path: OwnedObjectPath,
+}
+
+#[interface(name = "org.freedesktop.IBus.Engine")]
+impl IbusEngine {
+    async fn process_key_event(&self, keyval: u32, _keycode: u32, state: u32) -> bool {
+        self.shared.set_active(&self.path);
+        let Some(key) = classify(keyval, state) else {
+            return false;
+        };
+        let mut consumed = false;
+        let mut after = crate::session::State::Idle;
+        let ops = self.shared.run_session(|session| {
+            consumed = session.on_key(key);
+            after = session.state();
+        });
+        self.shared.sync_indicator();
+        dbg_edit(&format!("key {key:?} state_after={after:?}"));
+        emit_surface_ops(&self.shared.connection, &self.path, ops).await;
+        consumed
+    }
+
+    async fn focus_in(&self) {
+        dbg_edit(&format!("focus_in {}", self.path.as_str()));
+        self.shared.set_active(&self.path);
+        self.require_surrounding_text().await;
+    }
+    async fn enable(&self) {
+        dbg_edit(&format!("enable {}", self.path.as_str()));
+        self.shared.set_active(&self.path);
+        self.require_surrounding_text().await;
+    }
+
+    async fn focus_out(&self) {
+        dbg_edit(&format!("focus_out {}", self.path.as_str()));
+    }
+    async fn reset(&self) {
+        dbg_edit("reset");
+    }
+    async fn disable(&self) {
+        dbg_edit("disable");
+    }
+    async fn destroy(&self) {
+        dbg_edit("destroy");
+    }
+
+    async fn set_capabilities(&self, caps: u32) {
+        // IBUS_CAP_SURROUNDING_TEXT = 1 << 5. If the app supports surrounding
+        // text we can read its real content (capturing mouse/selection edits).
+        let surrounding = caps & (1 << 5) != 0;
+        dbg_edit(&format!("set_capabilities caps={caps:#x} surrounding_text={surrounding}"));
+        if surrounding {
+            self.require_surrounding_text().await;
+        }
+    }
+
+    /// The app reports the text around the cursor (and selection anchor). This
+    /// is ground truth for what the user actually edited, regardless of how.
+    async fn set_surrounding_text(
+        &self,
+        text: zbus::zvariant::Value<'_>,
+        cursor_index: u32,
+        anchor_pos: u32,
+    ) {
+        let body = ibus_text_str(&text);
+        dbg_edit(&format!(
+            "set_surrounding_text cursor={cursor_index} anchor={anchor_pos} text={body:?}"
+        ));
+    }
+
+    async fn set_cursor_location(&self, x: i32, y: i32, w: i32, h: i32) {
+        // Apps (notably Electron) interleave spurious 0-height reports (often
+        // 0,0) with the real caret rect; only trust those with a real line
+        // height, and anchor on the caret's vertical centre.
+        if h > 0 {
+            *self.shared.caret.lock().expect("caret mutex") = (x, y + h / 2);
+            // While recording, stream the moved caret so the indicator follows.
+            self.shared.sync_indicator();
+        }
+        dbg_edit(&format!("set_cursor_location x={x} y={y} w={w} h={h}"));
+    }
+}
+
+impl IbusEngine {
+    /// Ask the application to start sending us surrounding-text updates.
+    async fn require_surrounding_text(&self) {
+        let result = self
+            .shared
+            .connection
+            .emit_signal(
+                None::<&str>,
+                &self.path,
+                ENGINE_IFACE,
+                "RequireSurroundingText",
+                &(),
+            )
+            .await;
+        if let Err(error) = result {
+            dbg_edit(&format!("require_surrounding_text emit failed: {error}"));
+        }
+    }
+}
+
+/// The factory object IBus calls to create engine instances. Creation is instant
+/// (no I/O) — it just registers an object sharing the process-wide connection.
+pub struct IbusFactory {
+    shared: SharedRef,
+    next_id: Mutex<u32>,
+}
+
+#[interface(name = "org.freedesktop.IBus.Factory")]
+impl IbusFactory {
+    async fn create_engine(
+        &self,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
+        _engine_name: &str,
+    ) -> zbus::fdo::Result<OwnedObjectPath> {
+        let id = {
+            let mut guard = self.next_id.lock().expect("id mutex");
+            *guard += 1;
+            *guard
+        };
+        let path = OwnedObjectPath::try_from(format!("/org/freedesktop/IBus/Engine/idiolect/{id}"))
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let engine = IbusEngine {
+            shared: Arc::clone(&self.shared),
+            path: path.clone(),
+        };
+        server.at(&path, engine).await?;
+        Ok(path)
+    }
+}
+
+/// Toggle endpoint a GNOME global shortcut (Super+T) calls. The compositor
+/// grabs the Super key before any IME can see it, so the trigger can't be a
+/// key the engine receives — it comes in here over DBus instead, and acts on
+/// the currently-focused engine exactly as an in-engine trigger would.
+pub struct Trigger {
+    shared: SharedRef,
+}
+
+#[interface(name = "org.idiolect.Trigger1")]
+impl Trigger {
+    async fn toggle(&self) {
+        let mut after = crate::session::State::Idle;
+        let ops = self.shared.run_session(|session| {
+            session.on_key(Key::Trigger);
+            after = session.state();
+        });
+        self.shared.sync_indicator();
+        dbg_edit(&format!("toggle (Super+T) state_after={after:?}"));
+        let target = self
+            .shared
+            .active_path
+            .lock()
+            .expect("active_path mutex")
+            .clone();
+        if let Some(path) = target {
+            emit_surface_ops(&self.shared.connection, &path, ops).await;
+        }
+    }
+}
+
+/// Daemon read loop (one per process): delivers transcripts/errors into the
+/// shared session and emits the resulting preedit/commit on the *currently
+/// focused* engine object.
+fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSender) {
+    let handle = tokio::runtime::Handle::current();
+    let socket = ipc::default_socket_path();
+    tokio::task::spawn_blocking(move || loop {
+        let ops = match reader.read_message() {
+            Ok(IpcMessage::PreeditUpdate(update)) => {
+                dbg_edit(&format!(
+                    "transcript <- daemon: {:?} (review={})",
+                    update.text, update.review
+                ));
+                if update.review {
+                    // Review mode: show our own editable dialog (blocking — fine
+                    // on this dedicated reader thread), then commit the user's
+                    // final text into the app and record raw→edited, or cancel.
+                    match shared.dialog.review(&update.text) {
+                        Some(edited) => {
+                            dbg_edit(&format!("dialog -> insert {edited:?}"));
+                            shared.run_session(|s| s.commit_reviewed(&edited))
+                        }
+                        None => {
+                            dbg_edit("dialog -> cancelled");
+                            shared.run_session(|s| s.cancel_reviewed())
+                        }
+                    }
+                } else {
+                    shared.run_session(|s| s.on_transcript(update.text))
+                }
+            }
+            Ok(IpcMessage::InsertText(insert)) => {
+                // History re-insert: commit the stored text straight into the
+                // focused app at the cursor, bypassing the dictation session.
+                dbg_edit(&format!("insert_text <- daemon: {:?}", insert.text));
+                vec![SurfaceOp::Commit { text: insert.text }]
+            }
+            Ok(IpcMessage::RecordingStatus(status)) => {
+                // The daemon is the single authority for recording state; mirror it
+                // instead of tracking our own. Drives the "voice is live" indicator
+                // (refreshed by sync_indicator below).
+                dbg_edit(&format!("recording_status <- daemon: {}", status.recording));
+                shared.run_session(|s| s.on_recording_status(status.recording))
+            }
+            Ok(IpcMessage::Error(_)) => shared.run_session(|s| s.on_error()),
+            Ok(_) => continue,
+            Err(_) => {
+                // The daemon connection dropped — e.g. the daemon restarted. Rather
+                // than going permanently deaf (the old bug: a dead socket left the
+                // engine stuck), reconnect and resync from the daemon's authoritative
+                // state push. We retry until the daemon returns, so even a long outage
+                // (an update, a slow restart) self-heals.
+                reader = reconnect_reader(&socket, &sender);
+                shared.run_session(|s| s.reset_to_idle());
+                shared.sync_indicator();
+                continue;
+            }
+        };
+        shared.sync_indicator();
+        let target = shared.active_path.lock().expect("active_path mutex").clone();
+        if let Some(path) = target {
+            handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
+        }
+    });
+}
+
+/// Re-establish the daemon connection after it drops, retrying indefinitely while
+/// the daemon is down (a restart, an update). Swaps the live socket inside the
+/// shared `sender` so the session keeps working. The reader thread is dedicated, so
+/// polling here is harmless; never giving up means the engine always recovers when
+/// the daemon returns instead of going permanently deaf.
+fn reconnect_reader(socket: &Path, sender: &DaemonSender) -> DaemonReader {
+    loop {
+        match ipc::reconnect(socket, sender) {
+            Ok(reader) => return reader,
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+/// Connect to the daemon, retrying briefly so engine startup tolerates the
+/// daemon coming up at roughly the same time.
+fn connect_daemon() -> Result<(DaemonSender, DaemonReader), std::io::Error> {
+    let socket = ipc::default_socket_path();
+    let mut last = None;
+    for _ in 0..50 {
+        match ipc::connect(&socket) {
+            Ok(pair) => return Ok(pair),
+            Err(error) => {
+                last = Some(error);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("daemon connect failed")))
+}
+
+/// Resolve the IBus bus address. ibus does NOT pass `IBUS_ADDRESS` to spawned
+/// engines, so when it is unset we read the address ibus-daemon wrote to
+/// `$XDG_CONFIG_HOME/ibus/bus/<machine-id>-unix-<display>`. Falls back to the
+/// session bus (used by the headless tests, which set `IBUS_ADDRESS` explicitly).
+fn resolve_ibus_address() -> Option<String> {
+    if let Ok(address) = std::env::var("IBUS_ADDRESS") {
+        if !address.is_empty() {
+            return Some(address);
+        }
+    }
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let dir = config_home.join("ibus").join("bus");
+
+    // Prefer the address file matching the current X display (e.g. ":1" ->
+    // "unix-1"); otherwise take the most recently written file.
+    let want_suffix = std::env::var("DISPLAY").ok().and_then(|display| {
+        let num = display.trim_start_matches(':').split('.').next()?.to_owned();
+        Some(format!("unix-{num}"))
+    });
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    files.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    });
+    files.reverse(); // newest first
+    if let Some(suffix) = &want_suffix {
+        files.sort_by_key(|path| {
+            let matches = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix.as_str()));
+            !matches // display-matched files first (false sorts before true)
+        });
+    }
+    for path in files {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            for line in contents.lines() {
+                if let Some(address) = line.strip_prefix("IBUS_ADDRESS=") {
+                    return Some(address.trim().to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Connect to the IBus bus (or the session bus for tests), serve the factory,
+/// and run until killed.
+pub async fn run() -> zbus::Result<()> {
+    // Establish the single daemon connection up front (off the DBus handlers).
+    let (sender, reader) = connect_daemon()
+        .map_err(|error| zbus::Error::Failure(format!("daemon connect: {error}")))?;
+    // A second handle on the same shared socket so the read loop can swap it on
+    // reconnect without disturbing the session that owns the sender.
+    let reader_sender = sender.clone();
+
+    let builder = match resolve_ibus_address() {
+        Some(address) => zbus::connection::Builder::address(address.as_str())?,
+        None => zbus::connection::Builder::session()?,
+    };
+    let connection = builder.build().await?;
+
+    let shared = Arc::new(Shared {
+        session: Mutex::new(Session::new(sender, PendingSurface::default())),
+        active_path: Mutex::new(None),
+        dialog: Box::new(crate::review::SubprocessReviewDialog::discover()),
+        indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
+        caret: Mutex::new((400, 400)),
+        connection: connection.clone(),
+    });
+    spawn_reader(Arc::clone(&shared), reader, reader_sender);
+
+    connection
+        .object_server()
+        .at(
+            TRIGGER_PATH,
+            Trigger {
+                shared: Arc::clone(&shared),
+            },
+        )
+        .await?;
+    connection
+        .object_server()
+        .at(
+            FACTORY_PATH,
+            IbusFactory {
+                shared,
+                next_id: Mutex::new(0),
+            },
+        )
+        .await?;
+    connection.request_name(BUS_NAME).await?;
+
+    std::future::pending::<()>().await;
+    Ok(())
+}

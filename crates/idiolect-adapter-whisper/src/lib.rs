@@ -10,8 +10,37 @@ const ENGINE_NAME: &str = "whisper-rs";
 const WHISPER_RS_VERSION: &str = "0.16.0";
 const PRIMARY_FIXTURE_MODEL_FILE: &str = "ggml-tiny.en.bin";
 
+/// Whether this build offloads Whisper inference to the GPU. Toggled by the
+/// `cuda` cargo feature on this crate.
+const GPU_ENABLED: bool = cfg!(feature = "cuda");
+
 pub struct WhisperAsr {
     backend: backend::WhisperBackend,
+}
+
+/// Runtime options for loading the Whisper engine from a model file.
+#[derive(Debug, Clone)]
+pub struct WhisperOptions {
+    /// Request GPU offload. Effective only when built with the `cuda` feature;
+    /// a CPU build ignores it and runs on the CPU.
+    pub use_gpu: bool,
+    /// CUDA device index to use when `use_gpu` is active.
+    pub gpu_device: i32,
+    /// Decoding language hint (e.g. "en").
+    pub language: String,
+    /// CPU decode threads (still set for GPU builds; harmless there).
+    pub n_threads: u32,
+}
+
+impl Default for WhisperOptions {
+    fn default() -> Self {
+        Self {
+            use_gpu: GPU_ENABLED,
+            gpu_device: 0,
+            language: "en".to_owned(),
+            n_threads: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -61,25 +90,38 @@ mod backend {
     #[derive(Debug)]
     pub(crate) struct WhisperBackend {
         context: WhisperContext,
+        language: String,
+        n_threads: i32,
     }
 
     impl WhisperBackend {
         pub(crate) fn load_fixture_model() -> Result<Self, WhisperAsrLoadError> {
-            Self::load_model_from_path(fixture_model_path())
+            Self::load_model_from_path(fixture_model_path(), WhisperOptions::default())
         }
 
         pub(crate) fn load_model_from_path(
             model_path: PathBuf,
+            options: WhisperOptions,
         ) -> Result<Self, WhisperAsrLoadError> {
             if !model_path.is_file() {
                 return Err(MissingFixtureModel::new(model_path).into());
             }
 
-            let context =
-                WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-                    .map_err(|error| WhisperAsrError::backend(error.to_string()))?;
+            // Offload inference to the GPU when both the build (the `cuda`
+            // feature) and the runtime config allow it; otherwise whisper.cpp
+            // stays on the CPU.
+            let mut params = WhisperContextParameters::default();
+            params.use_gpu(options.use_gpu && GPU_ENABLED);
+            params.gpu_device(options.gpu_device);
 
-            Ok(Self { context })
+            let context = WhisperContext::new_with_params(&model_path, params)
+                .map_err(|error| WhisperAsrError::backend(error.to_string()))?;
+
+            Ok(Self {
+                context,
+                language: options.language,
+                n_threads: i32::try_from(options.n_threads.max(1)).unwrap_or(i32::MAX),
+            })
         }
 
         pub(crate) fn transcribe(
@@ -96,8 +138,8 @@ mod backend {
                 beam_size: 5,
                 patience: -1.0,
             });
-            params.set_n_threads(1);
-            params.set_language(Some("en"));
+            params.set_n_threads(self.n_threads);
+            params.set_language(Some(self.language.as_str()));
             params.set_translate(false);
             params.set_no_timestamps(true);
             params.set_print_special(false);
@@ -152,6 +194,16 @@ impl WhisperAsr {
         let backend = backend::WhisperBackend::load_fixture_model()?;
         Ok(Self { backend })
     }
+
+    /// Loads a Whisper model from a file with explicit runtime options. Returns
+    /// [`WhisperAsrLoadError::MissingFixtureModel`] if the file does not exist.
+    pub fn load(
+        model_path: impl Into<PathBuf>,
+        options: WhisperOptions,
+    ) -> Result<Self, WhisperAsrLoadError> {
+        let backend = backend::WhisperBackend::load_model_from_path(model_path.into(), options)?;
+        Ok(Self { backend })
+    }
 }
 
 impl AsrPort for WhisperAsr {
@@ -164,7 +216,7 @@ impl AsrPort for WhisperAsr {
             supports_streaming: false,
             supports_word_timestamps: false,
             supports_confidence: false,
-            supports_gpu: false,
+            supports_gpu: GPU_ENABLED,
             supports_incremental_updates: false,
         }
     }
@@ -202,7 +254,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let result = super::backend::WhisperBackend::load_model_from_path(path);
+        let result =
+            super::backend::WhisperBackend::load_model_from_path(path, super::WhisperOptions::default());
 
         assert!(matches!(
             result,
@@ -218,7 +271,10 @@ mod tests {
         ));
         std::fs::write(&path, b"not a whisper model").expect("invalid model fixture should write");
 
-        let result = super::backend::WhisperBackend::load_model_from_path(path.clone());
+        let result = super::backend::WhisperBackend::load_model_from_path(
+            path.clone(),
+            super::WhisperOptions::default(),
+        );
         let _ = std::fs::remove_file(&path);
 
         assert!(matches!(
@@ -237,7 +293,7 @@ mod tests {
         assert!(!capabilities.supports_streaming);
         assert!(!capabilities.supports_word_timestamps);
         assert!(!capabilities.supports_confidence);
-        assert!(!capabilities.supports_gpu);
+        assert_eq!(capabilities.supports_gpu, cfg!(feature = "cuda"));
         assert!(!capabilities.supports_incremental_updates);
         assert!(!std::any::type_name::<WhisperAsr>().contains("whisper_rs"));
     }

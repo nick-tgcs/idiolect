@@ -1,0 +1,581 @@
+//! Pure dictation state machine for the IBus engine.
+//!
+//! Knows nothing about IBus, DBus, sockets, or audio. Toggle model: a trigger
+//! starts recording; the next trigger stops it; when the daemon returns the
+//! transcript it is committed straight into the focused app (no preedit, no
+//! Enter step). Immediately after commit the engine opens a *correction window*
+//! and models the user's keyboard edits (cursor movement, insert, delete)
+//! against a shadow buffer, so a fix made anywhere in the just-dictated text is
+//! reported to the daemon as a raw→corrected training signal. Unit-testable
+//! with fakes.
+//!
+//! Limitation: edits are reconstructed from keystrokes, so mouse-click cursor
+//! repositioning (which sends no key event) is not modeled. The window only
+//! reports when the user actually changed existing dictated text — pure forward
+//! typing is treated as continuation, not a correction.
+
+/// The idiolect daemon, as the session needs it. The daemon owns the microphone
+/// and is the single authority for recording state, so the session never decides
+/// start-vs-stop: it sends one direction-free [`toggle`](DaemonClient::toggle)
+/// intent and learns the resulting state from the daemon's pushed `RecordingStatus`
+/// (delivered into [`Session::on_recording_status`]). `commit` finalizes the take
+/// into a training candidate; `report_correction` amends it when the user fixes the
+/// text in place right after it lands.
+pub trait DaemonClient {
+    /// "The user pressed the toggle key." The daemon decides whether this starts or
+    /// stops a recording and announces the result via `RecordingStatus`.
+    fn toggle(&mut self);
+    /// Finalize the session with the committed text (the daemon records it).
+    fn commit(&mut self, final_text: &str);
+    /// Amend the just-committed session with the user's in-place correction.
+    fn report_correction(&mut self, corrected_text: &str);
+    fn cancel(&mut self);
+}
+
+/// The text destination — in production an IBus input context. `commit_text`
+/// types the final text into the focused application.
+pub trait Surface {
+    fn commit_text(&mut self, text: &str);
+}
+
+/// A key, already classified from the raw IBus keyval/state by the engine layer,
+/// or delivered via the DBus toggle endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Key {
+    /// The dictation toggle (default Super+T, delivered via the toggle endpoint
+    /// because the compositor grabs the Super key).
+    Trigger,
+    /// Escape — abort an in-progress take / end the correction window.
+    Cancel,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    /// A printable character.
+    Char(char),
+    /// Anything else (Enter, Tab, Up/Down, …) — passes through and closes any
+    /// open correction window.
+    Passthrough,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum State {
+    /// Not recording. `Idle` and `Recording` mirror the daemon's authoritative
+    /// recording state — the session never sets them optimistically; they change
+    /// only when [`Session::on_recording_status`] arrives.
+    Idle,
+    /// The daemon reports the microphone is open.
+    Recording,
+    /// Just committed a transcript; modeling the user's in-place edits. This is a
+    /// purely local overlay — only the IME sees the keystrokes — so a stop's
+    /// `recording = false` does not close it.
+    Reviewing,
+}
+
+/// The post-commit correction buffer: a shadow copy of the dictated line plus a
+/// cursor, mirroring the user's keyboard edits. `corrected` becomes true only
+/// when existing dictated text is actually changed (a delete, or an insert that
+/// is not a pure append at the end) — distinguishing a fix from just typing on.
+struct Review {
+    committed: String,
+    chars: Vec<char>,
+    cursor: usize,
+    corrected: bool,
+}
+
+impl Review {
+    fn new(text: String) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let cursor = chars.len();
+        Self {
+            committed: text,
+            chars,
+            cursor,
+            corrected: false,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+}
+
+pub struct Session<D, S> {
+    daemon: D,
+    surface: S,
+    state: State,
+    review: Option<Review>,
+}
+
+impl<D, S> Session<D, S>
+where
+    D: DaemonClient,
+    S: Surface,
+{
+    pub fn new(daemon: D, surface: S) -> Self {
+        Self {
+            daemon,
+            surface,
+            state: State::Idle,
+            review: None,
+        }
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// Mutable access to the surface (the engine drains buffered commit effects
+    /// through this after each session call).
+    pub fn surface_mut(&mut self) -> &mut S {
+        &mut self.surface
+    }
+
+    /// Handle a classified key. Returns `true` if consumed (the IBus layer
+    /// swallows it), `false` to pass it through to the application.
+    pub fn on_key(&mut self, key: Key) -> bool {
+        match self.state {
+            // In both Idle and Recording a trigger is the same direction-free intent:
+            // tell the daemon, and let its `RecordingStatus` push move our state. We
+            // never flip the recording phase optimistically, so we can never disagree
+            // with the daemon.
+            State::Idle => match key {
+                Key::Trigger => {
+                    self.daemon.toggle();
+                    true
+                }
+                _ => false, // transparent passthrough — normal typing is unaffected
+            },
+            State::Recording => match key {
+                Key::Trigger => {
+                    self.daemon.toggle();
+                    true
+                }
+                Key::Cancel => {
+                    self.daemon.cancel();
+                    // Snappy local feedback; the daemon's `recording = false` push
+                    // reconciles to the same state.
+                    self.state = State::Idle;
+                    true
+                }
+                _ => false,
+            },
+            State::Reviewing => self.on_key_reviewing(key),
+        }
+    }
+
+    fn on_key_reviewing(&mut self, key: Key) -> bool {
+        let review = self.review.as_mut().expect("review buffer in Reviewing");
+        match key {
+            // Cursor movement: mirror the app so inserts/deletes land correctly.
+            Key::Left => {
+                review.cursor = review.cursor.saturating_sub(1);
+                false
+            }
+            Key::Right => {
+                if review.cursor < review.chars.len() {
+                    review.cursor += 1;
+                }
+                false
+            }
+            Key::Home => {
+                review.cursor = 0;
+                false
+            }
+            Key::End => {
+                review.cursor = review.chars.len();
+                false
+            }
+            Key::Backspace => {
+                if review.cursor > 0 {
+                    review.cursor -= 1;
+                    review.chars.remove(review.cursor);
+                    review.corrected = true;
+                }
+                false
+            }
+            Key::Delete => {
+                if review.cursor < review.chars.len() {
+                    review.chars.remove(review.cursor);
+                    review.corrected = true;
+                }
+                false
+            }
+            Key::Char(c) => {
+                if review.cursor < review.chars.len() {
+                    // Insert into existing text — a real edit.
+                    review.chars.insert(review.cursor, c);
+                    review.cursor += 1;
+                    review.corrected = true;
+                    false
+                } else if review.corrected {
+                    // Retyping at the end during an ongoing fix.
+                    review.chars.push(c);
+                    review.cursor += 1;
+                    false
+                } else {
+                    // Pure forward typing with no edit yet: continuation, not a
+                    // correction. Close the window and let it pass through.
+                    self.end_review();
+                    false
+                }
+            }
+            Key::Trigger => {
+                // Close the correction window (reporting any fix), then start a new
+                // take. The daemon's `recording = true` push will move us to Recording.
+                self.end_review();
+                self.daemon.toggle();
+                true
+            }
+            // Escape, Enter, Tab, Up/Down, …: close the window, pass the key on.
+            Key::Cancel | Key::Passthrough => {
+                self.end_review();
+                false
+            }
+        }
+    }
+
+    /// The daemon delivered the transcript: type it straight into the app, tell
+    /// the daemon to finalize, and open the correction window.
+    pub fn on_transcript(&mut self, text: String) {
+        if self.state != State::Recording {
+            return; // no take in progress; ignore an unsolicited/late transcript
+        }
+        if text.is_empty() {
+            self.state = State::Idle;
+            return;
+        }
+        self.surface.commit_text(&text);
+        self.daemon.commit(&text);
+        self.review = Some(Review::new(text));
+        self.state = State::Reviewing;
+    }
+
+    /// The daemon's authoritative recording state changed. This is the single
+    /// source of truth for the `Idle`/`Recording` phase, so the session mirrors it.
+    /// A `Reviewing` correction window is a local overlay: a stop's `false` is
+    /// expected and leaves it open, while a fresh `true` (a new take) closes it.
+    pub fn on_recording_status(&mut self, recording: bool) {
+        match self.state {
+            State::Reviewing => {
+                if recording {
+                    self.end_review();
+                    self.state = State::Recording;
+                }
+            }
+            _ => {
+                self.state = if recording {
+                    State::Recording
+                } else {
+                    State::Idle
+                };
+            }
+        }
+    }
+
+    /// Drop any in-flight take and return to idle. Used after a daemon reconnect:
+    /// the daemon re-pushes its authoritative `RecordingStatus`, so the session
+    /// resyncs from a clean slate rather than a stale guess.
+    pub fn reset_to_idle(&mut self) {
+        self.review = None;
+        self.state = State::Idle;
+    }
+
+    /// Commit the user's reviewed (possibly edited) text straight into the app
+    /// and record it with the daemon. Used by the review-dialog flow, where the
+    /// editing happens in a window the engine owns rather than in the app — so
+    /// no post-commit tracking is needed. An empty result cancels the take.
+    pub fn commit_reviewed(&mut self, text: &str) {
+        if text.is_empty() {
+            self.daemon.cancel();
+        } else {
+            self.surface.commit_text(text);
+            self.daemon.commit(text);
+        }
+        self.review = None;
+        self.state = State::Idle;
+    }
+
+    /// The user cancelled the review dialog: discard the take.
+    pub fn cancel_reviewed(&mut self) {
+        self.daemon.cancel();
+        self.review = None;
+        self.state = State::Idle;
+    }
+
+    /// Focus left the input context — close any open correction window.
+    pub fn on_focus_out(&mut self) {
+        if self.state == State::Reviewing {
+            self.end_review();
+        }
+    }
+
+    /// The daemon reported an error mid-take: return to idle.
+    pub fn on_error(&mut self) {
+        self.review = None;
+        self.state = State::Idle;
+    }
+
+    /// Close the correction window: if the user actually edited the dictated
+    /// text in place (and the result differs), report the correction.
+    fn end_review(&mut self) {
+        self.state = State::Idle;
+        if let Some(review) = self.review.take() {
+            let text = review.text();
+            if review.corrected && text != review.committed {
+                self.daemon.report_correction(&text);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeDaemon {
+        events: Vec<String>,
+    }
+    impl DaemonClient for FakeDaemon {
+        fn toggle(&mut self) {
+            self.events.push("toggle".to_owned());
+        }
+        fn commit(&mut self, final_text: &str) {
+            self.events.push(format!("commit:{final_text}"));
+        }
+        fn report_correction(&mut self, corrected_text: &str) {
+            self.events.push(format!("correct:{corrected_text}"));
+        }
+        fn cancel(&mut self) {
+            self.events.push("cancel".to_owned());
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeSurface {
+        committed: Vec<String>,
+    }
+    impl Surface for FakeSurface {
+        fn commit_text(&mut self, text: &str) {
+            self.committed.push(text.to_owned());
+        }
+    }
+
+    fn session() -> Session<FakeDaemon, FakeSurface> {
+        Session::new(FakeDaemon::default(), FakeSurface::default())
+    }
+
+    /// Dictate `transcript` so the correction window is open, mirroring the real
+    /// daemon flow: toggle (start) → daemon announces recording → toggle (stop) →
+    /// daemon delivers the transcript → daemon announces recording stopped. The
+    /// engine's recording phase is driven entirely by the daemon's pushes.
+    fn dictate(s: &mut Session<FakeDaemon, FakeSurface>, transcript: &str) {
+        s.on_key(Key::Trigger); // toggle: start intent
+        s.on_recording_status(true); // daemon: recording started
+        s.on_key(Key::Trigger); // toggle: stop intent
+        s.on_transcript(transcript.to_owned()); // daemon: transcript (-> Reviewing)
+        s.on_recording_status(false); // daemon: mic closed (does not close review)
+    }
+
+    fn type_str(s: &mut Session<FakeDaemon, FakeSurface>, text: &str) {
+        for c in text.chars() {
+            s.on_key(Key::Char(c));
+        }
+    }
+
+    fn last_correction(s: &Session<FakeDaemon, FakeSurface>) -> Option<String> {
+        s.daemon
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| e.strip_prefix("correct:").map(str::to_owned))
+    }
+
+    #[test]
+    fn passthrough_keys_are_not_consumed_when_idle() {
+        let mut s = session();
+        assert!(!s.on_key(Key::Char('a')));
+        assert!(!s.on_key(Key::Backspace));
+        assert!(!s.on_key(Key::Left));
+        assert!(!s.on_key(Key::Passthrough));
+        assert_eq!(s.state(), State::Idle);
+        assert!(s.daemon.events.is_empty());
+    }
+
+    #[test]
+    fn trigger_sends_toggle_and_mirrors_daemon_status() {
+        let mut s = session();
+        // A trigger sends one direction-free intent and does NOT flip the phase:
+        // the engine stays put until the daemon announces the new state.
+        assert!(s.on_key(Key::Trigger));
+        assert_eq!(s.state(), State::Idle, "no optimistic flip");
+        s.on_recording_status(true);
+        assert_eq!(s.state(), State::Recording);
+        // A second trigger is again just an intent — still no optimistic flip.
+        assert!(s.on_key(Key::Trigger));
+        assert_eq!(s.state(), State::Recording);
+        s.on_recording_status(false);
+        assert_eq!(s.state(), State::Idle);
+        assert_eq!(s.daemon.events, ["toggle", "toggle"]);
+    }
+
+    #[test]
+    fn transcript_auto_commits_and_opens_review() {
+        let mut s = session();
+        dictate(&mut s, "restart traffic");
+        assert_eq!(s.surface.committed, ["restart traffic"]);
+        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:restart traffic"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn recording_false_does_not_close_an_open_review() {
+        // The mic closes when a take stops, but the post-commit correction window is
+        // a local concern that must stay open for the user to fix the text.
+        let mut s = session();
+        dictate(&mut s, "restart traffic");
+        assert_eq!(s.state(), State::Reviewing);
+        s.on_recording_status(false);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn tail_correction_via_backspace_and_retype() {
+        let mut s = session();
+        dictate(&mut s, "restart traffic");
+        for _ in 0.."traffic".len() {
+            assert!(!s.on_key(Key::Backspace));
+        }
+        type_str(&mut s, "Traefik");
+        s.on_key(Key::Trigger); // next dictation closes the window (sends a toggle)
+        assert_eq!(last_correction(&s), Some("restart Traefik".to_owned()));
+        // The window is closed and a toggle was sent; the new take's Recording state
+        // arrives via the daemon's push.
+        assert_eq!(s.state(), State::Idle);
+        s.on_recording_status(true);
+        assert_eq!(s.state(), State::Recording);
+    }
+
+    #[test]
+    fn mid_sentence_edit_with_arrow_navigation() {
+        let mut s = session();
+        // Whisper heard "deploy traffic and engine X"; fix "traffic" -> "Traefik"
+        // and "engine X" -> "nginx" by navigating with arrows.
+        dictate(&mut s, "deploy engine X");
+        // Cursor is at end. Walk left to delete "engine X" (8 chars) and retype.
+        for _ in 0.."engine X".len() {
+            s.on_key(Key::Backspace);
+        }
+        type_str(&mut s, "nginx");
+        s.on_focus_out();
+        assert_eq!(last_correction(&s), Some("deploy nginx".to_owned()));
+    }
+
+    #[test]
+    fn insert_in_the_middle_is_captured() {
+        let mut s = session();
+        dictate(&mut s, "the cat sat");
+        // Move to just after "the " and insert "big ".
+        s.on_key(Key::Home);
+        for _ in 0..4 {
+            s.on_key(Key::Right); // cursor after "the "
+        }
+        type_str(&mut s, "big ");
+        s.on_focus_out();
+        assert_eq!(last_correction(&s), Some("the big cat sat".to_owned()));
+    }
+
+    #[test]
+    fn delete_key_removes_forward() {
+        let mut s = session();
+        dictate(&mut s, "hello world");
+        s.on_key(Key::Home);
+        s.on_key(Key::Delete); // remove 'h'
+        s.on_focus_out();
+        assert_eq!(last_correction(&s), Some("ello world".to_owned()));
+    }
+
+    #[test]
+    fn forward_typing_without_an_edit_is_not_a_correction() {
+        let mut s = session();
+        dictate(&mut s, "good morning");
+        type_str(&mut s, " everyone"); // continuation
+        assert!(last_correction(&s).is_none());
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn editing_back_to_the_original_reports_nothing() {
+        let mut s = session();
+        dictate(&mut s, "alpha");
+        s.on_key(Key::Backspace); // "alph"
+        s.on_key(Key::Char('a')); // "alpha" again
+        s.on_focus_out();
+        assert!(last_correction(&s).is_none());
+    }
+
+    #[test]
+    fn focus_out_reports_an_open_correction() {
+        let mut s = session();
+        dictate(&mut s, "hello world");
+        for _ in 0.."world".len() {
+            s.on_key(Key::Backspace);
+        }
+        type_str(&mut s, "World");
+        s.on_focus_out();
+        assert_eq!(last_correction(&s), Some("hello World".to_owned()));
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn reviewed_commit_types_and_records_edited_text() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_key(Key::Trigger);
+        // (review mode: the dialog returns the edited text instead of auto-commit)
+        s.commit_reviewed("deploy Traefik");
+        assert_eq!(s.surface.committed, ["deploy Traefik"]);
+        assert_eq!(s.daemon.events, ["toggle", "toggle", "commit:deploy Traefik"]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn reviewed_cancel_discards_the_take() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_key(Key::Trigger);
+        s.cancel_reviewed();
+        assert!(s.surface.committed.is_empty());
+        assert_eq!(s.daemon.events, ["toggle", "toggle", "cancel"]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn escape_during_recording_cancels() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true); // daemon: recording started
+        assert_eq!(s.state(), State::Recording);
+        assert!(s.on_key(Key::Cancel));
+        assert_eq!(s.daemon.events, ["toggle", "cancel"]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn reset_to_idle_clears_an_in_flight_take() {
+        // After a daemon reconnect the session resyncs from a clean slate.
+        let mut s = session();
+        dictate(&mut s, "restart traffic");
+        assert_eq!(s.state(), State::Reviewing);
+        s.reset_to_idle();
+        assert_eq!(s.state(), State::Idle);
+        // A late status push after reset is mirrored normally.
+        s.on_recording_status(true);
+        assert_eq!(s.state(), State::Recording);
+    }
+}

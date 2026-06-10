@@ -54,9 +54,16 @@ require_file "${lifecycle_root}" /usr/lib/systemd/user/idiolectd.service
 service="${lifecycle_root}/usr/lib/systemd/user/idiolectd.service"
 grep -F 'Description=Idiolect local speech-to-text daemon' "${service}" >/dev/null
 grep -F 'After=graphical-session.target' "${service}" >/dev/null
-grep -F 'ExecStart=/usr/bin/idiolectd run' "${service}" >/dev/null
+# The daemon exits code 2 without --config; the unit must pass the user config path.
+grep -F 'ExecStart=/usr/bin/idiolectd run --config %h/.config/idiolect/config.toml' "${service}" >/dev/null
 grep -F 'Restart=on-failure' "${service}" >/dev/null
-grep -F 'WantedBy=default.target' "${service}" >/dev/null
+# Bad/missing config (exit 2) must fail ONCE, never crash-loop; genuine crashes
+# get a bounded number of restarts before systemd gives up.
+grep -F 'RestartPreventExitStatus=2' "${service}" >/dev/null
+grep -F 'StartLimitIntervalSec=300' "${service}" >/dev/null
+grep -F 'StartLimitBurst=5' "${service}" >/dev/null
+# User-session daemon with a tray: start with the graphical session, not at any login.
+grep -F 'WantedBy=graphical-session.target' "${service}" >/dev/null
 
 addon="${lifecycle_root}/usr/share/fcitx5/addon/idiolect.conf"
 input_method="${lifecycle_root}/usr/share/fcitx5/inputmethod/idiolect.conf"
@@ -65,7 +72,7 @@ grep -F 'Name=Idiolect' "${input_method}" >/dev/null
 grep -F 'Addon=idiolect' "${input_method}" >/dev/null
 grep -F 'Icon=idiolect' "${input_method}" >/dev/null
 
-wants_dir="${lifecycle_root}/home/test/.config/systemd/user/default.target.wants"
+wants_dir="${lifecycle_root}/home/test/.config/systemd/user/graphical-session.target.wants"
 install -d "${wants_dir}"
 ln -s /usr/lib/systemd/user/idiolectd.service "${wants_dir}/idiolectd.service"
 test -L "${wants_dir}/idiolectd.service"

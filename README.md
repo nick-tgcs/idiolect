@@ -2,12 +2,216 @@
 
 **Speech-to-text that learns your way of speaking.**
 
-Idiolect is a local-first personalised speech-to-text input method. It runs through the operating system input method layer, captures corrections made before text is committed, and uses those corrections to improve a per-user speech model over time.
+Idiolect is a local-first personalised speech-to-text input method. It runs through the operating system input method layer, captures the corrections you make to dictated text — either by editing the live preedit or in an optional review dialog that works even in apps that hide their text (Electron/VS Code) — and uses those corrections to improve a per-user speech model over time. All processing is on-device; nothing is sent to the cloud.
+
+## Look &amp; feel
+
+Dictate, then **review and fix** in a window Idiolect controls — so your correction is captured even in apps that hide their text (Electron/VS Code). <kbd>Ctrl</kbd>+<kbd>Enter</kbd> inserts the result at the cursor; <kbd>Esc</kbd> cancels.
+
+<p align="center"><img src="docs/images/review-dialog.png" alt="Review-before-insert dialog: an editable box showing the dictated text" width="560"></p>
+
+A live microphone rides your **text caret** while you speak, and the tray icon shows state at a glance — idle, recording, or error:
+
+<p align="center">
+  <img src="docs/images/recording-indicator.png" alt="A small live mic that follows the text caret while dictating" width="660">
+  <br><br>
+  <img src="docs/images/tray-icons.png" alt="Tray icon states: idle, recording, error" width="430">
+</p>
+
+Everything else is in the **tray menu** — recent dictations (insert at the cursor / copy / delete), the review-before-insert toggle, and how long audio + transcripts are kept for training (presets or a custom value):
+
+<p align="center"><img src="docs/images/tray-menu.png" alt="Tray menu: Start/Stop/Cancel, Recent History with insert/copy/delete, Settings" width="660"></p>
+
+<p align="center"><img src="docs/images/retention-dialog.png" alt="Custom training-data retention dialog" width="430"></p>
+
+---
+
+## Installation & Usage
+
+Idiolect has two parts: the **daemon** (`idiolectd`, Rust — captures audio and runs Whisper) and the **fcitx5 input-method addon** (`idiolect.so`, C++ — binds a global hotkey and types the transcript into the focused app). You build both, run the daemon, and press a hotkey to dictate.
+
+> Status: builds from source. A one-command prebuilt `.deb` is **future work** — for now you compile it (below).
+
+### Prerequisites
+
+**Build-time (only for whoever compiles — not end users of a future package):**
+
+| Need | Why | Install (Ubuntu/Debian) |
+|------|-----|--------------------------|
+| Rust toolchain (1.96+) | builds the daemon | `rustup` |
+| CMake 3.16+, C++17 compiler | builds the fcitx5 addon | `sudo apt install cmake build-essential` |
+| CUDA toolkit (`nvcc`) | GPU Whisper build | NVIDIA CUDA toolkit (e.g. 13.x), then build with `CMAKE_CUDA_ARCHITECTURES=native` |
+| fcitx5 **-dev** packages | links the addon | `sudo apt install libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev extra-cmake-modules gettext` |
+
+**Runtime (to actually use it):**
+
+| Need | Why | Notes |
+|------|-----|-------|
+| NVIDIA driver | GPU inference | proprietary driver providing `libcuda.so`; the CUDA *runtime* libs come from the toolkit/build |
+| **fcitx5 as the active input method** | so a global hotkey reaches your apps | `sudo apt install fcitx5 fcitx5-frontend-gtk3 fcitx5-frontend-qt5`; then **switch from ibus**: `im-config -n fcitx5` (or set `GTK_IM_MODULE=fcitx`, `QT_IM_MODULE=fcitx`, `XMODIFIERS=@im=fcitx`) and **log out / back in** |
+| A Whisper ggml model | recognition | place a `.bin` in `~/.local/share/idiolect/models/whisper/` (e.g. `medium-en.bin`); set `asr.model` in the config to its name without `.bin` |
+
+### Build
+
+```bash
+# Daemon (GPU/CUDA build)
+CMAKE_CUDA_ARCHITECTURES=native PATH=/usr/local/cuda/bin:$PATH \
+  cargo build -p idiolectd --release --features cuda
+# (omit --features cuda for a CPU-only daemon)
+
+# IBus engine (pure-Rust; add `,trace` for a live event log at /tmp/idiolect-edit.log)
+cargo build -p idiolect-ibus --release --features ibus-engine
+# Its out-of-process GUI helpers — built into the same target/release/ dir so the
+# engine/daemon discover them by path (review dialog, caret indicator, retention):
+cargo build --release \
+  -p idiolect-review-dialog -p idiolect-recording-indicator -p idiolect-retention-dialog
+
+# fcitx5 addon (requires the fcitx5 -dev packages above)
+cd fcitx5/idiolect-fcitx5
+cmake -S . -B build && cmake --build build
+# produces build/idiolect.so when fcitx5 is found
+```
+
+The GUI helper crates aren't gated behind `ibus-engine` (they're plain binaries), but building them alongside the engine in one `--release` invocation keeps them all in `target/release/` where the engine/daemon look for them.
+
+### Install the addon
+
+The addon **descriptor** (`.conf`) is found under `~/.local/share/fcitx5/addon/`, but fcitx5 searches for the addon **library** (`.so`) only in its system addon dir — so the `.so` goes there (one-time `sudo`):
+
+```bash
+# descriptor: user-local is fine
+mkdir -p ~/.local/share/fcitx5/addon
+cp fcitx5/idiolect-fcitx5/data/idiolect-addon.conf ~/.local/share/fcitx5/addon/idiolect.conf
+
+# library: install into fcitx5's addon dir (needs sudo)
+sudo cp fcitx5/idiolect-fcitx5/build/idiolect.so /usr/lib/x86_64-linux-gnu/fcitx5/
+
+# OR, no-sudo: point fcitx5 at a user dir (must include the system dir too).
+#   mkdir -p ~/.local/lib/fcitx5 && cp fcitx5/idiolect-fcitx5/build/idiolect.so ~/.local/lib/fcitx5/
+#   export FCITX_ADDON_DIRS="$HOME/.local/lib/fcitx5:/usr/lib/x86_64-linux-gnu/fcitx5"
+#   (put that export in ~/.xprofile so it persists across logins)
+
+fcitx5 -r &                          # restart fcitx5 to load the module
+```
+
+### Configure & run the daemon
+
+Create `~/.config/idiolect/config.toml` with at least:
+
+```toml
+[audio]
+input_device = "default"          # real microphone (not "fixture")
+[vad]
+engine = "webrtc"                 # the implemented VAD; "silero" is accepted but served by the WebRTC adapter
+[asr]
+engine = "whisper-rs"
+model = "medium-en"               # file at ~/.local/share/idiolect/models/whisper/medium-en.bin
+use_gpu = true
+[storage]
+data_dir = "~/.local/share/idiolect"   # expand to an absolute path
+```
+
+To see every key with its default (then trim to the overrides above):
+
+```bash
+./target/release/idiolectd config print-default --json
+```
+
+Validate the config and print the resolved paths (socket, database, model) without starting the daemon:
+
+```bash
+./target/release/idiolectd run --config ~/.config/idiolect/config.toml --check-config
+```
+
+Then run it (leave running). The model file is resolved as `<storage.data_dir>/models/whisper/<asr.model>.bin`; if it is missing the daemon falls back to a tiny bundled fixture model so it still starts:
+
+```bash
+./target/release/idiolectd run --config ~/.config/idiolect/config.toml
+```
+
+### Autostart on login (systemd user service)
+
+The daemon ships a systemd user unit that starts it automatically when your graphical session starts and restarts it if it crashes. For a packaged install it enables with one command; for a source build you first point the unit at your binary:
+
+```bash
+# Source build: install a unit that references your compiled binary
+mkdir -p ~/.config/systemd/user
+sed "s|/usr/bin/idiolectd|$PWD/target/release/idiolectd|" \
+    packaging/debian/usr/lib/systemd/user/idiolectd.service \
+    > ~/.config/systemd/user/idiolectd.service
+systemctl --user daemon-reload
+
+# Both source and package: enable and start
+systemctl --user enable --now idiolectd
+```
+
+The unit is `WantedBy=graphical-session.target`, so it only runs inside a graphical login — not over SSH or in headless/tty sessions. The IM framework (fcitx5 or IBus) is managed by the desktop session's own autostart and loads the Idiolect addon automatically once running; you do not need a separate unit for it.
+
+### Dictate
+
+Focus any text field and press the toggle hotkey (default **Super+T**): the tray icon flips to *Recording*, speak, press **Super+T** again — the recognized text is typed straight into the app. **Esc** while recording aborts. The hotkey is configurable in `fcitx5-configtool` (Addons → Idiolect) or `~/.config/fcitx5/conf/idiolect.conf`.
+
+### IBus engine (alternative to fcitx5)
+
+Idiolect ships two interchangeable input-method front-ends; both are thin clients of the same daemon, so the learning loop is identical. Use whichever your desktop runs. The **IBus engine** is the lighter path if you already run IBus (most GNOME setups): **no IM-framework switch, no relogin to a different framework, and no C/`libibus-dev`** — it's a pure-Rust engine built on `zbus`.
+
+It's a **build-time option** (off by default so the normal build needs no IBus):
+
+```bash
+cargo build -p idiolect-ibus --release --features ibus-engine   # produces target/release/ibus-engine-idiolect
+```
+
+Install the component descriptor (with `<exec>` pointing at the built binary). **Important:** ibus only scans `/usr/share/ibus/component` by default — it does *not* scan `~/.local/share/ibus/component`. Pick one:
+
+```bash
+# Generate a descriptor with the correct exec path:
+sed "s#/usr/local/bin/ibus-engine-idiolect#$PWD/target/release/ibus-engine-idiolect#" \
+    crates/idiolect-adapters/desktop/ibus/data/idiolect.xml > /tmp/idiolect.xml
+
+# Option A (simplest, one-time sudo): drop it where ibus already scans.
+sudo cp /tmp/idiolect.xml /usr/share/ibus/component/idiolect.xml
+ibus restart
+
+# Option B (no sudo): keep it user-local and point ibus at the dir, then RE-LOGIN.
+mkdir -p ~/.local/share/ibus/component
+cp /tmp/idiolect.xml ~/.local/share/ibus/component/idiolect.xml
+mkdir -p ~/.config/environment.d
+echo "IBUS_COMPONENT_PATH=$HOME/.local/share/ibus/component" > ~/.config/environment.d/idiolect-ibus.conf
+rm -f ~/.cache/ibus/bus/registry      # force a rescan
+# log out and back in (the session must restart ibus with that env)
+
+# Confirm it loaded, then add "Idiolect" in GNOME Settings → Keyboard → Input Sources:
+ibus list-engine | grep idiolect
+```
+
+Then run the daemon as above (`input_device = "default"`, `--features cuda` for GPU), select **Idiolect** as your input source, and dictate: press the toggle (default **Super+T**), speak, press **Super+T** again to stop. A small floating microphone appears next to the text caret while recording. What happens at commit depends on the mode (toggle it in the tray — see below):
+
+- **Direct insert (default):** the recognized text is typed straight into the focused app.
+- **Review before insert:** a small editable dialog opens with the recognized text; you fix it there and press **Enter** (or **Esc** to cancel), then the final text is typed into the app. This is the robust capture path — because the edit happens in *our* window, the raw→corrected diff is captured **even in apps that don't expose their text** (notably Electron/VS Code). After the dialog closes, focus is returned to the exact window you were typing in, so you can hit Enter to send straight away.
+
+Either way the diff between what was recognized and what you committed becomes a training example.
+
+**Notes / tradeoffs:**
+- The active IBus engine sees keys in every app, so the toggle is effectively global. While idle the engine passes all keys through untouched, so you can leave Idiolect selected as your input source and keep typing normally — it only acts when you press the toggle. (The compositor grabs Super+T before any IME, so the engine also exposes a small `org.idiolect.Trigger1` D-Bus endpoint a GNOME global shortcut can call.)
+- Coverage of the *direct-insert* path depends on the app routing input through the IM framework (games, raw-input apps, password fields, some Electron apps won't receive it). **Review-before-insert sidesteps this** for capture: the correction is recorded regardless of the destination app, since you edit it in Idiolect's own dialog before it's inserted.
+- fcitx5 vs IBus is purely the front-end; the daemon, GPU transcription, history, and training are shared. The IBus engine is the actively developed path (review dialog, caret indicator, history insert, retention) and the one these docs assume.
+
+### Tray menu (manage history, retention & mode)
+
+The tray icon (a modern line-art microphone that fills in while recording) is the control surface:
+
+- **Start / Stop / Cancel recording** — the same as the toggle.
+- **Recent History** — recent dictations; each offers **Insert** (re-type it into the focused app at the cursor, via the IME), **Copy** (to the clipboard), and **Delete**.
+- **Review before insert** — toggles the review dialog described above (off by default).
+- **Settings → Tray history** — how long / how many recent dictations the menu shows (*Show last* 1/7/30 days, *Max items* 10/25/50).
+- **Settings → Training data kept for** — how long captured audio + transcripts are retained for learning: presets **1 month … 10 years** (default **1 year**) plus **Custom…** (a small dialog to type any number of days/months). This is deliberately separate from the tray-history list: history is a short convenience list; training data is the long-lived corpus. Past the window the daemon purges the whole session (audio + transcript + correction); everything inside the window is kept, because correct dictations are positive training signal too. Pruning runs on startup and hourly.
 
 ---
 
 ## Table of Contents
 
+- [Look & feel](#look--feel)
+- [Installation & Usage](#installation--usage)
 - [Core Architecture](#core-architecture)
 - [Why Idiolect Must Be an Input Method](#why-idiolect-must-be-an-input-method)
 - [System Processes](#system-processes)
@@ -107,12 +311,14 @@ The text layer is implemented through the operating system input method framewor
 
 ## System Processes
 
+The IME front-end is interchangeable: the fcitx5 C++ addon **or** the pure-Rust IBus engine, both thin clients of the same daemon over the same Unix-socket protocol.
+
 ```mermaid
 flowchart TD
-    A[idiolect-fcitx5 C++ Engine] <-->|Unix Socket IPC| B[idiolectd Rust Daemon]
+    A["IME front-end<br/>(idiolect-fcitx5 C++ OR ibus-engine-idiolect Rust)"] <-->|Unix Socket IPC| B[idiolectd Rust Daemon]
 
     B --> C[Audio Capture: CPAL]
-    C --> D[VAD: Silero]
+    C --> D[VAD: WebRTC]
     D --> E[PCM Utterance Buffer]
 
     E --> F[STT Runtime: whisper-rs / whisper.cpp]
@@ -121,15 +327,18 @@ flowchart TD
     F --> H[Draft Transcript]
     H --> A
 
-    A --> I[Preedit Text in Focused App]
-    I --> J[User Corrects / Accepts]
-    J --> K[Commit Text via Fcitx5]
-    J --> L[IME Correction Events]
+    A --> I{Review mode?}
+    I -->|Direct| J[Preedit / commit in focused app]
+    I -->|Review| RD[Editable review dialog<br/>then focus restored]
+    J --> K[User Corrects / Accepts]
+    RD --> K
+    K --> L[Commit Text + correction events]
 
     G --> M[Ogg Opus Audio Store]
     L --> N[SQLite Session Store]
     M --> N
 
+    N --> RET[Retention prune:<br/>purge sessions past the window]
     N --> O[Offline Classifier]
     O --> P[Training Dataset Builder]
     P --> Q[Rust-Native LoRA Trainer]
@@ -142,7 +351,7 @@ flowchart TD
 
 ## Interface Architecture: Ports and Adapters
 
-Idiolect must not be tightly coupled to any third-party component. Fcitx5, IBus, Whisper, Silero VAD, Opus, SQLite, ONNX Runtime, Burn, and any future model runtime are **replaceable adapters** behind stable Idiolect-owned interfaces.
+Idiolect must not be tightly coupled to any third-party component. Fcitx5, IBus, Whisper, webrtc-vad, Opus, SQLite, ksni, arboard, Burn, and any future model runtime are **replaceable adapters** behind stable Idiolect-owned interfaces.
 
 ```mermaid
 flowchart TD
@@ -195,7 +404,7 @@ Each external system is isolated by an Idiolect-owned trait or interface:
 ```text
 Fcitx5 does not own the input-method domain model.
 whisper-rs does not own the ASR result model.
-Silero does not own the segmentation model.
+webrtc-vad does not own the segmentation model.
 Opus does not own the utterance storage model.
 SQLite does not own the repository API.
 No third-party framework owns the training-run model.
@@ -229,14 +438,16 @@ idiolect-application
   depends on core + port traits
 
 idiolect-ports
-  traits/interfaces only
-  InputMethodPort, AudioCapturePort, VoiceActivityPort, SpeechToTextPort,
-  AudioCodecPort, SessionRepositoryPort, CandidateRepositoryPort,
-  TrainerPort, EvaluatorPort, AdapterRegistryPort, ClockPort, EventSinkPort
+  traits/interfaces only (actual trait names)
+  InputMethodPort, AudioInputPort, VadPort, AsrPort, AudioCodecPort,
+  AudioStorePort, MetadataStorePort, TrayPort,
+  TrainerPort, EvaluationPort, AdapterRegistryPort
+  (ClipboardPort is defined in idiolect-application; EncryptionPort in the crypto adapter)
 
 idiolect-adapters
   concrete implementations
-  Fcitx5, CPAL, Silero, whisper-rs, Opus, SQLite, Rust trainer, filesystem
+  fcitx5, IBus, CPAL, webrtc-vad, whisper-rs, Opus, SQLite, ksni tray,
+  arboard clipboard, ChaCha20-Poly1305 crypto, Burn trainer, fixtures
 
 idiolectd
   composition root
@@ -333,37 +544,68 @@ pub trait AdapterRegistryPort {
 
 ## Adapter Selection Through Configuration
 
-Runtime configuration selects adapters by logical capability, not hard-coded library names:
+Runtime configuration selects adapters by logical capability, not hard-coded library names. The schema below is what `idiolectd` actually reads (`idiolect-common/src/config.rs`); every section is optional and falls back to the defaults shown. Run `idiolectd config print-default --json` for the full default set.
 
 ```toml
-[input_method]
-backend = "fcitx5"
+[user]
+default_user_id = "default"
+
+[daemon]
+socket_path = "…"          # default: $XDG_RUNTIME_DIR/idiolect.sock
+log_level   = "info"
 
 [audio]
-backend = "cpal"
+input_device           = "default"
+capture_sample_rate    = 48000     # 8000–192000
+processing_sample_rate = 16000
+channels               = 1
 
 [vad]
-backend = "silero"
+engine          = "webrtc"   # "silero" is accepted, served by the WebRTC adapter
+threshold       = 0.5
+min_speech_ms   = 250
+pre_roll_ms     = 300
+post_roll_ms    = 700
+max_utterance_ms = 30000
 
 [asr]
-backend = "whisper-rs"
-model = "whisper-medium-en"
+engine   = "whisper-rs"
+model    = "whisper-medium-en"   # -> <data_dir>/models/whisper/whisper-medium-en.bin
+language = "en"
+use_gpu  = true
+threads  = 8
 
-[codec]
-backend = "ogg-opus"
+[storage]
+data_dir          = "…"      # default: $XDG_DATA_HOME/idiolect
+database_path     = "…"      # default: <data_dir>/db/idiolect.sqlite
+audio_codec       = "opus"
+audio_container   = "ogg"
+opus_bitrate_bps  = 24000
+high_value_opus_bitrate_bps = 32000
 
-[metadata_store]
-backend = "sqlite"
-
-[trainer]
-backend = "rust-native-lora"
+[training]
+min_approved_examples = 50
+trainer    = "rust-native-lora"
 auto_train = false
 
-[evaluator]
-backend = "jiwer"
+[privacy]
+retain_audio = false
+
+[history]
+retention_days          = 1     # one of 1, 7, 30
+max_entries             = 10    # one of 10, 25, 50
+clipboard_auto_clear_secs = 30  # 0 disables
+encrypt_at_rest         = false
+
+[observability]
+# all private-text logging flags must stay false (validation rejects true)
+log_raw_transcripts       = false
+log_corrected_transcripts = false
+log_surrounding_app_text  = false
+log_private_text          = false
 ```
 
-Compile-time feature selection is acceptable for v1, provided the core talks only to interfaces.
+Adapter choice is currently compile-time (Cargo features such as `cuda` / `ibus-engine`); the config selects model, devices, and behaviour while the core talks only to the port interfaces.
 
 ---
 
@@ -373,13 +615,13 @@ Every port must have a shared contract test suite. Any adapter implementing that
 
 | Port | Primary Adapter | Replacement/Test Adapter |
 |---|---|---|
-| `InputMethodPort` | Fcitx5 | headless fake input method |
-| `SpeechToTextPort` | whisper-rs | deterministic fixture recogniser |
-| `VoiceActivityPort` | Silero | fixture segmenter |
+| `InputMethodPort` | fcitx5 / IBus | headless fake input method |
+| `AsrPort` | whisper-rs | deterministic fixture recogniser |
+| `VadPort` | webrtc-vad | fixture segmenter |
 | `AudioCodecPort` | Opus | no-op PCM fixture codec |
-| `SessionRepositoryPort` | SQLite | in-memory repository |
-| `TrainerPort` | Rust-native trainer | fake trainer returning fixed metrics |
-| `EvaluatorPort` | jiwer evaluator | fixture evaluator |
+| `MetadataStorePort` | SQLite | in-memory store |
+| `TrainerPort` | Burn trainer | fake trainer returning fixed metrics |
+| `EvaluationPort` | Rust metric engine | fixture evaluator |
 | `AdapterRegistryPort` | filesystem registry | temp-dir registry |
 
 **Rule:** No port is architecturally proven until both the real adapter and replacement adapter pass the same contract test suite.
@@ -542,9 +784,12 @@ created -> recording -> transcribing -> preedit_active -> user_correcting -> com
 
 | Quality | Source | Example |
 |---|---|---|
-| **High** | IME preedit correction | Spoken: "restart Traefik" → STT: "restart traffic" → User fixes to "restart Traefik" |
-| **Medium** | Post-commit surrounding text | Committed "restart traffic", later observed "restart Traefik" in context |
-| **Low** | No correction captured | Store audio + raw STT + committed text only |
+| **High** | Review dialog | "restart Traefik" → STT "restart traffic" → user fixes it in Idiolect's own editable window, then it's inserted. Works in any app (incl. Electron) because the edit happens before the text reaches the app. |
+| **High** | IME preedit correction | User edits the live preedit (printable keys / backspace / arrows) before committing — captured directly in the engine's editable buffer. |
+| **Medium** | Post-commit amend | Committed "restart traffic", later corrected in place; the engine reports the corrected form (`ReportCorrection`) and the candidate is amended. |
+| **Low** | No correction captured | Store audio + raw STT + committed text only (still a valid positive training example). |
+
+Every committed dictation produces a training candidate — labelled `accepted_without_edit` when the recognition was kept verbatim, or `accepted_with_edit` when the diff (raw → corrected) is the learning signal. Audio is retained for all of them within the training-data retention window (see the tray's *Training data kept for*), since correct dictations are positive supervision too.
 
 ---
 
@@ -614,142 +859,72 @@ Always retain: current active adapter, previous active adapter, best historical 
 
 ## Repository Structure
 
+This is the actual Cargo workspace layout (see `Cargo.toml` for the authoritative member list). The ports/adapters split from the architecture above is realised as one crate per port-trait group and one crate per adapter.
+
 ```text
 idiolect/
-  Cargo.toml
+  Cargo.toml            # workspace: warnings = deny, unsafe_code = forbid
   README.md
-  LICENSE
+  LICENSE               # AGPL-3.0-only
 
   crates/
-    idiolect-core/
-      src/
-        domain/
-        services/
-        ports/
+    # --- domain / application / interfaces ---
+    idiolect-core/         # pure domain: ImeSession state machine, TrainingCandidate, rules
+    idiolect-ports/        # port traits only (see "Required Ports" below)
+    idiolect-application/  # use cases: Dictation, History, Menu, Maintenance
+    idiolect-common/       # ids, config (TOML + XDG path resolution), error, time
+    idiolect-ipc/          # Unix-socket JSON-Lines protocol: messages, framing, handshake
 
-    idiolect-adapters/
-      fcitx5-input-method/
-      ibus-input-method/
-      cpal-audio-input/
-      silero-vad/
-      whisper-rs-asr/
-      ogg-opus-codec/
-      sqlite-store/
-      rust-native-lora-trainer/
-      jiwer-evaluator/
+    # --- real adapters ---
+    idiolect-adapter-cpal/        # AudioInputPort  (cpal)
+    idiolect-adapter-vad/         # VadPort         (webrtc-vad)
+    idiolect-adapter-whisper/     # AsrPort         (whisper-rs; optional `cuda` feature)
+    idiolect-adapter-opus/        # AudioCodecPort  (opus)
+    idiolect-adapter-sqlite/      # MetadataStorePort + AudioStorePort (rusqlite, optional crypto)
 
-    idiolect-common/
-      src/
-        ids.rs
-        protocol.rs
-        config.rs
-        error.rs
-        time.rs
+    # --- fixture / in-memory adapters (tests & CI) ---
+    idiolect-adapter-memory/        # in-memory store stub
+    idiolect-adapter-fixture-audio/ # deterministic sine-wave AudioInputPort
+    idiolect-adapter-fixture-asr/   # deterministic AsrPort
+    idiolect-adapter-fixture-codec/ # no-op AudioCodecPort
 
-    idiolect-ipc/
-      src/
-        server.rs
-        client.rs
-        messages.rs
-        framing.rs
+    # --- desktop integration ---
+    idiolect-adapters/desktop/ksni/       # TrayPort (ksni); line-art mic icons rendered with tiny-skia
+    idiolect-adapters/desktop/clipboard/  # ClipboardPort  (arboard)
+    idiolect-adapters/desktop/ibus/       # IBus engine (ibus-engine-idiolect, feature `ibus-engine`).
+                                          #   session (pure state machine), ipc, ibus (zbus glue),
+                                          #   review (review-dialog trait), indicator (caret overlay
+                                          #   trait), focus (X11 focus capture/restore via x11rb)
+    idiolect-adapters/crypto/             # EncryptionPort (ChaCha20-Poly1305 at-rest)
 
-    idiolect-audio/
-      src/
-        capture.rs
-        devices.rs
-        buffer.rs
-        resample.rs
+    # --- out-of-process GUI helpers (pure-Rust egui/eframe, behind traits) ---
+    idiolect-review-dialog/        # editable review window (idiolect-review-dialog)
+    idiolect-recording-indicator/  # floating "mic is live" overlay tracking the caret
+    idiolect-retention-dialog/     # custom training-retention input (idiolect-retention-dialog)
 
-    idiolect-vad/
-      src/
-        silero.rs
-        segmenter.rs
-        config.rs
+    # --- training (early-stage) ---
+    idiolect-ml-core/        # manifest / artifact / evaluation value types
+    idiolect-trainer-burn/   # TrainerPort over Burn (stub)
+    idiolect-trainerctl/     # classifier, manifest, metrics, promotion + idiolect-train binary
 
-    idiolect-asr/
-      src/
-        whisper_rs.rs
-        runtime.rs
-        models.rs
-        transcript.rs
-
-    idiolect-codec/
-      src/
-        opus.rs
-        decode.rs
-        encode.rs
-        wav_debug.rs
-
-    idiolect-storage/
-      src/
-        db.rs
-        migrations.rs
-        utterances.rs
-        sessions.rs
-        candidates.rs
-        adapters.rs
-        audio_store.rs
-
-    idiolect-trainerctl/
-      src/
-        manifest.rs
-        classify.rs
-        train.rs
-        evaluate.rs
-        promote.rs
-
-    idiolectd/
-      src/
-        main.rs
-        daemon.rs
-        services.rs
-        commands.rs
+    # --- composition root + CLI + tests ---
+    idiolectd/                   # daemon: wires adapters, runs the IPC/run loop
+    idiolect-cli/                # operator CLI (binary: idiolect-cli, aliased idiolect)
+    idiolect-test-support/       # shared fakes & audio fixtures
+    idiolect-integration-tests/  # cross-crate integration tests
 
   fcitx5/
-    idiolect-fcitx5/
+    idiolect-fcitx5/      # C++ fcitx5 addon -> idiolect.so
       CMakeLists.txt
-      src/
-        engine.cpp
-        engine.h
-        ipc_client.cpp
-        ipc_client.h
-        preedit_session.cpp
-        preedit_session.h
-      data/
-        idiolect-addon.conf
-        idiolect.conf
+      src/                # engine, idiolect_module, ipc_client, preedit_session
+      data/               # idiolect-addon.conf, idiolect.conf, metainfo.xml
+      tests/              # preedit_session, toggle_session, disconnect_recovery, e2e_ipc_bridge
 
-  research/
-    python-trainer-reference/
-      README.md
-      pyproject.toml
-      train_lora.py
-      evaluate_adapter.py
-      build_manifest.py
-      classify_edits.py
-      merge_adapter.py
-      export_model.py
-
-  models/
-    README.md
-    whisper/
-      .gitkeep
-
-  docs/
-    00-master-plan.md
-    01-interface-architecture.md
-    02-input-method-architecture.md
-    03-fcitx5-engine.md
-    04-rust-daemon.md
-    05-audio-pipeline.md
-    06-storage-schema.md
-    07-correction-sessions.md
-    08-training-pipeline.md
-    09-models.md
-    10-burn-roadmap.md
-    11-security-privacy.md
-    12-testing-strategy.md
-    13-v1-delivery-target.md
+  ci/scripts/            # test-all.sh and the per-area gates it runs
+  packaging/             # Debian package layout + systemd user service
+  scripts/               # dictate helpers
+  docs/                  # master plan, decisions/ (ADRs), implementation/, future/
+  models/whisper/        # drop Whisper .bin model files here
 ```
 
 ---
@@ -757,11 +932,17 @@ idiolect/
 ## Binary Names
 
 ```text
-idiolectd          # local daemon
-idiolect           # CLI
-idiolect-fcitx5    # Fcitx5 input method engine/addon
-idiolect-train     # trainer orchestration CLI (optional)
+idiolectd                     # local daemon (composition root)
+idiolect-cli                  # operator CLI (installed also as `idiolect`)
+idiolect.so                   # fcitx5 input-method addon (built from fcitx5/idiolect-fcitx5)
+ibus-engine-idiolect          # IBus engine (built with `--features ibus-engine`)
+idiolect-review-dialog        # review-before-insert window (spawned by the engine)
+idiolect-recording-indicator  # floating caret mic overlay (spawned by the engine)
+idiolect-retention-dialog     # custom training-retention input (spawned by the daemon)
+idiolect-train                # trainer orchestration CLI (from idiolect-trainerctl; early-stage)
 ```
+
+The three GUI helpers run **out-of-process** behind traits (`ReviewDialog`, `RecordingIndicator`, `RetentionDialog`), so the egui/winit stack never runs inside the async IME and the toolkit stays swappable. The engine/daemon discovers each binary next to its own executable, so keep them in the same directory (e.g. `target/release/`).
 
 ---
 
@@ -774,14 +955,19 @@ idiolect-train     # trainer orchestration CLI (optional)
 | IPC | Unix domain socket + JSON Lines | behind `IpcTransportPort` |
 | Audio capture | CPAL | behind `AudioInputPort` |
 | Resampling | rubato | behind `AudioResamplerPort` |
-| VAD | Silero VAD Rust crate / ONNX Runtime | behind `VadPort` |
-| STT inference | whisper-rs over whisper.cpp | behind `AsrPort` |
+| VAD | webrtc-vad (16 kHz, 30 ms frames) | behind `VadPort` |
+| STT inference | whisper-rs over whisper.cpp (optional CUDA) | behind `AsrPort` |
 | First model | Whisper `medium.en` GGML/GGUF | model artifact, not domain dependency |
-| Audio storage | Ogg Opus, mono, 24 kbps VBR | behind `AudioCodecPort` |
-| Metadata storage | SQLite via rusqlite | behind `MetadataStorePort` |
-| Training orchestration | Rust | application service |
-| Training backend | Rust-native (Burn/Candle evaluated) | behind `TrainerPort` |
-| Evaluation | Rust metric engine first | behind `EvaluationPort` |
+| Audio storage | Opus, mono, 24 kbps | behind `AudioCodecPort` |
+| Metadata storage | SQLite via rusqlite (optional ChaCha20-Poly1305 at-rest) | behind `MetadataStorePort` / `AudioStorePort` |
+| Tray + clipboard | ksni tray, arboard clipboard | behind `TrayPort` / `ClipboardPort` |
+| Tray icons | tiny-skia (line-art mic rendered to ARGB pixmaps) | rendering detail of the ksni adapter |
+| Review / indicator / retention GUI | egui/eframe (pure-Rust, out-of-process) | behind `ReviewDialog` / `RecordingIndicator` / `RetentionDialog` |
+| Focus restore (review dialog) | x11rb (`_NET_ACTIVE_WINDOW`), engine feature only | behind `WindowFocus` (no-op fallback) |
+| IBus engine | zbus (pure-Rust D-Bus, no `libibus-dev`) | behind `InputMethodPort` (alt front-end to fcitx5) |
+| Training orchestration | Rust (early-stage) | application service |
+| Training backend | Burn (stub, behind `TrainerPort`) | behind `TrainerPort` |
+| Evaluation | Rust metric engine (early-stage) | behind `EvaluationPort` |
 | Python reference tools | optional research only | never required by v1 product |
 
 **Language Policy:** Rust is the default for product code. Allowed non-Rust: Fcitx5 C++ shim (thin boundary adapter), third-party C/C++ libraries behind Rust adapter crates, Python scripts (research/reference only, not required for v1 operation).
@@ -791,6 +977,8 @@ idiolect-train     # trainer orchestration CLI (optional)
 ## Testing Strategy
 
 Testing is a core product requirement, not an afterthought. Idiolect sits between microphone input, speech recognition, operating-system text composition, local storage, and model adaptation. Bugs can silently corrupt training data, commit wrong text into user applications, or promote a worse personalised model. The test strategy must cover correctness, privacy, data integrity, latency, and regression safety.
+
+**Test-Driven Development is mandatory** — see [CONTRIBUTING.md](CONTRIBUTING.md) and the repo-root [CLAUDE.md](CLAUDE.md). No production code changes without a failing test first: a bug fix starts with a test that fails on the current code, then is made to pass (red → green → refactor). Every behaviour is covered at **unit, integration, and end-to-end** levels; a level is skipped only with a written reason in the test file (e.g. a GUI/desktop boundary with no headless seam, such as a StatusNotifier tray click or the egui binaries themselves). End-to-end tests prefer self-provisioned infra so they run in CI rather than being `#[ignore]`d-and-forgotten — e.g. the IBus engine e2e spawns its own private `dbus-daemon` (see `ci/scripts/test-ibus-e2e.sh`). Both gates stay green before and after every change: `cargo test --workspace` and `cargo clippy --workspace --all-targets` (warnings are denied).
 
 ### Testing Layers
 
@@ -1063,33 +1251,42 @@ All warnings are errors, and any failing command blocks the current baseline. Ru
 bash ci/scripts/test-all.sh
 ```
 
-Direct gates run by `test-all.sh`:
+Gates run by `test-all.sh`, in order:
 
 ```bash
 bash ci/scripts/test-rust.sh
 bash ci/scripts/test-fcitx5.sh
 bash ci/scripts/test-integration.sh
 bash ci/scripts/test-e2e.sh
+bash ci/scripts/test-e2e-failure-recovery.sh
+bash ci/scripts/test-model-regression.sh
+bash ci/scripts/test-performance.sh
 bash ci/scripts/test-real-adapter-deps.sh
 bash ci/scripts/test-interface-no-backend-leakage.sh
 bash ci/scripts/test-packaging.sh
 bash ci/scripts/test-package-smoke.sh
+bash ci/scripts/test-package-lifecycle.sh
 bash ci/scripts/test-coverage-map.sh
 bash ci/scripts/test-coverage.sh
 ```
 
-Additional CI scripts (from master plan):
-```bash
-bash ci/scripts/test-cpp.sh
-bash ci/scripts/test-e2e-linux.sh
-bash ci/scripts/test-model-regression.sh
-```
+Other scripts in `ci/scripts/` (not part of the default run): `test-e2e-headless.sh`, `test-fcitx5-integration.sh`, and `fetch-whisper-fixture.sh` (downloads the Whisper test fixture).
 
 ---
 
 ## Status
 
-This repository is currently a prototype baseline and not yet Idiolect v1 complete.
+This repository builds and runs the core dictation loop, but is not yet Idiolect v1 complete.
+
+**Working today:**
+- Dictation loop end to end: CPAL capture → WebRTC VAD → whisper-rs (CPU or CUDA) → preedit → commit, over the Unix-socket JSON-Lines IPC.
+- Two interchangeable front-ends: fcitx5 addon (`idiolect.so`) and the IBus engine (`ibus-engine-idiolect`).
+- SQLite metadata + on-disk audio store (with optional ChaCha20-Poly1305 at-rest encryption), history, ksni tray menu, and clipboard reinsert/copy.
+- Operator CLI: `doctor`, `history`, `tray`, `privacy`, `logs` (see [CLI Surface](#cli-surface)).
+
+**Early-stage / not wired end to end:**
+- Training, evaluation, and adapter promotion/rollback (`idiolect-trainer-burn` and `idiolect-trainerctl` exist as scaffolding; the `train`/`adapters`/`candidates`/`sessions`/`models` CLI groups return `not-implemented`).
+- A one-command prebuilt `.deb` (packaging exists under `packaging/` and is exercised in CI, but you currently build from source).
 
 ### Baseline Verification Gates
 
@@ -1099,38 +1296,46 @@ All warnings are errors, and any failing command blocks the current baseline. Ru
 bash ci/scripts/test-all.sh
 ```
 
-Direct gates run by `test-all.sh`:
-
-```bash
-bash ci/scripts/test-rust.sh
-bash ci/scripts/test-fcitx5.sh
-bash ci/scripts/test-integration.sh
-bash ci/scripts/test-e2e.sh
-bash ci/scripts/test-real-adapter-deps.sh
-bash ci/scripts/test-interface-no-backend-leakage.sh
-bash ci/scripts/test-packaging.sh
-bash ci/scripts/test-package-smoke.sh
-bash ci/scripts/test-coverage-map.sh
-bash ci/scripts/test-coverage.sh
-```
+See [CI Gates](#ci-gates) for the full list of gates `test-all.sh` runs.
 
 ---
 
 ## CLI Surface
 
-Current product command groups are wired through `idiolect-cli`. Backed commands execute normally; commands whose backing services are later recovery tasks return nonzero JSON with `code: "not-implemented"`.
+Product command groups are wired through `idiolect-cli` (installed as both `idiolect-cli` and `idiolect`). Backed commands execute normally; commands whose backing services are not yet built return nonzero JSON with `code: "not-implemented"`.
+
+**Implemented today:**
 
 ```bash
+# diagnostics — resolves paths and checks DB migrations, socket, model, fcitx5 metadata
 idiolect-cli doctor --json
-idiolect-cli service status --json
-idiolect-cli models list --json
-idiolect-cli sessions list --json
-idiolect-cli candidates list --json
-idiolect-cli train export-manifest --json
-idiolect-cli adapters list --json
+
+# history (reads SQLite; reinsert/copy talk to the running daemon over the socket)
+idiolect-cli history list   --db path/to/idiolect.sqlite [--limit 10] [--json]
+idiolect-cli history show   --id <ID> --db path/to/idiolect.sqlite [--json]
+idiolect-cli history delete --id <ID> --db path/to/idiolect.sqlite --confirm-delete
+idiolect-cli history prune  --days <N> --db path/to/idiolect.sqlite --confirm-delete
+idiolect-cli history reinsert --id <ID> [--socket PATH] [--json]
+idiolect-cli history copy     --id <ID> [--socket PATH] [--json]
+
+# tray / history settings (tray-history retention-days ∈ {1,7,30}, max-entries ∈ {10,25,50})
+idiolect-cli tray status --db path/to/idiolect.sqlite [--json]
+idiolect-cli tray config --db path/to/idiolect.sqlite [--retention-days 7] [--max-entries 25]
+idiolect-cli tray menu   --db path/to/idiolect.sqlite [--json]
+# NOTE: training-data retention (default 365 days) is managed from the tray
+#   ("Settings → Training data kept for", presets + Custom…), persisted in
+#   tray_settings as `training_retention_days`; it is separate from the
+#   tray-history `retention_days` above and from `history prune`.
+
+# privacy
 idiolect-cli privacy export --user default --db path/to/idiolect.sqlite
-idiolect-cli privacy delete-all --user default --confirm-delete --json
+idiolect-cli privacy delete --user default --db path/to/idiolect.sqlite --confirm-delete
+
+# logs (redacts transcript/clipboard fields unless --include-private)
+idiolect-cli logs show --log-file path/to/log [--include-private]
 ```
+
+**Not yet implemented** (return `code: "not-implemented"`): `service status|restart`, `models list|install`, `sessions list|show|delete`, `candidates list`, `memory list|delete`, `train export-manifest|classify|run`, `adapters list|promote|rollback`, `privacy delete-all`.
 
 ---
 

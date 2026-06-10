@@ -18,7 +18,7 @@ fn real_media_full_stack_transcribes_fixture_and_commits_candidate() {
     e2e::send_message(&mut stream, &IpcMessage::StartRecording);
 
     let transcript = match e2e::read_message(&mut reader) {
-        IpcMessage::PreeditUpdate(PreeditUpdate { text }) => text,
+        IpcMessage::PreeditUpdate(PreeditUpdate { text, .. }) => text,
         other => panic!("expected PreeditUpdate, got {other:?}"),
     };
     let lower_transcript = transcript.to_lowercase();

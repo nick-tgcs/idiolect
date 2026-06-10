@@ -28,6 +28,7 @@ const SESSION_STATE_CREATED: &str = "created";
 const SESSION_STATE_COMMITTED: &str = "committed";
 const SESSION_STATE_CANCELLED: &str = "cancelled";
 const TRAINING_SOURCE_ACCEPTED: &str = "accepted_without_edit";
+const TRAINING_SOURCE_CORRECTED: &str = "accepted_with_edit";
 const TRAINING_STATUS_CAPTURED: &str = "captured";
 const CAPTURE_QUALITY_LIVE: &str = "live";
 const CANCEL_PAYLOAD: &str = "cancelled";
@@ -724,6 +725,88 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    /// Purge training data — audio + transcript + training candidate + session —
+    /// for every session older than the retention window. `older_than_days == 0`
+    /// disables pruning (returns 0), matching `prune_history`. Returns the number
+    /// of sessions purged. Audio files are removed first (filesystem), then the DB
+    /// rows in a single transaction, mirroring the privacy-delete coordination.
+    pub fn prune_training_data(
+        &mut self,
+        older_than_days: u32,
+        audio_store: &FileAudioStore,
+    ) -> Result<u64, SqliteStorageError> {
+        if older_than_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = format!("-{older_than_days} days");
+
+        // 1. Identify expired sessions and the audio they own.
+        let expired: Vec<(String, String, String)> = {
+            let mut statement = backend_result(self.connection.prepare(
+                "SELECT id, user_id, utterance_id
+                 FROM ime_text_sessions
+                 WHERE COALESCE(committed_at, cancelled_at, created_at)
+                       < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            ))?;
+            let rows = backend_result(statement.query_map(params![cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            }))?;
+            backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?
+        };
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        // 2. Delete audio files (outside the transaction — filesystem, not SQL).
+        for (_, user_id, utterance_id) in &expired {
+            audio_store
+                .delete_source_audio_for(user_id, utterance_id)
+                .map_err(SqliteStorageError::audio_delete)?;
+        }
+
+        // 3. Delete the DB rows atomically. manifest_items reference candidates, so
+        //    they go first; then candidates, edit events, history, the session, and
+        //    finally its utterance rows.
+        let transaction = backend_result(self.connection.transaction())?;
+        for (session_key, _user_id, utterance_id) in &expired {
+            backend_result(transaction.execute(
+                "DELETE FROM manifest_items WHERE training_candidate_id IN
+                   (SELECT id FROM training_candidates WHERE session_id = ?1)",
+                params![session_key],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM training_candidates WHERE session_id = ?1",
+                params![session_key],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM ime_edit_events WHERE session_id = ?1",
+                params![session_key],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM ime_text_history WHERE session_id = ?1",
+                params![session_key],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM ime_text_sessions WHERE id = ?1",
+                params![session_key],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM utterance_audio_files WHERE utterance_id = ?1",
+                params![utterance_id],
+            ))?;
+            backend_result(transaction.execute(
+                "DELETE FROM utterances WHERE id = ?1",
+                params![utterance_id],
+            ))?;
+        }
+        backend_result(transaction.commit())?;
+        Ok(expired.len() as u64)
+    }
+
     pub fn delete_user_data_with_retention_for_test(
         &mut self,
         user_id: &str,
@@ -886,6 +969,79 @@ impl SqliteMetadataStore {
 
     pub fn training_candidate_count_for_test(&self) -> Result<i64, SqliteStorageError> {
         self.training_candidate_count()
+    }
+
+    /// `(raw_text, corrected_text, source)` of the most recent training
+    /// candidate, for assertions in integration/e2e tests.
+    pub fn latest_training_candidate_for_test(
+        &self,
+    ) -> Result<Option<(String, String, String)>, SqliteStorageError> {
+        backend_result(
+            self.connection
+                .query_row(
+                    "SELECT raw_text, corrected_text, source FROM training_candidates
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional(),
+        )
+    }
+
+    /// Amend the most recently committed session with the user's in-place
+    /// correction: record the edit (committed → corrected) and rewrite the
+    /// training candidate so it carries a real raw→corrected signal instead of
+    /// `accepted_without_edit`. No-op when the text is unchanged.
+    pub fn amend_correction(
+        &mut self,
+        session_id: ImeSessionId,
+        committed_text: &str,
+        corrected_text: &str,
+    ) -> Result<(), SqliteStorageError> {
+        if corrected_text == committed_text {
+            return Ok(());
+        }
+        let session_key = Self::session_key(session_id)?;
+        let transaction = backend_result(self.connection.transaction())?;
+        if !Self::session_exists(&transaction, &session_key)? {
+            return Err(SqliteStorageError::not_found(
+                "ime_text_sessions row",
+                &session_key,
+            ));
+        }
+        backend_result(transaction.execute(
+            "INSERT INTO ime_edit_events(
+                session_id,
+                text_session_id,
+                from_text,
+                to_text,
+                event_index,
+                event_type,
+                timestamp_ms
+             ) VALUES (
+                ?1, ?1, ?2, ?3, 1, 'post_commit_correction',
+                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+             )",
+            params![session_key, committed_text, corrected_text],
+        ))?;
+        backend_result(transaction.execute(
+            "UPDATE ime_text_sessions
+             SET committed_text = ?1,
+                 final_preedit_text = ?1,
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2",
+            params![corrected_text, session_key],
+        ))?;
+        backend_result(transaction.execute(
+            "UPDATE training_candidates
+             SET corrected_text = ?1,
+                 candidate_transcript = ?1,
+                 source = ?2
+             WHERE session_id = ?3",
+            params![corrected_text, TRAINING_SOURCE_CORRECTED, session_key],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
     }
 
     pub fn insert_dangling_training_candidate_for_test(&self) -> Result<(), SqliteStorageError> {
@@ -1862,7 +2018,14 @@ impl MetadataStorePort for SqliteMetadataStore {
                 session_key,
                 raw_text,
                 committed_text,
-                TRAINING_SOURCE_ACCEPTED,
+                // Label by whether the user actually changed the transcript —
+                // regardless of whether the edit came from a preedit, the review
+                // dialog, or none at all.
+                if committed_text == raw_text {
+                    TRAINING_SOURCE_ACCEPTED
+                } else {
+                    TRAINING_SOURCE_CORRECTED
+                },
                 1.0_f64,
                 CAPTURE_QUALITY_LIVE,
                 idempotency_key,
@@ -2106,4 +2269,109 @@ fn parse_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> 
         state,
         created_at: row.get(4)?,
     })
+}
+
+#[cfg(test)]
+mod amend_correction_tests {
+    use super::*;
+
+    fn candidate(store: &SqliteMetadataStore, key: &str) -> (String, String, String) {
+        store
+            .connection
+            .query_row(
+                "SELECT raw_text, corrected_text, source FROM training_candidates WHERE session_id = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("candidate row")
+    }
+
+    fn post_commit_edits(store: &SqliteMetadataStore, key: &str) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM ime_edit_events
+                 WHERE session_id = ?1 AND event_type = 'post_commit_correction'",
+                params![key],
+                |row| row.get(0),
+            )
+            .expect("edit count")
+    }
+
+    #[test]
+    fn amend_rewrites_candidate_with_a_raw_to_corrected_signal() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("restart traffic"))
+            .expect("create");
+        store
+            .commit_session(session, "restart traffic", "commit-1")
+            .expect("commit");
+        let key = SqliteMetadataStore::session_key(session).expect("key");
+
+        // Baseline: auto-commit recorded it with no edit signal.
+        assert_eq!(
+            candidate(&store, &key),
+            (
+                "restart traffic".to_owned(),
+                "restart traffic".to_owned(),
+                "accepted_without_edit".to_owned()
+            )
+        );
+
+        store
+            .amend_correction(session, "restart traffic", "restart Traefik")
+            .expect("amend");
+
+        // Raw ASR preserved, corrected updated, marked as an edit.
+        assert_eq!(
+            candidate(&store, &key),
+            (
+                "restart traffic".to_owned(),
+                "restart Traefik".to_owned(),
+                "accepted_with_edit".to_owned()
+            )
+        );
+        assert_eq!(post_commit_edits(&store, &key), 1);
+    }
+
+    #[test]
+    fn commit_labels_an_edited_transcript_as_accepted_with_edit() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        // The review dialog (or any client) commits text different from the raw
+        // transcript -> it must be recorded as an edit, not accepted-as-is.
+        let session = store.create_session(Some("Deploy Trefiq")).expect("create");
+        store
+            .commit_session(session, "Deploy Traefik", "commit-1")
+            .expect("commit");
+        let key = SqliteMetadataStore::session_key(session).expect("key");
+        assert_eq!(
+            candidate(&store, &key),
+            (
+                "Deploy Trefiq".to_owned(),
+                "Deploy Traefik".to_owned(),
+                "accepted_with_edit".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn amend_is_a_no_op_when_text_is_unchanged() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store.create_session(Some("hello")).expect("create");
+        store
+            .commit_session(session, "hello", "commit-1")
+            .expect("commit");
+        let key = SqliteMetadataStore::session_key(session).expect("key");
+
+        store
+            .amend_correction(session, "hello", "hello")
+            .expect("amend no-op");
+
+        assert_eq!(post_commit_edits(&store, &key), 0);
+        assert_eq!(candidate(&store, &key).2, "accepted_without_edit");
+    }
 }

@@ -109,6 +109,56 @@ fn daemon_run_unsupported_asr_engine_returns_safe_error() {
     }
 }
 
+#[test]
+fn daemon_survives_a_client_connection_reset() {
+    // An IME engine that crashes or restarts resets its socket (RST), not a clean
+    // FIN. The daemon must treat that like a normal disconnect and exit cleanly —
+    // never crash — otherwise any engine restart takes the whole daemon down.
+    let fixture = DaemonFixture::new("reset");
+    let daemon = fixture.spawn_daemon();
+    {
+        let mut stream = connect_client(&fixture.socket_path());
+        // Send hello + start but NEVER read the daemon's responses. Closing a socket
+        // with unread received data makes the Linux kernel send RST, so the daemon's
+        // read sees ConnectionReset rather than EOF.
+        let hello = encode_json_line(&IpcMessage::ClientHello(ClientHello {
+            client_name: "idiolect-reset-test".to_owned(),
+            protocol_version: 1,
+            features: vec!["preedit".to_owned(), "commit".to_owned()],
+        }))
+        .expect("encode hello");
+        stream.write_all(hello.as_bytes()).expect("write hello");
+        let start = encode_json_line(&IpcMessage::StartRecording).expect("encode start");
+        stream.write_all(start.as_bytes()).expect("write start");
+        stream.flush().expect("flush");
+        // Give the daemon time to buffer its responses into our (unread) recv queue,
+        // so the close below triggers RST.
+        thread::sleep(Duration::from_millis(300));
+        // drop(stream) without reading -> connection reset.
+    }
+    // The daemon must exit cleanly (Ok), not crash with an I/O error.
+    assert_daemon_exits_successfully(daemon);
+}
+
+#[test]
+fn daemon_rebinds_over_a_stale_socket_file() {
+    // A previous daemon that exited uncleanly (or was killed) can leave the unix
+    // socket file behind. The daemon must unlink it before binding, otherwise the
+    // restart fails with "Address already in use" — the wedge we hit in the field.
+    let fixture = DaemonFixture::new("stale-socket");
+    fs::create_dir_all(fixture.socket_path().parent().expect("socket parent"))
+        .expect("socket parent should be created");
+    fs::write(fixture.socket_path(), b"stale").expect("stale socket file should be written");
+
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+    client.send_hello();
+    client.send(IpcMessage::StartRecording);
+    client.expect_preedit("restart traffic");
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+}
+
 struct DaemonFixture {
     root: PathBuf,
 }
@@ -290,7 +340,7 @@ impl DaemonClient {
 
     fn expect_preedit(&mut self, expected: &str) {
         match self.read() {
-            IpcMessage::PreeditUpdate(PreeditUpdate { text }) => assert_eq!(text, expected),
+            IpcMessage::PreeditUpdate(PreeditUpdate { text, .. }) => assert_eq!(text, expected),
             other => panic!("expected PreeditUpdate, got {other:?}"),
         }
     }

@@ -1,0 +1,38 @@
+[package]
+name = "idiolect-ibus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Build the actual IBus engine binary (pulls in zbus). Off by default so the
+# pure state-machine + IPC-client library and its tests build everywhere,
+# including CI without IBus. Enable with: --features ibus-engine
+ibus-engine = ["dep:zbus", "dep:tokio", "dep:x11rb"]
+# Write a live event trace to /tmp/idiolect-edit.log for debugging. Off by
+# default; enable with: --features ibus-engine,trace
+trace = []
+
+[dependencies]
+idiolect-ipc = { path = "../../../idiolect-ipc" }
+zbus = { version = "5", optional = true, features = ["tokio"] }
+tokio = { workspace = true, optional = true }
+# X11 focus capture/restore around the review dialog (only with the real engine).
+x11rb = { version = "0.13", optional = true }
+
+[[bin]]
+name = "ibus-engine-idiolect"
+path = "src/main.rs"
+required-features = ["ibus-engine"]
+
+[dev-dependencies]
+idiolectd = { path = "../../../idiolectd" }
+idiolect-adapter-sqlite = { path = "../../../idiolect-adapter-sqlite" }
+idiolect-ports = { path = "../../../idiolect-ports" }
+zbus = { version = "5", features = ["tokio"] }
+tokio = { workspace = true }
+futures-util = "0.3"

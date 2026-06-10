@@ -67,10 +67,12 @@ public:
                     "client should request preedit feature");
             require(hello.find("\"commit\"") != std::string::npos,
                     "client should request commit feature");
+            require(hello.find("\"recording_status\"") != std::string::npos,
+                    "client should request recording_status feature");
 
             write_line(client_fd,
                        "{\"type\":\"ServerHello\",\"payload\":{\"protocol_version\":1,"
-                       "\"accepted_features\":[\"preedit\",\"commit\"]}}\n");
+                       "\"accepted_features\":[\"preedit\",\"commit\",\"recording_status\"]}}\n");
 
             const std::string start = read_line(client_fd);
             require(start.find("\"type\":\"StartRecording\"") != std::string::npos,

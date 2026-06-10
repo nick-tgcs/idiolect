@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -55,11 +56,11 @@ std::string json_escape(const std::string& input) {
     return output;
 }
 
-std::string extract_text_payload(const std::string& line) {
-    const std::string prefix = "\"text\":\"";
+std::string extract_string_field(const std::string& line, const std::string& key) {
+    const std::string prefix = "\"" + key + "\":\"";
     const auto start = line.find(prefix);
     if (start == std::string::npos) {
-        throw std::runtime_error("preedit update missing text payload");
+        throw std::runtime_error("message missing \"" + key + "\" field");
     }
 
     std::string output;
@@ -94,7 +95,18 @@ std::string extract_text_payload(const std::string& line) {
         output.push_back(character);
     }
 
-    throw std::runtime_error("preedit update text payload is unterminated");
+    throw std::runtime_error("string field \"" + key + "\" is unterminated");
+}
+
+/// Extract a JSON boolean field (e.g. `"recording":true`). Unlike a string field
+/// the value is an unquoted literal, so we match `true`/`false` after the key.
+bool extract_bool_field(const std::string& line, const std::string& key) {
+    const std::string prefix = "\"" + key + "\":";
+    const auto start = line.find(prefix);
+    if (start == std::string::npos) {
+        throw std::runtime_error("message missing \"" + key + "\" field");
+    }
+    return line.find("true", start + prefix.size()) == start + prefix.size();
 }
 
 std::vector<std::string> parse_accepted_features(const std::string& line) {
@@ -114,7 +126,8 @@ std::uint16_t client_protocol_version() {
 }
 
 std::vector<std::string> client_features() {
-    return {"preedit", "commit"};
+    // The daemon is authoritative for recording state; ask for its pushes.
+    return {"preedit", "commit", "recording_status"};
 }
 
 UnixSocketIpcClient::UnixSocketIpcClient(const std::string& socket_path) : socket_path_(socket_path) {
@@ -125,8 +138,16 @@ UnixSocketIpcClient::~UnixSocketIpcClient() {
     close_socket();
 }
 
+void UnixSocketIpcClient::toggle_recording() {
+    send_json_line("{\"type\":\"ToggleRecording\"}\n");
+}
+
 void UnixSocketIpcClient::start_recording() {
     send_json_line("{\"type\":\"StartRecording\"}\n");
+}
+
+void UnixSocketIpcClient::stop_recording() {
+    send_json_line("{\"type\":\"StopRecording\"}\n");
 }
 
 void UnixSocketIpcClient::commit_preedit(const std::string& text) {
@@ -146,7 +167,53 @@ void UnixSocketIpcClient::reconnect() {
 std::string UnixSocketIpcClient::read_preedit_update() {
     const std::string line = read_json_line();
     require_contains(line, "\"type\":\"PreeditUpdate\"", "server should send PreeditUpdate");
-    return extract_text_payload(line);
+    return extract_string_field(line, "text");
+}
+
+int UnixSocketIpcClient::fd() const {
+    return socket_fd_;
+}
+
+std::optional<ServerMessage> UnixSocketIpcClient::poll_server_message() {
+    // Drain whatever is available without blocking, accumulating into the line
+    // buffer. The event loop calls this in a loop until it returns nullopt.
+    char chunk[512];
+    while (true) {
+        const ssize_t got = ::recv(socket_fd_, chunk, sizeof(chunk), MSG_DONTWAIT);
+        if (got > 0) {
+            read_buffer_.append(chunk, static_cast<std::size_t>(got));
+            continue;
+        }
+        if (got == 0) {
+            throw std::runtime_error("daemon closed the connection");
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break; // no more data right now
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        throw system_error("recv");
+    }
+
+    const auto newline = read_buffer_.find('\n');
+    if (newline == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string line = read_buffer_.substr(0, newline + 1);
+    read_buffer_.erase(0, newline + 1);
+
+    if (line.find("\"type\":\"PreeditUpdate\"") != std::string::npos) {
+        return ServerMessage{ServerMessageKind::Preedit, extract_string_field(line, "text"), false};
+    }
+    if (line.find("\"type\":\"Error\"") != std::string::npos) {
+        return ServerMessage{ServerMessageKind::Error, extract_string_field(line, "message"), false};
+    }
+    if (line.find("\"type\":\"RecordingStatus\"") != std::string::npos) {
+        return ServerMessage{ServerMessageKind::RecordingStatus, {},
+                             extract_bool_field(line, "recording")};
+    }
+    return ServerMessage{ServerMessageKind::Other, {}, false};
 }
 
 std::uint16_t UnixSocketIpcClient::negotiated_protocol_version() const {
@@ -179,7 +246,7 @@ void UnixSocketIpcClient::connect_and_negotiate(const std::string& socket_path) 
 
     send_json_line(
         "{\"type\":\"ClientHello\",\"payload\":{\"client_name\":\"idiolect-fcitx5\","
-        "\"protocol_version\":1,\"features\":[\"preedit\",\"commit\"]}}\n");
+        "\"protocol_version\":1,\"features\":[\"preedit\",\"commit\",\"recording_status\"]}}\n");
 
     const std::string server_hello = read_json_line();
     require_contains(server_hello, "\"type\":\"ServerHello\"", "server should send ServerHello");

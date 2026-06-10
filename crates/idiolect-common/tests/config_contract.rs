@@ -89,6 +89,34 @@ fn config_defaults_match_master_plan() {
 }
 
 #[test]
+fn training_retention_defaults_to_one_year_when_omitted() {
+    // The master-plan TOML has no `history.training_retention_days`, so the serde
+    // default must fill in one year.
+    let config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config must parse");
+    assert_eq!(config.history.training_retention_days, 365);
+}
+
+#[test]
+fn training_retention_accepts_presets_zero_and_custom_but_rejects_absurd_values() {
+    let mut config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
+
+    // Presets, "keep forever" (0), and an arbitrary custom value all validate.
+    for days in [0, 30, 365, 730, 3650, 540, 36_500] {
+        config.history.training_retention_days = days;
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("training_retention_days={days} should validate: {e}"));
+    }
+
+    // Beyond the sanity cap is rejected (guards against a fat-fingered custom value).
+    config.history.training_retention_days = 36_501;
+    let error = config.validate().expect_err("absurd retention must be rejected");
+    assert!(format!("{error}").to_lowercase().contains("training_retention_days"));
+}
+
+#[test]
 fn config_rejects_empty_user_id() {
     let mut config =
         IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");

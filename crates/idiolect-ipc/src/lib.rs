@@ -6,7 +6,8 @@ pub mod messages;
 
 pub use messages::{
     ClientHello, CommitPreedit, ErrorMessage, HistoryCopy, HistoryCopyResponse, HistoryReinsert,
-    HistoryReinsertResponse, IpcMessage, PreeditUpdate, ServerHello,
+    HistoryReinsertResponse, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    ReportCorrection, ServerHello,
 };
 
 /// Returns this crate's package name for smoke tests.

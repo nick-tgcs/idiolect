@@ -8,8 +8,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Run Whisper inference on the GPU (CUDA). Requires the CUDA toolkit at build
+# time: `cargo build -p idiolectd --release --features cuda`.
+cuda = ["idiolect-adapter-whisper/cuda"]
+
 [dependencies]
 idiolect-adapter-clipboard = { path = "../idiolect-adapters/desktop/clipboard" }
+idiolect-adapter-cpal = { path = "../idiolect-adapter-cpal" }
 idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
 idiolect-adapter-ksni = { path = "../idiolect-adapters/desktop/ksni" }
 idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }

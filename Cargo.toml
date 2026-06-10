@@ -20,10 +20,14 @@ members = [
     "crates/idiolect-trainer-burn",
     "crates/idiolectd",
     "crates/idiolect-cli",
+    "crates/idiolect-review-dialog",
+    "crates/idiolect-recording-indicator",
+    "crates/idiolect-retention-dialog",
     "crates/idiolect-test-support",
     "crates/idiolect-integration-tests",
     "crates/idiolect-adapters/desktop/ksni",
     "crates/idiolect-adapters/desktop/clipboard",
+    "crates/idiolect-adapters/desktop/ibus",
     "crates/idiolect-adapters/crypto",
 ]
 

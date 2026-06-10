@@ -18,7 +18,7 @@ fn fixture_full_stack_commit_records_preedit_commit_storage_and_candidate() {
     e2e::send_message(&mut stream, &IpcMessage::StartRecording);
 
     match e2e::read_message(&mut reader) {
-        IpcMessage::PreeditUpdate(PreeditUpdate { text }) => assert_eq!(text, "restart traffic"),
+        IpcMessage::PreeditUpdate(PreeditUpdate { text, .. }) => assert_eq!(text, "restart traffic"),
         other => panic!("expected PreeditUpdate, got {other:?}"),
     }
 
@@ -55,7 +55,7 @@ fn fixture_full_stack_cancel_clears_preedit_and_records_no_candidate() {
     e2e::send_message(&mut stream, &IpcMessage::StartRecording);
 
     match e2e::read_message(&mut reader) {
-        IpcMessage::PreeditUpdate(PreeditUpdate { text }) => assert_eq!(text, "open notes"),
+        IpcMessage::PreeditUpdate(PreeditUpdate { text, .. }) => assert_eq!(text, "open notes"),
         other => panic!("expected PreeditUpdate, got {other:?}"),
     }
 

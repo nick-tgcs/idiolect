@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+    <name>org.freedesktop.IBus.Idiolect</name>
+    <description>Idiolect speech-to-text input method</description>
+    <exec>/usr/local/bin/ibus-engine-idiolect</exec>
+    <version>0.1.0</version>
+    <author>Idiolect</author>
+    <license>AGPL-3.0-only</license>
+    <homepage>https://github.com/nick-tgcs/idiolect</homepage>
+    <textdomain>idiolect</textdomain>
+    <engines>
+        <engine>
+            <name>idiolect</name>
+            <language>en</language>
+            <license>AGPL-3.0-only</license>
+            <author>Idiolect</author>
+            <layout>us</layout>
+            <longname>Idiolect</longname>
+            <description>Local speech-to-text that learns your corrections</description>
+            <icon>audio-input-microphone</icon>
+            <rank>50</rank>
+        </engine>
+    </engines>
+</component>

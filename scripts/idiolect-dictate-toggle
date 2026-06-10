@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Toggle idiolect dictation. Bound to a GNOME global shortcut (Super+T) because
+# the compositor grabs the Super key before any IME can see it.
+set -euo pipefail
+addr="$(ibus address 2>/dev/null || true)"
+[ -n "$addr" ] || { echo "ibus not running" >&2; exit 1; }
+exec gdbus call --address "$addr" \
+  --dest org.freedesktop.IBus.Idiolect \
+  --object-path /org/idiolect/Trigger \
+  --method org.idiolect.Trigger1.Toggle

@@ -174,6 +174,19 @@ impl FileAudioStore {
         Self::path_from_key(&self.audio_root, &audio_ref.object_key, AUDIO_KEY_PREFIX)
     }
 
+    /// Delete the stored source audio for a single utterance, by the same
+    /// `(user_id, utterance_id)` key it was written under. Used by training-data
+    /// retention pruning; a missing file is a no-op (idempotent).
+    pub fn delete_source_audio_for(
+        &self,
+        user_id: &str,
+        utterance_id: &str,
+    ) -> Result<(), FileAudioStoreError> {
+        let object_key = Self::source_object_key(user_id, utterance_id)?;
+        let path = Self::path_from_key(&self.audio_root, &object_key, AUDIO_KEY_PREFIX)?;
+        Self::remove_file_if_exists(&path)
+    }
+
     fn decoded_cache_path_from_ref(
         &self,
         cache_ref: &DecodedAudioCacheRef,

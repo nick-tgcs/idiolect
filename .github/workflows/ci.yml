@@ -201,6 +201,9 @@ jobs:
       - name: Run FCITX5 integration tests
         run: bash ci/scripts/test-fcitx5-integration.sh
 
+      - name: Run IBus engine E2E (headless, private D-Bus session)
+        run: bash ci/scripts/test-ibus-e2e.sh
+
   # =========================================================================
   # FAILURE RECOVERY TESTS
   # =========================================================================

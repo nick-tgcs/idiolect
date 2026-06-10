@@ -8,6 +8,12 @@ rust-version = "1.96"
 [lints]
 workspace = true
 
+[features]
+# Build whisper.cpp with the CUDA backend and run inference on the GPU.
+# Requires the CUDA toolkit (nvcc) at build time. Off by default so the CPU
+# build (and CI without a GPU) is unaffected.
+cuda = ["whisper-rs/cuda"]
+
 [dependencies]
 idiolect-ports = { path = "../idiolect-ports" }
 thiserror = "=1.0.61"

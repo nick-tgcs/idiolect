@@ -9,8 +9,16 @@ namespace {
 
 class FakeIpcClient final : public idiolect::fcitx5::IpcClient {
 public:
+    void toggle_recording() override {
+        messages.emplace_back("toggle_recording");
+    }
+
     void start_recording() override {
         messages.emplace_back("start_recording");
+    }
+
+    void stop_recording() override {
+        messages.emplace_back("stop_recording");
     }
 
     void commit_preedit(const std::string& text) override {
@@ -30,7 +38,9 @@ public:
 
 class FailingReconnectClient final : public idiolect::fcitx5::IpcClient {
 public:
+    void toggle_recording() override {}
     void start_recording() override {}
+    void stop_recording() override {}
     void commit_preedit(const std::string&) override {}
     void cancel_preedit() override {}
 

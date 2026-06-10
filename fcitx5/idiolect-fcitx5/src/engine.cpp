@@ -10,6 +10,57 @@ Engine::Engine(IpcClient& ipc_client)
 Engine::Engine(IpcClient& ipc_client, DisconnectPreeditPolicy disconnect_policy)
     : ipc_client_(ipc_client), disconnect_policy_(disconnect_policy) {}
 
+Engine::Engine(IpcClient& ipc_client, TextCommitter& committer)
+    : Engine(ipc_client, committer, DisconnectPreeditPolicy::Clear) {}
+
+Engine::Engine(IpcClient& ipc_client, TextCommitter& committer,
+               DisconnectPreeditPolicy disconnect_policy)
+    : ipc_client_(ipc_client), committer_(&committer), disconnect_policy_(disconnect_policy) {}
+
+void Engine::toggle() {
+    // One direction-free intent. The daemon decides start-vs-stop and announces
+    // the new state via on_recording_status; we never flip the phase locally, so
+    // we can never disagree with the daemon.
+    ipc_client_.toggle_recording();
+}
+
+void Engine::on_recording_status(bool recording) {
+    // The daemon is the single authority for recording state; mirror it. (The
+    // daemon sends the transcript before announcing recording=false, so a stop's
+    // false never races ahead of on_transcript.)
+    state_ = recording ? RecordingState::Recording : RecordingState::Idle;
+}
+
+void Engine::on_transcript(std::string text) {
+    if (state_ != RecordingState::Recording) {
+        // Unsolicited or late transcript; ignore to avoid stray commits.
+        return;
+    }
+    visible_preedit_ = std::move(text);
+    if (committer_ != nullptr) {
+        committer_->commit(visible_preedit_);
+    }
+    // Tell the daemon to finalize the session (records a training candidate).
+    ipc_client_.commit_preedit(visible_preedit_);
+    visible_preedit_.clear();
+    state_ = RecordingState::Idle;
+}
+
+void Engine::cancel() {
+    ipc_client_.cancel_preedit();
+    visible_preedit_.clear();
+    state_ = RecordingState::Idle;
+}
+
+void Engine::on_error() {
+    visible_preedit_.clear();
+    state_ = RecordingState::Idle;
+}
+
+RecordingState Engine::state() const {
+    return state_;
+}
+
 void Engine::start_recording() {
     ipc_client_.start_recording();
 }

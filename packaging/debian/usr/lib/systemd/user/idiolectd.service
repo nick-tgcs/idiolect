@@ -1,11 +1,17 @@
 [Unit]
 Description=Idiolect local speech-to-text daemon
 After=graphical-session.target
+# A genuinely crashing daemon gets a bounded number of restarts, then systemd
+# gives up instead of looping forever (exhausts inotify watches, spams journal).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-ExecStart=/usr/bin/idiolectd run
+ExecStart=/usr/bin/idiolectd run --config %h/.config/idiolect/config.toml
 Restart=on-failure
 RestartSec=2
+# Exit 2 = usage/bad-config: restarting cannot help, fail once and stay down.
+RestartPreventExitStatus=2
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

@@ -4,6 +4,8 @@ use idiolect_ports::storage::{TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort
 use ksni::menu::{StandardItem, RadioGroup, CheckmarkItem, MenuItem, RadioItem, SubMenu};
 use ksni::{Tray, ToolTip, blocking::TrayMethods};
 
+mod icons;
+
 /// Commands the tray adapter sends back to the daemon's main thread.
 #[derive(Debug, Clone)]
 pub enum TrayCallback {
@@ -12,11 +14,14 @@ pub enum TrayCallback {
 }
 
 pub struct KsniTray {
-    handle: ksni::blocking::Handle<InnerTray>,
+    /// `None` when no tray host (`StatusNotifierWatcher`) was available at startup —
+    /// e.g. a headless box, or the daemon started before the desktop shell at login.
+    /// The tray then degrades to a no-op so dictation still works without an icon.
+    handle: Option<ksni::blocking::Handle<InnerTray>>,
 }
 
 struct InnerTray {
-    icon: String,
+    icon: TrayIcon,
     tooltip: String,
     status: ksni::Status,
     menu_items: Vec<TrayMenuItem>,
@@ -28,22 +33,25 @@ impl TrayPort for KsniTray {
     type Error = KsniTrayError;
 
     fn set_icon(&mut self, icon: TrayIcon) -> Result<(), Self::Error> {
-        let icon_name = match icon {
-            TrayIcon::Idle => "idiolect-idle",
-            TrayIcon::Recording => "idiolect-recording",
-            TrayIcon::Error => "idiolect-error",
-        };
-        self.handle.update(|inner| inner.icon = icon_name.to_owned());
+        // Custom line-art microphone rendered as a pixmap (see `icons`), so the
+        // tray looks the same in any theme instead of a generic glyph.
+        if let Some(handle) = &self.handle {
+            handle.update(move |inner| inner.icon = icon);
+        }
         Ok(())
     }
 
     fn set_tooltip(&mut self, tooltip: &str) -> Result<(), Self::Error> {
-        self.handle.update(|inner| inner.tooltip = tooltip.to_owned());
+        if let Some(handle) = &self.handle {
+            handle.update(|inner| inner.tooltip = tooltip.to_owned());
+        }
         Ok(())
     }
 
     fn set_menu(&mut self, items: Vec<TrayMenuItem>) -> Result<(), Self::Error> {
-        self.handle.update(|inner| inner.menu_items = items);
+        if let Some(handle) = &self.handle {
+            handle.update(|inner| inner.menu_items = items);
+        }
         Ok(())
     }
 
@@ -52,7 +60,9 @@ impl TrayPort for KsniTray {
             TrayStatus::Active => ksni::Status::Active,
             TrayStatus::Passive => ksni::Status::Passive,
         };
-        self.handle.update(|inner| inner.status = ksni_status);
+        if let Some(handle) = &self.handle {
+            handle.update(|inner| inner.status = ksni_status);
+        }
         Ok(())
     }
 }
@@ -60,13 +70,23 @@ impl TrayPort for KsniTray {
 impl KsniTray {
     pub fn new(sender: mpsc::Sender<TrayCallback>) -> Result<Self, KsniTrayError> {
         let inner = InnerTray {
-            icon: "idiolect-idle".to_owned(),
+            icon: TrayIcon::Idle,
             tooltip: "Idiolect — Ready".to_owned(),
             status: ksni::Status::Passive,
             menu_items: Vec::new(),
             sender,
         };
-        let handle = inner.spawn()?;
+        // Degrade gracefully when there is no tray host: a missing
+        // `StatusNotifierWatcher` (headless, or the desktop shell not up yet at
+        // login) must not crash the daemon — dictation works without an icon, and
+        // the daemon stays up instead of the autostart unit giving up on it.
+        let handle = match inner.spawn() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                eprintln!("idiolect: tray unavailable, running without a tray icon: {error}");
+                None
+            }
+        };
         Ok(Self { handle })
     }
 }
@@ -146,7 +166,12 @@ impl Tray for InnerTray {
     }
 
     fn icon_name(&self) -> String {
-        self.icon.clone()
+        // Empty so the host uses our custom `icon_pixmap` below.
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![icons::render(self.icon)]
     }
 
     fn title(&self) -> String {
@@ -179,4 +204,21 @@ impl Tray for InnerTray {
 pub enum KsniTrayError {
     #[error("ksni error: {0}")]
     Ksni(#[from] ksni::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn degraded_tray_without_a_host_is_a_safe_noop() {
+        // When no tray host is available the tray has no handle; every operation
+        // must succeed as a no-op so the daemon runs headless instead of crashing.
+        let mut tray = KsniTray { handle: None };
+
+        assert!(tray.set_icon(TrayIcon::Recording).is_ok());
+        assert!(tray.set_tooltip("Idiolect — Recording…").is_ok());
+        assert!(tray.set_menu(Vec::new()).is_ok());
+        assert!(tray.set_status(TrayStatus::Active).is_ok());
+    }
 }

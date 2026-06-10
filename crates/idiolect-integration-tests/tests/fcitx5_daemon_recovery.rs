@@ -237,7 +237,7 @@ impl RecoveryClient {
 
     fn expect_preedit(&mut self, expected: &str) {
         match self.read() {
-            IpcMessage::PreeditUpdate(PreeditUpdate { text }) => assert_eq!(text, expected),
+            IpcMessage::PreeditUpdate(PreeditUpdate { text, .. }) => assert_eq!(text, expected),
             other => panic!("expected PreeditUpdate, got {other:?}"),
         }
     }
