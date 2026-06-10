@@ -103,6 +103,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-pr-
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

@@ -48,6 +48,11 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -239,6 +244,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+
       - name: Run failure recovery tests
         run: bash ci/scripts/test-e2e-failure-recovery.sh
 
@@ -272,6 +282,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
 
       - name: Fetch Whisper fixture model
         run: bash ci/scripts/fetch-whisper-fixture.sh
@@ -311,7 +326,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install /usr/bin/time
-        run: sudo apt-get update && sudo apt-get install -y time
+        run: sudo apt-get update && sudo apt-get install -y time libasound2-dev libpulse-dev libglib2.0-dev
 
       - name: Run performance tests
         run: bash ci/scripts/test-performance.sh
@@ -425,7 +440,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev dpkg-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev
 
       - name: Build FCITX5
         run: |
