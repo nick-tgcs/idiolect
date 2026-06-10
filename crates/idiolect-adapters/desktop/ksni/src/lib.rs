@@ -1,8 +1,8 @@
 use std::sync::mpsc;
 
 use idiolect_ports::storage::{TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus};
-use ksni::menu::{StandardItem, RadioGroup, CheckmarkItem, MenuItem, RadioItem, SubMenu};
-use ksni::{Tray, ToolTip, blocking::TrayMethods};
+use ksni::menu::{CheckmarkItem, MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+use ksni::{blocking::TrayMethods, ToolTip, Tray};
 
 mod icons;
 
@@ -92,7 +92,11 @@ impl KsniTray {
 }
 
 impl InnerTray {
-    fn map_menu_item(&self, item: &TrayMenuItem, sender: mpsc::Sender<TrayCallback>) -> MenuItem<InnerTray> {
+    fn map_menu_item(
+        &self,
+        item: &TrayMenuItem,
+        sender: mpsc::Sender<TrayCallback>,
+    ) -> MenuItem<InnerTray> {
         match &item.kind {
             TrayMenuItemKind::Standard {
                 submenu: Some(sub_items),

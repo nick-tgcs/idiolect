@@ -78,7 +78,10 @@ async fn engine_dictates_and_daemon_records_the_session() {
         let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
         extract_ibus_text(&text)
     };
-    assert_eq!(committed, DRAFT, "the transcript is committed straight into the app");
+    assert_eq!(
+        committed, DRAFT,
+        "the transcript is committed straight into the app"
+    );
 
     // Fix it in place: backspace "traffic" and retype "Traefik". These pass
     // through to the app, but the engine tracks the tail edit.
@@ -107,7 +110,11 @@ async fn engine_dictates_and_daemon_records_the_session() {
     assert_eq!(store.training_candidate_count_for_test().unwrap(), 1);
     assert_eq!(
         store.latest_training_candidate_for_test().unwrap().unwrap(),
-        (DRAFT.to_owned(), CORRECTED.to_owned(), "accepted_with_edit".to_owned()),
+        (
+            DRAFT.to_owned(),
+            CORRECTED.to_owned(),
+            "accepted_with_edit".to_owned()
+        ),
         "the in-place correction feeds the learning loop"
     );
 }
@@ -141,7 +148,9 @@ async fn engine_inserts_history_text_on_daemon_request() {
     let mut server_writer = stream.try_clone().expect("clone");
     let mut server_reader = BufReader::new(stream);
     let mut hello = String::new();
-    server_reader.read_line(&mut hello).expect("read ClientHello");
+    server_reader
+        .read_line(&mut hello)
+        .expect("read ClientHello");
     assert!(
         matches!(decode_json_line(&hello), Ok(IpcMessage::ClientHello(_))),
         "engine should greet with ClientHello"
@@ -193,7 +202,10 @@ async fn engine_inserts_history_text_on_daemon_request() {
         let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
         extract_ibus_text(&text)
     };
-    assert_eq!(committed, ENTRY, "history entry is typed at the cursor via CommitText");
+    assert_eq!(
+        committed, ENTRY,
+        "history entry is typed at the cursor via CommitText"
+    );
 
     drop(engine);
     drop(conn);
@@ -443,7 +455,10 @@ impl PrivateBus {
             .read_line(&mut address)
             .expect("read bus address");
         let address = address.trim().to_owned();
-        assert!(address.starts_with("unix:"), "unexpected bus address {address:?}");
+        assert!(
+            address.starts_with("unix:"),
+            "unexpected bus address {address:?}"
+        );
         Some(Self { child, address })
     }
 

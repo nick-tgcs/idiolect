@@ -40,7 +40,9 @@ fn tray_settings_get_all_returns_all() {
 
     store.set_tray_setting("retention_days", "7").unwrap();
     store.set_tray_setting("max_entries", "25").unwrap();
-    store.set_tray_setting("custom_key", "custom_value").unwrap();
+    store
+        .set_tray_setting("custom_key", "custom_value")
+        .unwrap();
 
     let all = store.get_all_tray_settings().unwrap();
     assert_eq!(all.get("retention_days"), Some(&"7".to_string()));

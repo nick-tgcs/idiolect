@@ -43,11 +43,15 @@ fn prune_purges_sessions_older_than_the_window_and_keeps_recent_ones() {
         "the recent session's candidate remains"
     );
     assert!(
-        !audio_store.source_audio_exists_for_test(&old_audio).expect("query"),
+        !audio_store
+            .source_audio_exists_for_test(&old_audio)
+            .expect("query"),
         "expired session's audio is deleted"
     );
     assert!(
-        audio_store.source_audio_exists_for_test(&new_audio).expect("query"),
+        audio_store
+            .source_audio_exists_for_test(&new_audio)
+            .expect("query"),
         "recent session's audio is kept (all audio is training data)"
     );
     let surviving: Vec<String> = store
@@ -56,7 +60,11 @@ fn prune_purges_sessions_older_than_the_window_and_keeps_recent_ones() {
         .into_iter()
         .map(|entry| entry.text)
         .collect();
-    assert_eq!(surviving, vec!["deploy traefik".to_owned()], "only the recent transcript remains");
+    assert_eq!(
+        surviving,
+        vec!["deploy traefik".to_owned()],
+        "only the recent transcript remains"
+    );
 }
 
 #[test]
@@ -75,7 +83,9 @@ fn prune_with_zero_retention_is_disabled() {
     assert_eq!(purged, 0, "retention 0 disables pruning");
     assert_eq!(store.training_candidate_count_for_test().expect("count"), 1);
     assert!(
-        audio_store.source_audio_exists_for_test(&old_audio).expect("query"),
+        audio_store
+            .source_audio_exists_for_test(&old_audio)
+            .expect("query"),
         "nothing is deleted when retention is disabled"
     );
 }

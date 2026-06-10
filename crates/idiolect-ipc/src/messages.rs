@@ -9,8 +9,7 @@ pub const FEATURE_COMMIT: &str = "commit";
 /// same byte stream as before.
 pub const FEATURE_RECORDING_STATUS: &str = "recording_status";
 
-const SUPPORTED_FEATURES: [&str; 3] =
-    [FEATURE_PREEDIT, FEATURE_COMMIT, FEATURE_RECORDING_STATUS];
+const SUPPORTED_FEATURES: [&str; 3] = [FEATURE_PREEDIT, FEATURE_COMMIT, FEATURE_RECORDING_STATUS];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {

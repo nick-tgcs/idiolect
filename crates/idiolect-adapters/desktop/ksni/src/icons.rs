@@ -34,7 +34,13 @@ pub(crate) fn render(kind: TrayIcon) -> ksni::Icon {
         let mut paint = Paint::default();
         paint.set_color(rgb(fill_color));
         paint.anti_alias = true;
-        pixmap.fill_path(&body, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &body,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
     let mut stroke_paint = Paint::default();
     stroke_paint.set_color(rgb(stroke_color));

@@ -34,7 +34,9 @@ impl ClipboardPort for ArboardClipboard {
     type Error = ArboardClipboardError;
 
     fn set_text(&mut self, text: &str) -> Result<(), Self::Error> {
-        self.clipboard.set_text(text).map_err(ArboardClipboardError::Arboard)?;
+        self.clipboard
+            .set_text(text)
+            .map_err(ArboardClipboardError::Arboard)?;
         Ok(())
     }
 }
