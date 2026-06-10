@@ -107,13 +107,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check compilation (with warnings as errors)
-        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --all-features
+        run: RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --features idiolect-ibus/ibus-engine
 
       - name: Run clippy (with warnings as errors)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --features idiolect-ibus/ibus-engine -- -D warnings
 
       - name: Run tests (quick - no doc tests, no coverage)
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --workspace --all-targets --features idiolect-ibus/ibus-engine
 
   # =========================================================================
   # FCITX5: Quick validation
