@@ -13,6 +13,10 @@ concurrency:
 env:
   RUST_VERSION: "1.96.0"
   CARGO_TERM_COLOR: always
+  # Headless runners have a session bus but no StatusNotifierWatcher; several
+  # integration tests run multiple daemons per process, whose pid-keyed ksni
+  # tray registrations collide and reset clients. Skip the tray across CI.
+  IDIOLECT_DISABLE_TRAY: "1"
 
 jobs:
   # =========================================================================
