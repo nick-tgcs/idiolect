@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use idiolect_adapter_clipboard::{ArboardClipboard, ArboardClipboardError};
+use idiolect_adapter_clipboard::ArboardClipboard;
 use idiolect_adapter_crypto::{
     ChaCha20Poly1305Cipher, CryptoError, EncryptionKeyPort, EncryptionPort, FileKey,
 };
@@ -101,13 +101,6 @@ impl RunLoopError {
     pub(crate) fn tray(action: &str, error: KsniTrayError) -> Self {
         Self {
             message: format!("tray {action} failed: {error}"),
-            source: Some(Box::new(error)),
-        }
-    }
-
-    pub(crate) fn clipboard(action: &str, error: ArboardClipboardError) -> Self {
-        Self {
-            message: format!("clipboard {action} failed: {error}"),
             source: Some(Box::new(error)),
         }
     }
@@ -220,8 +213,16 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
     let (tray_callback_tx, tray_callback_rx) = mpsc::channel::<TrayCallback>();
     let mut tray =
         KsniTray::new(tray_callback_tx).map_err(|error| RunLoopError::tray("tray init", error))?;
-    let mut clipboard = ArboardClipboard::new()
-        .map_err(|error| RunLoopError::clipboard("clipboard init", error))?;
+    // Degrade gracefully when there is no display (headless server, or a CI
+    // runner without Xvfb): a missing system clipboard disables history copy but
+    // must not stop the daemon — same policy as the tray above.
+    let mut clipboard = match ArboardClipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            eprintln!("idiolect: clipboard unavailable, history copy disabled: {error}");
+            ArboardClipboard::disabled()
+        }
+    };
 
     refresh_tray_menu(
         &mut tray,
