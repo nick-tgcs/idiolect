@@ -82,6 +82,7 @@ fn run_train_cli(args: &[String]) -> Result<String, String> {
         learning_rate: 1e-3,
         rank: 8,
         max_samples: None,
+        gpu: false,
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -113,6 +114,7 @@ fn run_train_cli(args: &[String]) -> Result<String, String> {
                         .map_err(|_| "--max-samples needs a number".to_owned())?,
                 );
             }
+            "--gpu" => flags.gpu = true,
             other => return Err(format!("unknown flag: {other}")),
         }
     }

@@ -103,3 +103,33 @@ fn training_emits_a_loadable_merged_artifact_without_applying_it() {
     assert_eq!(merged.hparams, base.hparams);
     assert_eq!(merged.tensors.len(), base.tensors.len());
 }
+
+/// Builds WITHOUT the `cuda` feature must reject `--gpu` with a clear error
+/// rather than silently training on the CPU. (Compiled out on cuda builds —
+/// there the flag is real; actual GPU execution has no headless CI seam.)
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn gpu_flag_on_a_cpu_only_build_fails_with_guidance() {
+    let root = fixture_root("gpu-refused");
+    let run = Command::new(env!("CARGO_BIN_EXE_idiolect-trainerctl"))
+        .args([
+            "train",
+            "--db",
+            root.join("idiolect.sqlite").to_str().expect("utf8"),
+            "--audio-root",
+            root.join("audio").to_str().expect("utf8"),
+            "--base-model",
+            base_model_path().to_str().expect("utf8"),
+            "--output",
+            root.join("out.bin").to_str().expect("utf8"),
+            "--gpu",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(!run.status.success(), "--gpu must not silently fall back to CPU");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("--features cuda"),
+        "the error must say how to fix it: {stderr}"
+    );
+}

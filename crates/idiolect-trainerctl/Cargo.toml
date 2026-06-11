@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 # GPU transcription for revalidation against large models; CI never enables it.
-cuda = ["idiolect-adapter-whisper/cuda"]
+cuda = ["idiolect-adapter-whisper/cuda", "idiolect-trainer-burn/cuda"]
 
 [dependencies]
 idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }

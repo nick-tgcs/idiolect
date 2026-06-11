@@ -23,9 +23,7 @@ use idiolect_trainer_burn::ggml::GgmlModel;
 use idiolect_trainer_burn::lora::{merge_into_ggml, Adam, DecoderLora, LoraConfig};
 use idiolect_trainer_burn::mel::log_mel_spectrogram;
 use idiolect_trainer_burn::train::train_step;
-use idiolect_trainer_burn::whisper::{
-    WhisperRuntime, TOKEN_EOT, TOKEN_NO_TIMESTAMPS, TOKEN_SOT,
-};
+use idiolect_trainer_burn::whisper::{SpecialTokens, WhisperRuntime};
 
 type Cpu = NdArray<f32>;
 type Train = Autodiff<Cpu>;
@@ -79,7 +77,8 @@ fn a_freshly_initialised_adapter_is_an_exact_identity() {
     // property of the adapter algebra, not of real audio.
     let encoder_output: Tensor<Cpu, 2> =
         Tensor::ones([8, runtime.dims.n_audio_state], &device) * 0.01;
-    let tokens = [TOKEN_SOT, TOKEN_NO_TIMESTAMPS, 1_000, 2_000, TOKEN_EOT];
+    let special = SpecialTokens::for_vocab(runtime.dims.n_vocab);
+    let tokens = [special.sot, special.no_timestamps, 1_000, 2_000, special.eot];
 
     let base = runtime.decoder_logits(&tokens, encoder_output.clone(), None);
     let lora = DecoderLora::<Cpu>::init(
@@ -107,9 +106,11 @@ fn an_overfitted_adapter_merges_into_a_model_the_engine_serves() {
     // as something the base model would never produce.
     let target_text = " deploy the traefik ingress";
     let tokenizer = WhisperAsr::load_fixture_model().expect("tokenizer model loads");
-    let mut tokens = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+    let special = SpecialTokens::for_vocab(model.hparams.n_vocab as usize);
+    let mut tokens = special.transcription_prompt();
+    let prompt_len = tokens.len();
     tokens.extend(tokenizer.tokenize(target_text).expect("target tokenizes"));
-    tokens.push(TOKEN_EOT);
+    tokens.push(special.eot);
 
     let audio = restart_traffic_fixture_16khz_mono();
     let mel = log_mel_spectrogram(&audio.samples_f32_mono, &model.filters);
@@ -134,7 +135,7 @@ fn an_overfitted_adapter_merges_into_a_model_the_engine_serves() {
     let mut last_loss = f32::NAN;
     for step in 0..60 {
         let encoded: Tensor<Train, 2> = Tensor::from_inner(encoded_inner.clone());
-        let loss = train_step(&trainer, encoded, &tokens, &mut lora, &mut optimizer);
+        let loss = train_step(&trainer, encoded, &tokens, prompt_len, &mut lora, &mut optimizer);
         if step == 0 {
             first_loss = loss;
         }

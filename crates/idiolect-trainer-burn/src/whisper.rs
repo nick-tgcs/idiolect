@@ -19,12 +19,56 @@ use burn::tensor::{activation, module, Int, Tensor, TensorData};
 use crate::ggml::{GgmlError, GgmlModel, GgmlTensor};
 use crate::lora::AttentionLora;
 
-/// English-only model special tokens (n_vocab = 51864).
-pub const TOKEN_EOT: i32 = 50_256;
-pub const TOKEN_SOT: i32 = 50_257;
-pub const TOKEN_NO_TIMESTAMPS: i32 = 50_362;
 /// The id of the " " token, suppressed on the first sampled step.
 pub const TOKEN_BLANK: i32 = 220;
+
+/// Whisper's special-token ids depend on the vocabulary: English-only models
+/// (n_vocab 51864) use whisper.cpp's defaults; multilingual models insert
+/// their language tokens right after `sot`, shifting everything later by
+/// `num_languages - 98` (one, for the standard 99-language models).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialTokens {
+    pub multilingual: bool,
+    pub num_languages: i32,
+    pub eot: i32,
+    pub sot: i32,
+    pub transcribe: i32,
+    pub no_timestamps: i32,
+}
+
+impl SpecialTokens {
+    #[must_use]
+    pub fn for_vocab(n_vocab: usize) -> Self {
+        let multilingual = n_vocab >= 51_865;
+        let num_languages = n_vocab as i32 - 51_765 - i32::from(multilingual);
+        let shift = if multilingual { num_languages - 98 } else { 0 };
+        Self {
+            multilingual,
+            num_languages,
+            eot: 50_256 + i32::from(multilingual),
+            sot: 50_257 + i32::from(multilingual),
+            transcribe: 50_358 + shift,
+            no_timestamps: 50_362 + shift,
+        }
+    }
+
+    /// The id of the `index`-th language token (0 = English).
+    #[must_use]
+    pub fn language(&self, index: i32) -> i32 {
+        self.sot + 1 + index
+    }
+
+    /// The teacher-forcing/decode prompt for plain English transcription with
+    /// timestamps off — whisper.cpp's initial sequence for these settings.
+    #[must_use]
+    pub fn transcription_prompt(&self) -> Vec<i32> {
+        if self.multilingual {
+            vec![self.sot, self.language(0), self.transcribe, self.no_timestamps]
+        } else {
+            vec![self.sot, self.no_timestamps]
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WhisperDims {
@@ -343,11 +387,18 @@ impl<B: Backend> WhisperRuntime<B> {
         x.matmul(self.token_embedding.clone().transpose())
     }
 
-    /// Greedy transcription of an encoded window, mirroring whisper.cpp's
-    /// default token suppression for an English-only model with timestamps
-    /// off. Returns only the text tokens (no specials).
+    /// The special-token ids for this model's vocabulary.
+    #[must_use]
+    pub fn special_tokens(&self) -> SpecialTokens {
+        SpecialTokens::for_vocab(self.dims.n_vocab)
+    }
+
+    /// Greedy English transcription of an encoded window with timestamps off,
+    /// mirroring whisper.cpp's default suppression. Returns only the text
+    /// tokens (no specials).
     pub fn greedy_decode(&self, encoder_output: Tensor<B, 2>, max_tokens: usize) -> Vec<i32> {
-        let mut tokens = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+        let special = self.special_tokens();
+        let mut tokens = special.transcription_prompt();
         let mut text = Vec::new();
         for step in 0..max_tokens {
             let logits = self.decoder_logits(&tokens, encoder_output.clone(), None);
@@ -356,21 +407,20 @@ impl<B: Backend> WhisperRuntime<B> {
             let mut row = last.to_vec::<f32>().expect("logits are f32");
             // Specials and timestamps are never sampled; blank/eot are banned
             // on the very first step (suppress_blank).
-            for id in TOKEN_SOT..self.dims.n_vocab as i32 {
+            for id in special.eot + 1..self.dims.n_vocab as i32 {
                 row[id as usize] = f32::NEG_INFINITY;
             }
             if step == 0 {
                 row[TOKEN_BLANK as usize] = f32::NEG_INFINITY;
-                row[TOKEN_EOT as usize] = f32::NEG_INFINITY;
+                row[special.eot as usize] = f32::NEG_INFINITY;
             }
             let (best, _) = row
                 .iter()
                 .enumerate()
-                .filter(|(id, _)| *id != TOKEN_SOT as usize)
                 .max_by(|a, b| a.1.partial_cmp(b.1).expect("no NaN logits"))
                 .expect("non-empty vocab");
             let best = best as i32;
-            if best == TOKEN_EOT {
+            if best == special.eot {
                 break;
             }
             tokens.push(best);
@@ -447,4 +497,39 @@ fn gelu2<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     let inner = (x.clone() * (x.clone().powf_scalar(2.0) * 0.044_715 + 1.0))
         * 0.797_884_560_802_865_4;
     x * 0.5 * (inner.tanh() + 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpecialTokens;
+
+    #[test]
+    fn english_only_models_use_the_classic_token_ids() {
+        // tiny.en / medium.en: n_vocab 51864 (whisper.cpp defaults, unshifted).
+        let tokens = SpecialTokens::for_vocab(51_864);
+        assert!(!tokens.multilingual);
+        assert_eq!(tokens.eot, 50_256);
+        assert_eq!(tokens.sot, 50_257);
+        assert_eq!(tokens.no_timestamps, 50_362);
+        // English-only prompt carries no language/task tokens.
+        assert_eq!(tokens.transcription_prompt(), vec![50_257, 50_362]);
+    }
+
+    #[test]
+    fn multilingual_models_shift_the_ids_and_prompt_with_language_and_task() {
+        // medium/large (99 languages): n_vocab 51865 shifts everything by one
+        // (dt = num_languages - 98 = 1), languages sit at sot+1..sot+99.
+        let tokens = SpecialTokens::for_vocab(51_865);
+        assert!(tokens.multilingual);
+        assert_eq!(tokens.eot, 50_257);
+        assert_eq!(tokens.sot, 50_258);
+        assert_eq!(tokens.transcribe, 50_359);
+        assert_eq!(tokens.no_timestamps, 50_363);
+        assert_eq!(tokens.language(0), 50_259, "English is the first language token");
+        // Multilingual transcription prompt: [sot, lang, transcribe, not].
+        assert_eq!(
+            tokens.transcription_prompt(),
+            vec![50_258, 50_259, 50_359, 50_363]
+        );
+    }
 }

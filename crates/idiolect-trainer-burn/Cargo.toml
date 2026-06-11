@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# GPU training backend (CubeCL/CUDA); CI never enables it.
+cuda = ["burn/cuda"]
+
 [dependencies]
 burn.workspace = true
 burn-ndarray.workspace = true

@@ -7,12 +7,18 @@
 //! frozen encoder (computed once, cached across epochs) → teacher-forced
 //! decoder with LoRA on the attention query/value projections. Labels are the
 //! candidate's corrected transcript, tokenized with the BASE MODEL'S OWN
-//! tokenizer (via whisper-rs) so trainer and serving engine can never drift.
-//! Every 10th usable sample is held out for a before/after validation loss.
+//! tokenizer (via whisper-rs) so trainer and serving engine can never drift;
+//! the teacher-forcing prompt comes from the model's vocabulary (English-only
+//! vs multilingual prompts differ). Every 10th usable sample is held out for
+//! a before/after validation loss.
+//!
+//! `--gpu` trains on the CUDA backend (CubeCL); builds without the `cuda`
+//! feature reject it with a clear error instead of silently training on CPU.
 
 use std::path::Path;
 
 use burn::backend::{Autodiff, NdArray};
+use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
 use idiolect_adapter_opus::OpusCodec;
@@ -24,11 +30,8 @@ use idiolect_trainer_burn::ggml::GgmlModel;
 use idiolect_trainer_burn::lora::{merge_into_ggml, Adam, DecoderLora, LoraConfig};
 use idiolect_trainer_burn::mel::{log_mel_spectrogram, SAMPLE_RATE};
 use idiolect_trainer_burn::train::{sequence_loss, train_step};
-use idiolect_trainer_burn::whisper::{WhisperRuntime, TOKEN_EOT, TOKEN_NO_TIMESTAMPS, TOKEN_SOT};
+use idiolect_trainer_burn::whisper::WhisperRuntime;
 use serde::Serialize;
-
-type Cpu = NdArray<f32>;
-type Train = Autodiff<Cpu>;
 
 pub struct TrainFlags {
     pub db: String,
@@ -40,10 +43,12 @@ pub struct TrainFlags {
     pub learning_rate: f32,
     pub rank: usize,
     pub max_samples: Option<usize>,
+    pub gpu: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TrainReport {
+    pub backend: String,
     pub usable_samples: usize,
     pub trained_samples: usize,
     pub holdout_samples: usize,
@@ -57,17 +62,39 @@ pub struct TrainReport {
     pub applied: bool,
 }
 
-struct Example {
+struct Example<B: Backend> {
     tokens: Vec<i32>,
-    encoded: Tensor<Cpu, 2>,
+    encoded: Tensor<B, 2>,
 }
 
 pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
+    if flags.gpu {
+        #[cfg(feature = "cuda")]
+        {
+            return run_train_backend::<burn::backend::Cuda<f32, i32>>(flags, "burn-cuda");
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err(
+                "this build has no GPU training support — rebuild trainerctl with --features cuda"
+                    .to_owned(),
+            );
+        }
+    }
+    run_train_backend::<NdArray<f32>>(flags, "burn-ndarray")
+}
+
+fn run_train_backend<B: Backend>(flags: &TrainFlags, backend: &str) -> Result<TrainReport, String>
+where
+    B::Device: Default,
+{
+    let device = B::Device::default();
     let mut store =
         SqliteMetadataStore::open_path(&flags.db).map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     let audio_root = std::path::PathBuf::from(&flags.audio_root);
-    let audio_store = FileAudioStore::new(audio_root.clone(), audio_root.with_file_name("decoded-cache"));
+    let audio_store =
+        FileAudioStore::new(audio_root.clone(), audio_root.with_file_name("decoded-cache"));
 
     let base = GgmlModel::read_file(Path::new(&flags.base_model))
         .map_err(|error| format!("reading base model: {error}"))?;
@@ -79,11 +106,13 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
         },
     )
     .map_err(|error| format!("loading tokenizer: {error}"))?;
-    let device = Default::default();
-    let inference = WhisperRuntime::<Cpu>::load(&base, &device)
+    // ONE weight copy serves both encoding and training: an autodiff tensor
+    // without require_grad tracks nothing, and a second runtime would double
+    // GPU memory (medium is ~3 GB of f32 weights).
+    let trainer = WhisperRuntime::<Autodiff<B>>::load(&base, &device)
         .map_err(|error| format!("loading weights: {error}"))?;
-    let trainer = WhisperRuntime::<Train>::load(&base, &device)
-        .map_err(|error| format!("loading weights: {error}"))?;
+    let prompt = trainer.special_tokens().transcription_prompt();
+    let prompt_len = prompt.len();
 
     let candidates = store
         .training_candidates_for_manifest_v2(&flags.user)
@@ -91,7 +120,7 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
     let codec = OpusCodec::new();
 
     let mut skipped = Vec::new();
-    let mut examples = Vec::new();
+    let mut examples: Vec<Example<B>> = Vec::new();
     for candidate in candidates {
         if let Some(limit) = flags.max_samples {
             if examples.len() >= limit {
@@ -129,7 +158,7 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
         }
         // Whisper transcripts conventionally lead with a space.
         let label = format!(" {text}");
-        let mut tokens = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+        let mut tokens = prompt.clone();
         match tokenizer.tokenize(&label) {
             Ok(text_tokens) => tokens.extend(text_tokens),
             Err(error) => {
@@ -137,13 +166,13 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
                 continue;
             }
         }
-        tokens.push(TOKEN_EOT);
+        tokens.push(trainer.special_tokens().eot);
         if tokens.len() > trainer.dims.n_text_ctx {
             skipped.push(format!("#{id}: transcript exceeds the text context"));
             continue;
         }
         let mel = log_mel_spectrogram(&samples, &base.filters);
-        let encoded = inference.encode(&mel);
+        let encoded = trainer.encode(&mel).inner();
         examples.push(Example { tokens, encoded });
         eprintln!("prepared {} example(s)", examples.len());
     }
@@ -167,7 +196,7 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
         rank: flags.rank,
         alpha: 2.0 * flags.rank as f32,
     };
-    let mut lora = DecoderLora::<Train>::init(
+    let mut lora = DecoderLora::<Autodiff<B>>::init(
         config,
         trainer.dims.n_text_layer,
         trainer.dims.n_text_state,
@@ -177,15 +206,15 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
     .trainable();
     let mut optimizer = Adam::new(flags.learning_rate);
 
-    let holdout_loss = |lora: &DecoderLora<Train>| -> f32 {
+    let holdout_loss = |lora: &DecoderLora<Autodiff<B>>| -> f32 {
         if holdout.is_empty() {
             return f32::NAN;
         }
         let total: f32 = holdout
             .iter()
             .map(|example| {
-                let encoded: Tensor<Train, 2> = Tensor::from_inner(example.encoded.clone());
-                sequence_loss(&trainer, encoded, &example.tokens, lora)
+                let encoded: Tensor<Autodiff<B>, 2> = Tensor::from_inner(example.encoded.clone());
+                sequence_loss(&trainer, encoded, &example.tokens, prompt_len, lora)
                     .into_data()
                     .to_vec::<f32>()
                     .expect("scalar loss")[0]
@@ -200,8 +229,15 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
     for epoch in 0..flags.epochs {
         let mut total = 0.0f32;
         for (index, example) in training.iter().enumerate() {
-            let encoded: Tensor<Train, 2> = Tensor::from_inner(example.encoded.clone());
-            let loss = train_step(&trainer, encoded, &example.tokens, &mut lora, &mut optimizer);
+            let encoded: Tensor<Autodiff<B>, 2> = Tensor::from_inner(example.encoded.clone());
+            let loss = train_step(
+                &trainer,
+                encoded,
+                &example.tokens,
+                prompt_len,
+                &mut lora,
+                &mut optimizer,
+            );
             total += loss;
             if index % 10 == 0 {
                 eprintln!(
@@ -229,6 +265,7 @@ pub fn run_train(flags: &TrainFlags) -> Result<TrainReport, String> {
         .map_err(|error| format!("writing artifact: {error}"))?;
 
     Ok(TrainReport {
+        backend: backend.to_owned(),
         usable_samples: training.len() + holdout.len(),
         trained_samples: training.len(),
         holdout_samples: holdout.len(),
