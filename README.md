@@ -261,11 +261,51 @@ target/release/idiolect-trainerctl train \
 
 `--gpu` uses the CUDA backend (a few minutes for `medium` on a modern card);
 without it training runs on the CPU — fine for `tiny`, hours for `medium`.
-A CPU-only build refuses `--gpu` rather than silently crawling. Other knobs:
-`--epochs`, `--lr`, `--rank`, `--max-samples`, `--user`. The JSON report
-shows train/holdout loss before and after — **holdout loss must drop**; it is
-computed on takes the adapter never saw. Takes longer than one 30 s window
-are skipped (windowing is future work) and listed in the report.
+A CPU-only build refuses `--gpu` rather than silently crawling. The JSON
+report shows train/holdout loss before and after — **holdout loss must
+drop**; it is computed on takes the adapter never saw. Takes longer than one
+30 s window are skipped (windowing is future work) and listed in the report.
+
+#### Choosing the training settings
+
+The constraint that drives everything: this is a *small personal corpus*
+(typically 100–500 takes), so the failure mode to fear is **overfitting** —
+the adapter memorising your exact takes instead of learning your voice and
+vocabulary. The defaults are deliberately conservative. Your meter is the
+report's two loss pairs: *train falling while holdout falls* = learning;
+*train falling while holdout rises* = memorising — back something off.
+
+| Knob | Default | Raise it when… | …at the cost of |
+|---|---|---|---|
+| `--epochs` | 2 | holdout loss was still falling at the end of the run — there was more to learn | each extra pass over the same takes pushes toward memorisation; past the point where holdout flattens, more epochs only widen the train/holdout gap |
+| `--lr` | 1e-3 | loss barely moves (typical when the corpus grows large and each step is one small sample) | too high and the loss oscillates or spikes instead of falling — LoRA with Adam tolerates a lot, but 1e-2 on a few hundred samples visibly wobbles; halve it if the per-sample losses in the progress log jump around |
+| `--rank` | 8 | the adapter has more to absorb: lots of unusual jargon, a strong accent, several hundred+ corrected takes | capacity is exactly what overfits a small corpus — rank 16 on 150 takes memorises faster than it generalises; it also scales adapter parameters (and a little GPU memory/time) linearly |
+| `--max-samples` | all | never for real runs — it exists to smoke-test the pipeline cheaply | training on a subset throws away signal; the holdout numbers also become noisy (the holdout is every 10th sample of what was *loaded*) |
+
+Notes that don't fit in a table:
+
+- **Alpha is pinned to 2×rank** on purpose. The adapter's effective strength
+  is `alpha/rank × B·A`, so exposing alpha separately just gives you a second
+  learning-rate dial that fights `--lr`. Keeping the ratio fixed means
+  `--rank` changes *capacity* without silently changing *step size* — the
+  standard LoRA practice.
+- **Epochs × lr trade against each other.** 4 epochs at 5e-4 covers similar
+  ground to 2 at 1e-3 with smoother steps. If you raise epochs, consider
+  lowering lr; never raise both at once or you lose the ability to tell which
+  change did what.
+- **More data beats more knobs.** Going from 150 → 500 corrected takes will
+  do more for holdout loss than any setting here. In particular, jargon and
+  proper nouns are learned almost entirely from takes where you *fixed the
+  word in the review dialog* — an accepted-without-edit take mostly teaches
+  acoustics and style, a corrected take teaches vocabulary.
+- **What the defaults gave on a real ~150-take corpus** (medium, rank 8,
+  2 epochs, lr 1e-3): train 0.30 → 0.11, holdout 0.335 → 0.164. Holdout
+  halved with the gap still modest — a healthy run to calibrate against. If
+  your gap looks much wider (say train 0.05, holdout 0.30), that's the
+  memorisation signature: drop rank or epochs.
+- **Same audio, new settings = just re-run.** Training never mutates the
+  corpus or the daemon; every run is a fresh artifact you can compare by its
+  holdout numbers (and discard).
 
 **Step 3 — try it (optional, reversible).** The artifact is a plain
 whisper.cpp model. To serve it, place it where models live and point the
