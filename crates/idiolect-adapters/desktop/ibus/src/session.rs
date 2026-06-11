@@ -110,6 +110,9 @@ pub struct Session<D, S> {
     /// The daemon's authoritative mic state, mirrored independently of `state`
     /// (which may be `Reviewing` while the mic is still open in streaming mode).
     recording: bool,
+    /// The most recent streamed (partial) snippet typed this take: at stop it
+    /// seeds the in-place correction window over the take's final snippet.
+    pending_tail: Option<String>,
 }
 
 impl<D, S> Session<D, S>
@@ -124,6 +127,7 @@ where
             state: State::Idle,
             review: None,
             recording: false,
+            pending_tail: None,
         }
     }
 
@@ -160,7 +164,9 @@ where
                 Key::Cancel => {
                     self.daemon.cancel();
                     // Snappy local feedback; the daemon's `recording = false` push
-                    // reconciles to the same state.
+                    // reconciles to the same state. A discarded take leaves no
+                    // tail to correct.
+                    self.pending_tail = None;
                     self.state = State::Idle;
                     true
                 }
@@ -256,6 +262,9 @@ where
             State::Reviewing if self.recording => self.end_review(),
             _ => return, // no take in progress; ignore an unsolicited/late transcript
         }
+        // A take-final transcript supersedes any streamed tail: the correction
+        // window below covers the full text.
+        self.pending_tail = None;
         if text.is_empty() {
             self.state = State::Idle;
             return;
@@ -266,10 +275,28 @@ where
         self.state = State::Reviewing;
     }
 
+    /// The daemon delivered a mid-take snippet of a streamed take (a PARTIAL
+    /// preedit): type it into the app and keep recording. Nothing is finalized
+    /// — the daemon owns the take's single session and commits it at stop —
+    /// and no correction window opens mid-take. The snippet is remembered so
+    /// the stop can open the usual in-place correction window over the take's
+    /// final snippet.
+    pub fn on_partial_transcript(&mut self, text: String) {
+        if self.state != State::Recording || text.is_empty() {
+            return; // no live take; ignore a stray/late partial
+        }
+        self.surface.commit_text(&text);
+        self.pending_tail = Some(text);
+    }
+
     /// The daemon's authoritative recording state changed. This is the single
     /// source of truth for the `Idle`/`Recording` phase, so the session mirrors it.
     /// A `Reviewing` correction window is a local overlay: a stop's `false` is
     /// expected and leaves it open, while a fresh `true` (a new take) closes it.
+    ///
+    /// When a streamed take stops (partials were typed, daemon committed the
+    /// merged session), the stop opens the correction window over the take's
+    /// final snippet, so the in-place-fix flow works exactly as for batch takes.
     pub fn on_recording_status(&mut self, recording: bool) {
         self.recording = recording;
         match self.state {
@@ -278,6 +305,15 @@ where
                     self.end_review();
                     self.state = State::Recording;
                 }
+            }
+            State::Recording if !recording => {
+                self.state = match self.pending_tail.take() {
+                    Some(tail) => {
+                        self.review = Some(Review::new(tail));
+                        State::Reviewing
+                    }
+                    None => State::Idle,
+                };
             }
             _ => {
                 self.state = if recording {
@@ -294,6 +330,7 @@ where
     /// resyncs from a clean slate rather than a stale guess.
     pub fn reset_to_idle(&mut self) {
         self.review = None;
+        self.pending_tail = None;
         self.state = State::Idle;
         self.recording = false;
     }
@@ -330,6 +367,7 @@ where
     /// The daemon reported an error mid-take: return to idle.
     pub fn on_error(&mut self) {
         self.review = None;
+        self.pending_tail = None;
         self.state = State::Idle;
     }
 
@@ -588,48 +626,81 @@ mod tests {
     }
 
     #[test]
-    fn streaming_snippets_commit_sequentially_while_recording() {
-        // Pause-triggered translation: the daemon delivers one transcript per
-        // pause while the mic stays open. Every snippet must commit — the old
-        // single-shot logic ignored anything after the first because the session
-        // had already moved to Reviewing.
+    fn partial_snippets_type_without_finalizing() {
+        // Streaming translation: the take is ONE conversation. Each partial is
+        // typed into the app as it arrives, but nothing is finalized per
+        // snippet — the daemon commits the whole merged take itself at stop.
         let mut s = session();
         s.on_key(Key::Trigger);
         s.on_recording_status(true);
 
-        s.on_transcript("hello world".to_owned());
-        assert_eq!(s.state(), State::Reviewing);
-        s.on_transcript("second snippet".to_owned());
+        s.on_partial_transcript("hello world".to_owned());
+        s.on_partial_transcript(" second snippet".to_owned());
 
-        assert_eq!(s.surface.committed, ["hello world", "second snippet"]);
-        assert_eq!(
-            s.daemon.events,
-            ["toggle", "commit:hello world", "commit:second snippet"]
-        );
-        // The newest snippet's correction window is open; the stop's `false`
-        // leaves it open as usual.
-        assert_eq!(s.state(), State::Reviewing);
-        s.on_recording_status(false);
-        assert_eq!(s.state(), State::Reviewing);
+        assert_eq!(s.surface.committed, ["hello world", " second snippet"]);
+        assert_eq!(s.daemon.events, ["toggle"], "no per-snippet finalize");
+        assert_eq!(s.state(), State::Recording, "still mid-take");
     }
 
     #[test]
-    fn edit_to_previous_snippet_is_reported_when_the_next_arrives() {
-        // Fixing snippet N in place must still be captured when snippet N+1
-        // displaces its correction window mid-recording.
+    fn stop_after_partials_keeps_the_tail_editable() {
+        // After the daemon closes the streamed take, the engine's only local
+        // job is the usual in-place correction window — over the FINAL snippet
+        // (the daemon splices the fix into the merged string).
         let mut s = session();
         s.on_key(Key::Trigger);
         s.on_recording_status(true);
-        s.on_transcript("hello wrld".to_owned());
+        s.on_partial_transcript("hello world".to_owned());
+        s.on_partial_transcript(" deploy nginx".to_owned());
 
-        for _ in 0.."wrld".len() {
+        s.on_recording_status(false);
+        assert_eq!(s.state(), State::Reviewing);
+
+        for _ in 0.."nginx".len() {
             s.on_key(Key::Backspace);
         }
-        type_str(&mut s, "world");
+        type_str(&mut s, "Nginx");
+        s.on_focus_out();
 
-        s.on_transcript("next snippet".to_owned());
-        assert_eq!(last_correction(&s), Some("hello world".to_owned()));
-        assert_eq!(s.surface.committed, ["hello wrld", "next snippet"]);
+        // The correction carries the snippet exactly as it was typed (joining
+        // space included), so the daemon's suffix splice lines up.
+        assert_eq!(last_correction(&s), Some(" deploy Nginx".to_owned()));
+        let commits = s.daemon.events.iter().filter(|e| e.starts_with("commit:")).count();
+        assert_eq!(commits, 0, "streamed takes are finalized daemon-side only");
+    }
+
+    #[test]
+    fn partials_outside_a_live_take_are_ignored() {
+        let mut s = session();
+        s.on_partial_transcript("ghost".to_owned());
+        assert!(s.surface.committed.is_empty(), "idle: nothing typed");
+
+        // After a finished batch take (review window open, mic closed) a stray
+        // partial must not type either.
+        dictate(&mut s, "restart traffic");
+        s.on_partial_transcript("ghost".to_owned());
+        assert_eq!(s.surface.committed, ["restart traffic"]);
+    }
+
+    #[test]
+    fn a_new_take_reports_the_previous_tail_correction_first() {
+        // Tail window open from a streamed take; the next take's recording=true
+        // must close it (reporting the fix) before the new take begins.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("deploy nginx".to_owned());
+        s.on_recording_status(false);
+        for _ in 0.."nginx".len() {
+            s.on_key(Key::Backspace);
+        }
+        type_str(&mut s, "Traefik");
+
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+
+        assert_eq!(last_correction(&s), Some("deploy Traefik".to_owned()));
+        assert_eq!(s.state(), State::Recording);
     }
 
     #[test]

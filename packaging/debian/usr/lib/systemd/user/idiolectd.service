@@ -8,6 +8,10 @@ StartLimitBurst=5
 
 [Service]
 ExecStart=/usr/bin/idiolectd run --config %h/.config/idiolect/config.toml
+# A crash (e.g. whisper segfaulting when another app holds all GPU memory) is
+# invisible from inside the dying process — surface it as a desktop
+# notification so dictation never fails silently.
+ExecStopPost=/usr/bin/idiolect-crash-notify
 Restart=on-failure
 RestartSec=2
 # Exit 2 = usage/bad-config: restarting cannot help, fail once and stay down.

@@ -32,6 +32,12 @@ pub struct PreeditUpdate {
     /// rather than committing immediately. Defaults false for older clients.
     #[serde(default)]
     pub review: bool,
+    /// When true, this is a live mid-take snippet (streaming translation): the
+    /// client types it into the app and keeps going — no finalize, no review.
+    /// The whole take is finalized once, at stop. Defaults false (a take-final
+    /// transcript) so daemons/clients that predate streaming interoperate.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

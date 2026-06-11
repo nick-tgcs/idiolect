@@ -20,6 +20,7 @@ min_speech_ms = 250
 pre_roll_ms = 300
 post_roll_ms = 700
 max_utterance_ms = 30000
+auto_stop_silence_ms = 0
 
 [asr]
 engine = "whisper-rs"
@@ -73,6 +74,7 @@ fn config_defaults_match_master_plan() {
     assert_eq!(config.vad.pre_roll_ms, 300);
     assert_eq!(config.vad.post_roll_ms, 700);
     assert_eq!(config.vad.max_utterance_ms, 30_000);
+    assert_eq!(config.vad.auto_stop_silence_ms, 0);
 
     assert_eq!(config.asr.engine, "whisper-rs");
     assert_eq!(config.asr.model, "whisper-medium-en");
@@ -212,6 +214,32 @@ fn training_retention_accepts_presets_zero_and_custom_but_rejects_absurd_values(
 }
 
 #[test]
+fn auto_stop_defaults_off_and_must_exceed_the_snippet_pause() {
+    // Omitted ⇒ disabled: listening NEVER times out by default — the take ends
+    // only when the user toggles (Super+T). Silence auto-stop is strictly
+    // opt-in for those who want it.
+    let config = IdiolectConfig::from_toml_str("[user]\ndefault_user_id = \"default\"\n")
+        .expect("minimal config must parse");
+    assert_eq!(config.vad.auto_stop_silence_ms, 0);
+
+    let mut config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
+
+    // 0 disables auto-stop (manual toggle only).
+    config.vad.auto_stop_silence_ms = 0;
+    config.validate().expect("0 (disabled) must validate");
+
+    // A nonzero value below the snippet pause threshold could end the take
+    // before a single snippet ever completes — reject it.
+    config.vad.auto_stop_silence_ms = config.vad.post_roll_ms - 1;
+    let error = config.validate().expect_err("sub-pause auto-stop must be rejected");
+    assert!(format!("{error}").contains("auto_stop_silence_ms"));
+
+    config.vad.auto_stop_silence_ms = config.vad.post_roll_ms;
+    config.validate().expect("equal to the pause threshold is allowed");
+}
+
+#[test]
 fn config_rejects_empty_user_id() {
     let mut config =
         IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
@@ -244,4 +272,20 @@ fn config_resolves_xdg_paths_without_private_text() {
     assert!(!paths_text.to_lowercase().contains(unsafe_log_fragment));
     assert!(!paths_text.to_lowercase().contains("corrected transcript"));
     assert!(!paths_text.to_lowercase().contains("app text"));
+}
+
+#[test]
+fn notify_command_defaults_to_notify_send_and_is_overridable() {
+    // Daemon-side user notifications (e.g. "translation unavailable") shell out
+    // to `<notify_command> <summary> <body>`; notify-send is the desktop default.
+    let config = IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("config must parse");
+    assert_eq!(config.daemon.notify_command, "notify-send");
+
+    let overridden = MASTER_PLAN_TOML.replace(
+        "[daemon]\nlog_level = \"info\"",
+        "[daemon]\nlog_level = \"info\"\nnotify_command = \"/opt/custom-notifier\"",
+    );
+    let config = IdiolectConfig::from_toml_str(&overridden).expect("override must parse");
+    config.validate().expect("override must validate");
+    assert_eq!(config.daemon.notify_command, "/opt/custom-notifier");
 }

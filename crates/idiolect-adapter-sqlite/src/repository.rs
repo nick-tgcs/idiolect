@@ -1207,6 +1207,7 @@ impl SqliteMetadataStore {
              JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
              JOIN utterances AS u ON u.id = tc.utterance_id
              WHERE s.user_id = ?1
+               AND tc.status != 'rejected'
              ORDER BY tc.id",
         ))?;
         let rows = backend_result(statement.query_map([user_id], |row| {
@@ -1226,6 +1227,66 @@ impl SqliteMetadataStore {
         }))?;
         let candidates = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
         Ok(candidates)
+    }
+
+    /// Replaces every stored copy of a candidate's text with a fresh decode of
+    /// its stored audio: the candidate's raw/corrected/transcript columns AND
+    /// the linked utterance's raw STT text (the manifest feed coalesces from
+    /// the utterance first). Used by revalidation when the snippet pipeline is
+    /// shown to have dropped words the audio contains.
+    pub fn retranscribe_training_candidate(
+        &mut self,
+        candidate_id: i64,
+        text: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let updated = backend_result(transaction.execute(
+            "UPDATE training_candidates
+             SET raw_text = ?1,
+                 corrected_text = ?1,
+                 candidate_transcript = ?1
+             WHERE id = ?2",
+            params![text, candidate_id],
+        ))?;
+        if updated == 0 {
+            return Err(SqliteStorageError::not_found(
+                "training candidate",
+                &candidate_id.to_string(),
+            ));
+        }
+        backend_result(transaction.execute(
+            "UPDATE utterances
+             SET raw_stt_text = ?1
+             WHERE id = (SELECT utterance_id FROM training_candidates WHERE id = ?2)",
+            params![text, candidate_id],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    /// Marks a candidate untrainable: its text cannot be trusted against its
+    /// audio (e.g. the user corrected text the snippet pipeline had already
+    /// dropped words from). Rejected candidates leave the manifest feed.
+    pub fn reject_training_candidate(
+        &mut self,
+        candidate_id: i64,
+        reason: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let updated = backend_result(self.connection.execute(
+            "UPDATE training_candidates
+             SET status = 'rejected',
+                 classifier_reason = ?1,
+                 classified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2",
+            params![reason, candidate_id],
+        ))?;
+        if updated == 0 {
+            return Err(SqliteStorageError::not_found(
+                "training candidate",
+                &candidate_id.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn set_audio_digest_for_test(

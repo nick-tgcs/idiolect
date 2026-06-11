@@ -36,6 +36,16 @@ struct ServerMessage {
     ServerMessageKind kind;
     std::string text;
     bool recording = false; ///< Meaningful only when `kind == RecordingStatus`.
+    /// Meaningful only when `kind == Preedit`: a streamed mid-take snippet the
+    /// engine types and keeps going (the daemon finalizes the take at stop),
+    /// vs. a take-final transcript. Daemons that predate streaming never write
+    /// the field, which decodes as final.
+    bool partial = false;
+    /// Meaningful only when `kind == Preedit`: "review before insert" payload.
+    /// Combined with `partial` it marks a display-only snippet (fed live into
+    /// the IBus engine's review dialog); this addon has no dialog, so it must
+    /// skip those rather than type them. Missing field decodes as direct.
+    bool review = false;
 };
 
 class UnixSocketIpcClient final : public IpcClient {

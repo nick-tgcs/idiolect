@@ -98,6 +98,12 @@ async fn engine_dictates_and_daemon_records_the_session() {
         "the transcript is committed straight into the app"
     );
 
+    // The streamed snippet's correction window opens when the daemon's
+    // recording=false push lands — one IPC message AFTER the CommitText we just
+    // observed, on a different channel than these D-Bus keys. Give the reader a
+    // beat so the keys below are tracked, as a human's first backspace would be.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     // Fix it in place: backspace "traffic" and retype "Traefik". These pass
     // through to the app, but the engine tracks the tail edit.
     for _ in 0.."traffic".len() {

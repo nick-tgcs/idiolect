@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use burn::tensor::{Data, Shape, Tensor};
+use burn::tensor::{Shape, Tensor, TensorData};
 use idiolect_ml_core::{TrainingArtifact, TrainingConfig, TrainingManifest, TrainingManifestItem};
 use idiolect_ports::trainer::TrainerPort;
 use sha2::{Digest, Sha256};
@@ -12,7 +12,7 @@ type BurnBackend = burn::backend::NdArray<f32>;
 pub struct BurnTrainer;
 
 impl BurnTrainer {
-    const BACKEND_ID: &'static str = "burn-ndarray-0.13.2";
+    const BACKEND_ID: &'static str = "burn-ndarray-0.21.0";
 
     #[must_use]
     pub fn new() -> Self {
@@ -84,8 +84,11 @@ fn burn_manifest_signal(items: &[TrainingManifestItem]) -> f32 {
         .iter()
         .map(|item| (item.audio_digest().len() + item.transcript().len()) as f32)
         .collect::<Vec<_>>();
-    let tensor =
-        Tensor::<BurnBackend, 1>::from_data(Data::new(values, Shape::new([items.len()])), &device);
+    let item_count = items.len();
+    let tensor = Tensor::<BurnBackend, 1>::from_data(
+        TensorData::new(values, Shape::new([item_count])),
+        &device,
+    );
     tensor.sum().into_scalar()
 }
 

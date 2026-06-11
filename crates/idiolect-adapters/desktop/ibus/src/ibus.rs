@@ -67,8 +67,10 @@ impl Surface for PendingSurface {
 struct Shared {
     session: Mutex<Session<DaemonSender, PendingSurface>>,
     active_path: Mutex<Option<OwnedObjectPath>>,
-    /// Review dialog used in "review before insert" mode. Behind a trait so the
-    /// GUI toolkit is swappable; runs out-of-process so it never blocks the IME.
+    /// Review dialog used in "review before insert" mode. Doubles as the live
+    /// mid-take surface (snippets stream into it as the user pauses). Behind a
+    /// trait so the GUI toolkit is swappable; runs out-of-process so it never
+    /// blocks the IME.
     dialog: Box<dyn crate::review::ReviewDialog>,
     /// "Voice is live" overlay shown next to the caret while recording.
     indicator: Box<dyn crate::indicator::RecordingIndicator>,
@@ -403,13 +405,28 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
         let ops = match reader.read_message() {
             Ok(IpcMessage::PreeditUpdate(update)) => {
                 dbg_edit(&format!(
-                    "transcript <- daemon: {:?} (review={})",
-                    update.text, update.review
+                    "transcript <- daemon: {:?} (review={} partial={})",
+                    update.text, update.review, update.partial
                 ));
-                if update.review {
-                    // Review mode: show our own editable dialog (blocking — fine
-                    // on this dedicated reader thread), then commit the user's
-                    // final text into the app and record raw→edited, or cancel.
+                if update.partial && update.review {
+                    // A display-only snippet of a review-mode take: stream it
+                    // into the review dialog (opening it, in its listening
+                    // state, on the first snippet) so the user watches the
+                    // take grow in the same window they will edit at stop;
+                    // nothing touches the document.
+                    shared.dialog.append(&update.text);
+                    continue;
+                }
+                if update.partial {
+                    // A mid-take snippet of a streamed take: type it and keep
+                    // recording. The daemon finalizes the whole take at stop.
+                    shared.run_session(|s| s.on_partial_transcript(update.text))
+                } else if update.review {
+                    // Review mode: the take is over — the listening dialog
+                    // turns editable with the full merged text (blocking —
+                    // fine on this dedicated reader thread), then commit the
+                    // user's final text into the app and record raw→edited,
+                    // or cancel.
                     match shared.dialog.review(&update.text) {
                         Some(edited) => {
                             dbg_edit(&format!("dialog -> insert {edited:?}"));
@@ -435,9 +452,19 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                 // instead of tracking our own. Drives the "voice is live" indicator
                 // (refreshed by sync_indicator below).
                 dbg_edit(&format!("recording_status <- daemon: {}", status.recording));
+                if !status.recording {
+                    // A take that ends WITH a final transcript already consumed
+                    // its dialog in review() above; this only tears down a
+                    // still-listening dialog (cancelled take), where it is the
+                    // engine's only signal.
+                    shared.dialog.close();
+                }
                 shared.run_session(|s| s.on_recording_status(status.recording))
             }
-            Ok(IpcMessage::Error(_)) => shared.run_session(|s| s.on_error()),
+            Ok(IpcMessage::Error(_)) => {
+                shared.dialog.close();
+                shared.run_session(|s| s.on_error())
+            }
             Ok(_) => continue,
             Err(_) => {
                 // The daemon connection dropped — e.g. the daemon restarted. Rather
@@ -446,6 +473,7 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                 // state push. We retry until the daemon returns, so even a long outage
                 // (an update, a slow restart) self-heals.
                 reader = reconnect_reader(&socket, &sender);
+                shared.dialog.close();
                 shared.run_session(|s| s.reset_to_idle());
                 shared.sync_indicator();
                 continue;

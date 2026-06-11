@@ -166,7 +166,8 @@ fn tray_menu_cli_dumps_menu_structure() {
     let output = idiolect_cli::execute(&argv(&["tray", "menu", "--db", db, "--json"])).unwrap();
     let value: Value = serde_json::from_str(&output).unwrap();
     let menu = value["menu"].as_array().unwrap();
-    // Start/Stop/Cancel + separator + history + settings.
-    assert!(menu.iter().any(|item| item["id"] == "settings"));
+    // Start/Stop/Cancel + separator + history + the Settings-window opener
+    // (multi-choice settings live in the window, not in the menu).
+    assert!(menu.iter().any(|item| item["id"] == "settings:open"));
     assert!(menu.iter().any(|item| item["id"] == "history"));
 }

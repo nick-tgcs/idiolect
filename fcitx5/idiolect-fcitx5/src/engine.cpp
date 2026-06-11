@@ -43,10 +43,22 @@ void Engine::on_transcript(std::string text) {
     // Tell the daemon to finalize the session (records a training candidate).
     ipc_client_.commit_preedit(visible_preedit_);
     visible_preedit_.clear();
-    // The phase deliberately stays Recording: the daemon may deliver more
-    // pause-snippets while the mic is open (streaming translation), and a
-    // stop-time transcript is always followed by the daemon's recording=false
-    // push, which is what returns the engine to Idle.
+    // The phase deliberately stays Recording: a stop-time transcript is always
+    // followed by the daemon's recording=false push, which is what returns the
+    // engine to Idle.
+}
+
+void Engine::on_partial_transcript(std::string text) {
+    if (state_ != RecordingState::Recording) {
+        // No live take; ignore a stray/late snippet.
+        return;
+    }
+    // A streamed mid-take snippet: type it and keep recording. The take is ONE
+    // conversation — the daemon merges the snippets and finalizes the single
+    // session itself at stop, so no commit_preedit is sent here.
+    if (committer_ != nullptr) {
+        committer_->commit(text);
+    }
 }
 
 void Engine::cancel() {

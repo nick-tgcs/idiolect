@@ -74,9 +74,10 @@ int main() {
         require(ipc.messages[2] == "commit:restart traffic");
     }
 
-    // Streaming (pause-triggered translation): the daemon delivers one
-    // transcript per pause while the mic stays open. Every snippet must commit,
-    // and the phase stays Recording throughout the take.
+    // Streaming (pause-triggered translation): the take is ONE conversation.
+    // Each PARTIAL snippet is typed into the app as it arrives, but the daemon
+    // finalizes the merged take itself at stop — the engine must NOT send a
+    // per-snippet commit, and the phase stays Recording throughout.
     {
         FakeIpcClient ipc;
         FakeCommitter committer;
@@ -85,9 +86,9 @@ int main() {
         engine.toggle();
         engine.on_recording_status(true);
 
-        engine.on_transcript("first snippet");
+        engine.on_partial_transcript("first snippet");
         require(engine.state() == RecordingState::Recording);
-        engine.on_transcript("second snippet");
+        engine.on_partial_transcript(" second snippet");
         require(engine.state() == RecordingState::Recording);
 
         engine.toggle(); // stop intent
@@ -96,11 +97,22 @@ int main() {
 
         require(committer.committed.size() == 2);
         require(committer.committed[0] == "first snippet");
-        require(committer.committed[1] == "second snippet");
-        require(ipc.messages.size() == 4);
-        require(ipc.messages[1] == "commit:first snippet");
-        require(ipc.messages[2] == "commit:second snippet");
-        require(ipc.messages[3] == "toggle_recording");
+        require(committer.committed[1] == " second snippet");
+        // Only the two toggles: streamed takes are finalized daemon-side.
+        require(ipc.messages.size() == 2);
+        require(ipc.messages[0] == "toggle_recording");
+        require(ipc.messages[1] == "toggle_recording");
+    }
+
+    // A stray partial outside a live take must not type anything.
+    {
+        FakeIpcClient ipc;
+        FakeCommitter committer;
+        Engine engine(ipc, committer);
+
+        engine.on_partial_transcript("ghost");
+        require(committer.committed.empty());
+        require(ipc.messages.empty());
     }
 
     // RecordingStatus is the single source of truth for the phase.

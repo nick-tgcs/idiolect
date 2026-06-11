@@ -138,6 +138,25 @@ mod backend {
             })
         }
 
+        pub(crate) fn tokenize(&self, text: &str) -> Result<Vec<i32>, WhisperAsrError> {
+            // Generous bound: BPE never yields more tokens than bytes.
+            self.context
+                .tokenize(text, text.len() + 8)
+                .map_err(|error| WhisperAsrError::backend(error.to_string()))
+        }
+
+        pub(crate) fn detokenize(&self, tokens: &[i32]) -> Result<String, WhisperAsrError> {
+            let mut text = String::new();
+            for &token in tokens {
+                text.push_str(
+                    self.context
+                        .token_to_str(token)
+                        .map_err(|error| WhisperAsrError::backend(error.to_string()))?,
+                );
+            }
+            Ok(text)
+        }
+
         pub(crate) fn transcribe(
             &self,
             audio: &AudioSegment,
@@ -221,6 +240,19 @@ impl WhisperAsr {
         Ok(Self { backend })
     }
 
+    /// Tokenizes text with the loaded model's own BPE vocabulary — the
+    /// tokenizer training labels must be built with, so a Burn-side trainer
+    /// can never drift from the engine that serves the model.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<i32>, WhisperAsrError> {
+        self.backend.tokenize(text)
+    }
+
+    /// Inverse of [`Self::tokenize`]: concatenates each token's vocabulary
+    /// text.
+    pub fn detokenize(&self, tokens: &[i32]) -> Result<String, WhisperAsrError> {
+        self.backend.detokenize(tokens)
+    }
+
     /// Transcribes with an explicit per-call decode task (language override
     /// and/or Whisper's built-in X→English translate task). The plain
     /// [`AsrPort::transcribe`] is equivalent to the default task.
@@ -282,6 +314,19 @@ mod tests {
     // plumbing contract: per-call task selection exists, the default task is
     // plain transcription, and a task-equivalent call produces the same result
     // as the legacy `transcribe` entry point.
+    #[test]
+    fn tokenize_round_trips_through_the_models_own_vocab() {
+        // Training labels must use the model's own BPE: a token sequence that
+        // detokenizes back to the input text, with every id inside the vocab.
+        let adapter = WhisperAsr::load_fixture_model().expect("fixture model should be present");
+        let tokens = adapter
+            .tokenize(" restart traffic")
+            .expect("text should tokenize");
+        assert!(!tokens.is_empty());
+        let text = adapter.detokenize(&tokens).expect("tokens should detokenize");
+        assert_eq!(text, " restart traffic");
+    }
+
     #[test]
     fn default_decode_task_is_plain_transcription() {
         let task = super::WhisperDecodeTask::default();

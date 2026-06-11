@@ -4,6 +4,7 @@ pub mod daemon;
 mod retention_dialog;
 mod run_loop;
 pub mod runtime;
+mod settings_launcher;
 
 mod adapters;
 

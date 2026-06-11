@@ -8,7 +8,21 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# GPU transcription for revalidation against large models; CI never enables it.
+cuda = ["idiolect-adapter-whisper/cuda"]
+
 [dependencies]
+idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
+idiolect-trainer-burn = { path = "../idiolect-trainer-burn" }
+burn.workspace = true
+idiolect-ports = { path = "../idiolect-ports" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+idiolect-common = { path = "../idiolect-common" }
+idiolect-test-support = { path = "../idiolect-test-support" }

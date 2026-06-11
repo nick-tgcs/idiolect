@@ -565,8 +565,12 @@ engine          = "webrtc"   # "silero" is accepted, served by the WebRTC adapte
 threshold       = 0.5
 min_speech_ms   = 250
 pre_roll_ms     = 300
-post_roll_ms    = 700
+post_roll_ms    = 700        # a pause this long completes a snippet mid-take
 max_utterance_ms = 30000
+# OPT-IN: silence this long (after the take's first speech) ends the take by
+# itself, exactly like the toggle. 0 (the default) disables it — listening
+# never times out; only Super+T stops a take. Must be >= post_roll_ms when set.
+auto_stop_silence_ms = 0
 
 [asr]
 engine   = "whisper-rs"

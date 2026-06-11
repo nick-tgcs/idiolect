@@ -1,5 +1,5 @@
-use idiolect_common::config::{HistoryConfig, TranslationConfig};
-use idiolect_common::languages::LANGUAGES;
+use idiolect_common::config::TranslationConfig;
+use idiolect_common::languages::{language_name, LANGUAGES};
 use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayMenuItem, TrayMenuItemKind};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -84,7 +84,7 @@ pub fn validate_training_retention_days(days: u32) -> Result<(), MenuUseCaseErro
 /// current value isn't one of the presets (a custom value), an extra
 /// "N days (custom)" option is appended and selected so the menu always shows the
 /// active choice.
-fn training_retention_radio(current_days: u32) -> (Vec<String>, usize) {
+pub fn training_retention_radio(current_days: u32) -> (Vec<String>, usize) {
     let mut options: Vec<String> = TRAINING_RETENTION_CHOICES
         .iter()
         .map(|(label, _)| (*label).to_owned())
@@ -96,6 +96,77 @@ fn training_retention_radio(current_days: u32) -> (Vec<String>, usize) {
         Some(index) => (options, index),
         None => {
             options.push(format!("{current_days} days (custom)"));
+            let selected = options.len() - 1;
+            (options, selected)
+        }
+    }
+}
+
+/// Dictation-timing presets surfaced in the tray (milliseconds). Each radio's
+/// parent label explains the behaviour, since DBusMenu offers no tooltips.
+///
+/// "Send a phrase after a pause of": the silence that completes a snippet.
+pub const PAUSE_CHOICES_MS: [u32; 4] = [400, 700, 1_200, 2_000];
+/// "Ignore noises shorter than": bursts below this are dropped as blips.
+pub const MIN_SPEECH_CHOICES_MS: [u32; 3] = [150, 250, 400];
+/// "Force-split non-stop speech after": cap on a single unpaused phrase.
+pub const MAX_PHRASE_CHOICES_MS: [u32; 3] = [15_000, 30_000, 60_000];
+/// "Stop listening after silence of": 0 = never (listening never times out).
+pub const AUTO_STOP_CHOICES_MS: [u32; 4] = [0, 5_000, 10_000, 30_000];
+
+/// Maps a `settings:pause:N` menu index back to milliseconds.
+#[must_use]
+pub fn pause_ms_for_index(index: usize) -> Option<u32> {
+    PAUSE_CHOICES_MS.get(index).copied()
+}
+
+/// Maps a `settings:min_speech:N` menu index back to milliseconds.
+#[must_use]
+pub fn min_speech_ms_for_index(index: usize) -> Option<u32> {
+    MIN_SPEECH_CHOICES_MS.get(index).copied()
+}
+
+/// Maps a `settings:max_phrase:N` menu index back to milliseconds.
+#[must_use]
+pub fn max_phrase_ms_for_index(index: usize) -> Option<u32> {
+    MAX_PHRASE_CHOICES_MS.get(index).copied()
+}
+
+/// Maps a `settings:auto_stop:N` menu index back to milliseconds (0 = never).
+#[must_use]
+pub fn auto_stop_ms_for_index(index: usize) -> Option<u32> {
+    AUTO_STOP_CHOICES_MS.get(index).copied()
+}
+
+/// A human label for a timing value: "Never" for 0, otherwise seconds
+/// ("0.25 s", "0.7 s", "30 s").
+pub fn seconds_label(ms: u32) -> String {
+    if ms == 0 {
+        return "Never".to_owned();
+    }
+    let seconds = f64::from(ms) / 1_000.0;
+    format!("{seconds} s")
+}
+
+/// Radio options + selected index for one timing knob. The crate default is
+/// marked "(default)"; a config-set value outside the presets is appended as
+/// "N ms (custom)" and selected, so the menu always shows the active choice.
+pub fn timing_radio(choices: &[u32], current: u32, default: u32) -> (Vec<String>, usize) {
+    let mut options: Vec<String> = choices
+        .iter()
+        .map(|&ms| {
+            let base = seconds_label(ms);
+            if ms == default {
+                format!("{base} (default)")
+            } else {
+                base
+            }
+        })
+        .collect();
+    match choices.iter().position(|&ms| ms == current) {
+        Some(index) => (options, index),
+        None => {
+            options.push(format!("{current} ms (custom)"));
             let selected = options.len() - 1;
             (options, selected)
         }
@@ -121,7 +192,7 @@ pub fn translation_output_language_for_index(index: usize) -> Option<&'static st
 
 /// The "Speak in" radio options plus the selected index for the current code.
 /// An unknown stored code falls back to "Auto detect" rather than panicking.
-fn translation_input_radio(current: &str) -> (Vec<String>, usize) {
+pub fn translation_input_radio(current: &str) -> (Vec<String>, usize) {
     let mut options = Vec::with_capacity(LANGUAGES.len() + 1);
     options.push("Auto detect".to_owned());
     options.extend(LANGUAGES.iter().map(|(_, name)| (*name).to_owned()));
@@ -138,7 +209,7 @@ fn translation_input_radio(current: &str) -> (Vec<String>, usize) {
 
 /// The "Translate to" radio options plus the selected index. An unknown stored
 /// code falls back to English (the engine-internal translation target).
-fn translation_output_radio(current: &str) -> (Vec<String>, usize) {
+pub fn translation_output_radio(current: &str) -> (Vec<String>, usize) {
     let options: Vec<String> = LANGUAGES
         .iter()
         .map(|(_, name)| (*name).to_owned())
@@ -260,7 +331,6 @@ impl MenuUseCase {
         &self,
         recording_state: RecordingState,
         history: &[HistoryEntry],
-        config: &HistoryConfig,
         translation: &TranslationConfig,
     ) -> Vec<TrayMenuItem> {
         let mut items = Vec::new();
@@ -367,138 +437,88 @@ impl MenuUseCase {
             },
         });
 
-        // Translation: the toggle plus "any language in, any language out"
-        // pickers (the full Whisper catalogue, auto-detect on the input side).
-        let (input_options, input_selected) = translation_input_radio(&translation.input_language);
-        let (output_options, output_selected) =
-            translation_output_radio(&translation.output_language);
         items.push(TrayMenuItem {
-            id: "translation".to_owned(),
-            label: "Translation".to_owned(),
-            enabled: true,
-            kind: TrayMenuItemKind::Standard {
-                submenu: Some(vec![
-                    TrayMenuItem {
-                        id: "translation:enabled".to_owned(),
-                        label: "Translate while dictating".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::Checkable {
-                            checked: translation.enabled,
-                        },
-                    },
-                    TrayMenuItem {
-                        id: "translation:input".to_owned(),
-                        label: "Speak in".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::RadioGroup {
-                            options: input_options,
-                            selected: input_selected,
-                        },
-                    },
-                    TrayMenuItem {
-                        id: "translation:output".to_owned(),
-                        label: "Translate to".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::RadioGroup {
-                            options: output_options,
-                            selected: output_selected,
-                        },
-                    },
-                ]),
-            },
+            id: "sep2".to_owned(),
+            label: String::new(),
+            enabled: false,
+            kind: TrayMenuItemKind::Separator,
         });
 
-        // Settings submenu: two distinct retention concepts, kept visually
-        // separate — the short tray-history list vs the long training-data corpus.
-        let retention_options = vec![
-            "1 day".to_owned(),
-            "7 days".to_owned(),
-            "30 days".to_owned(),
-        ];
-        let retention_selected = match config.retention_days {
-            1 => 0,
-            7 => 1,
-            30 => 2,
-            _ => 0,
-        };
-
-        let max_entries_options = vec!["10".to_owned(), "25".to_owned(), "50".to_owned()];
-        let max_entries_selected = match config.max_entries {
-            10 => 0,
-            25 => 1,
-            50 => 2,
-            _ => 0,
-        };
-
-        // "Tray history": how long / how many recent dictations the menu shows.
-        let tray_history = TrayMenuItem {
-            id: "settings:tray_history".to_owned(),
-            label: "Tray history".to_owned(),
-            enabled: true,
-            kind: TrayMenuItemKind::Standard {
-                submenu: Some(vec![
-                    TrayMenuItem {
-                        id: "settings:retention".to_owned(),
-                        label: "Show last".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::RadioGroup {
-                            options: retention_options,
-                            selected: retention_selected,
-                        },
-                    },
-                    TrayMenuItem {
-                        id: "settings:max_entries".to_owned(),
-                        label: "Max items".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::RadioGroup {
-                            options: max_entries_options,
-                            selected: max_entries_selected,
-                        },
-                    },
-                ]),
-            },
-        };
-
-        // "Training data kept for": how long captured audio + transcripts are
-        // retained for learning. Presets plus a free-form "Custom…" entry.
-        let (training_options, training_selected) =
-            training_retention_radio(config.training_retention_days);
-        let training_data = TrayMenuItem {
-            id: "settings:training_data".to_owned(),
-            label: "Training data kept for".to_owned(),
-            enabled: true,
-            kind: TrayMenuItemKind::Standard {
-                submenu: Some(vec![
-                    TrayMenuItem {
-                        id: "settings:training_retention".to_owned(),
-                        label: "Keep for".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::RadioGroup {
-                            options: training_options,
-                            selected: training_selected,
-                        },
-                    },
-                    TrayMenuItem {
-                        id: "settings:training_retention_custom".to_owned(),
-                        label: "Custom…".to_owned(),
-                        enabled: true,
-                        kind: TrayMenuItemKind::Standard { submenu: None },
-                    },
-                ]),
-            },
-        };
-
+        // Quick toggle: a single click, so it is fine in a menu that closes on
+        // every activation. Multi-choice settings are NOT — DBusMenu menus
+        // close on each click and the protocol cannot keep them open, so those
+        // all live in the Settings window instead ("settings:open" below).
         items.push(TrayMenuItem {
-            id: "settings".to_owned(),
-            label: "Settings".to_owned(),
+            id: "translation:enabled".to_owned(),
+            label: "Translate while dictating".to_owned(),
             enabled: true,
-            kind: TrayMenuItemKind::Standard {
-                submenu: Some(vec![tray_history, training_data]),
+            kind: TrayMenuItemKind::Checkable {
+                checked: translation.enabled,
             },
+        });
+        // Only English works without an external translator (whisper's built-in
+        // task). Any other target with no command fails every snippet at
+        // dictation time — say so HERE, before the user dictates into silence.
+        if translation.enabled
+            && translation.output_language != "en"
+            && translation.command.is_empty()
+        {
+            let language = language_name(&translation.output_language)
+                .unwrap_or(translation.output_language.as_str());
+            items.push(TrayMenuItem {
+                id: "translation:unavailable".to_owned(),
+                label: format!(
+                    "⚠ {language} won't work: set translation.command in config.toml (only English works without it)"
+                ),
+                enabled: false,
+                kind: TrayMenuItemKind::Standard { submenu: None },
+            });
+        }
+
+        // Everything multi-choice (languages, timing, retention) opens in one
+        // window that stays open while the user adjusts several things and
+        // closes when they click elsewhere.
+        items.push(TrayMenuItem {
+            id: "settings:open".to_owned(),
+            label: "Settings…".to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::Standard { submenu: None },
         });
 
         items
     }
+}
+
+/// Radio options + selected index for the tray-history retention presets.
+pub fn retention_radio(current_days: u32) -> (Vec<String>, usize) {
+    let options = RETENTION_DAY_CHOICES
+        .iter()
+        .map(|days| {
+            if *days == 1 {
+                "1 day".to_owned()
+            } else {
+                format!("{days} days")
+            }
+        })
+        .collect();
+    let selected = RETENTION_DAY_CHOICES
+        .iter()
+        .position(|days| *days == current_days)
+        .unwrap_or(0);
+    (options, selected)
+}
+
+/// Radio options + selected index for the tray-history max-entry presets.
+pub fn max_entries_radio(current: u32) -> (Vec<String>, usize) {
+    let options = MAX_ENTRY_CHOICES
+        .iter()
+        .map(|count| count.to_string())
+        .collect();
+    let selected = MAX_ENTRY_CHOICES
+        .iter()
+        .position(|count| *count == current)
+        .unwrap_or(0);
+    (options, selected)
 }
 
 impl Default for MenuUseCase {
@@ -510,10 +530,10 @@ impl Default for MenuUseCase {
 #[cfg(test)]
 mod tests {
     use super::{
-        mask_sensitive, truncate_for_menu, validate_max_entries, validate_retention_days,
+        mask_sensitive, max_entries_radio, retention_radio, training_retention_radio,
+        truncate_for_menu, validate_max_entries, validate_retention_days,
         validate_training_retention_days, MenuUseCase, RecordingState, MENU_PREVIEW_MAX_CHARS,
     };
-    use idiolect_common::config::HistoryConfig;
     use idiolect_common::ids::ImeSessionId;
     use idiolect_ports::storage::{HistoryEntry, HistoryState, TrayMenuItem, TrayMenuItemKind};
 
@@ -523,20 +543,6 @@ mod tests {
             .iter()
             .find(|item| item.id == id)
             .unwrap_or_else(|| panic!("missing menu item {id}"))
-    }
-
-    fn submenu(item: &TrayMenuItem) -> &[TrayMenuItem] {
-        match &item.kind {
-            TrayMenuItemKind::Standard { submenu: Some(sub) } => sub,
-            _ => panic!("{} should have a submenu", item.id),
-        }
-    }
-
-    fn radio_selected(item: &TrayMenuItem) -> (usize, &[String]) {
-        match &item.kind {
-            TrayMenuItemKind::RadioGroup { selected, options } => (*selected, options),
-            _ => panic!("{} should be a radio group", item.id),
-        }
     }
 
     fn entry(id: i64, text: &str, state: HistoryState) -> HistoryEntry {
@@ -576,13 +582,8 @@ mod tests {
         // Per-item tray tooltips are not supported by the DBusMenu protocol, so the
         // labels themselves must convey what Stop vs Cancel do: Stop transcribes and
         // inserts the text; Cancel throws the audio away.
-        let config = HistoryConfig::default();
-        let menu = MenuUseCase::new().get_menu(
-            RecordingState::Recording,
-            &[],
-            &config,
-            &Default::default(),
-        );
+        let menu =
+            MenuUseCase::new().get_menu(RecordingState::Recording, &[], &Default::default());
 
         assert_eq!(child(&menu, "start_recording").label, "Start Recording");
         assert_eq!(child(&menu, "stop_recording").label, "Stop & Insert");
@@ -590,62 +591,62 @@ mod tests {
     }
 
     #[test]
-    fn menu_reflects_retention_selection_and_history() {
-        let config = HistoryConfig {
-            retention_days: 30,
-            max_entries: 25,
-            ..HistoryConfig::default()
-        };
+    fn the_menu_is_actions_only_with_a_settings_window_entry() {
+        // DBusMenu menus close on every click and cannot be kept open, so
+        // multi-choice settings don't belong in them at all: the menu offers
+        // actions, single-click toggles, and ONE "Settings…" entry that opens
+        // the window where all multi-choice configuration lives.
         let history = vec![entry(1, "hello world", HistoryState::Committed)];
         let menu = MenuUseCase::new().get_menu(
             RecordingState::Idle,
             &history,
-            &config,
             &Default::default(),
         );
 
-        let settings = submenu(child(&menu, "settings"));
-        // Tray-history retention now lives under the "Tray history" group.
-        let tray_history = submenu(child(settings, "settings:tray_history"));
-        let (selected, _) = radio_selected(child(tray_history, "settings:retention"));
-        assert_eq!(selected, 2, "30 days -> index 2");
-        let (max_selected, _) = radio_selected(child(tray_history, "settings:max_entries"));
-        assert_eq!(max_selected, 1, "25 entries -> index 1");
+        let settings = child(&menu, "settings:open");
+        assert_eq!(settings.label, "Settings…");
+        assert!(settings.enabled);
+        assert!(
+            matches!(settings.kind, TrayMenuItemKind::Standard { submenu: None }),
+            "opens the window; no inline submenu"
+        );
+
+        fn no_radio_groups(items: &[TrayMenuItem]) {
+            for item in items {
+                match &item.kind {
+                    TrayMenuItemKind::RadioGroup { .. } => {
+                        panic!("multi-choice {} must live in the Settings window", item.id)
+                    }
+                    TrayMenuItemKind::Standard { submenu: Some(sub) } => no_radio_groups(sub),
+                    _ => {}
+                }
+            }
+        }
+        no_radio_groups(&menu);
+    }
+
+    #[test]
+    fn retention_and_max_entry_radios_select_the_current_value() {
+        // These builders feed the Settings window; index grammar must mirror
+        // the daemon's `settings:retention:N` / `settings:max_entries:N` ids.
+        let (options, selected) = retention_radio(30);
+        assert_eq!(options, vec!["1 day", "7 days", "30 days"]);
+        assert_eq!(selected, 2);
+        let (options, selected) = max_entries_radio(25);
+        assert_eq!(options, vec!["10", "25", "50"]);
+        assert_eq!(selected, 1);
     }
 
     #[test]
     fn training_retention_radio_selects_the_matching_preset() {
-        let config = HistoryConfig {
-            training_retention_days: 365, // "1 year" -> index 4
-            ..HistoryConfig::default()
-        };
-        let menu =
-            MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config, &Default::default());
-
-        let settings = submenu(child(&menu, "settings"));
-        let training = submenu(child(settings, "settings:training_data"));
-        let (selected, options) = radio_selected(child(training, "settings:training_retention"));
+        let (options, selected) = training_retention_radio(365);
         assert_eq!(options.len(), 8, "the eight presets, no custom marker");
         assert_eq!(options[selected], "1 year");
-        // The free-form custom entry point is present.
-        assert_eq!(
-            child(training, "settings:training_retention_custom").label,
-            "Custom…"
-        );
     }
 
     #[test]
     fn training_retention_radio_shows_a_custom_value_as_selected() {
-        let config = HistoryConfig {
-            training_retention_days: 540, // not a preset
-            ..HistoryConfig::default()
-        };
-        let menu =
-            MenuUseCase::new().get_menu(RecordingState::Idle, &[], &config, &Default::default());
-
-        let settings = submenu(child(&menu, "settings"));
-        let training = submenu(child(settings, "settings:training_data"));
-        let (selected, options) = radio_selected(child(training, "settings:training_retention"));
+        let (options, selected) = training_retention_radio(540);
         assert_eq!(options.len(), 9, "presets + the custom marker");
         assert_eq!(options[selected], "540 days (custom)");
     }
@@ -659,69 +660,173 @@ mod tests {
         assert!(validate_training_retention_days(36_501).is_err());
     }
 
+    mod dictation_timing_choices {
+        use super::super::{
+            auto_stop_ms_for_index, max_phrase_ms_for_index, min_speech_ms_for_index,
+            pause_ms_for_index, timing_radio, AUTO_STOP_CHOICES_MS, MAX_PHRASE_CHOICES_MS,
+            MIN_SPEECH_CHOICES_MS, PAUSE_CHOICES_MS,
+        };
+        use idiolect_common::config::VadConfig;
+
+        // These builders feed the Settings window; the option order must mirror
+        // the daemon's `settings:pause:N` etc. action-id grammar, and the
+        // defaults are marked in the options themselves.
+        #[test]
+        fn timing_radios_offer_all_four_knobs_with_defaults_selected() {
+            let vad = VadConfig::default();
+
+            let (options, selected) = timing_radio(&PAUSE_CHOICES_MS, vad.post_roll_ms, 700);
+            assert_eq!(options.len(), PAUSE_CHOICES_MS.len());
+            assert_eq!(options[selected], "0.7 s (default)");
+
+            let (options, selected) = timing_radio(&MIN_SPEECH_CHOICES_MS, vad.min_speech_ms, 250);
+            assert_eq!(options.len(), MIN_SPEECH_CHOICES_MS.len());
+            assert_eq!(options[selected], "0.25 s (default)");
+
+            let (options, selected) =
+                timing_radio(&MAX_PHRASE_CHOICES_MS, vad.max_utterance_ms, 30_000);
+            assert_eq!(options.len(), MAX_PHRASE_CHOICES_MS.len());
+            assert_eq!(options[selected], "30 s (default)");
+
+            let (options, selected) =
+                timing_radio(&AUTO_STOP_CHOICES_MS, vad.auto_stop_silence_ms, 0);
+            assert_eq!(options.len(), AUTO_STOP_CHOICES_MS.len());
+            assert_eq!(options[selected], "Never (default)");
+        }
+
+        #[test]
+        fn config_set_values_outside_the_presets_render_as_custom() {
+            let (options, selected) = timing_radio(&PAUSE_CHOICES_MS, 900, 700);
+            assert_eq!(options[selected], "900 ms (custom)");
+        }
+
+        #[test]
+        fn menu_indices_map_back_to_milliseconds() {
+            assert_eq!(pause_ms_for_index(0), Some(400));
+            assert_eq!(pause_ms_for_index(1), Some(700));
+            assert_eq!(pause_ms_for_index(PAUSE_CHOICES_MS.len()), None);
+            assert_eq!(min_speech_ms_for_index(1), Some(250));
+            assert_eq!(max_phrase_ms_for_index(2), Some(60_000));
+            assert_eq!(auto_stop_ms_for_index(0), Some(0), "index 0 is Never");
+            assert_eq!(auto_stop_ms_for_index(1), Some(5_000));
+            assert_eq!(auto_stop_ms_for_index(AUTO_STOP_CHOICES_MS.len()), None);
+        }
+    }
+
     mod translation_menu {
         use super::super::{
-            translation_input_language_for_index, translation_output_language_for_index,
-            MenuUseCase, RecordingState,
+            translation_input_language_for_index, translation_input_radio,
+            translation_output_language_for_index, translation_output_radio, MenuUseCase,
+            RecordingState,
         };
-        use super::{child, radio_selected, submenu};
-        use idiolect_common::config::{HistoryConfig, TranslationConfig};
+        use super::child;
+        use idiolect_common::config::TranslationConfig;
         use idiolect_common::languages::LANGUAGES;
         use idiolect_ports::storage::TrayMenuItemKind;
 
         fn menu_with(
             translation: &TranslationConfig,
         ) -> Vec<idiolect_ports::storage::TrayMenuItem> {
-            MenuUseCase::new().get_menu(
-                RecordingState::Idle,
-                &[],
-                &HistoryConfig::default(),
-                translation,
-            )
+            MenuUseCase::new().get_menu(RecordingState::Idle, &[], translation)
         }
 
         #[test]
-        fn translation_submenu_offers_toggle_and_every_language_both_ways() {
+        fn the_toggle_is_a_top_level_single_click() {
+            // The toggle is the one translation control that works in a menu
+            // that closes per click; the language pickers live in the Settings
+            // window.
             let translation = TranslationConfig {
                 enabled: true,
-                input_language: "sv".to_owned(),
-                output_language: "ja".to_owned(),
-                command: String::new(),
+                ..TranslationConfig::default()
             };
             let menu = menu_with(&translation);
-
-            let root = submenu(child(&menu, "translation"));
-            match &child(root, "translation:enabled").kind {
+            match &child(&menu, "translation:enabled").kind {
                 TrayMenuItemKind::Checkable { checked } => assert!(*checked),
                 other => panic!("toggle should be checkable, got {other:?}"),
             }
-
-            // Input: "Auto detect" plus the full catalogue ("any" language in).
-            let (input_selected, input_options) = radio_selected(child(root, "translation:input"));
-            assert_eq!(input_options.len(), LANGUAGES.len() + 1);
-            assert_eq!(input_options[0], "Auto detect");
-            assert_eq!(input_options[input_selected], "Swedish");
-
-            // Output: the full catalogue ("any" language out; no auto).
-            let (output_selected, output_options) =
-                radio_selected(child(root, "translation:output"));
-            assert_eq!(output_options.len(), LANGUAGES.len());
-            assert_eq!(output_options[output_selected], "Japanese");
-        }
-
-        #[test]
-        fn toggle_renders_unchecked_and_auto_selected_by_default() {
             let menu = menu_with(&TranslationConfig::default());
-            let root = submenu(child(&menu, "translation"));
-            match &child(root, "translation:enabled").kind {
+            match &child(&menu, "translation:enabled").kind {
                 TrayMenuItemKind::Checkable { checked } => assert!(!*checked),
                 other => panic!("toggle should be checkable, got {other:?}"),
             }
-            let (input_selected, _) = radio_selected(child(root, "translation:input"));
-            assert_eq!(input_selected, 0, "auto-detect by default");
-            let (output_selected, output_options) =
-                radio_selected(child(root, "translation:output"));
-            assert_eq!(output_options[output_selected], "English");
+        }
+
+        #[test]
+        fn language_radios_offer_every_language_both_ways() {
+            // These builders feed the Settings window; option order must mirror
+            // the daemon's translation:input:N / translation:output:N grammar.
+            let (input_options, input_selected) = translation_input_radio("sv");
+            assert_eq!(input_options.len(), LANGUAGES.len() + 1);
+            assert_eq!(input_options[0], "Auto detect");
+            assert_eq!(input_options[input_selected], "Swedish");
+            let (_, auto_selected) = translation_input_radio("auto");
+            assert_eq!(auto_selected, 0, "auto-detect is the first entry");
+
+            let (output_options, output_selected) = translation_output_radio("ja");
+            assert_eq!(output_options.len(), LANGUAGES.len());
+            assert_eq!(output_options[output_selected], "Japanese");
+            let (output_options, en_selected) = translation_output_radio("en");
+            assert_eq!(output_options[en_selected], "English");
+        }
+
+        #[test]
+        fn unworkable_output_language_warns_instead_of_failing_silently() {
+            // Enabled + non-English target + no translator command means every
+            // snippet will fail at dictation time. The menu must say so up
+            // front — never let the user dictate into silence.
+            let translation = TranslationConfig {
+                enabled: true,
+                input_language: "auto".to_owned(),
+                output_language: "zh".to_owned(),
+                command: String::new(),
+            };
+            let menu = menu_with(&translation);
+            let warning = child(&menu, "translation:unavailable");
+            assert!(!warning.enabled, "informational, not clickable");
+            assert!(
+                warning.label.contains("Chinese"),
+                "names the broken language: {}",
+                warning.label
+            );
+            assert!(
+                warning.label.contains("translation.command"),
+                "says what would fix it: {}",
+                warning.label
+            );
+        }
+
+        #[test]
+        fn no_warning_when_the_configuration_actually_works() {
+            let workable = [
+                // English target: whisper translates in-engine, no command needed.
+                TranslationConfig {
+                    enabled: true,
+                    input_language: "auto".to_owned(),
+                    output_language: "en".to_owned(),
+                    command: String::new(),
+                },
+                // Non-English target but a translator command is configured.
+                TranslationConfig {
+                    enabled: true,
+                    input_language: "auto".to_owned(),
+                    output_language: "zh".to_owned(),
+                    command: "/usr/local/bin/translate".to_owned(),
+                },
+                // Translation off: nothing can fail, nothing to warn about.
+                TranslationConfig {
+                    enabled: false,
+                    input_language: "auto".to_owned(),
+                    output_language: "zh".to_owned(),
+                    command: String::new(),
+                },
+            ];
+            for translation in &workable {
+                let menu = menu_with(translation);
+                assert!(
+                    menu.iter().all(|item| item.id != "translation:unavailable"),
+                    "no warning for workable config {translation:?}"
+                );
+            }
         }
 
         #[test]
@@ -785,14 +890,9 @@ mod tests {
 
     #[test]
     fn cancelled_entries_render_as_cancelled_label() {
-        let config = HistoryConfig::default();
         let history = vec![entry(1, "", HistoryState::Cancelled)];
-        let menu = MenuUseCase::new().get_menu(
-            RecordingState::Idle,
-            &history,
-            &config,
-            &Default::default(),
-        );
+        let menu =
+            MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")

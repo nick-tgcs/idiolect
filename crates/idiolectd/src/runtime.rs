@@ -276,6 +276,7 @@ fn run_daemon_with_tray(
         history_config: config.history.clone(),
         translation_config: config.translation.clone(),
         vad_config: config.vad.clone(),
+        notify_command: config.daemon.notify_command.clone(),
     })
 }
 
@@ -488,6 +489,7 @@ fn handle_fixture_connection(
                     &IpcMessage::PreeditUpdate(PreeditUpdate {
                         text: transcript.to_owned(),
                         review: false,
+                        partial: false,
                     }),
                 )?;
             }
