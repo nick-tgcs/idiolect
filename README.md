@@ -206,6 +206,88 @@ The tray icon (a modern line-art microphone that fills in while recording) is th
 - **Settings → Tray history** — how long / how many recent dictations the menu shows (*Show last* 1/7/30 days, *Max items* 10/25/50).
 - **Settings → Training data kept for** — how long captured audio + transcripts are retained for learning: presets **1 month … 10 years** (default **1 year**) plus **Custom…** (a small dialog to type any number of days/months). This is deliberately separate from the tray-history list: history is a short convenience list; training data is the long-lived corpus. Past the window the daemon purges the whole session (audio + transcript + correction); everything inside the window is kept, because correct dictations are positive training signal too. Pruning runs on startup and hourly.
 
+### Train a personal model (LoRA fine-tuning)
+
+Every take you dictate becomes a training pair (audio + final text), and every
+correction you make in the review dialog is gold signal. `idiolect-trainerctl`
+turns that corpus into a personalised Whisper model — **pure Rust end to end**
+(Burn for training, no Python, no sidecars). whisper.cpp cannot load adapters
+at inference, so the trained LoRA is *merged* into the base weights and
+written out as an ordinary `.bin` the daemon serves unchanged.
+
+Build it (the `cuda` feature enables both GPU revalidation and GPU training):
+
+```sh
+cargo build --release -p idiolect-trainerctl --features cuda
+```
+
+**Step 1 — clean the corpus.** Re-decodes every stored take's audio whole and
+repairs/rejects records whose text disagrees with it (early versions of the
+streaming pipeline could drop words at pause boundaries; a poisoned pair
+teaches the model to skip words). Dry-run by default; `--apply` writes:
+
+```sh
+# Stop the daemon while writing to its database, and back it up first.
+cp ~/.local/share/idiolect/idiolect.sqlite ~/.local/share/idiolect/idiolect.sqlite.bak
+systemctl --user stop idiolectd
+
+target/release/idiolect-trainerctl revalidate \
+  --db ~/.local/share/idiolect/idiolect.sqlite \
+  --audio-root ~/.local/share/idiolect/audio \
+  --model ~/.local/share/idiolect/models/whisper/medium.bin --gpu \
+  --apply --json
+
+systemctl --user start idiolectd
+```
+
+Unproofread records are re-labelled from the audio; user corrections are kept
+unless the audio contains word runs the user never saw (those are rejected —
+an untrustworthy label is worse than one fewer sample). Rejected records stay
+in the database for audit but leave the training feed.
+
+**Step 2 — train.** Trains LoRA adapters (decoder attention q/v, rank 8 by
+default) on the cleaned feed, holds out every 10th take for validation, then
+merges the adapter and writes the artifact. Reads the database, **applies
+nothing** — the daemon keeps serving its configured model:
+
+```sh
+target/release/idiolect-trainerctl train \
+  --db ~/.local/share/idiolect/idiolect.sqlite \
+  --audio-root ~/.local/share/idiolect/audio \
+  --base-model ~/.local/share/idiolect/models/whisper/medium.bin \
+  --output ~/.local/share/idiolect/adapters/ggml-medium-personal-v0.bin \
+  --epochs 2 --lr 1e-3 --rank 8 --gpu
+```
+
+`--gpu` uses the CUDA backend (a few minutes for `medium` on a modern card);
+without it training runs on the CPU — fine for `tiny`, hours for `medium`.
+A CPU-only build refuses `--gpu` rather than silently crawling. Other knobs:
+`--epochs`, `--lr`, `--rank`, `--max-samples`, `--user`. The JSON report
+shows train/holdout loss before and after — **holdout loss must drop**; it is
+computed on takes the adapter never saw. Takes longer than one 30 s window
+are skipped (windowing is future work) and listed in the report.
+
+**Step 3 — try it (optional, reversible).** The artifact is a plain
+whisper.cpp model. To serve it, place it where models live and point the
+config at it:
+
+```sh
+cp ~/.local/share/idiolect/adapters/ggml-medium-personal-v0.bin \
+   ~/.local/share/idiolect/models/whisper/medium-personal-v0.bin
+# config.toml: [asr] model = "medium-personal-v0"
+systemctl --user restart idiolectd
+```
+
+Switching back is editing the name back and restarting. An automated
+WER-based promotion gate (see [Training Pipeline](#training-pipeline)) is the
+planned replacement for this manual step.
+
+Practical notes: more *corrected* takes mean more signal — jargon and proper
+nouns ("E2E", "fail2ban", product names) are only learned from takes where
+you actually fixed them, so use the review dialog and fix words in place.
+Multilingual (`medium`) and English-only (`tiny.en`, `medium.en`) bases both
+work; the trainer derives the right token prompt from the model file itself.
+
 ---
 
 ## Table of Contents
@@ -831,15 +913,17 @@ flowchart LR
 - Candidate reranking
 - Proper noun preference
 
-### Path B: Research/Mid-Term (Deferred Model Adaptation)
-- Train LoRA/DoRA adapters through Rust-owned `TrainerPort`
-- Evaluate Burn and Candle as Rust-native training backends
-- Produce versioned export/merge artifacts validated through `AsrPort` contract tests
+### Path B: Model Adaptation (BUILT — Burn-native)
+- LoRA adapters trained in **Burn** (chosen over Candle), pure Rust, CPU or CUDA
+- The whole Whisper forward pass runs in Burn, loaded straight from the same
+  ggml `.bin` the daemon serves — decode parity against whisper-rs is a test gate
+- Trained adapters are **merged** into the base weights and emitted as a plain
+  whisper.cpp model: inference never needs adapter support or a Python runtime
+- See [Train a personal model](#train-a-personal-model-lora-fine-tuning) for usage
 
 ### Path C: Long-Term
-- Build adapter-aware inference/training in Rust
-- Burn or Candle as candidate backends
-- Personalised adapters load without Python runtime
+- Adapter-aware inference in Rust (serve adapters without merging)
+- Automated retraining on a schedule once the promotion gate is wired
 
 ---
 
@@ -847,20 +931,34 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A[Approved Candidates] --> B[Build Manifest]
+    A0[Stored Takes] --> A[Revalidate vs Audio]
+    A --> B[Trainable Feed]
     B --> C[Decode Opus]
-    C --> D[Resample to 16 kHz]
-    D --> E[Feature Extraction]
-    E --> F[Train LoRA Adapter]
-    F --> G[Validation]
-    G --> H[Save Candidate Adapter]
-    H --> I[Evaluate vs Active Adapter]
+    C --> D[Log-Mel Features]
+    D --> E[Frozen Burn Encoder]
+    E --> F[Train Decoder LoRA]
+    F --> G[Holdout Validation]
+    G --> H[Merge into ggml .bin]
+    H --> I[Evaluate vs Active Model]
     I --> J{Promotion Gate}
-    J -->|Pass| K[Promote Adapter]
-    J -->|Fail| L[Reject Adapter]
+    J -->|Pass| K[Promote Model]
+    J -->|Fail| L[Keep Base]
 ```
 
-**Initial LoRA Settings:** rank 8-16, alpha 16-32, dropout 0.05, target attention q/v layers, conservative LR, few epochs, early stopping.
+Implemented today (`idiolect-trainerctl`, crate `idiolect-trainer-burn`):
+revalidation, opus → log-mel (an exact port of whisper.cpp's spectrogram),
+the full Whisper forward pass in Burn loaded from the ggml file, LoRA on the
+decoder attention q/v projections, hand-rolled Adam, train/holdout split and
+before/after holdout loss, and the merge back into a plain whisper.cpp `.bin`.
+Correctness is gated by tests, in dependency order: ggml read→write is
+byte-identical; Burn's greedy decode matches whisper-rs on the same model
+file; a zero-initialised adapter changes nothing; an overfitted adapter,
+merged, is served by the unmodified engine. Still to wire: the WER-based
+promotion gate below (rules exist in `trainerctl`'s promotion module),
+adapter registry bookkeeping, and >30 s take windowing.
+
+**LoRA settings:** rank 8 (`--rank`, alpha = 2×rank), decoder attention q/v,
+conservative LR (`--lr`, default 1e-3), few epochs (`--epochs`, default 2).
 
 ### Promotion Criteria
 
@@ -926,7 +1024,7 @@ idiolect/
     # --- training (early-stage) ---
     idiolect-ml-core/        # manifest / artifact / evaluation value types
     idiolect-trainer-burn/   # TrainerPort over Burn (stub)
-    idiolect-trainerctl/     # classifier, manifest, metrics, promotion + idiolect-train binary
+    idiolect-trainerctl/     # revalidate/train CLI + classifier, manifest, metrics, promotion
 
     # --- composition root + CLI + tests ---
     idiolectd/                   # daemon: wires adapters, runs the IPC/run loop
@@ -960,7 +1058,7 @@ ibus-engine-idiolect          # IBus engine (built with `--features ibus-engine`
 idiolect-review-dialog        # review-before-insert window (spawned by the engine)
 idiolect-recording-indicator  # floating caret mic overlay (spawned by the engine)
 idiolect-retention-dialog     # custom training-retention input (spawned by the daemon)
-idiolect-train                # trainer orchestration CLI (from idiolect-trainerctl; early-stage)
+idiolect-trainerctl           # training CLI: revalidate (corpus cleaning) + train (LoRA -> merged .bin)
 ```
 
 The three GUI helpers run **out-of-process** behind traits (`ReviewDialog`, `RecordingIndicator`, `RetentionDialog`), so the egui/winit stack never runs inside the async IME and the toolkit stays swappable. The engine/daemon discovers each binary next to its own executable, so keep them in the same directory (e.g. `target/release/`).
@@ -1304,9 +1402,11 @@ This repository builds and runs the core dictation loop, but is not yet Idiolect
 - Two interchangeable front-ends: fcitx5 addon (`idiolect.so`) and the IBus engine (`ibus-engine-idiolect`).
 - SQLite metadata + on-disk audio store (with optional ChaCha20-Poly1305 at-rest encryption), history, ksni tray menu, and clipboard reinsert/copy.
 - Operator CLI: `doctor`, `history`, `tray`, `privacy`, `logs` (see [CLI Surface](#cli-surface)).
+- LoRA training end to end: `idiolect-trainerctl revalidate` (corpus cleaning) and `train` (Burn, CPU or CUDA) emitting a merged whisper.cpp `.bin` — see [Train a personal model](#train-a-personal-model-lora-fine-tuning).
 
 **Early-stage / not wired end to end:**
-- Training, evaluation, and adapter promotion/rollback (`idiolect-trainer-burn` and `idiolect-trainerctl` exist as scaffolding; the `train`/`adapters`/`candidates`/`sessions`/`models` CLI groups return `not-implemented`).
+- Automated evaluation and adapter promotion/rollback (the promotion rules and registry exist in `idiolect-trainerctl`, but applying a trained model is still the manual config switch; the `idiolect-cli` `train`/`adapters`/`candidates`/`sessions`/`models` groups return `not-implemented`).
+- Takes longer than one 30 s Whisper window are skipped by training (no windowing yet).
 - A one-command prebuilt `.deb` (packaging exists under `packaging/` and is exercised in CI, but you currently build from source).
 
 ### Baseline Verification Gates
