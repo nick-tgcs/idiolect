@@ -68,6 +68,13 @@ impl TrayPort for KsniTray {
 }
 
 impl KsniTray {
+    /// Whether the ksni service loop is running and the tray will (re-)register
+    /// with `StatusNotifierWatcher` when it appears. `false` means the daemon is
+    /// running headless (no icon, no reconnect).
+    pub fn is_live(&self) -> bool {
+        self.handle.is_some()
+    }
+
     pub fn new(sender: mpsc::Sender<TrayCallback>) -> Result<Self, KsniTrayError> {
         // Escape hatch for headless/in-process use (notably integration tests that
         // run several daemons inside one process): registering a StatusNotifierItem
@@ -84,11 +91,18 @@ impl KsniTray {
             menu_items: Vec::new(),
             sender,
         };
-        // Degrade gracefully when there is no tray host: a missing
-        // `StatusNotifierWatcher` (headless, or the desktop shell not up yet at
-        // login) must not crash the daemon — dictation works without an icon, and
-        // the daemon stays up instead of the autostart unit giving up on it.
-        let handle = match inner.spawn() {
+        // The daemon's systemd unit fires as soon as graphical-session.target is
+        // reached, but GNOME Shell (which registers org.kde.StatusNotifierWatcher)
+        // can take ~800 ms longer. assume_sni_available(true) tells ksni to treat
+        // a missing watcher as transient: it starts its reconnect loop instead of
+        // returning Err, so the icon appears once GNOME Shell catches up. Without
+        // this, the spawn failed with ServiceUnknown, the handle became None, and
+        // no icon ever appeared for the entire daemon session.
+        //
+        // If the session bus is absent entirely (headless server, CI without
+        // dbus-run-session), the session() connection builder itself fails before
+        // we reach the watcher check, and we still degrade gracefully to None.
+        let handle = match inner.assume_sni_available(true).spawn() {
             Ok(handle) => Some(handle),
             Err(error) => {
                 eprintln!("idiolect: tray unavailable, running without a tray icon: {error}");
@@ -239,6 +253,15 @@ pub enum KsniTrayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_is_not_live_when_handle_is_none() {
+        // is_live() is the observable proxy for whether the ksni reconnect loop is
+        // running. handle: None means either IDIOLECT_DISABLE_TRAY was set or the
+        // session bus was absent; either way the tray is not live.
+        let tray = KsniTray { handle: None };
+        assert!(!tray.is_live());
+    }
 
     #[test]
     fn degraded_tray_without_a_host_is_a_safe_noop() {
