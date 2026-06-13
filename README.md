@@ -64,7 +64,8 @@ cargo build -p idiolect-ibus --release --features ibus-engine
 # Its out-of-process GUI helpers — built into the same target/release/ dir so the
 # engine/daemon discover them by path (review dialog, caret indicator, retention):
 cargo build --release \
-  -p idiolect-review-dialog -p idiolect-recording-indicator -p idiolect-retention-dialog
+  -p idiolect-review-dialog -p idiolect-recording-indicator -p idiolect-retention-dialog \
+  -p idiolect-settings
 
 # fcitx5 addon (requires the fcitx5 -dev packages above)
 cd fcitx5/idiolect-fcitx5
@@ -1060,6 +1061,7 @@ idiolect/
     idiolect-review-dialog/        # editable review window (idiolect-review-dialog)
     idiolect-recording-indicator/  # floating "mic is live" overlay tracking the caret
     idiolect-retention-dialog/     # custom training-retention input (idiolect-retention-dialog)
+    idiolect-settings/             # full settings window: VAD, review mode, translation, history, training retention
 
     # --- training (early-stage) ---
     idiolect-ml-core/        # manifest / artifact / evaluation value types
@@ -1098,6 +1100,7 @@ ibus-engine-idiolect          # IBus engine (built with `--features ibus-engine`
 idiolect-review-dialog        # review-before-insert window (spawned by the engine)
 idiolect-recording-indicator  # floating caret mic overlay (spawned by the engine)
 idiolect-retention-dialog     # custom training-retention input (spawned by the daemon)
+idiolect-settings             # full settings window: VAD, review mode, translation, history, training retention (spawned by the daemon)
 idiolect-trainerctl           # training CLI: revalidate (corpus cleaning) + train (LoRA -> merged .bin)
 ```
 
