@@ -531,7 +531,8 @@ fn handle_fixture_connection(
             IpcMessage::HistoryReinsert(_)
             | IpcMessage::HistoryCopy(_)
             | IpcMessage::HistoryReinsertResponse(_)
-            | IpcMessage::HistoryCopyResponse(_) => {
+            | IpcMessage::HistoryCopyResponse(_)
+            | IpcMessage::HistoryEdited(_) => {
                 send_ipc_message(
                     &mut stream,
                     &IpcMessage::Error(ErrorMessage {
@@ -544,6 +545,7 @@ fn handle_fixture_connection(
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
+            | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
                 send_ipc_message(
                     &mut stream,

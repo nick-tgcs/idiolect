@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use idiolect_ipc::messages::{EditHistory, HistoryEdited};
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{Array, Dict, OwnedObjectPath, Signature, StructureBuilder, Value};
 use zbus::{interface, Connection};
@@ -398,7 +399,7 @@ impl Trigger {
 /// Daemon read loop (one per process): delivers transcripts/errors into the
 /// shared session and emits the resulting preedit/commit on the *currently
 /// focused* engine object.
-fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSender) {
+fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonSender) {
     let handle = tokio::runtime::Handle::current();
     let socket = ipc::default_socket_path();
     tokio::task::spawn_blocking(move || loop {
@@ -465,6 +466,18 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                 shared.dialog.close();
                 shared.run_session(|s| s.on_error())
             }
+            Ok(IpcMessage::EditHistory(edit)) => {
+                // Retroactive history edit: run the review dialog over the stored
+                // take and report the user's correction. Only the record changes —
+                // nothing is typed into the app — so this never touches the session
+                // or emits surface ops; it always `continue`s.
+                dbg_edit(&format!(
+                    "edit_history <- daemon: id={} text={:?}",
+                    edit.id, edit.text
+                ));
+                handle_edit_history(&*shared.dialog, &mut sender, edit);
+                continue;
+            }
             Ok(_) => continue,
             Err(_) => {
                 // The daemon connection dropped — e.g. the daemon restarted. Rather
@@ -489,6 +502,27 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
             handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
         }
     });
+}
+
+/// Run the review dialog over a stored history entry's text and report the
+/// user's correction back to the daemon as `HistoryEdited`; a cancelled dialog
+/// reports nothing. Updates only the record — it types nothing into the focused
+/// app — so it runs outside the session/surface path.
+fn handle_edit_history(
+    dialog: &dyn crate::review::ReviewDialog,
+    sender: &mut DaemonSender,
+    edit: EditHistory,
+) {
+    match dialog.review(&edit.text) {
+        Some(corrected) => {
+            dbg_edit(&format!("edit_history -> confirmed id={}", edit.id));
+            let _ = sender.send(&IpcMessage::HistoryEdited(HistoryEdited {
+                id: edit.id,
+                corrected_text: corrected,
+            }));
+        }
+        None => dbg_edit(&format!("edit_history -> cancelled id={}", edit.id)),
+    }
 }
 
 /// Re-establish the daemon connection after it drops, retrying indefinitely while
@@ -627,4 +661,98 @@ pub async fn run() -> zbus::Result<()> {
 
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(all(test, feature = "ibus-engine"))]
+mod tests {
+    //! Tests for the retroactive history-edit arm: the engine runs the review
+    //! dialog over the daemon's stored text and reports the user's correction
+    //! back, typing nothing. Driven through `handle_edit_history` over a bare
+    //! socket pair — no runtime, no D-Bus, no live reader loop.
+
+    use std::io::{BufRead, BufReader, ErrorKind, Read};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use idiolect_ipc::framing::decode_json_line;
+    use idiolect_ipc::messages::EditHistory;
+    use idiolect_ipc::IpcMessage;
+
+    use crate::ipc::DaemonSender;
+    use crate::review::ReviewDialog;
+
+    use super::handle_edit_history;
+
+    /// A dialog with a fixed verdict: `Some(text)` confirms with that text,
+    /// `None` cancels.
+    struct FakeDialog {
+        reply: Option<String>,
+    }
+    impl ReviewDialog for FakeDialog {
+        fn append(&self, _chunk: &str) {}
+        fn review(&self, _transcript: &str) -> Option<String> {
+            self.reply.clone()
+        }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn confirmed_edit_reports_history_edited_with_the_corrected_text() {
+        let (engine_side, daemon_side) = UnixStream::pair().expect("socketpair");
+        let mut sender = DaemonSender::from_stream(daemon_side);
+        let dialog = FakeDialog {
+            reply: Some("restart Traefik".to_owned()),
+        };
+
+        handle_edit_history(
+            &dialog,
+            &mut sender,
+            EditHistory {
+                id: 42,
+                text: "restart traffic".to_owned(),
+            },
+        );
+        // Close the write end so the read sees EOF after the one message.
+        drop(sender);
+
+        let mut line = String::new();
+        BufReader::new(engine_side)
+            .read_line(&mut line)
+            .expect("read");
+        match decode_json_line(&line).expect("decode") {
+            IpcMessage::HistoryEdited(edited) => {
+                assert_eq!(edited.id, 42);
+                assert_eq!(edited.corrected_text, "restart Traefik");
+            }
+            other => panic!("expected HistoryEdited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_edit_reports_nothing() {
+        let (engine_side, daemon_side) = UnixStream::pair().expect("socketpair");
+        let mut sender = DaemonSender::from_stream(daemon_side);
+        let dialog = FakeDialog { reply: None };
+
+        handle_edit_history(
+            &dialog,
+            &mut sender,
+            EditHistory {
+                id: 7,
+                text: "original".to_owned(),
+            },
+        );
+        drop(sender);
+
+        // A cancelled review must type nothing back: a short read finds no bytes.
+        engine_side
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let mut buf = [0u8; 1];
+        match (&engine_side).read(&mut buf) {
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Ok(0) => {}
+            other => panic!("expected no data for a cancelled edit, got {other:?}"),
+        }
+    }
 }

@@ -404,6 +404,14 @@ impl MenuUseCase {
                     enabled: true,
                     kind: TrayMenuItemKind::Standard {
                         submenu: Some(vec![
+                            // Enabled only when there is a transcript worth correcting.
+                            TrayMenuItem {
+                                id: format!("edit:{}", entry.id),
+                                label: "Edit\u{2026}".to_owned(),
+                                enabled: entry.state == HistoryState::Committed
+                                    && !entry.text.is_empty(),
+                                kind: TrayMenuItemKind::Standard { submenu: None },
+                            },
                             TrayMenuItem {
                                 id: format!("insert:{}", entry.id),
                                 label: "Insert".to_owned(),
@@ -901,5 +909,64 @@ mod tests {
             panic!("history should have a submenu");
         };
         assert!(sub[0].label.contains("[cancelled]"));
+    }
+
+    fn entry_submenu(history: &[HistoryEntry], entry_id: i64) -> Vec<TrayMenuItem> {
+        let menu =
+            MenuUseCase::new().get_menu(RecordingState::Idle, history, &Default::default());
+        let history_item = menu
+            .iter()
+            .find(|item| item.id == "history")
+            .expect("history present");
+        let TrayMenuItemKind::Standard { submenu: Some(sub) } = &history_item.kind else {
+            panic!("history should have a submenu");
+        };
+        let entry_item = sub
+            .iter()
+            .find(|item| item.id == format!("history:{entry_id}"))
+            .expect("entry item present");
+        let TrayMenuItemKind::Standard { submenu: Some(entry_sub) } = &entry_item.kind else {
+            panic!("entry item should have a submenu");
+        };
+        entry_sub.clone()
+    }
+
+    #[test]
+    fn edit_action_enabled_for_committed_nonempty_entry_and_placed_before_insert() {
+        let history = vec![entry(42, "hello world", HistoryState::Committed)];
+        let sub = entry_submenu(&history, 42);
+
+        let edit_item = child(&sub, "edit:42");
+        assert_eq!(edit_item.label, "Edit…");
+        assert!(edit_item.enabled, "edit should be enabled for committed non-empty entry");
+        assert!(
+            matches!(edit_item.kind, TrayMenuItemKind::Standard { submenu: None }),
+            "edit item should be Standard with no submenu"
+        );
+
+        // Edit… must appear before Insert in the submenu.
+        let edit_pos = sub.iter().position(|i| i.id == "edit:42").unwrap();
+        let insert_pos = sub.iter().position(|i| i.id == "insert:42").unwrap();
+        assert!(edit_pos < insert_pos, "Edit… must come before Insert");
+    }
+
+    #[test]
+    fn edit_action_disabled_for_cancelled_entry() {
+        let history = vec![entry(7, "", HistoryState::Cancelled)];
+        let sub = entry_submenu(&history, 7);
+
+        let edit_item = child(&sub, "edit:7");
+        assert_eq!(edit_item.label, "Edit…");
+        assert!(!edit_item.enabled, "edit should be disabled for cancelled entry");
+    }
+
+    #[test]
+    fn edit_action_disabled_for_empty_text_committed_entry() {
+        // An entry can be committed but with empty text (edge case); no transcript to correct.
+        let history = vec![entry(99, "", HistoryState::Committed)];
+        let sub = entry_submenu(&history, 99);
+
+        let edit_item = child(&sub, "edit:99");
+        assert!(!edit_item.enabled, "edit should be disabled when text is empty");
     }
 }

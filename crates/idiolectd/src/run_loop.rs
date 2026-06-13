@@ -33,8 +33,8 @@ use idiolect_common::languages::is_supported_language;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
-    CommitPreedit, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse, InsertText,
-    IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
+    CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
+    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -818,6 +818,36 @@ fn handle_connection(
                 )?;
                 send_ipc_message(&mut stream, &IpcMessage::HistoryCopyResponse(response))?;
             }
+            IpcMessage::HistoryEdited(edited) => {
+                // The user retroactively corrected a past history entry via the
+                // review dialog: amend the stored record and its raw→corrected
+                // training pair. Any entry (not just the current take) may be
+                // targeted by id; if the edited entry is the active session, keep
+                // live state consistent so a later correction doesn't clobber it.
+                match store.get_history_entry(edited.id) {
+                    Ok(Some(entry)) => {
+                        match apply_history_edit(store, edited.id, &edited.corrected_text) {
+                            Ok(_) => {
+                                if let Some(active) = live.active_session.as_mut() {
+                                    if active.session_id == entry.session_id {
+                                        active.current_text = edited.corrected_text.clone();
+                                    }
+                                }
+                                live.status_tx.refresh_tray(tray, store, config)?;
+                            }
+                            Err(error) => {
+                                eprintln!("history edit: amend failed: {error}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("history edit: entry {} not found", edited.id);
+                    }
+                    Err(error) => {
+                        eprintln!("history edit: lookup failed: {error}");
+                    }
+                }
+            }
             IpcMessage::HistoryReinsertResponse(_) | IpcMessage::HistoryCopyResponse(_) => {
                 send_ipc_message(
                     &mut stream,
@@ -831,6 +861,7 @@ fn handle_connection(
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
+            | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
                 send_ipc_message(
                     &mut stream,
@@ -1840,6 +1871,12 @@ fn handle_tray_action(
             let id = parse_id_suffix(action, "insert:").expect("checked by guard");
             insert_entry_via_ime(stream, ctx.store, id)?;
         }
+        // "Edit…" opens the review dialog over a past history entry so the user
+        // can fix it; the result comes back as `HistoryEdited` (engine→daemon).
+        action if parse_id_suffix(action, "edit:").is_some() => {
+            let id = parse_id_suffix(action, "edit:").expect("checked by guard");
+            edit_entry_via_ime(stream, ctx.store, id)?;
+        }
         _ => handle_tray_callback(
             TrayCallback::Activate(action),
             tray,
@@ -1895,6 +1932,47 @@ fn insert_entry_via_ime(
         stream,
         &IpcMessage::InsertText(InsertText { text: entry.text }),
     )
+}
+
+/// Open the review dialog over a stored history entry so the user can fix a past
+/// take without typing anything into the active app. `stream` is the connected
+/// engine; if the entry is missing or the send fails it is logged, never fatal.
+fn edit_entry_via_ime(
+    stream: &mut UnixStream,
+    store: &SqliteMetadataStore,
+    id: i64,
+) -> Result<(), RunLoopError> {
+    let entry = store
+        .get_history_entry(id)
+        .map_err(|error| RunLoopError::storage("get history entry", error))?;
+    let Some(entry) = entry else {
+        eprintln!("tray edit: history entry {id} not found");
+        return Ok(());
+    };
+    send_ipc_message(
+        stream,
+        &IpcMessage::EditHistory(EditHistory { id, text: entry.text }),
+    )
+}
+
+/// Look up history entry `id` and amend its stored record and raw→corrected
+/// training pair with `corrected_text`. Returns `Ok(true)` if the entry was
+/// found and amended, `Ok(false)` if it was not found (non-fatal).
+fn apply_history_edit(
+    store: &mut SqliteMetadataStore,
+    id: i64,
+    corrected_text: &str,
+) -> Result<bool, RunLoopError> {
+    let entry = store
+        .get_history_entry(id)
+        .map_err(|error| RunLoopError::storage("get history entry", error))?;
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    store
+        .amend_correction(entry.session_id, &entry.text, corrected_text)
+        .map_err(|error| RunLoopError::storage("amend history edit", error))?;
+    Ok(true)
 }
 
 /// Persist a training-data retention value (in days) as the runtime override.
@@ -2232,6 +2310,7 @@ mod tests {
         assert_eq!(parse_id_suffix("delete:42", "delete:"), Some(42));
         assert_eq!(parse_id_suffix("delete:nan", "delete:"), None);
         assert_eq!(parse_id_suffix("copy:1", "delete:"), None);
+        assert_eq!(parse_id_suffix("edit:7", "edit:"), Some(7));
         assert_eq!(
             parse_index_suffix("settings:retention:2", "settings:retention:"),
             Some(2)
@@ -2378,6 +2457,106 @@ mod tests {
                 Ok(0) => {}
                 other => panic!("expected no data for a missing entry, got {other:?}"),
             }
+        }
+    }
+
+    mod edit_via_ime {
+        use std::io::{BufRead, BufReader, ErrorKind, Read};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_ipc::messages::IpcMessage;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::{apply_history_edit, edit_entry_via_ime};
+
+        /// Seed one committed history entry and return its store and row id.
+        fn store_with_entry(text: &str) -> (SqliteMetadataStore, i64) {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let session = store.create_session(Some(text)).expect("create");
+            store
+                .commit_session(session, text, "commit-1")
+                .expect("commit");
+            let id = store
+                .recent_history(10)
+                .expect("recent")
+                .first()
+                .expect("one entry")
+                .id;
+            (store, id)
+        }
+
+        #[test]
+        fn edit_sends_the_entry_text_as_edit_history_to_the_engine() {
+            // The daemon must forward an `EditHistory` (not `InsertText`) down the
+            // engine socket so the engine can seed the review dialog with the
+            // stored text. The id must round-trip so the engine's response carries
+            // the correct entry id back.
+            let (store, id) = store_with_entry("restart traefik");
+            let (engine_side, mut daemon_side) = UnixStream::pair().expect("socketpair");
+
+            edit_entry_via_ime(&mut daemon_side, &store, id).expect("edit");
+            drop(daemon_side);
+
+            let mut reader = BufReader::new(engine_side);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read");
+            assert!(
+                !line.is_empty(),
+                "edit must send a message, not type nothing"
+            );
+            match idiolect_ipc::framing::decode_json_line(&line).expect("decode") {
+                IpcMessage::EditHistory(edit) => {
+                    assert_eq!(edit.id, id);
+                    assert_eq!(edit.text, "restart traefik");
+                }
+                other => panic!("expected EditHistory, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn edit_of_a_missing_entry_sends_nothing() {
+            let (store, id) = store_with_entry("present");
+            let (engine_side, mut daemon_side) = UnixStream::pair().expect("socketpair");
+
+            edit_entry_via_ime(&mut daemon_side, &store, id + 999).expect("edit");
+
+            engine_side
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut buf = [0u8; 1];
+            match (&engine_side).read(&mut buf) {
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Ok(0) => {}
+                other => panic!("expected no data for a missing entry, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn apply_history_edit_amends_the_stored_entry() {
+            // A confirmed review: the stored text must be updated to the corrected
+            // form and the function returns Ok(true).
+            let (mut store, id) = store_with_entry("restart traffic");
+
+            let result = apply_history_edit(&mut store, id, "restart Traefik").expect("amend");
+            assert!(result, "should return true when entry found");
+
+            // The corrected text must be persisted so the tray lists the fix and a
+            // re-edit starts from it — not left stale on the original transcript.
+            let entry = store.get_history_entry(id).expect("lookup").expect("exists");
+            assert_eq!(entry.text, "restart Traefik");
+        }
+
+        #[test]
+        fn apply_history_edit_returns_false_for_missing_id() {
+            let (mut store, id) = store_with_entry("present");
+
+            let result =
+                apply_history_edit(&mut store, id + 999, "corrected").expect("no error");
+            assert!(!result, "should return false when entry not found");
         }
     }
 

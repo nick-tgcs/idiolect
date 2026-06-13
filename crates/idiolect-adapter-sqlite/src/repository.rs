@@ -988,10 +988,11 @@ impl SqliteMetadataStore {
         )
     }
 
-    /// Amend the most recently committed session with the user's in-place
-    /// correction: record the edit (committed → corrected) and rewrite the
-    /// training candidate so it carries a real raw→corrected signal instead of
-    /// `accepted_without_edit`. No-op when the text is unchanged.
+    /// Amend a committed session with the user's correction: record the edit
+    /// (committed → corrected), rewrite the training candidate so it carries a
+    /// real raw→corrected signal instead of `accepted_without_edit`, and refresh
+    /// the materialized history projection so the entry the tray shows reflects
+    /// the correction. No-op when the text is unchanged.
     pub fn amend_correction(
         &mut self,
         session_id: ImeSessionId,
@@ -1002,6 +1003,10 @@ impl SqliteMetadataStore {
             return Ok(());
         }
         let session_key = Self::session_key(session_id)?;
+        // Encode before opening the transaction: the cipher borrows `self`, which
+        // the live transaction's `&mut self.connection` would otherwise lock out
+        // (mirrors `commit_session`).
+        let history_text = self.encode_history_text(corrected_text)?;
         let transaction = backend_result(self.connection.transaction())?;
         if !Self::session_exists(&transaction, &session_key)? {
             return Err(SqliteStorageError::not_found(
@@ -1039,6 +1044,14 @@ impl SqliteMetadataStore {
                  source = ?2
              WHERE session_id = ?3",
             params![corrected_text, TRAINING_SOURCE_CORRECTED, session_key],
+        ))?;
+        // Keep the history projection (what the tray lists) in sync with the
+        // correction; the text is encrypted at rest like the original commit.
+        backend_result(transaction.execute(
+            "UPDATE ime_text_history
+             SET text = ?1
+             WHERE session_id = ?2 AND state = 'committed'",
+            params![history_text, session_key],
         ))?;
         backend_result(transaction.commit())?;
         Ok(())
@@ -2419,6 +2432,32 @@ mod amend_correction_tests {
                 "accepted_with_edit".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn amend_refreshes_the_displayed_history_text() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("restart traffic"))
+            .expect("create");
+        store
+            .commit_session(session, "restart traffic", "commit-1")
+            .expect("commit");
+
+        store
+            .amend_correction(session, "restart traffic", "restart Traefik")
+            .expect("amend");
+
+        // The tray reads the materialized projection, not the session row — so a
+        // correction must land there too or the listed entry stays stale.
+        let entry = store
+            .recent_history(10)
+            .expect("recent")
+            .into_iter()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.text, "restart Traefik");
     }
 
     #[test]

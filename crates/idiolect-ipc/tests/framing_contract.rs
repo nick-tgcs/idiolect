@@ -1,6 +1,6 @@
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::messages::{
-    ClientHello, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    ClientHello, EditHistory, HistoryEdited, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
 };
 
 #[test]
@@ -56,6 +56,34 @@ fn insert_text_round_trips_over_the_wire() {
     // the cursor; the message must survive the newline-JSON framing intact.
     let message = IpcMessage::InsertText(InsertText {
         text: "Deploy traefik and nginx".to_owned(),
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn edit_history_round_trips_over_the_wire() {
+    // The daemon asks the engine to reopen the review dialog over a stored entry
+    // so the user can retroactively fix it; id + text must survive framing intact.
+    let message = IpcMessage::EditHistory(EditHistory {
+        id: 42,
+        text: "deploy traffic and engine ex".to_owned(),
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn history_edited_round_trips_over_the_wire() {
+    // The engine returns the user's corrected text for a reviewed entry; the
+    // daemon amends the record and its training pair off this message.
+    let message = IpcMessage::HistoryEdited(HistoryEdited {
+        id: 42,
+        corrected_text: "deploy traefik and nginx".to_owned(),
     });
 
     let line = encode_json_line(&message).expect("message should encode");

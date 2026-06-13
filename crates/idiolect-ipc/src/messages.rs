@@ -62,6 +62,27 @@ pub struct InsertText {
     pub text: String,
 }
 
+/// Server→client request to open the review/correction dialog seeded with an
+/// existing history entry's text, so the user can retroactively fix a take that
+/// was committed without live review. Unlike [`InsertText`] it types nothing into
+/// the app: the user's edit comes back as [`HistoryEdited`] and only updates the
+/// stored record and its raw→corrected training pair.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EditHistory {
+    pub id: i64,
+    pub text: String,
+}
+
+/// Client→server result of an [`EditHistory`] review: the user's corrected text
+/// for history entry `id`. The daemon amends the stored entry and rewrites its
+/// training pair (raw stays the input, this becomes the target). Sent only when
+/// the user confirms; a cancelled dialog sends nothing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryEdited {
+    pub id: i64,
+    pub corrected_text: String,
+}
+
 /// Server→client push of the daemon's authoritative recording state. The daemon
 /// owns the microphone, so this is the single source of truth: adapters mirror it
 /// rather than tracking recording state locally. Sent once after the handshake and
@@ -118,7 +139,11 @@ pub enum IpcMessage {
     CommitPreedit(CommitPreedit),
     CancelPreedit,
     ReportCorrection(ReportCorrection),
+    /// Client→server: the user's corrected text from an [`EditHistory`] review.
+    HistoryEdited(HistoryEdited),
     InsertText(InsertText),
+    /// Server→client: open the review dialog over a stored history entry (see [`EditHistory`]).
+    EditHistory(EditHistory),
     Error(ErrorMessage),
     HistoryReinsert(HistoryReinsert),
     HistoryCopy(HistoryCopy),
