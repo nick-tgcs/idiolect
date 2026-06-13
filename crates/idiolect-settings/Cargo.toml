@@ -13,6 +13,7 @@ path = "src/main.rs"
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
 idiolect-application = { path = "../idiolect-application" }
 serde_json.workspace = true
+tiny-skia = "0.11"
 
 [lints]
 workspace = true

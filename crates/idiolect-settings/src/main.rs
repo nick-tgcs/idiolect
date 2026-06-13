@@ -22,8 +22,12 @@
 //! remaining unreachable sliver.
 
 use std::io::Write as _;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
+
+mod icon;
 use idiolect_application::use_cases::menu::{
     max_entries_radio, retention_radio, timing_radio, training_retention_radio,
     translation_input_language_for_index, translation_input_radio,
@@ -224,6 +228,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([560.0, 720.0])
             .with_min_inner_size([460.0, 420.0])
             .with_always_on_top()
+            .with_icon(Arc::new(icon::window_icon()))
             .with_title("Idiolect — Settings"),
         ..Default::default()
     };
@@ -235,7 +240,7 @@ fn main() -> eframe::Result<()> {
             install_theme(&cc.egui_ctx);
             Ok(Box::new(SettingsApp {
                 model,
-                ever_focused: false,
+                dismiss: Dismiss::default(),
             }))
         }),
     )
@@ -295,9 +300,70 @@ fn install_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// How long the window must stay unfocused AND stationary before a focus-loss is
+/// treated as a click-away and dismisses it. Long enough to ride over a WM move
+/// (focus returns when the drag ends) and the compositor's transient blips, short
+/// enough that clicking away still feels like dismissing a menu.
+const DISMISS_GRACE: Duration = Duration::from_millis(350);
+
+/// Decides when a focus-loss should close the window. Closing on click-away is
+/// intentional (it mirrors the tray menu it replaces), but a WM title-bar drag
+/// also drops focus while streaming new positions, and compositors emit the odd
+/// transient focus blip — both would otherwise slam the window shut. So a
+/// dismissal fires only once the window has been BOTH unfocused and stationary
+/// for [`DISMISS_GRACE`]: a move keeps resetting the timer (the position keeps
+/// changing), a blip refocuses before it elapses, and a genuine click-away rides
+/// it out. Pure and clock-injected so it is unit-tested without a display.
+#[derive(Default)]
+struct Dismiss {
+    ever_focused: bool,
+    last_pos: Option<(f32, f32)>,
+    idle_since: Option<Instant>,
+}
+
+impl Dismiss {
+    /// Feed one frame's `focused`/window-position; returns true to close now.
+    fn poll(&mut self, focused: bool, pos: Option<(f32, f32)>, now: Instant, grace: Duration) -> bool {
+        let moving = matches!(
+            (self.last_pos, pos),
+            (Some((ax, ay)), Some((bx, by))) if (ax - bx).abs() > 0.5 || (ay - by).abs() > 0.5
+        );
+        self.last_pos = pos;
+
+        if focused {
+            self.ever_focused = true;
+            self.idle_since = None;
+            return false;
+        }
+        // Opened (or still) without ever having had focus: never insta-close.
+        if !self.ever_focused {
+            return false;
+        }
+        if moving {
+            // Being dragged by the window manager — stay open, reset the timer.
+            self.idle_since = None;
+            return false;
+        }
+        // Unfocused and stationary: start (or continue) timing, and only dismiss
+        // once it has stayed that way for the whole grace.
+        match self.idle_since {
+            None => {
+                self.idle_since = Some(now);
+                false
+            }
+            Some(started) => now.duration_since(started) >= grace,
+        }
+    }
+
+    /// True while a dismissal is being timed, so the caller can schedule a repaint.
+    fn pending(&self) -> bool {
+        self.idle_since.is_some()
+    }
+}
+
 struct SettingsApp {
     model: Model,
-    ever_focused: bool,
+    dismiss: Dismiss,
 }
 
 /// Print one action line for the daemon, immediately (the pipe is line-read).
@@ -309,13 +375,18 @@ fn emit(action: &str) {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // "Click off" closes the window, like the menu it replaces. (Only after
-        // it actually had focus once — opening unfocused must not insta-close.)
+        // "Click off" closes the window, like the menu it replaces — but a window
+        // manager title-bar *move* also drops focus (while streaming the new
+        // position), so dismissal is debounced through `Dismiss`: it fires only on
+        // a sustained, stationary focus-loss (a real click-away), never mid-move
+        // and not on the compositor's occasional transient blip.
         let focused = ctx.input(|i| i.focused);
-        if focused {
-            self.ever_focused = true;
-        } else if self.ever_focused {
+        let pos = ctx.input(|i| i.viewport().outer_rect.map(|r| (r.min.x, r.min.y)));
+        if self.dismiss.poll(focused, pos, Instant::now(), DISMISS_GRACE) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if self.dismiss.pending() {
+            // Keep re-evaluating the grace even while no further input arrives.
+            ctx.request_repaint_after(DISMISS_GRACE);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -662,5 +733,79 @@ mod tests {
         let mut model = Model::from_json_line(STATE);
         model.toggle_translation();
         assert_eq!(model.translation_warning(), None);
+    }
+
+    mod dismiss {
+        use super::super::{Dismiss, DISMISS_GRACE};
+        use std::time::{Duration, Instant};
+
+        const GRACE: Duration = DISMISS_GRACE;
+        const POS: Option<(f32, f32)> = Some((100.0, 100.0));
+
+        #[test]
+        fn opening_unfocused_never_dismisses() {
+            // The window opens without focus (it must not steal it from the app);
+            // a stream of unfocused frames before it is ever focused must not close.
+            let mut d = Dismiss::default();
+            let t = Instant::now();
+            assert!(!d.poll(false, POS, t, GRACE));
+            assert!(!d.poll(false, POS, t + Duration::from_secs(5), GRACE));
+        }
+
+        #[test]
+        fn sustained_click_away_dismisses_after_the_grace() {
+            let mut d = Dismiss::default();
+            let t = Instant::now();
+            assert!(!d.poll(true, POS, t, GRACE), "gained focus");
+            // Stationary + unfocused, but the grace has not elapsed yet:
+            assert!(!d.poll(false, POS, t + Duration::from_millis(10), GRACE));
+            assert!(!d.poll(false, POS, t + Duration::from_millis(200), GRACE));
+            // Past the grace, still stationary and unfocused: a real click-away.
+            assert!(d.poll(false, POS, t + Duration::from_millis(400), GRACE));
+        }
+
+        #[test]
+        fn moving_the_window_never_dismisses_however_long_it_takes() {
+            // A WM title-bar drag drops focus and streams a new position every
+            // frame for well past the grace; the window must survive the whole move.
+            let mut d = Dismiss::default();
+            let t0 = Instant::now();
+            assert!(!d.poll(true, POS, t0, GRACE), "focused once");
+            let mut x = 100.0_f32;
+            for frame in 0..120 {
+                x += 3.0; // position changes every frame
+                let now = t0 + Duration::from_millis(50 + frame * 16);
+                assert!(
+                    !d.poll(false, Some((x, 100.0)), now, GRACE),
+                    "must not dismiss mid-move at frame {frame}"
+                );
+            }
+        }
+
+        #[test]
+        fn transient_blur_then_refocus_resets_and_does_not_dismiss() {
+            let mut d = Dismiss::default();
+            let t = Instant::now();
+            assert!(!d.poll(true, POS, t, GRACE));
+            // A couple of stationary unfocused frames (a compositor blip) under grace.
+            assert!(!d.poll(false, POS, t + Duration::from_millis(16), GRACE));
+            assert!(!d.poll(false, POS, t + Duration::from_millis(32), GRACE));
+            // Focus returns: the timer resets.
+            assert!(!d.poll(true, POS, t + Duration::from_millis(48), GRACE));
+            // A fresh brief blur must start timing again, not insta-close.
+            assert!(!d.poll(false, POS, t + Duration::from_millis(64), GRACE));
+        }
+
+        #[test]
+        fn click_away_after_a_move_still_dismisses() {
+            // Move ends (focus returns), then a genuine click-away must still work.
+            let mut d = Dismiss::default();
+            let t0 = Instant::now();
+            d.poll(true, Some((100.0, 100.0)), t0, GRACE);
+            d.poll(false, Some((130.0, 100.0)), t0 + Duration::from_millis(20), GRACE); // moving
+            d.poll(true, Some((160.0, 100.0)), t0 + Duration::from_millis(40), GRACE); // released
+            assert!(!d.poll(false, Some((160.0, 100.0)), t0 + Duration::from_millis(60), GRACE));
+            assert!(d.poll(false, Some((160.0, 100.0)), t0 + Duration::from_millis(500), GRACE));
+        }
     }
 }
