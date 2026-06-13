@@ -291,15 +291,15 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
     drop(conn);
 }
 
-/// The reported bug, deterministic and headless: the SAME direct take as above but
-/// with NO `FocusIn` (so `active_path` stays `None`, exactly as when idiolect is not
-/// the focused IBus context). The engine still reports the commit back to the daemon
-/// (the take is recorded — `CommitPreedit`), but emits NO `CommitText`: the text is
-/// typed into no app. This pins both the user-visible symptom and the training-data
-/// hazard — a "committed" pair whose text never landed. Only `FocusIn` differs from
-/// the test above, so `active_path` is proven to be the cause.
+/// The belt-and-braces behaviour for "no focused context": the SAME direct take as
+/// above but with NO `FocusIn` (so `active_path` stays `None`, as when idiolect is
+/// not the focused IBus context). Rather than silently lose the text into nowhere
+/// AND let the daemon bank a never-landed training pair, the engine DISCARDS the
+/// take — it sends `CancelPreedit` (not `CommitPreedit`) and emits no `CommitText`.
+/// Only `FocusIn` differs from the test above, so `active_path` is proven to be the
+/// cause, and a missing target no longer poisons the corpus.
 #[tokio::test]
-async fn direct_transcript_without_focus_in_is_recorded_but_not_typed() {
+async fn direct_transcript_without_focus_in_is_discarded_not_typed_or_recorded() {
     let Some(bus) = PrivateBus::start() else {
         panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
     };
@@ -329,16 +329,76 @@ async fn direct_transcript_without_focus_in_is_recorded_but_not_typed() {
         }),
     );
 
-    // The take WAS processed (engine reports the commit so the daemon records it)...
-    expect_commit_preedit(&mut server_reader);
-    // ...but nothing reached the app: a bounded wait for CommitText times out.
+    // No focused context: the engine discards the take (cancels it daemon-side)
+    // rather than recording a pair whose text never landed...
+    expect_cancel_preedit(&mut server_reader);
+    // ...and nothing reaches the app.
     let typed = {
         use futures_util::StreamExt;
         tokio::time::timeout(Duration::from_secs(2), commit_signals.next()).await
     };
     assert!(
         typed.is_err(),
-        "with no focused context the transcript is recorded but dropped, not typed (the bug)"
+        "with no focused context the transcript is discarded, not typed"
+    );
+
+    drop(engine);
+    drop(conn);
+}
+
+/// Invalidate-on-destroy: a context that had focus is destroyed (the app/window
+/// went away), so `active_path` must not keep pointing at it. After `Destroy`, a
+/// direct take has no live target and is discarded — proving the dead context is
+/// no longer a stale commit destination.
+#[tokio::test]
+async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-direct-destroyed");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, mut server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Focus the context (sets active_path), then destroy it (must clear active_path).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+    engine_proxy
+        .call::<_, _, ()>("Destroy", &())
+        .await
+        .expect("Destroy");
+
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: DRAFT.to_owned(),
+            review: false,
+            partial: false,
+        }),
+    );
+
+    // The dead context is not targeted: the take is discarded, nothing is typed.
+    expect_cancel_preedit(&mut server_reader);
+    let typed = {
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(2), commit_signals.next()).await
+    };
+    assert!(
+        typed.is_err(),
+        "a destroyed context must not receive a CommitText"
     );
 
     drop(engine);
@@ -400,6 +460,21 @@ fn expect_commit_preedit(reader: &mut BufReader<UnixStream>) {
             assert_eq!(text, DRAFT, "the take is committed daemon-side")
         }
         other => panic!("expected CommitPreedit, got {other:?}"),
+    }
+}
+
+/// The engine discards an un-typeable take by cancelling it daemon-side — assert
+/// that `CancelPreedit` (so no history row and no training pair is recorded).
+fn expect_cancel_preedit(reader: &mut BufReader<UnixStream>) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read CancelPreedit");
+    match decode_json_line(&line).expect("decode") {
+        IpcMessage::CancelPreedit => {}
+        other => panic!("expected CancelPreedit, got {other:?}"),
     }
 }
 

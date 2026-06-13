@@ -357,6 +357,24 @@ where
         self.state = State::Idle;
     }
 
+    /// A finished direct (review-off) take arrived but the engine has no focused
+    /// context to type it into. Rather than silently lose the text into nowhere —
+    /// and let the daemon bank a "you accepted this" training pair that never
+    /// landed — discard the take (cancel it daemon-side); the user re-dictates
+    /// into a focused field. Like [`on_transcript`](Self::on_transcript) it acts
+    /// only on a live take; a stray/late transcript is ignored.
+    pub fn on_transcript_without_target(&mut self) {
+        match self.state {
+            State::Recording => {}
+            State::Reviewing if self.recording => {}
+            _ => return,
+        }
+        self.daemon.cancel();
+        self.pending_tail = None;
+        self.review = None;
+        self.state = State::Idle;
+    }
+
     /// Focus left the input context — close any open correction window.
     pub fn on_focus_out(&mut self) {
         if self.state == State::Reviewing {
@@ -456,6 +474,35 @@ mod tests {
         assert!(!s.on_key(Key::Passthrough));
         assert_eq!(s.state(), State::Idle);
         assert!(s.daemon.events.is_empty());
+    }
+
+    #[test]
+    fn direct_transcript_without_target_discards_the_take() {
+        // A finished direct take with no focused context to type into: nothing is
+        // typed, and the take is cancelled daemon-side (so no never-landed training
+        // pair is recorded), returning to idle.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_key(Key::Trigger);
+        s.on_transcript_without_target();
+
+        assert!(s.surface.committed.is_empty(), "nothing is typed");
+        assert_eq!(
+            s.daemon.events,
+            ["toggle", "toggle", "cancel"],
+            "the take is cancelled daemon-side, not committed"
+        );
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn discard_without_target_ignores_a_stray_transcript_when_idle() {
+        // No take in progress: the call must not cancel anything.
+        let mut s = session();
+        s.on_transcript_without_target();
+        assert!(s.daemon.events.is_empty(), "no live take -> no cancel");
+        assert_eq!(s.state(), State::Idle);
     }
 
     #[test]

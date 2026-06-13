@@ -88,6 +88,15 @@ impl Shared {
         *self.active_path.lock().expect("active_path mutex") = Some(path.clone());
     }
 
+    /// Forget the active target if it is this (now-gone) context, so a destroyed
+    /// or disabled context can never be a stale commit target.
+    fn clear_active_if(&self, path: &OwnedObjectPath) {
+        let mut active = self.active_path.lock().expect("active_path mutex");
+        if active.as_ref() == Some(path) {
+            *active = None;
+        }
+    }
+
     /// Run a session operation and return the resulting surface ops (lock held
     /// only briefly; never nested with `active_path`).
     fn run_session<F: FnOnce(&mut Session<DaemonSender, PendingSurface>)>(
@@ -277,9 +286,11 @@ impl IbusEngine {
     }
     async fn disable(&self) {
         dbg_edit("disable");
+        self.shared.clear_active_if(&self.path);
     }
     async fn destroy(&self) {
         dbg_edit("destroy");
+        self.shared.clear_active_if(&self.path);
     }
 
     async fn set_capabilities(&self, caps: u32) {
@@ -448,8 +459,15 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                             shared.run_session(|s| s.cancel_reviewed())
                         }
                     }
-                } else {
+                } else if shared.active_path.lock().expect("active_path mutex").is_some() {
+                    // Direct (review-off) take with a focused context to type into.
                     shared.run_session(|s| s.on_transcript(update.text))
+                } else {
+                    // Direct take but NO focused context: typing would lose the
+                    // text into nowhere AND the daemon would bank a never-landed
+                    // training pair. Discard it instead (and trace it loudly).
+                    dbg_edit("direct transcript with no active_path: discarding take (not typed, not recorded)");
+                    shared.run_session(|s| s.on_transcript_without_target())
                 }
             }
             Ok(IpcMessage::InsertText(insert)) => {
