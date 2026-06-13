@@ -202,6 +202,11 @@ fn ibus_text_str(value: &Value<'_>) -> String {
 
 async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
     for SurfaceOp::Commit { text } in ops {
+        dbg_edit(&format!(
+            "emit CommitText -> {} : {:?}",
+            engine_path.as_str(),
+            text
+        ));
         let result = conn
             .emit_signal(
                 None::<&str>,
@@ -390,8 +395,13 @@ impl Trigger {
             .lock()
             .expect("active_path mutex")
             .clone();
-        if let Some(path) = target {
-            emit_surface_ops(&self.shared.connection, &path, ops).await;
+        match target {
+            Some(path) => emit_surface_ops(&self.shared.connection, &path, ops).await,
+            None if !ops.is_empty() => dbg_edit(&format!(
+                "toggle emit DROPPED: active_path None — {} op(s) NOT typed",
+                ops.len()
+            )),
+            None => {}
         }
     }
 }
@@ -498,8 +508,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
             .lock()
             .expect("active_path mutex")
             .clone();
-        if let Some(path) = target {
-            handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
+        match target {
+            Some(path) => handle.block_on(emit_surface_ops(&shared.connection, &path, ops)),
+            // No focused IBus context to type into: the transcript is still
+            // recorded daemon-side but lands in no app. Trace it — this otherwise
+            // silent drop is exactly the "text in history but not in the app" bug.
+            None if !ops.is_empty() => dbg_edit(&format!(
+                "emit DROPPED: active_path None — {} commit op(s) NOT typed into any app",
+                ops.len()
+            )),
+            None => {}
         }
     });
 }
