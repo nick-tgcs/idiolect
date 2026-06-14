@@ -353,11 +353,14 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   e2e proving a production-computed digest flows through `build_v2`. **Still TODO:**
   the `synced` status const + setter (rolls into S1). **Exit (met):** desktop
   manifest validation works on real captures.
-- **S1 — Delete-after-ship locally.** `mark_synced_and_drop_audio` (status flip +
-  `delete_source_audio_for`) + the outbox query (`status = 'captured'`).
-  *Tests:* integration — audio file gone, row+transcript survive, training still
-  runs; property test that an un-synced candidate is never dropped. **Exit:**
-  storage reclaim proven on desktop.
+- **S1 — Delete-after-ship locally.** ✅ **Done.** `TRAINING_STATUS_SYNCED` +
+  `mark_synced_and_drop_audio` (status flip committed *before* the narrow
+  `delete_source_audio_for`) + the outbox query `training_candidates_pending_sync`
+  (`status = 'captured'`); the manifest feed now excludes `synced` too (shared
+  `collect_candidates` helper). *Tests (green, [sync_reclaim.rs](crates/idiolect-integration-tests/tests/sync_reclaim.rs)):*
+  integration — audio file gone, row+transcript survive, synced candidate leaves
+  both manifest and outbox while the un-synced one is untouched and still trains;
+  unknown candidate errors. **Exit (met):** storage reclaim proven on desktop.
 - **S2 — Transport + ingest on one box.** `idiolect-sync-server` (axum) +
   `idiolect-sync-client`; an `idiolect-cli sync push` subcommand. *Tests:* e2e —
   capture in data-root A → POST over loopback/Tailscale → `trainerctl revalidate`
@@ -508,10 +511,14 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
 2. ✅ **S0b — done.** `idiolect-sync` crate: `SyncLearning`/`SyncBatch`/`SyncBatchEnvelope`
    DTOs + a length-prefixed binary container codec (`encode_batch`/`decode_batch`),
    round-trip and framing-error tests green.
-3. **NEXT — S1 + M2 (parallelisable):** S1 = `synced` status const + setter +
-   `mark_synced_and_drop_audio` (delete-after-ship, narrow `delete_source_audio_for`).
-   M2 = lift the streaming orchestration into `idiolect-application/streaming.rs`,
-   rewire `run_loop`, prove behaviour-neutral against the existing daemon tests.
+3. ✅ **S1 — done.** `TRAINING_STATUS_SYNCED` + `mark_synced_and_drop_audio`
+   (delete-after-ship via the narrow `delete_source_audio_for`) + the
+   `training_candidates_pending_sync` outbox; manifest feed excludes `synced`.
+4. **NEXT — S2 + M2 (parallelisable):** S2 = `idiolect-sync-server` (axum) +
+   `idiolect-sync-client` + an `idiolect-cli sync push`, validating the whole
+   protocol on one box before any Kotlin. M2 = lift the streaming orchestration
+   into `idiolect-application/streaming.rs`, rewire `run_loop`, prove
+   behaviour-neutral against the existing daemon tests.
 
 ---
 

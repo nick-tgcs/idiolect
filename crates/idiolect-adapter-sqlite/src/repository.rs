@@ -30,6 +30,11 @@ const SESSION_STATE_CANCELLED: &str = "cancelled";
 const TRAINING_SOURCE_ACCEPTED: &str = "accepted_without_edit";
 const TRAINING_SOURCE_CORRECTED: &str = "accepted_with_edit";
 const TRAINING_STATUS_CAPTURED: &str = "captured";
+/// A candidate whose learning has been shipped to the PC and whose source audio
+/// has been dropped locally to reclaim storage. The row + transcript survive,
+/// but it leaves the manifest feed (no audio to train on) and the sync outbox
+/// (already shipped). Freeform `TEXT` column — no migration needed.
+const TRAINING_STATUS_SYNCED: &str = "synced";
 const CAPTURE_QUALITY_LIVE: &str = "live";
 const CANCEL_PAYLOAD: &str = "cancelled";
 const DEFAULT_USER_ID: &str = "default";
@@ -1197,15 +1202,40 @@ impl SqliteMetadataStore {
         Ok(candidates)
     }
 
+    /// Candidates eligible for a training manifest: everything except `rejected`
+    /// (untrustworthy text) and `synced` (audio dropped after shipping, so there
+    /// is nothing left to train on locally).
     pub fn training_candidates_for_manifest_v2(
         &self,
         user_id: &str,
+    ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
+        self.collect_candidates(user_id, "tc.status NOT IN ('rejected', 'synced')")
+    }
+
+    /// The sync outbox: candidates captured locally but not yet shipped to the
+    /// PC. Only `captured` rows — `rejected` are untrainable and `synced` already
+    /// left. Same shape as the manifest feed so the sync client maps them
+    /// straight to `SyncLearning`s.
+    pub fn training_candidates_pending_sync(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
+        self.collect_candidates(user_id, "tc.status = 'captured'")
+    }
+
+    /// Shared projection behind the manifest feed and the sync outbox. The
+    /// `status_predicate` is a trusted in-crate literal (never user input), so
+    /// interpolating it is safe.
+    fn collect_candidates(
+        &self,
+        user_id: &str,
+        status_predicate: &str,
     ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
         if self.user_data_deleted_event_count(user_id)? > 0 {
             return Ok(Vec::new());
         }
 
-        let mut statement = backend_result(self.connection.prepare(
+        let sql = format!(
             "SELECT tc.id,
                     s.user_id,
                     u.id,
@@ -1220,9 +1250,10 @@ impl SqliteMetadataStore {
              JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
              JOIN utterances AS u ON u.id = tc.utterance_id
              WHERE s.user_id = ?1
-               AND tc.status != 'rejected'
-             ORDER BY tc.id",
-        ))?;
+               AND {status_predicate}
+             ORDER BY tc.id"
+        );
+        let mut statement = backend_result(self.connection.prepare(&sql))?;
         let rows = backend_result(statement.query_map([user_id], |row| {
             let trust_score = row.get::<_, f64>(9)?;
             Ok(ManifestV2TrainingCandidate {
@@ -1299,6 +1330,54 @@ impl SqliteMetadataStore {
                 &candidate_id.to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Delete-after-ship: mark a candidate `synced` and drop **only** its source
+    /// audio, keeping the row + transcript. Used once a learning is durably
+    /// stored on the PC, to reclaim phone storage without losing the record of
+    /// what was said. Narrow by construction — it never touches other rows or the
+    /// cascading delete in [`prune_training_data`].
+    ///
+    /// The status flip is committed *before* the file delete: a crash in between
+    /// leaves a `synced` row with a stale (harmless) audio file that the next
+    /// retention prune reclaims — far better than dropping audio under a row that
+    /// still looks shippable.
+    pub fn mark_synced_and_drop_audio(
+        &mut self,
+        candidate_id: i64,
+        audio_store: &FileAudioStore,
+    ) -> Result<(), SqliteStorageError> {
+        let (user_id, utterance_id) = {
+            let mut statement = backend_result(self.connection.prepare(
+                "SELECT s.user_id, tc.utterance_id
+                 FROM training_candidates AS tc
+                 JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+                 WHERE tc.id = ?1",
+            ))?;
+            let mut rows = backend_result(statement.query(params![candidate_id]))?;
+            match backend_result(rows.next())? {
+                Some(row) => (
+                    backend_result(row.get::<_, String>(0))?,
+                    backend_result(row.get::<_, String>(1))?,
+                ),
+                None => {
+                    return Err(SqliteStorageError::not_found(
+                        "training candidate",
+                        &candidate_id.to_string(),
+                    ));
+                }
+            }
+        };
+
+        backend_result(self.connection.execute(
+            "UPDATE training_candidates SET status = ?1 WHERE id = ?2",
+            params![TRAINING_STATUS_SYNCED, candidate_id],
+        ))?;
+
+        audio_store
+            .delete_source_audio_for(&user_id, &utterance_id)
+            .map_err(SqliteStorageError::audio_delete)?;
         Ok(())
     }
 

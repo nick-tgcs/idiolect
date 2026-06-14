@@ -420,10 +420,11 @@ existing IBus/eframe caveats.
   capture now **populates `utterances.audio_sha256` (desktop too)** via
   `persist_session` → `set_audio_digest` — this also unblocks manifest validation,
   which rejects empty digests.
-- **S1 — Delete-after-ship locally.** Add the `synced` status +
-  `mark_synced_and_drop_audio` (status flip + `delete_source_audio_for`) + the
-  outbox query (`status NOT IN ('synced','rejected')`). Prove on desktop that
-  audio can be dropped while row+transcript survive and training still runs.
+- **S1 — Delete-after-ship locally.** ✅ **Done.** Added the `synced` status +
+  `mark_synced_and_drop_audio` (status flip then narrow `delete_source_audio_for`)
+  + the outbox query `training_candidates_pending_sync` (`status = 'captured'`);
+  the manifest feed now also excludes `synced`. Proven on desktop: audio dropped
+  while row+transcript survive and the remaining captured candidate still trains.
 - **S2 — Transport + ingest on one box.** Stand up the HTTP ingest beside the
   Unix listener; add an `idiolect-cli` subcommand that POSTs a batch from one
   data-root to another over loopback/Tailscale and reclaims on ACK. E2E: capture
