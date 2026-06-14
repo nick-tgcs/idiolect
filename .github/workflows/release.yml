@@ -52,7 +52,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev
 
       - name: Build FCITX5
         run: |
@@ -70,16 +70,31 @@ jobs:
       - name: Verify package
         run: bash ci/scripts/test-package-smoke.sh && bash ci/scripts/test-package-lifecycle.sh
 
+      # Stage into a flat dir before upload. upload-artifact@v4 preserves the
+      # directory structure relative to the least-common ancestor of its paths,
+      # so mixing target/release/* with target/package/*.deb would bury files
+      # under release/ and package/ and break the flat paths the release step
+      # expects. The `cp` of explicit binaries also fails the job loudly if a
+      # binary name ever drifts (bash runs with `set -e`).
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/idiolectd \
+             target/release/idiolect-cli \
+             target/release/idiolect-trainerctl \
+             dist/
+          cp target/package/*.deb dist/
+          ls -l dist
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-artifacts
-          path: |
-            target/release/idiolect
-            target/release/idiolect-cli
-            target/release/idiolectd
-            target/release/idiolect-trainerctl
-            target/package/*.deb
+          # The `.deb` is the primary distributable; the loose binaries are a
+          # convenience. (There is no bare `idiolect` binary — the CLI ships as
+          # `idiolect-cli`.)
+          if-no-files-found: error
+          path: dist/
           retention-days: 30
 
   # =========================================================================
@@ -103,11 +118,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-artifacts/idiolect
-            release-artifacts/idiolect-cli
             release-artifacts/idiolectd
+            release-artifacts/idiolect-cli
             release-artifacts/idiolect-trainerctl
             release-artifacts/*.deb
+          fail_on_unmatched_files: true
           generate_release_notes: true
           draft: false
           prerelease: false

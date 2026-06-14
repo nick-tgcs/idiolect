@@ -2,15 +2,27 @@
 //! text in an editable box we fully control, so the user's correction can be
 //! captured no matter which application the text is destined for.
 //!
+//! The dialog is also the live mid-take surface: in "review before insert"
+//! mode the engine opens it at the first pause and streams each snippet into
+//! it, so the user watches the conversation grow in the SAME window that they
+//! will edit at stop — there is no separate preview.
+//!
 //! Protocol (so the toolkit stays swappable behind the engine's `ReviewDialog`):
-//!   stdin  : the raw transcript to review (UTF-8).
+//!   stdin  : one command per line —
+//!              `append <payload>` : one more pause-snippet; the dialog shows
+//!                                   it read-only in its "listening" state.
+//!              `final <payload>`  : the take is over; the full merged text
+//!                                   replaces the draft, the dialog takes
+//!                                   focus and becomes editable.
+//!            Payloads escape backslash as `\\` and newline as `\n`.
+//!            EOF before any `final` means the take was cancelled: close.
 //!   stdout : on confirm, the final edited text; process exits 0.
 //!   exit 1 : the user cancelled (nothing written).
 //!
 //! This is one interchangeable implementation; the engine only knows the
 //! stdin/stdout contract, never egui.
 
-use std::io::Read;
+use std::io::BufRead;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -22,15 +34,46 @@ struct Outcome {
     confirmed: bool,
 }
 
-fn main() -> eframe::Result<()> {
-    let mut transcript = String::new();
-    let _ = std::io::stdin().read_to_string(&mut transcript);
-    let transcript = transcript.trim_end_matches('\n').to_owned();
+/// Lines arriving from the engine on stdin, drained by the UI each frame.
+#[derive(Default)]
+struct Feed {
+    lines: Vec<String>,
+    eof: bool,
+}
 
-    let outcome = Arc::new(Mutex::new(Outcome {
-        text: transcript.clone(),
-        confirmed: false,
-    }));
+/// Decode a protocol payload: `\\` is a backslash, `\n` a newline.
+fn unescape_payload(payload: &str) -> String {
+    let mut output = String::with_capacity(payload.len());
+    let mut escaping = false;
+    for character in payload.chars() {
+        if escaping {
+            match character {
+                'n' => output.push('\n'),
+                other => output.push(other),
+            }
+            escaping = false;
+        } else if character == '\\' {
+            escaping = true;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn main() -> eframe::Result<()> {
+    let feed = Arc::new(Mutex::new(Feed::default()));
+    let reader_feed = Arc::clone(&feed);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            reader_feed.lock().expect("feed mutex").lines.push(line);
+        }
+        reader_feed.lock().expect("feed mutex").eof = true;
+    });
+
+    let outcome = Arc::new(Mutex::new(Outcome::default()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -39,6 +82,10 @@ fn main() -> eframe::Result<()> {
             .with_resizable(true)
             .with_decorations(false)
             .with_always_on_top()
+            // The dialog can open mid-take (first pause): it must not steal
+            // keystrokes from the app the user is dictating into. It takes
+            // focus itself when the `final` text arrives.
+            .with_active(false)
             .with_title("Idiolect — review"),
         ..Default::default()
     };
@@ -49,7 +96,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx);
-            Ok(Box::new(ReviewApp::new(transcript.clone(), app_outcome)))
+            Ok(Box::new(ReviewApp::new(feed, app_outcome)))
         }),
     )?;
 
@@ -63,6 +110,7 @@ fn main() -> eframe::Result<()> {
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);
+const LIVE: egui::Color32 = egui::Color32::from_rgb(235, 87, 87);
 const BG: egui::Color32 = egui::Color32::from_rgb(22, 23, 30);
 const SURFACE: egui::Color32 = egui::Color32::from_rgb(31, 33, 43);
 const FIELD: egui::Color32 = egui::Color32::from_rgb(16, 17, 23);
@@ -127,18 +175,42 @@ fn install_theme(ctx: &egui::Context) {
 
 struct ReviewApp {
     text: String,
+    /// True while the take is still recording: text is read-only and grows
+    /// per pause; confirm/cancel are disabled until `final` arrives.
+    listening: bool,
     outcome: Arc<Mutex<Outcome>>,
+    feed: Arc<Mutex<Feed>>,
     focused: bool,
     centered: bool,
 }
 
 impl ReviewApp {
-    fn new(text: String, outcome: Arc<Mutex<Outcome>>) -> Self {
+    fn new(feed: Arc<Mutex<Feed>>, outcome: Arc<Mutex<Outcome>>) -> Self {
         Self {
-            text,
+            text: String::new(),
+            listening: true,
             outcome,
+            feed,
             focused: false,
             centered: false,
+        }
+    }
+
+    /// Apply one protocol line. Returns true when this line ended the
+    /// listening state (the caller then raises the window).
+    fn apply_line(&mut self, line: &str) -> bool {
+        if let Some(payload) = line.strip_prefix("append ") {
+            self.text.push_str(&unescape_payload(payload));
+            false
+        } else if let Some(payload) = line.strip_prefix("final ") {
+            self.text = unescape_payload(payload);
+            let was_listening = self.listening;
+            self.listening = false;
+            // Re-request focus so the now-editable field is ready to type in.
+            self.focused = false;
+            was_listening
+        } else {
+            false
         }
     }
 
@@ -178,13 +250,38 @@ impl ReviewApp {
     /// The per-frame draw, split out of `eframe::App::update` so it can be
     /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
     fn ui(&mut self, ctx: &egui::Context) {
+        // Drain the engine's feed first so this frame draws the latest state.
+        let (lines, eof) = {
+            let mut feed = self.feed.lock().expect("feed mutex");
+            (std::mem::take(&mut feed.lines), feed.eof)
+        };
+        let mut finalized = false;
+        for line in &lines {
+            finalized |= self.apply_line(line);
+        }
+        if finalized {
+            // The take ended: now (and only now) the dialog may take focus,
+            // so Ctrl+Enter / typing land here instead of in the user's app.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if eof && self.listening {
+            // The engine went away before the take finished (cancel, error,
+            // daemon restart): close without a result.
+            self.finish(ctx, false);
+            return;
+        }
+
         self.center(ctx);
         let mut action: Option<bool> = None; // Some(true)=insert, Some(false)=cancel
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            action = Some(false);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) {
-            action = Some(true);
+                                             // Keys act only if the frame STARTED reviewable — a keystroke racing
+                                             // the `final` line must not confirm text the user never saw.
+        if !self.listening && !finalized {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                action = Some(false);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) {
+                action = Some(true);
+            }
         }
 
         // Draggable header (the window is frameless) + title and hint.
@@ -197,23 +294,26 @@ impl ReviewApp {
             }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let (title, color) = if self.listening {
+                        ("● Listening", LIVE)
+                    } else {
+                        ("Review dictation", TEXT)
+                    };
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Review dictation")
-                                .heading()
-                                .strong()
-                                .color(TEXT),
+                            egui::RichText::new(title).heading().strong().color(color),
                         )
                         .selectable(false),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let hint = if self.listening {
+                            "Keep talking — Super+T to finish"
+                        } else {
+                            "Ctrl+Enter to insert  ·  Esc to cancel"
+                        };
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new("Ctrl+Enter to insert  ·  Esc to cancel")
-                                    .small()
-                                    .color(MUTED),
-                            )
-                            .selectable(false),
+                            egui::Label::new(egui::RichText::new(hint).small().color(MUTED))
+                                .selectable(false),
                         );
                     });
                 });
@@ -245,20 +345,21 @@ impl ReviewApp {
                     )
                     .fill(ACCENT)
                     .min_size(egui::vec2(104.0, 34.0));
-                    if ui.add(insert).clicked() {
+                    if ui.add_enabled(!self.listening, insert).clicked() {
                         action = Some(true);
                     }
                     ui.add_space(4.0);
                     let cancel = egui::Button::new(egui::RichText::new("Cancel").color(MUTED))
                         .fill(SURFACE)
                         .min_size(egui::vec2(96.0, 34.0));
-                    if ui.add(cancel).clicked() {
+                    if ui.add_enabled(!self.listening, cancel).clicked() {
                         action = Some(false);
                     }
                 });
             });
 
-        // The editable transcript fills the space between, scrolling if long.
+        // The transcript fills the space between, scrolling if long. Read-only
+        // while listening (the daemon owns the text until the take ends).
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
                 left: 22.0,
@@ -267,26 +368,25 @@ impl ReviewApp {
                 bottom: 2.0,
             }))
             .show(ctx, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "Edit it however you like — your fix is recorded for training.",
-                        )
-                        .color(MUTED),
-                    )
-                    .selectable(false),
-                );
+                let blurb = if self.listening {
+                    "Each pause adds a phrase. Nothing is typed until you finish."
+                } else {
+                    "Edit it however you like — your fix is recorded for training."
+                };
+                ui.add(egui::Label::new(egui::RichText::new(blurb).color(MUTED)).selectable(false));
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical()
+                    .stick_to_bottom(self.listening)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let edit = egui::TextEdit::multiline(&mut self.text)
                             .desired_width(f32::INFINITY)
                             .desired_rows(6)
+                            .interactive(!self.listening)
                             .font(egui::TextStyle::Body)
                             .margin(egui::vec2(12.0, 10.0));
                         let response = ui.add_sized(ui.available_size(), edit);
-                        if !self.focused {
+                        if !self.listening && !self.focused {
                             response.request_focus();
                             self.focused = true;
                         }
@@ -296,6 +396,12 @@ impl ReviewApp {
         if let Some(confirmed) = action {
             self.finish(ctx, confirmed);
         }
+
+        // Poll the feed even while idle so new snippets (and the final text)
+        // appear without user interaction.
+        if self.listening {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
     }
 }
 
@@ -303,10 +409,15 @@ impl ReviewApp {
 mod tests {
     use super::*;
 
-    fn app(text: &str) -> (ReviewApp, Arc<Mutex<Outcome>>) {
+    fn app() -> (ReviewApp, Arc<Mutex<Outcome>>, Arc<Mutex<Feed>>) {
         let outcome = Arc::new(Mutex::new(Outcome::default()));
-        let app = ReviewApp::new(text.to_owned(), Arc::clone(&outcome));
-        (app, outcome)
+        let feed = Arc::new(Mutex::new(Feed::default()));
+        let app = ReviewApp::new(Arc::clone(&feed), Arc::clone(&outcome));
+        (app, outcome, feed)
+    }
+
+    fn push(feed: &Arc<Mutex<Feed>>, line: &str) {
+        feed.lock().unwrap().lines.push(line.to_owned());
     }
 
     fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
@@ -324,6 +435,17 @@ mod tests {
         input
     }
 
+    fn ctrl_enter() -> egui::RawInput {
+        key(
+            egui::Key::Enter,
+            egui::Modifiers {
+                command: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        )
+    }
+
     fn run(app: &mut ReviewApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
@@ -331,43 +453,101 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_frame_without_input_and_does_not_confirm() {
-        let (mut app, outcome) = app("hello world");
+    fn unescape_decodes_newlines_and_backslashes() {
+        assert_eq!(unescape_payload("a\\nb"), "a\nb");
+        assert_eq!(unescape_payload("a\\\\nb"), "a\\nb");
+        assert_eq!(unescape_payload("plain"), "plain");
+    }
+
+    #[test]
+    fn appended_snippets_accumulate_while_listening() {
+        let (mut app, _, feed) = app();
+        push(&feed, "append hello");
+        run(&mut app, egui::RawInput::default());
+        push(&feed, "append  world");
+        run(&mut app, egui::RawInput::default());
+        assert_eq!(app.text, "hello world");
+        assert!(app.listening, "still mid-take");
+    }
+
+    #[test]
+    fn confirm_and_cancel_are_inert_while_listening() {
+        let (mut app, outcome, feed) = app();
+        push(&feed, "append draft");
+        run(&mut app, ctrl_enter());
+        assert!(
+            !outcome.lock().unwrap().confirmed,
+            "Ctrl+Enter ignored mid-take"
+        );
+        run(&mut app, key(egui::Key::Escape, egui::Modifiers::default()));
+        assert!(app.listening, "Escape ignored mid-take");
+        assert_eq!(app.text, "draft", "text survives");
+    }
+
+    #[test]
+    fn final_replaces_the_draft_and_enables_confirm() {
+        let (mut app, outcome, feed) = app();
+        push(&feed, "append helo");
+        run(&mut app, egui::RawInput::default());
+        push(&feed, "final hello world");
+        run(&mut app, egui::RawInput::default());
+        assert!(!app.listening);
+        assert_eq!(
+            app.text, "hello world",
+            "merged final text replaces the draft"
+        );
+
+        app.text = "hello world!".to_owned(); // user edited the field
+        run(&mut app, ctrl_enter());
+        let out = outcome.lock().unwrap();
+        assert!(out.confirmed);
+        assert_eq!(out.text, "hello world!");
+    }
+
+    #[test]
+    fn final_without_any_appends_goes_straight_to_review() {
+        // A take with no mid-take pause: the dialog opens already finalized.
+        let (mut app, outcome, feed) = app();
+        push(&feed, "final quick note");
+        run(&mut app, ctrl_enter());
+        // The final applies on the same frame, but the key arrived before the
+        // user could see the text — the NEXT Ctrl+Enter confirms.
+        run(&mut app, ctrl_enter());
+        let out = outcome.lock().unwrap();
+        assert!(out.confirmed);
+        assert_eq!(out.text, "quick note");
+    }
+
+    #[test]
+    fn escape_cancels_after_final() {
+        let (mut app, outcome, feed) = app();
+        push(&feed, "final text");
+        run(&mut app, egui::RawInput::default());
+        run(&mut app, key(egui::Key::Escape, egui::Modifiers::default()));
+        assert!(!outcome.lock().unwrap().confirmed);
+    }
+
+    #[test]
+    fn eof_before_final_closes_without_confirming() {
+        // Cancelled take / engine death: the feed ends with no final line.
+        let (mut app, outcome, feed) = app();
+        push(&feed, "append doomed");
+        feed.lock().unwrap().eof = true;
         run(&mut app, egui::RawInput::default());
         assert!(!outcome.lock().unwrap().confirmed);
     }
 
     #[test]
-    fn ctrl_enter_confirms_with_the_edited_text() {
-        let (mut app, outcome) = app("deploy traefik");
-        app.text = "deploy traefik and nginx".to_owned(); // user edited the field
-        run(
-            &mut app,
-            key(
-                egui::Key::Enter,
-                egui::Modifiers {
-                    command: true,
-                    ctrl: true,
-                    ..Default::default()
-                },
-            ),
-        );
-        let out = outcome.lock().unwrap();
-        assert!(out.confirmed);
-        assert_eq!(out.text, "deploy traefik and nginx");
-    }
-
-    #[test]
-    fn plain_enter_without_modifier_does_not_confirm() {
-        let (mut app, outcome) = app("text");
-        run(&mut app, key(egui::Key::Enter, egui::Modifiers::default()));
-        assert!(!outcome.lock().unwrap().confirmed);
-    }
-
-    #[test]
-    fn escape_cancels_without_confirming() {
-        let (mut app, outcome) = app("text");
-        run(&mut app, key(egui::Key::Escape, egui::Modifiers::default()));
-        assert!(!outcome.lock().unwrap().confirmed);
+    fn eof_after_final_keeps_the_dialog_open_for_editing() {
+        // The engine closes its pipe right after `final` (it is waiting on our
+        // exit); that EOF must not close the dialog under the user.
+        let (mut app, outcome, feed) = app();
+        push(&feed, "final keep me");
+        feed.lock().unwrap().eof = true;
+        run(&mut app, egui::RawInput::default());
+        assert!(!app.listening);
+        assert_eq!(app.text, "keep me");
+        run(&mut app, ctrl_enter());
+        assert!(outcome.lock().unwrap().confirmed);
     }
 }

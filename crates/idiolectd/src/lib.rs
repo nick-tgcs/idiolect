@@ -1,9 +1,11 @@
 //! Crate documentation for the Idiolect workspace.
 
 pub mod daemon;
+mod desktop_integration;
 mod retention_dialog;
 mod run_loop;
 pub mod runtime;
+mod settings_launcher;
 
 mod adapters;
 

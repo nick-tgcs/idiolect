@@ -1,0 +1,86 @@
+#!/bin/sh
+# idiolect-crash-notify — systemd ExecStopPost hook that makes daemon crashes
+# VISIBLE. The daemon cannot report its own death (a native segfault never
+# returns control to Rust), so systemd tells the user instead.
+#
+# systemd provides: SERVICE_RESULT (e.g. "success", "core-dump", "signal"),
+# EXIT_STATUS (exit code or signal name). Clean stops are silent.
+#
+# Injectable for tests:
+#   IDIOLECT_NOTIFY_CMD    notifier, called as: <cmd> <summary> <body>
+#                          (default: notify-send -u critical -- … )
+#   IDIOLECT_JOURNAL_CMD   prints the recent daemon journal tail
+#   IDIOLECT_GPU_CMD       prints nvidia-smi compute-apps CSV (pid, name, MiB)
+#   IDIOLECT_THROTTLE_FILE crash-loop stamp file
+#   IDIOLECT_THROTTLE_SECS minimum seconds between notifications (default 60)
+#
+# This hook must NEVER fail the unit: every path exits 0.
+
+set -u
+
+[ "${SERVICE_RESULT:-success}" = "success" ] && exit 0
+
+# A crash loop restarts the daemon several times in seconds; one toast is
+# enough. Skip when the stamp file is newer than the throttle window.
+throttle_file="${IDIOLECT_THROTTLE_FILE:-${XDG_RUNTIME_DIR:-/tmp}/idiolect-crash-notify.stamp}"
+throttle_secs="${IDIOLECT_THROTTLE_SECS:-60}"
+if [ -f "$throttle_file" ]; then
+    now=$(date +%s)
+    last=$(stat -c %Y "$throttle_file" 2>/dev/null || echo 0)
+    [ $((now - last)) -lt "$throttle_secs" ] && exit 0
+fi
+touch "$throttle_file" 2>/dev/null || true
+
+journal_cmd="${IDIOLECT_JOURNAL_CMD:-}"
+if [ -n "$journal_cmd" ]; then
+    tail_lines=$("$journal_cmd" 2>/dev/null || true)
+else
+    tail_lines=$(journalctl --user -u idiolectd -n 80 --no-pager 2>/dev/null || true)
+fi
+
+# Who is actually holding GPU memory right now? Never guess a name — query,
+# pick the dominant consumer (the crashed daemon itself excluded), or admit
+# we can't see one.
+gpu_holder() {
+    if [ -n "${IDIOLECT_GPU_CMD:-}" ]; then
+        apps=$("$IDIOLECT_GPU_CMD" 2>/dev/null || true)
+    else
+        apps=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+            --format=csv,noheader,nounits 2>/dev/null || true)
+    fi
+    printf '%s\n' "$apps" | awk -F', *' '
+        NF >= 3 && $2 !~ /idiolectd/ && $3 + 0 > max {
+            max = $3 + 0
+            name = $2
+        }
+        END {
+            if (name != "") {
+                n = split(name, parts, "/")
+                printf "%s (%d MiB)", parts[n], max
+            }
+        }'
+}
+
+summary="Idiolect stopped working"
+case "$tail_lines" in
+    *"cudaMalloc failed: out of memory"*|*"failed to allocate CUDA"*)
+        holder=$(gpu_holder)
+        if [ -n "$holder" ]; then
+            using_now="the biggest GPU user right now is $holder"
+        else
+            using_now="run nvidia-smi to see what is holding it"
+        fi
+        body="The GPU ran out of memory mid-transcription — $using_now. Dictation restarts automatically and recovers once GPU memory frees. Crash detail: ${SERVICE_RESULT:-?} (${EXIT_STATUS:-?})."
+        ;;
+    *)
+        body="The dictation daemon crashed: ${SERVICE_RESULT:-?} (${EXIT_STATUS:-?}). It restarts automatically; if dictation stays dead, see: journalctl --user -u idiolectd"
+        ;;
+esac
+
+if [ -n "${IDIOLECT_NOTIFY_CMD:-}" ]; then
+    "$IDIOLECT_NOTIFY_CMD" "$summary" "$body" 2>/dev/null || true
+else
+    notify-send -u critical -- "$summary" "$body" 2>/dev/null || true
+fi
+
+exit 0

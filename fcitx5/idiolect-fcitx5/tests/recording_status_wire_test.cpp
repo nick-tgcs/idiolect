@@ -91,6 +91,19 @@ int main() {
             write_line(client_fd,
                        "{\"type\":\"RecordingStatus\",\"payload\":{\"recording\":true}}\n");
 
+            // A streamed mid-take snippet (partial), a display-only review-mode
+            // snippet (partial+review — fcitx5 must NOT type these; it has no
+            // review dialog), and a take-final transcript from an older daemon
+            // that never writes the fields.
+            write_line(client_fd,
+                       "{\"type\":\"PreeditUpdate\",\"payload\":{\"text\":\" and more\","
+                       "\"review\":false,\"partial\":true}}\n");
+            write_line(client_fd,
+                       "{\"type\":\"PreeditUpdate\",\"payload\":{\"text\":\"display only\","
+                       "\"review\":true,\"partial\":true}}\n");
+            write_line(client_fd,
+                       "{\"type\":\"PreeditUpdate\",\"payload\":{\"text\":\"restart traffic\"}}\n");
+
             // The client's direction-free intent.
             toggle_line = read_line(client_fd);
             ::close(client_fd);
@@ -121,6 +134,40 @@ int main() {
         require(message->kind == idiolect::fcitx5::ServerMessageKind::RecordingStatus,
                 "message should classify as RecordingStatus");
         require(message->recording, "the JSON-bool payload should decode to true");
+
+        const auto next_message = [&]() {
+            std::optional<idiolect::fcitx5::ServerMessage> polled;
+            for (int attempt = 0; attempt < 500 && !polled; ++attempt) {
+                polled = client.poll_server_message();
+                if (!polled) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            require(polled.has_value(), "client should receive the next push");
+            return *polled;
+        };
+
+        // A streamed snippet is classified as a PARTIAL preedit…
+        const auto partial = next_message();
+        require(partial.kind == idiolect::fcitx5::ServerMessageKind::Preedit,
+                "snippet should classify as Preedit");
+        require(partial.partial, "the snippet must carry partial=true");
+        require(!partial.review, "a typed snippet is not display-only");
+        require(partial.text == " and more", "snippet text should decode");
+
+        // …a review-mode snippet is display-only (partial AND review)…
+        const auto display_only = next_message();
+        require(display_only.kind == idiolect::fcitx5::ServerMessageKind::Preedit,
+                "display-only snippet should classify as Preedit");
+        require(display_only.partial && display_only.review,
+                "review-mode snippets carry partial+review");
+
+        // …and a preedit without the fields (an older daemon) is take-final.
+        const auto final_preedit = next_message();
+        require(final_preedit.kind == idiolect::fcitx5::ServerMessageKind::Preedit,
+                "transcript should classify as Preedit");
+        require(!final_preedit.partial, "a missing partial field must mean final");
+        require(!final_preedit.review, "a missing review field must mean direct");
 
         client.toggle_recording();
     } catch (...) {

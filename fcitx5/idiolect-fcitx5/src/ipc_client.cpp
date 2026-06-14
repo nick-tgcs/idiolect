@@ -109,6 +109,17 @@ bool extract_bool_field(const std::string& line, const std::string& key) {
     return line.find("true", start + prefix.size()) == start + prefix.size();
 }
 
+/// Like extract_bool_field, but a missing key yields `fallback` instead of
+/// throwing — for optional fields older daemons never write (e.g. `partial`).
+bool extract_bool_field_or(const std::string& line, const std::string& key, bool fallback) {
+    const std::string prefix = "\"" + key + "\":";
+    const auto start = line.find(prefix);
+    if (start == std::string::npos) {
+        return fallback;
+    }
+    return line.find("true", start + prefix.size()) == start + prefix.size();
+}
+
 std::vector<std::string> parse_accepted_features(const std::string& line) {
     std::vector<std::string> features;
     for (const auto& feature : client_features()) {
@@ -204,7 +215,9 @@ std::optional<ServerMessage> UnixSocketIpcClient::poll_server_message() {
     read_buffer_.erase(0, newline + 1);
 
     if (line.find("\"type\":\"PreeditUpdate\"") != std::string::npos) {
-        return ServerMessage{ServerMessageKind::Preedit, extract_string_field(line, "text"), false};
+        return ServerMessage{ServerMessageKind::Preedit, extract_string_field(line, "text"), false,
+                             extract_bool_field_or(line, "partial", false),
+                             extract_bool_field_or(line, "review", false)};
     }
     if (line.find("\"type\":\"Error\"") != std::string::npos) {
         return ServerMessage{ServerMessageKind::Error, extract_string_field(line, "message"), false};

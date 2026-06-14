@@ -988,10 +988,11 @@ impl SqliteMetadataStore {
         )
     }
 
-    /// Amend the most recently committed session with the user's in-place
-    /// correction: record the edit (committed → corrected) and rewrite the
-    /// training candidate so it carries a real raw→corrected signal instead of
-    /// `accepted_without_edit`. No-op when the text is unchanged.
+    /// Amend a committed session with the user's correction: record the edit
+    /// (committed → corrected), rewrite the training candidate so it carries a
+    /// real raw→corrected signal instead of `accepted_without_edit`, and refresh
+    /// the materialized history projection so the entry the tray shows reflects
+    /// the correction. No-op when the text is unchanged.
     pub fn amend_correction(
         &mut self,
         session_id: ImeSessionId,
@@ -1002,6 +1003,10 @@ impl SqliteMetadataStore {
             return Ok(());
         }
         let session_key = Self::session_key(session_id)?;
+        // Encode before opening the transaction: the cipher borrows `self`, which
+        // the live transaction's `&mut self.connection` would otherwise lock out
+        // (mirrors `commit_session`).
+        let history_text = self.encode_history_text(corrected_text)?;
         let transaction = backend_result(self.connection.transaction())?;
         if !Self::session_exists(&transaction, &session_key)? {
             return Err(SqliteStorageError::not_found(
@@ -1039,6 +1044,14 @@ impl SqliteMetadataStore {
                  source = ?2
              WHERE session_id = ?3",
             params![corrected_text, TRAINING_SOURCE_CORRECTED, session_key],
+        ))?;
+        // Keep the history projection (what the tray lists) in sync with the
+        // correction; the text is encrypted at rest like the original commit.
+        backend_result(transaction.execute(
+            "UPDATE ime_text_history
+             SET text = ?1
+             WHERE session_id = ?2 AND state = 'committed'",
+            params![history_text, session_key],
         ))?;
         backend_result(transaction.commit())?;
         Ok(())
@@ -1207,6 +1220,7 @@ impl SqliteMetadataStore {
              JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
              JOIN utterances AS u ON u.id = tc.utterance_id
              WHERE s.user_id = ?1
+               AND tc.status != 'rejected'
              ORDER BY tc.id",
         ))?;
         let rows = backend_result(statement.query_map([user_id], |row| {
@@ -1226,6 +1240,66 @@ impl SqliteMetadataStore {
         }))?;
         let candidates = backend_result(rows.collect::<rusqlite::Result<Vec<_>>>())?;
         Ok(candidates)
+    }
+
+    /// Replaces every stored copy of a candidate's text with a fresh decode of
+    /// its stored audio: the candidate's raw/corrected/transcript columns AND
+    /// the linked utterance's raw STT text (the manifest feed coalesces from
+    /// the utterance first). Used by revalidation when the snippet pipeline is
+    /// shown to have dropped words the audio contains.
+    pub fn retranscribe_training_candidate(
+        &mut self,
+        candidate_id: i64,
+        text: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let transaction = backend_result(self.connection.transaction())?;
+        let updated = backend_result(transaction.execute(
+            "UPDATE training_candidates
+             SET raw_text = ?1,
+                 corrected_text = ?1,
+                 candidate_transcript = ?1
+             WHERE id = ?2",
+            params![text, candidate_id],
+        ))?;
+        if updated == 0 {
+            return Err(SqliteStorageError::not_found(
+                "training candidate",
+                &candidate_id.to_string(),
+            ));
+        }
+        backend_result(transaction.execute(
+            "UPDATE utterances
+             SET raw_stt_text = ?1
+             WHERE id = (SELECT utterance_id FROM training_candidates WHERE id = ?2)",
+            params![text, candidate_id],
+        ))?;
+        backend_result(transaction.commit())?;
+        Ok(())
+    }
+
+    /// Marks a candidate untrainable: its text cannot be trusted against its
+    /// audio (e.g. the user corrected text the snippet pipeline had already
+    /// dropped words from). Rejected candidates leave the manifest feed.
+    pub fn reject_training_candidate(
+        &mut self,
+        candidate_id: i64,
+        reason: &str,
+    ) -> Result<(), SqliteStorageError> {
+        let updated = backend_result(self.connection.execute(
+            "UPDATE training_candidates
+             SET status = 'rejected',
+                 classifier_reason = ?1,
+                 classified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2",
+            params![reason, candidate_id],
+        ))?;
+        if updated == 0 {
+            return Err(SqliteStorageError::not_found(
+                "training candidate",
+                &candidate_id.to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn set_audio_digest_for_test(
@@ -2358,6 +2432,32 @@ mod amend_correction_tests {
                 "accepted_with_edit".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn amend_refreshes_the_displayed_history_text() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("restart traffic"))
+            .expect("create");
+        store
+            .commit_session(session, "restart traffic", "commit-1")
+            .expect("commit");
+
+        store
+            .amend_correction(session, "restart traffic", "restart Traefik")
+            .expect("amend");
+
+        // The tray reads the materialized projection, not the session row — so a
+        // correction must land there too or the listed entry stays stale.
+        let entry = store
+            .recent_history(10)
+            .expect("recent")
+            .into_iter()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.text, "restart Traefik");
     }
 
     #[test]

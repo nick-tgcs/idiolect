@@ -903,12 +903,6 @@ fn tray_menu(args: &[String]) -> Result<String, CliError> {
     let settings = store
         .get_all_tray_settings()
         .map_err(|e| CliError::storage("get settings", e))?;
-    let retention = settings
-        .get("retention_days")
-        .cloned()
-        .unwrap_or_else(|| "1".to_string())
-        .parse::<u32>()
-        .unwrap_or(1);
     let max_entries = settings
         .get("max_entries")
         .cloned()
@@ -916,19 +910,12 @@ fn tray_menu(args: &[String]) -> Result<String, CliError> {
         .parse::<u32>()
         .unwrap_or(10);
 
-    let history_config = idiolect_common::config::HistoryConfig {
-        retention_days: retention,
-        max_entries,
-        ..idiolect_common::config::HistoryConfig::default()
-    };
-
     let entries = store
         .recent_history(max_entries)
         .map_err(|e| CliError::storage("list", e))?;
     let menu = idiolect_application::use_cases::menu::MenuUseCase::new().get_menu(
         idiolect_application::use_cases::menu::RecordingState::Idle,
         &entries,
-        &history_config,
         &idiolect_common::config::TranslationConfig::default(),
     );
 

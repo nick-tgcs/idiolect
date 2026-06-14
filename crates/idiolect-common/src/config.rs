@@ -80,6 +80,14 @@ impl IdiolectConfig {
             });
         }
 
+        if self.vad.auto_stop_silence_ms != 0
+            && self.vad.auto_stop_silence_ms < self.vad.post_roll_ms
+        {
+            return Err(ConfigError::ValidationError {
+                field: "vad.auto_stop_silence_ms".to_owned(),
+            });
+        }
+
         if self.asr.threads == 0 {
             return Err(ConfigError::ValidationError {
                 field: "asr.threads".to_owned(),
@@ -147,6 +155,11 @@ pub struct DaemonConfig {
     pub socket_path: Option<String>,
     #[serde(default = "default_daemon_log_level")]
     pub log_level: String,
+    /// Command used to surface daemon-side problems to the user as a desktop
+    /// notification, invoked as `<command> <summary> <body>` (best-effort —
+    /// a missing binary is ignored). Empty disables notifications.
+    #[serde(default = "default_daemon_notify_command")]
+    pub notify_command: String,
 }
 
 impl Default for DaemonConfig {
@@ -154,6 +167,7 @@ impl Default for DaemonConfig {
         Self {
             socket_path: None,
             log_level: default_daemon_log_level(),
+            notify_command: default_daemon_notify_command(),
         }
     }
 }
@@ -181,7 +195,7 @@ impl Default for AudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VadConfig {
     #[serde(default = "default_vad_engine")]
     pub engine: String,
@@ -195,6 +209,14 @@ pub struct VadConfig {
     pub post_roll_ms: u32,
     #[serde(default = "default_vad_max_utterance_ms")]
     pub max_utterance_ms: u32,
+    /// Opt-in: continuous silence (after the take's first speech) that ends the
+    /// take automatically, as if the user had pressed the toggle — popping the
+    /// single review dialog or finalizing the streamed text. `0` (the default)
+    /// disables it: listening never times out and only the toggle stops a take.
+    /// Must be at least `post_roll_ms` when nonzero, or a take could end before
+    /// one snippet pause ever completes.
+    #[serde(default = "default_vad_auto_stop_silence_ms")]
+    pub auto_stop_silence_ms: u32,
 }
 
 impl Default for VadConfig {
@@ -206,6 +228,7 @@ impl Default for VadConfig {
             pre_roll_ms: default_vad_pre_roll_ms(),
             post_roll_ms: default_vad_post_roll_ms(),
             max_utterance_ms: default_vad_max_utterance_ms(),
+            auto_stop_silence_ms: default_vad_auto_stop_silence_ms(),
         }
     }
 }
@@ -509,6 +532,10 @@ fn default_daemon_log_level() -> String {
     "info".to_owned()
 }
 
+fn default_daemon_notify_command() -> String {
+    "notify-send".to_owned()
+}
+
 fn default_audio_input_device() -> String {
     "default".to_owned()
 }
@@ -547,6 +574,11 @@ fn default_vad_post_roll_ms() -> u32 {
 
 fn default_vad_max_utterance_ms() -> u32 {
     30_000
+}
+
+/// Disabled by default: listening never times out; only the toggle stops a take.
+fn default_vad_auto_stop_silence_ms() -> u32 {
+    0
 }
 
 fn default_asr_engine() -> String {

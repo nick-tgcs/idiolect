@@ -1,0 +1,138 @@
+name: Release (main)
+
+# Rolling "edge" release built off every push to main. The tag-driven
+# `release.yml` still produces versioned, non-prerelease releases on `v*` tags;
+# this one keeps a single, always-current prerelease (`edge`) pointing at the
+# latest green main commit so there is always a downloadable build of HEAD.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # =========================================================================
+  # FULL CI GATE (same suite as the main-branch CI) — never ship a red build
+  # =========================================================================
+  full-ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  # =========================================================================
+  # BUILD RELEASE ARTIFACTS (Linux). A macOS matrix job slots in here once the
+  # macOS port lands — see docs/future/009-macos-port.md.
+  # =========================================================================
+  build-release:
+    name: Build Release Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [full-ci]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
+
+      - name: Build FCITX5
+        run: |
+          cmake -S fcitx5/idiolect-fcitx5 -B fcitx5/idiolect-fcitx5/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          cmake --build fcitx5/idiolect-fcitx5/build
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build Debian package
+        run: bash ci/scripts/test-packaging.sh
+
+      - name: Verify package
+        run: bash ci/scripts/test-package-smoke.sh && bash ci/scripts/test-package-lifecycle.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          # The `.deb` is the primary distributable; the loose binaries are a
+          # convenience. (There is no bare `idiolect` binary — the CLI ships as
+          # `idiolect-cli`.)
+          path: |
+            target/release/idiolectd
+            target/release/idiolect-cli
+            target/release/idiolect-trainerctl
+            target/package/*.deb
+          retention-days: 30
+
+  # =========================================================================
+  # PUBLISH ROLLING "edge" PRERELEASE — moves the `edge` tag to this commit and
+  # replaces the single prerelease so it always tracks the latest green main.
+  # =========================================================================
+  publish-edge:
+    name: Publish edge prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build-release]
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
+      # softprops won't move an *existing* tag via target_commitish, so retire
+      # the previous edge release+tag first; it is then recreated at this commit.
+      - name: Retire previous edge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete edge --cleanup-tag --yes -R "${{ github.repository }}" || true
+
+      - name: Publish/replace edge release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: edge
+          name: Edge (latest main)
+          body: |
+            Rolling prerelease built from the latest green commit on `main`
+            (`${{ github.sha }}`). For stable, versioned releases see the
+            `v*`-tagged releases.
+          prerelease: true
+          # Recreate the `edge` tag at this commit on each run.
+          target_commitish: ${{ github.sha }}
+          files: |
+            release-artifacts/idiolectd
+            release-artifacts/idiolect-cli
+            release-artifacts/idiolect-trainerctl
+            release-artifacts/*.deb
