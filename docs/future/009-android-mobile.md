@@ -439,10 +439,12 @@ existing IBus/eframe caveats.
   cargo-ndk): the brain + portable adapters build for `aarch64-linux-android` and
   `x86_64-linux-android` via `scripts/android-cross-build.sh` (whisper.cpp, opus,
   bundled SQLite, webrtc-vad all clean; `cuda`/`vulkan` OFF). A dead
-  `usearch`/`numkong` C++ dep was removed. **Still TODO:** `libc++_shared`
-  bundling + LTO-off release; and **verify the Android whisper-rs/ggml build
-  against the same fixture as the desktop parity test** (run on the emulator) so
-  the tokenizer/decode doesn't drift.
+  `usearch`/`numkong` C++ dep was removed. ✅ **Run-half proven too:** the core
+  *executes* on the x86_64 emulator (`scripts/android-emulator-test.sh`, 25 groups
+  green) including the **real whisper decode** (whisper.cpp transcribing the
+  fixture on-device; same assertion passes host + device = no tokenizer/decode
+  drift). **Still TODO:** `libc++_shared` bundling in the APK + LTO-off release
+  (rolls into M1/M3).
 - **M1 — Path provider + UniFFI facade.** `PathProvider` trait (XDG desktop impl,
   `filesDir` Android impl); `idiolect-ffi` exposing `toggle/commit/cancel/
   report_correction` + the `RecordingStatus`/`PreeditUpdate` callback flow;

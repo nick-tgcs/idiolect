@@ -389,11 +389,17 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   just `_HOME`); whisper.cpp built in ~20 s with host libclang for bindgen. A dead
   `usearch`/`numkong` C++ dep (via unused `sqlite-vector-rs` in the sqlite
   adapter) was **removed** — it broke the Android C++ build and bloated desktop.
-  **Still TODO for M0 exit:** the `.so`/cdylib (lands with M1's FFI crate),
-  `libc++_shared` bundling, LTO-off release profile, a CI compile-only job, and
-  the **instrumented parity test** (run the desktop `whisper_*` fixture through the
-  cross-built core on the emulator → identical tokens). **Exit:** the core *runs*
-  on the emulator with byte-identical decode — build half done, run half next.
+  ✅ **Run half also proven.** The full portable core *executes* on the x86_64
+  API-33 emulator via [scripts/android-emulator-test.sh](scripts/android-emulator-test.sh):
+  **25 test-groups, 0 failures** — bundled SQLite (incl. encrypted history,
+  event-sourcing, migrations, the audio-digest + sync work), webrtc-vad, opus, the
+  application/common logic, the sync codec, **and 8 whisper tests including the
+  real fixture *decode* (whisper.cpp transcribing on-device, ~21 s; same assertion
+  passes host + device = decode parity).** `libc++_shared.so` is pushed to the
+  device and rpath'd in (whisper links it dynamically). **M0 exit met at the proof
+  level.** Housekeeping still owed (rolls into M1/M3): the actual cdylib/`.so`,
+  bundling `libc++_shared` in the APK, an LTO-off release profile, and the CI
+  jobs (compile-only + emulator).
 - **M1 — PathProvider + UniFFI facade.** `idiolect-ffi` exposing
   `toggle/commit/cancel/report_correction/push_pcm_frame` + the
   `RecordingStatus/Preedit/InsertText/EditHistory` callback flow; Android path
@@ -536,14 +542,17 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    `idiolect-sync-server::ingest` + `sync_round_trip.rs` prove the whole protocol
    (build → wire codec → ingest → trainable on B → reclaim on A; idempotent
    replay) without any network library.
-6. ✅ **M0 build half — done.** The whole native core cross-compiles to
-   arm64-v8a + x86_64 via [scripts/android-cross-build.sh](scripts/android-cross-build.sh)
-   (NDK r28). Both build spikes retired; dead `usearch` C++ dep removed.
-7. **NEXT (dependency order, mobile track):** **M0 run half** — get the
-   cross-built core *running on the emulator* and decoding a fixture to identical
-   tokens (the real M0 exit), which also forces the first cdylib/`.so`. That sets
-   up **M1** (the UniFFI facade the Kotlin app loads). M2 (streaming lift) and the
-   S2 HTTP hop (axum) remain parallel tracks.
+6. ✅ **M0 — done (proof level).** Whole native core cross-compiles to arm64-v8a +
+   x86_64 ([android-cross-build.sh](scripts/android-cross-build.sh)) **and** runs
+   on the emulator incl. real whisper decode ([android-emulator-test.sh](scripts/android-emulator-test.sh),
+   25 groups green). Spikes retired; dead `usearch` removed. The existential
+   "can it run on the phone?" risk is **answered: yes.**
+7. **NEXT (dependency order, mobile track): M1 — the UniFFI facade** (`idiolect-ffi`):
+   the single `cdylib` the Kotlin app loads, exposing toggle/commit/cancel/
+   report-correction/push-PCM + the RecordingStatus/Preedit/InsertText callbacks,
+   tested through the UniFFI seam against fixture adapters. This also produces the
+   real `.so` (M0 housekeeping). M2 (streaming lift) and the S2 HTTP hop (axum)
+   remain parallel no-Kotlin tracks.
 
 ---
 

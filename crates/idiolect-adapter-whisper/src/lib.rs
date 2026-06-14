@@ -212,9 +212,24 @@ mod backend {
     }
 
     fn fixture_model_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/whisper")
-            .join(PRIMARY_FIXTURE_MODEL_FILE)
+        // On the host, the fixture lives in-repo relative to CARGO_MANIFEST_DIR.
+        // When these tests are cross-run on an Android device/emulator (cargo-ndk),
+        // that host path does not exist on the device, so fall back to a pushed
+        // device location. An explicit override always wins (and lets CI point at
+        // a downloaded model). Host behaviour is unchanged.
+        if let Some(path) = std::env::var_os("IDIOLECT_WHISPER_FIXTURE_MODEL") {
+            return PathBuf::from(path);
+        }
+        #[cfg(target_os = "android")]
+        {
+            PathBuf::from("/data/local/tmp/whisper").join(PRIMARY_FIXTURE_MODEL_FILE)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/whisper")
+                .join(PRIMARY_FIXTURE_MODEL_FILE)
+        }
     }
 
     fn prepare_audio(audio: &AudioSegment) -> Vec<f32> {
