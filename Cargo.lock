@@ -4229,6 +4229,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 1.0.61",
  "time",
  "toml 0.8.23",
@@ -4330,6 +4331,16 @@ dependencies = [
  "idiolect-application",
  "serde_json",
  "tiny-skia",
+]
+
+[[package]]
+name = "idiolect-sync"
+version = "0.1.0"
+dependencies = [
+ "idiolect-common",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.61",
 ]
 
 [[package]]

@@ -1151,7 +1151,7 @@ fn materialize_session(
         Ok(draft) => draft,
         Err(error) => return Ok(StartSessionOutcome::Recoverable(error)),
     };
-    let session_id = persist_session(store, audio_store, config, &encoded, &draft.text)?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &draft.text)?;
 
     Ok(StartSessionOutcome::Started(ActiveSession {
         session_id,
@@ -1167,7 +1167,7 @@ fn materialize_session(
 fn persist_session(
     store: &mut SqliteMetadataStore,
     audio_store: &FileAudioStore,
-    config: &RunLoopConfig,
+    user_id: &str,
     encoded: &idiolect_ports::audio::EncodedAudio,
     text: &str,
 ) -> Result<ImeSessionId, RunLoopError> {
@@ -1176,8 +1176,15 @@ fn persist_session(
         .map_err(|error| RunLoopError::storage("create session", error))?;
     let utterance_id = utterance_id_for_session(session_id)?;
     audio_store
-        .write_source_audio(&config.user_id, &utterance_id, encoded)
+        .write_source_audio(user_id, &utterance_id, encoded)
         .map_err(|error| RunLoopError::audio_store("write source audio", error))?;
+    // Content digest of the encoded payload. The trainer's manifest builder
+    // rejects an empty digest, so without this real captures could never be
+    // validated/trained — historically the column was only ever set in tests.
+    let audio_digest = idiolect_common::digest::audio_sha256_hex(&encoded.payload);
+    store
+        .set_audio_digest(&utterance_id, &audio_digest)
+        .map_err(|error| RunLoopError::storage("set audio digest", error))?;
     Ok(session_id)
 }
 
@@ -1549,7 +1556,7 @@ fn finalize_streamed_take(
         .map_err(|error| RunLoopError::codec("encode audio", error))?;
 
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
-    let session_id = persist_session(store, audio_store, config, &encoded, &final_text)?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &final_text)?;
 
     if review_mode_enabled(store) {
         *active_session = Some(ActiveSession {
@@ -2418,6 +2425,68 @@ mod tests {
             merge_tail_correction("something else", Some("deploy nginx"), "deploy Nginx"),
             "something else"
         );
+    }
+
+    mod capture_persist {
+        use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+        use idiolect_common::digest::audio_sha256_hex;
+        use idiolect_ports::audio::EncodedAudio;
+
+        use crate::run_loop::persist_session;
+
+        #[test]
+        fn persisting_a_capture_records_the_audio_digest() {
+            // The production gap S0a closes: a real capture must populate
+            // `utterances.audio_sha256` (content digest of the encoded payload),
+            // because the trainer's manifest builder rejects an empty digest.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let audio_store =
+                FileAudioStore::new(tmp.path().join("audio"), tmp.path().join("decoded"));
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+
+            let payload = b"IDOPUS1 fake encoded opus payload".to_vec();
+            let encoded = EncodedAudio {
+                codec_name: "opus".to_owned(),
+                sample_rate_hz: 16_000,
+                channels: 1,
+                payload: payload.clone(),
+            };
+
+            let session_id = persist_session(
+                &mut store,
+                &audio_store,
+                "default",
+                &encoded,
+                "restart traffic",
+            )
+            .expect("persist should succeed");
+
+            let link = store
+                .session_utterance_link_for_test(session_id)
+                .expect("link should query")
+                .expect("link should exist");
+
+            // The stored audio file landed...
+            assert!(
+                audio_store
+                    .source_audio_exists_for_test(&idiolect_ports::storage::AudioObjectRef {
+                        object_key: format!("audio/1970/01/01/default/{}.ogg", link.utterance_id),
+                        codec_name: "opus".to_owned(),
+                        sample_rate_hz: 16_000,
+                        channels: 1,
+                    })
+                    .expect("exists query"),
+                "capture must write the source audio",
+            );
+            // ...and the utterance row carries the digest of exactly those bytes.
+            assert_eq!(
+                store
+                    .audio_digest_for_test(&link.utterance_id)
+                    .expect("digest should query"),
+                Some(audio_sha256_hex(&payload)),
+            );
+        }
     }
 
     mod insert_via_ime {

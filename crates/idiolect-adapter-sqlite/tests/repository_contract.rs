@@ -199,6 +199,48 @@ fn commit_session_without_created_session_fails_without_writes() {
     assert_training_candidate_count(&store, 0);
 }
 
+#[test]
+fn audio_digest_persists_and_reads_back() {
+    let mut store = migrated_store();
+    let session_id = store
+        .create_session(Some("restart traffic"))
+        .expect("session should be created");
+    let link = store
+        .session_utterance_link_for_test(session_id)
+        .expect("link should query")
+        .expect("link should exist");
+
+    // A freshly created utterance carries no audio digest yet — capture must
+    // populate it, and nothing else does.
+    assert_eq!(
+        store
+            .audio_digest_for_test(&link.utterance_id)
+            .expect("digest should query"),
+        None,
+    );
+
+    let digest = idiolect_common::digest::audio_sha256_hex(b"idopus1-payload-bytes");
+    store
+        .set_audio_digest(&link.utterance_id, &digest)
+        .expect("digest should persist");
+
+    assert_eq!(
+        store
+            .audio_digest_for_test(&link.utterance_id)
+            .expect("digest should query"),
+        Some(digest),
+    );
+}
+
+#[test]
+fn set_audio_digest_for_unknown_utterance_errors() {
+    let store = migrated_store();
+    let error = store
+        .set_audio_digest("utterance:missing", "deadbeef")
+        .expect_err("unknown utterance should fail");
+    assert_eq!(error.kind(), SqliteStorageErrorKind::Backend);
+}
+
 fn migrated_store() -> SqliteMetadataStore {
     let mut store = SqliteMetadataStore::open_in_memory().expect("store should open");
     store.migrate().expect("migration should apply");

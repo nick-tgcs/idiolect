@@ -62,6 +62,9 @@ that is "similar but not quite the same" and whose concepts we can leverage.
 - Ship learnings to the PC, free phone storage after confirmed receipt.
 - Train on the PC; optionally pull a personalised `.bin` back to the phone.
 - Maximise Rust code reuse; keep one source of truth for the dictation pipeline.
+- **Run on GrapheneOS** (de-Googled, hardened): no Google Play Services,
+  network-optional, `hardened_malloc`-safe native libs, FOSS-only. See the
+  *GrapheneOS compatibility* section in [009-android-implementation-plan.md](009-android-implementation-plan.md#grapheneos-compatibility--a-hard-target).
 
 **Non-goals (initially)**
 - On-device training (stays on PC).
@@ -247,12 +250,15 @@ which is precisely why "limit mobile storage" means *ship then delete the Opus*.
 
 ### Wire format
 
-- `POST /v1/learnings/batch` (phone → PC, the hot path): `multipart/mixed` so
-  audio stays binary (no base64 bloat). Part 0 = JSON
-  `{protocol_version, device_id, batch_id, base_model_id, learnings:[SyncLearning]}`;
-  parts 1..N = `audio/idopus` raw IDOPUS1 bytes, one per learning, **named by its
-  `audio_digest`**. Response: `{accepted, rejected, already_have}`. **Idempotent**
-  on `(device_id, audio_digest)`.
+- `POST /v1/learnings/batch` (phone → PC, the hot path): a **length-prefixed
+  binary container** (`Content-Type: application/vnd.idiolect.sync.v1`,
+  magic `IDSYNC1`) so audio stays binary (no base64 bloat) **and** without the
+  boundary-collision risk of `multipart/mixed` over binary blobs. Layout: JSON
+  `{device_id, batch_id, learnings:[SyncLearning]}` then `audio_count` parts of
+  raw IDOPUS1 bytes, each **content-addressed by its `audio_digest`** (so a
+  digest shared by two learnings ships its bytes once). Response:
+  `{accepted, rejected, already_have}`. **Idempotent** on `(device_id, audio_digest)`.
+  Implemented in [`idiolect-sync`](../../crates/idiolect-sync/src/codec.rs).
 - `GET /v1/model/current?base=<id>&since=<version>` (PC → phone): the merged ggml
   `.bin` as `octet-stream`, `Range`-resumable, `X-Artifact-Sha256` verified; `304`
   if current.
@@ -381,7 +387,7 @@ Key facts that make A the clear minimal-waste choice:
 crates/idiolect-adapters/android/        # mirrors the existing desktop/ subtree
   capture/   idiolect-adapter-android-audio   # AudioInputPort via AudioRecord
   ime/       idiolect-adapter-android-ime     # InputMethodPort over an FFI callback
-crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, multipart codec)
+crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, binary container codec) ✅ exists
 crates/idiolect-sync-client/   # phone: outbox, ACK-then-delete
 crates/idiolect-sync-server/   # PC: HTTP ingest hung off idiolectd; GET /model
 crates/idiolect-mobile-runtime/  # Android twin of idiolectd's run_loop (in-process, no socket)
@@ -408,10 +414,12 @@ boundary marked untestable-headless (with the reason stated), mirroring the
 existing IBus/eframe caveats.
 
 **Sync-protocol track (mostly desktop-side, no Android needed):**
-- **S0 — Foundation.** New `idiolect-sync` crate: `SyncLearning`/`SyncBatch` DTOs
-  + multipart codec (unit-tested round-trip). Add SHA-256 `audio_digest` compute
-  and **finally populate `utterances.audio_sha256` on capture (desktop too)** —
-  this also unblocks `BurnTrainer.validate_manifest`, which rejects empty digests.
+- **S0 — Foundation.** ✅ **Done.** New `idiolect-sync` crate: `SyncLearning`/`SyncBatch`
+  DTOs + length-prefixed binary container codec (unit-tested round-trip + framing
+  errors). SHA-256 `audio_digest` compute lives in `idiolect_common::digest`, and
+  capture now **populates `utterances.audio_sha256` (desktop too)** via
+  `persist_session` → `set_audio_digest` — this also unblocks manifest validation,
+  which rejects empty digests.
 - **S1 — Delete-after-ship locally.** Add the `synced` status +
   `mark_synced_and_drop_audio` (status flip + `delete_source_audio_for`) + the
   outbox query (`status NOT IN ('synced','rejected')`). Prove on desktop that

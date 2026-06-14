@@ -34,8 +34,13 @@ fn manifest_builder_exports_valid_v2_splits_from_sqlite_candidates() {
             .session_utterance_link_for_test(session_id)
             .expect("link should query")
             .expect("link should exist");
+        // Use the production digest path with a real content hash, so this proves
+        // a genuinely-computed digest (not a fabricated string) flows through
+        // build_v2 — the same code capture now runs.
+        let digest =
+            idiolect_common::digest::audio_sha256_hex(format!("opus-payload-{index}").as_bytes());
         store
-            .set_audio_digest_for_test(&link.utterance_id, &format!("audio-digest-{index:02}"))
+            .set_audio_digest(&link.utterance_id, &digest)
             .expect("audio digest should persist");
     }
 

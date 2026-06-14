@@ -1,5 +1,5 @@
 [package]
-name = "idiolect-common"
+name = "idiolect-sync"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -10,11 +10,8 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
-sha2.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-time.workspace = true
-toml.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+idiolect-common = { path = "../idiolect-common" }

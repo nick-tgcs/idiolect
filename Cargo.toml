@@ -17,6 +17,7 @@ members = [
     "crates/idiolect-adapter-vad",
     "crates/idiolect-adapter-whisper",
     "crates/idiolect-trainerctl",
+    "crates/idiolect-sync",
     "crates/idiolect-ml-core",
     "crates/idiolect-trainer-burn",
     "crates/idiolectd",

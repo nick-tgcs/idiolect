@@ -1302,7 +1302,12 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
-    pub fn set_audio_digest_for_test(
+    /// Persist the content digest (lowercase-hex SHA-256 of the encoded audio
+    /// payload) for an utterance. Capture calls this so the training-manifest
+    /// builder — which rejects an empty `audio_digest` — accepts real captures.
+    /// The digest itself is computed via
+    /// [`idiolect_common::digest::audio_sha256_hex`] so every layer agrees.
+    pub fn set_audio_digest(
         &self,
         utterance_id: &str,
         audio_digest: &str,
@@ -1315,6 +1320,19 @@ impl SqliteMetadataStore {
             return Err(SqliteStorageError::not_found("utterance", utterance_id));
         }
         Ok(())
+    }
+
+    /// Read back an utterance's stored audio digest. `None` means the column is
+    /// still NULL (digest never populated). Test/inspection helper.
+    pub fn audio_digest_for_test(
+        &self,
+        utterance_id: &str,
+    ) -> Result<Option<String>, SqliteStorageError> {
+        backend_result(self.connection.query_row(
+            "SELECT audio_sha256 FROM utterances WHERE id = ?1",
+            params![utterance_id],
+            |row| row.get::<_, Option<String>>(0),
+        ))
     }
 
     pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
