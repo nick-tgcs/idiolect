@@ -122,6 +122,7 @@ intentional divergence from Linux's in-daemon ksni.
 | `macos/IdiolectIMK/` (new) | `objc2` IMK component + `.app` bundle (`Info.plist`, ad-hoc/Developer-ID signing, `TISRegisterInputSource`) |
 | `idiolect-adapters/desktop/tray-macos` (new) | `NSStatusItem` menu-bar agent over IPC |
 | `idiolectd` | `cfg(target_os)` adapter selection; `cfg` out `desktop_integration.rs` on macOS |
+| `idiolect-cli` (+ ibus client `default_socket_path`) | route socket discovery through `XdgBaseDirs::for_platform`/`resolve_xdg_paths` instead of the hardcoded Linux `~/.local/run/idiolect` chain, so clients find the daemon's `$TMPDIR` socket on macOS. Currently Linux-only and unchanged; **must** land when `idiolect-cli` joins the macOS CI matrix (Phase 2), or `doctor`/history-reinsert will report the socket down while the daemon is up. |
 | `dist/macos/` (new) | launchd plist, bundle-assembly + install scripts, TCC docs |
 
 ## TDD strategy

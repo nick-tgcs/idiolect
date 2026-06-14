@@ -154,7 +154,12 @@ impl MetadataStorePort for FakeMetadataStore {
 
     fn recent_history(&self, limit: u32) -> Result<Vec<HistoryEntry>, Self::Error> {
         let mut entries = self.history_entries.clone();
-        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Newest first by timestamp, with the monotonic id breaking ties. The id
+        // tiebreaker is what keeps ordering deterministic on a coarse clock (e.g.
+        // macOS), where two commits microseconds apart can share a created_at
+        // string; the real store sees distinct millisecond timestamps so the
+        // realistic newest-first order is preserved here without one.
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
         let entries: Vec<HistoryEntry> = entries
             .into_iter()
             .take(limit as usize)
@@ -187,7 +192,16 @@ impl MetadataStorePort for FakeMetadataStore {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
         let original_len = self.history_entries.len();
-        self.history_entries.retain(|e| e.created_at >= cutoff_str);
+        // Keep entries *strictly* newer than the cutoff. With `older_than_days == 0`
+        // the cutoff is "now", and entries committed microseconds earlier must all
+        // be pruned ("0 days = clear all"). A `>=` here is clock-resolution
+        // dependent: on a coarse clock (e.g. macOS) a just-committed entry's
+        // RFC3339 string can equal the cutoff and wrongly survive — a real flake
+        // this exact test surfaced on a macOS runner. `>` matches the SQLite
+        // store's observable behaviour, where a real time gap makes commits
+        // strictly precede the prune.
+        self.history_entries
+            .retain(|e| e.created_at.as_str() > cutoff_str.as_str());
         Ok((original_len - self.history_entries.len()) as u64)
     }
 
