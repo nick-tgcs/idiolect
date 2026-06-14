@@ -79,7 +79,20 @@ struct Shared {
     /// so the indicator can appear right where the user is dictating.
     caret: Mutex<(i32, i32)>,
     connection: Connection,
+    /// Restores X11 focus to the app the user was dictating into before a direct
+    /// (no-dialog) commit, mirroring what the review dialog already does — the WM
+    /// may not have handed focus back yet after the take (indicator, focus churn),
+    /// and a commit racing that transition lands nowhere.
+    focus: Box<dyn crate::focus::WindowFocus>,
+    /// The window that was focused when the current take started recording — the
+    /// commit target to re-assert focus on (captured on `recording=true`).
+    dictation_target: Mutex<Option<crate::focus::WindowId>>,
 }
+
+/// After re-asserting focus, give the WM + app a moment to process the focus-in
+/// and re-establish their input context before the engine commits — otherwise the
+/// commit races the focus hand-back (the same settle the review dialog uses).
+const FOCUS_SETTLE: Duration = Duration::from_millis(120);
 
 type SharedRef = Arc<Shared>;
 
@@ -442,6 +455,15 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 if update.partial {
                     // A mid-take snippet of a streamed take: type it and keep
                     // recording. The daemon finalizes the whole take at stop.
+                    // Re-assert focus on the dictation target first (same dance as
+                    // the final direct commit) so the snippet lands in the app and
+                    // not wherever the WM's focus churn left things — streaming
+                    // dictation hits THIS arm, not the batch one below.
+                    let target = *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex");
+                    restore_dictation_focus(shared.focus.as_ref(), target);
                     shared.run_session(|s| s.on_partial_transcript(update.text))
                 } else if update.review {
                     // Review mode: the take is over — the listening dialog
@@ -461,6 +483,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     }
                 } else if shared.active_path.lock().expect("active_path mutex").is_some() {
                     // Direct (review-off) take with a focused context to type into.
+                    // Re-assert focus on the window the user started dictating in and
+                    // let it settle BEFORE committing — after a take the WM may not
+                    // have handed focus back yet (indicator/focus churn), and a commit
+                    // racing that transition lands nowhere. This is the focus dance the
+                    // review dialog already does; the direct path was missing it.
+                    let target = *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex");
+                    restore_dictation_focus(shared.focus.as_ref(), target);
                     shared.run_session(|s| s.on_transcript(update.text))
                 } else {
                     // Direct take but NO focused context: typing would lose the
@@ -481,7 +513,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 // instead of tracking our own. Drives the "voice is live" indicator
                 // (refreshed by sync_indicator below).
                 dbg_edit(&format!("recording_status <- daemon: {}", status.recording));
-                if !status.recording {
+                if status.recording {
+                    // Capture the window the user is dictating into NOW, before the
+                    // take can disrupt focus, so a direct commit can re-assert it.
+                    let target = shared.focus.active_window();
+                    dbg_edit(&format!("dictation target captured: {target:?}"));
+                    *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex") = target;
+                } else {
                     // A take that ends WITH a final transcript already consumed
                     // its dialog in review() above; this only tears down a
                     // still-listening dialog (cancelled take), where it is the
@@ -538,6 +579,23 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
             None => {}
         }
     });
+}
+
+/// Re-assert X11 focus on the window the user was dictating into (if one was
+/// captured at record-start) and let it settle, so a direct commit lands there
+/// instead of racing the WM's focus hand-back after a take. Returns whether a
+/// restore was performed. The same focus dance the review dialog does before it
+/// commits — the direct path was missing it, so direct commits could vanish while
+/// review-mode commits (which restore + settle) landed fine.
+fn restore_dictation_focus(
+    focus: &dyn crate::focus::WindowFocus,
+    target: Option<crate::focus::WindowId>,
+) -> bool {
+    let Some(window) = target else { return false };
+    dbg_edit(&format!("direct commit: restoring focus to window {window}"));
+    focus.restore(window);
+    std::thread::sleep(FOCUS_SETTLE);
+    true
 }
 
 /// Run the review dialog over a stored history entry's text and report the
@@ -671,6 +729,8 @@ pub async fn run() -> zbus::Result<()> {
         indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
         caret: Mutex::new((400, 400)),
         connection: connection.clone(),
+        focus: crate::focus::default_window_focus(),
+        dictation_target: Mutex::new(None),
     });
     spawn_reader(Arc::clone(&shared), reader, reader_sender);
 
@@ -714,10 +774,45 @@ mod tests {
     use idiolect_ipc::messages::EditHistory;
     use idiolect_ipc::IpcMessage;
 
+    use std::sync::Mutex as StdMutex;
+
+    use crate::focus::{WindowFocus, WindowId};
     use crate::ipc::DaemonSender;
     use crate::review::ReviewDialog;
 
-    use super::handle_edit_history;
+    use super::{handle_edit_history, restore_dictation_focus};
+
+    /// Records the windows focus was re-asserted on, so we can assert the direct
+    /// commit hands focus back to where the user was dictating.
+    struct RecordingFocus {
+        restored: StdMutex<Vec<WindowId>>,
+    }
+    impl WindowFocus for RecordingFocus {
+        fn active_window(&self) -> Option<WindowId> {
+            None
+        }
+        fn restore(&self, window: WindowId) {
+            self.restored.lock().expect("restored mutex").push(window);
+        }
+    }
+
+    #[test]
+    fn direct_commit_restores_focus_to_the_captured_window() {
+        let focus = RecordingFocus {
+            restored: StdMutex::new(Vec::new()),
+        };
+        assert!(restore_dictation_focus(&focus, Some(42)));
+        assert_eq!(*focus.restored.lock().expect("restored mutex"), vec![42]);
+    }
+
+    #[test]
+    fn direct_commit_without_a_captured_window_does_not_restore() {
+        let focus = RecordingFocus {
+            restored: StdMutex::new(Vec::new()),
+        };
+        assert!(!restore_dictation_focus(&focus, None));
+        assert!(focus.restored.lock().expect("restored mutex").is_empty());
+    }
 
     /// A dialog with a fixed verdict: `Some(text)` confirms with that text,
     /// `None` cancels.

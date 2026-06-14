@@ -57,16 +57,7 @@ fn main() -> eframe::Result<()> {
     });
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([WIN, WIN])
-            .with_position(caret_to_window(x, y))
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_mouse_passthrough(true)
-            .with_taskbar(false)
-            .with_title("idiolect-recording"),
+        viewport: viewport(x, y),
         ..Default::default()
     };
 
@@ -75,6 +66,42 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |_cc| Ok(Box::new(Indicator { caret }))),
     )
+}
+
+/// The HUD window configuration, split out of `main` so its focus-proofing can be
+/// asserted without launching a GUI (the `eframe::run_native` call is the real
+/// GUI boundary and stays untestable).
+///
+/// This window must be a **passive, non-focusing overlay**: it appears mid-take,
+/// on top of the app being dictated into, and must never take the input focus. If
+/// it does, it registers an IBus input context and trades X11 focus with the app
+/// frame-by-frame for the whole take — so the engine's `CommitText` races that flap
+/// and the dictated text lands in the HUD (i.e. nowhere) about half the time. The
+/// `Notification` window type is the decisive lever: WMs never give input focus to
+/// `_NET_WM_WINDOW_TYPE_NOTIFICATION` windows (and docks never list them), so the app
+/// keeps focus throughout and the commit is deterministic. `with_active(false)` (don't
+/// activate on map) and `with_mouse_passthrough(true)` are belt-and-braces on the same
+/// intent.
+///
+/// NOTE: this only works because the crate enables eframe's `x11` feature — egui-winit
+/// applies `with_window_type` solely under `#[cfg(feature = "x11")]`, so without it the
+/// type is silently dropped and the window reverts to a focus-stealing, dock-listed
+/// `_NET_WM_WINDOW_TYPE_NORMAL`. The window type can't be asserted headlessly (it only
+/// reaches X11 at `run_native`), so the guarantee is the `x11` feature + a manual xprop
+/// check; the test below pins the `ViewportBuilder` config that feeds it.
+fn viewport(x: f32, y: f32) -> egui::ViewportBuilder {
+    egui::ViewportBuilder::default()
+        .with_inner_size([WIN, WIN])
+        .with_position(caret_to_window(x, y))
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_resizable(false)
+        .with_mouse_passthrough(true)
+        .with_active(false)
+        .with_window_type(egui::X11WindowType::Notification)
+        .with_taskbar(false)
+        .with_title("idiolect-recording")
 }
 
 struct Indicator {
@@ -197,6 +224,22 @@ mod tests {
             })
         });
         assert!(moved_to_caret, "indicator should reposition onto the caret");
+    }
+
+    #[test]
+    fn viewport_is_a_passive_non_focusing_overlay() {
+        let vb = viewport(400.0, 400.0);
+        // The crux: a Notification-type window is never given input focus by the WM,
+        // so the HUD can't steal the IBus input context from the app being dictated
+        // into — without this the engine's CommitText races a focus flap and the
+        // text vanishes on roughly every other take.
+        assert_eq!(vb.window_type, Some(egui::X11WindowType::Notification));
+        // Reinforcing the same "never take focus" intent.
+        assert_eq!(vb.active, Some(false));
+        assert_eq!(vb.mouse_passthrough, Some(true));
+        assert_eq!(vb.taskbar, Some(false));
+        // Still positioned on the caret it was launched at.
+        assert_eq!(vb.position, Some(caret_to_window(400.0, 400.0)));
     }
 
     #[test]

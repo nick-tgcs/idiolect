@@ -228,6 +228,16 @@ fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
     let base_dirs = XdgBaseDirs::default();
     let paths = resolve_xdg_paths(&config, &base_dirs);
     prepare_configured_paths(&paths)?;
+    // Desktop integration (the GNOME dock mic) is a side effect of a *real,
+    // persistent* daemon launch only — never config validation or the ephemeral
+    // test daemons, which must not write into the user's real ~/.local/share.
+    if crate::desktop_integration::should_install(
+        run_args.check_config,
+        run_args.shutdown_after_client,
+        std::env::var_os("IDIOLECT_DISABLE_TRAY").is_some(),
+    ) {
+        crate::desktop_integration::ensure(&base_dirs);
+    }
     if !paths.model_path.is_file() {
         return Err(RuntimeError::usage(format!(
             "ASR model path does not exist: {}",
