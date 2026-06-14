@@ -407,8 +407,14 @@ fn rejected_socket_path_error_names_the_limit() {
     let error = check_socket_path_len(&too_long, Platform::MacOs)
         .expect_err("a 201-byte path must be rejected");
     let message = format!("{error}").to_lowercase();
-    assert!(message.contains("socket path"), "names the offending path: {message}");
-    assert!(message.contains("104"), "names the platform limit: {message}");
+    assert!(
+        message.contains("socket path"),
+        "names the offending path: {message}"
+    );
+    assert!(
+        message.contains("104"),
+        "names the platform limit: {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +434,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// removes), serialized against other env tests, restoring the prior values
 /// before returning `f`'s result.
 fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved: Vec<(String, Option<String>)> = vars
         .iter()
         .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))

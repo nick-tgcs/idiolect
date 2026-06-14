@@ -165,8 +165,14 @@ fn run_check_config_rejects_a_socket_path_that_overflows_sun_path() {
 
     let err = run_cli(&args).expect_err("an overlong socket path must be rejected");
     let message = err.to_string().to_lowercase();
-    assert!(message.contains("socket path"), "names the cause: {message}");
-    assert!(message.contains("too long"), "explains the cause: {message}");
+    assert!(
+        message.contains("socket path"),
+        "names the cause: {message}"
+    );
+    assert!(
+        message.contains("too long"),
+        "explains the cause: {message}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

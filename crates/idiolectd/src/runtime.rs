@@ -891,7 +891,13 @@ mod socket_guard_tests {
         let error = prepare_configured_paths(&paths_with_socket(too_long))
             .expect_err("a 201-byte socket path overflows sun_path");
         let message = format!("{error}").to_lowercase();
-        assert!(message.contains("socket path"), "explains the cause: {message}");
-        assert!(message.contains("too long"), "explains the cause: {message}");
+        assert!(
+            message.contains("socket path"),
+            "explains the cause: {message}"
+        );
+        assert!(
+            message.contains("too long"),
+            "explains the cause: {message}"
+        );
     }
 }
