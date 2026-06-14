@@ -12,6 +12,10 @@ use idiolectd::runtime::run_cli;
 use serde_json::Value;
 
 fn config_toml(root: &Path) -> String {
+    config_toml_with_socket(root, &root.join("runtime").join("idiolect.sock"))
+}
+
+fn config_toml_with_socket(root: &Path, socket: &Path) -> String {
     format!(
         r#"[user]
 default_user_id = "default"
@@ -61,7 +65,7 @@ private_text_probe = "private probe text"
 [observability]
 log_private_text = false
 "#,
-        socket = root.join("runtime").join("idiolect.sock").display(),
+        socket = socket.display(),
         data = root.join("data").display(),
         db = root
             .join("data")
@@ -121,6 +125,48 @@ fn run_check_config_prepares_paths_and_validates_model_presence() {
     fs::remove_file(&model_path).expect("remove model");
     let err = run_cli(&args).expect_err("check-config should fail without the model");
     assert!(err.to_string().contains("ASR model path does not exist"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// End-to-end counterpart to the unit guard in `runtime::socket_guard_tests`:
+/// a configured `daemon.socket_path` that overflows `sun_path` must be rejected
+/// by the real CLI preflight (before any `bind`/EINVAL) with a readable message.
+/// The accept path is the happy `--check-config` above (a short socket → ready).
+/// No `HOME`/env mutation here, so it never races the env-dependent test.
+#[test]
+fn run_check_config_rejects_a_socket_path_that_overflows_sun_path() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock");
+    let root = env::temp_dir().join(format!(
+        "idiolectd-overlong-socket-{}-{}",
+        std::process::id(),
+        now.as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("temp root");
+
+    // A 150-char socket filename overflows the limit (108 Linux / 104 macOS)
+    // regardless of how short the temp root is — deterministic on any host.
+    let overlong_socket = root.join(format!("{}.sock", "a".repeat(150)));
+    let config_path = root.join("config.toml");
+    fs::write(
+        &config_path,
+        config_toml_with_socket(&root, &overlong_socket),
+    )
+    .expect("config write");
+
+    let args = vec![
+        "run".to_owned(),
+        "--config".to_owned(),
+        config_path.to_str().expect("utf8 config path").to_owned(),
+        "--check-config".to_owned(),
+    ];
+
+    let err = run_cli(&args).expect_err("an overlong socket path must be rejected");
+    let message = err.to_string().to_lowercase();
+    assert!(message.contains("socket path"), "names the cause: {message}");
+    assert!(message.contains("too long"), "explains the cause: {message}");
 
     let _ = fs::remove_dir_all(&root);
 }

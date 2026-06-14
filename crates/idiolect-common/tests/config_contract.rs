@@ -1,4 +1,10 @@
-use idiolect_common::config::{resolve_xdg_paths, IdiolectConfig, XdgBaseDirs};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use idiolect_common::config::{
+    check_socket_path_len, max_socket_path_len, resolve_xdg_paths, IdiolectConfig, Platform,
+    XdgBaseDirs,
+};
 
 const MASTER_PLAN_TOML: &str = r#"
 [user]
@@ -292,4 +298,234 @@ fn notify_command_defaults_to_notify_send_and_is_overridable() {
     let config = IdiolectConfig::from_toml_str(&overridden).expect("override must parse");
     config.validate().expect("override must validate");
     assert_eq!(config.daemon.notify_command, "/opt/custom-notifier");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-platform base directories (macOS port — see docs/future/009-macos-port).
+//
+// `platform_defaults` is pure (no env lookups), so both OS layouts are asserted
+// here regardless of which host runs the suite. This is what lets the Linux CI
+// prove the macOS layout, and the future macOS runner prove the Linux one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn linux_base_dirs_follow_the_xdg_layout() {
+    let home = PathBuf::from("/home/ada");
+    let tmp = PathBuf::from("/run/user/1000");
+    let dirs = XdgBaseDirs::platform_defaults(Platform::Linux, &home, &tmp);
+
+    assert_eq!(dirs.config_home, Path::new("/home/ada/.config"));
+    assert_eq!(dirs.data_home, Path::new("/home/ada/.local/share"));
+    assert_eq!(dirs.cache_home, Path::new("/home/ada/.cache"));
+    // Linux falls back to a home-relative runtime dir; `tmp` is unused here.
+    assert_eq!(dirs.runtime_dir, Path::new("/home/ada/.local/run/idiolect"));
+}
+
+#[test]
+fn macos_base_dirs_follow_the_apple_layout() {
+    let home = PathBuf::from("/Users/ada");
+    let tmp = PathBuf::from("/var/folders/q5/abc/T");
+    let dirs = XdgBaseDirs::platform_defaults(Platform::MacOs, &home, &tmp);
+
+    // Config and data both live under Application Support (macOS has no XDG
+    // split); a TOML config belongs there, not in plist-only ~/Library/Preferences.
+    assert_eq!(
+        dirs.config_home,
+        Path::new("/Users/ada/Library/Application Support")
+    );
+    assert_eq!(
+        dirs.data_home,
+        Path::new("/Users/ada/Library/Application Support")
+    );
+    assert_eq!(dirs.cache_home, Path::new("/Users/ada/Library/Caches"));
+    // The control socket lives in the per-user temp dir (`$TMPDIR`); macOS has
+    // no XDG_RUNTIME_DIR, and TMPDIR is short enough to stay within sun_path.
+    assert_eq!(dirs.runtime_dir, Path::new("/var/folders/q5/abc/T"));
+}
+
+#[test]
+fn macos_resolved_paths_land_under_application_support() {
+    let config =
+        IdiolectConfig::from_toml_str(MASTER_PLAN_TOML).expect("master-plan config should parse");
+    let dirs = XdgBaseDirs::platform_defaults(
+        Platform::MacOs,
+        Path::new("/Users/ada"),
+        Path::new("/var/folders/q5/abc/T"),
+    );
+    let paths = resolve_xdg_paths(&config, &dirs);
+
+    assert_eq!(
+        paths.config_file,
+        Path::new("/Users/ada/Library/Application Support/idiolect/config.toml")
+    );
+    assert_eq!(
+        paths.socket_path,
+        Path::new("/var/folders/q5/abc/T/idiolect.sock")
+    );
+    assert!(paths
+        .database_path
+        .starts_with("/Users/ada/Library/Application Support/idiolect"));
+    assert!(paths
+        .decoded_cache_dir
+        .starts_with("/Users/ada/Library/Caches/idiolect"));
+}
+
+// ---------------------------------------------------------------------------
+// Socket-path length guard. A `sockaddr_un` holds a fixed `sun_path`; exceed it
+// and `bind` fails with a bare EINVAL. macOS' budget (104) is shorter than
+// Linux' (108), so a path that binds on Linux can fail on macOS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn socket_path_limit_is_shorter_on_macos() {
+    assert_eq!(max_socket_path_len(Platform::Linux), 108);
+    assert_eq!(max_socket_path_len(Platform::MacOs), 104);
+}
+
+#[test]
+fn overlong_socket_paths_are_rejected_per_platform() {
+    // 103 usable bytes fit on both; 104 fills macOS' budget (no room for NUL)
+    // but still fits Linux; 108 overflows both.
+    let p103 = PathBuf::from(format!("/{}", "a".repeat(102)));
+    assert_eq!(p103.as_os_str().len(), 103);
+    let p104 = PathBuf::from(format!("/{}", "a".repeat(103)));
+    let p108 = PathBuf::from(format!("/{}", "a".repeat(107)));
+
+    check_socket_path_len(&p103, Platform::MacOs).expect("103 bytes fits macOS");
+    check_socket_path_len(&p103, Platform::Linux).expect("103 bytes fits Linux");
+
+    check_socket_path_len(&p104, Platform::MacOs).expect_err("104 bytes overflows macOS sun_path");
+    check_socket_path_len(&p104, Platform::Linux).expect("104 bytes still fits Linux");
+
+    check_socket_path_len(&p108, Platform::MacOs).expect_err("108 bytes overflows macOS");
+    check_socket_path_len(&p108, Platform::Linux).expect_err("108 bytes overflows Linux");
+}
+
+#[test]
+fn rejected_socket_path_error_names_the_limit() {
+    let too_long = PathBuf::from(format!("/{}", "a".repeat(200)));
+    let error = check_socket_path_len(&too_long, Platform::MacOs)
+        .expect_err("a 201-byte path must be rejected");
+    let message = format!("{error}").to_lowercase();
+    assert!(message.contains("socket path"), "names the offending path: {message}");
+    assert!(message.contains("104"), "names the platform limit: {message}");
+}
+
+// ---------------------------------------------------------------------------
+// `for_platform` env-resolution layer: HOME/TMPDIR resolution, the per-key
+// `XDG_*` overrides layered on the platform defaults, and the `/tmp` fallbacks.
+// This is the seam the macOS port introduces (TMPDIR routing the socket, `XDG_*`
+// honoured on every OS) — covered here, not just the pure `platform_defaults`.
+//
+// `for_platform` reads process-global env, so these serialize on a mutex and
+// restore the prior values; assertions run *after* restore so a failure can't
+// leave the environment dirty for other tests in this binary.
+// ---------------------------------------------------------------------------
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `f` with `vars` applied to the process environment (`Some` sets, `None`
+/// removes), serialized against other env tests, restoring the prior values
+/// before returning `f`'s result.
+fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let saved: Vec<(String, Option<String>)> = vars
+        .iter()
+        .map(|(key, _)| ((*key).to_owned(), std::env::var(key).ok()))
+        .collect();
+    for (key, value) in vars {
+        match value {
+            Some(val) => std::env::set_var(key, val),
+            None => std::env::remove_var(key),
+        }
+    }
+    let result = f();
+    for (key, value) in saved {
+        match value {
+            Some(val) => std::env::set_var(&key, val),
+            None => std::env::remove_var(&key),
+        }
+    }
+    result
+}
+
+const XDG_VARS: [&str; 4] = [
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+fn cleared_xdg() -> Vec<(&'static str, Option<&'static str>)> {
+    XDG_VARS.iter().map(|key| (*key, None)).collect()
+}
+
+#[test]
+fn for_platform_macos_routes_the_socket_through_tmpdir() {
+    let mut vars = cleared_xdg();
+    vars.push(("HOME", Some("/Users/ada")));
+    vars.push(("TMPDIR", Some("/var/folders/q5/abc/T")));
+    let dirs = with_env(&vars, || XdgBaseDirs::for_platform(Platform::MacOs));
+
+    // The macOS socket follows $TMPDIR (catches a per-key swap that would route
+    // runtime_dir to, say, the Caches default instead).
+    assert_eq!(dirs.runtime_dir, Path::new("/var/folders/q5/abc/T"));
+    assert_eq!(
+        dirs.config_home,
+        Path::new("/Users/ada/Library/Application Support")
+    );
+}
+
+#[test]
+fn for_platform_falls_back_to_tmp_when_home_and_tmpdir_are_absent() {
+    let mut vars = cleared_xdg();
+    vars.push(("HOME", None));
+    vars.push(("TMPDIR", None));
+    let dirs = with_env(&vars, || XdgBaseDirs::for_platform(Platform::MacOs));
+
+    // Both fall back to /tmp: HOME→/tmp gives /tmp/Library/...; TMPDIR→/tmp
+    // gives the socket dir.
+    assert_eq!(
+        dirs.config_home,
+        Path::new("/tmp/Library/Application Support")
+    );
+    assert_eq!(dirs.runtime_dir, Path::new("/tmp"));
+}
+
+#[test]
+fn for_platform_lets_each_xdg_override_win_over_its_own_default() {
+    // Each override must land on its matching field — not a neighbour's. Setting
+    // all four to distinct paths pins the wiring against a copy/paste swap.
+    let dirs = with_env(
+        &[
+            ("HOME", Some("/Users/ada")),
+            ("TMPDIR", Some("/var/folders/q5/abc/T")),
+            ("XDG_CONFIG_HOME", Some("/over/config")),
+            ("XDG_DATA_HOME", Some("/over/data")),
+            ("XDG_CACHE_HOME", Some("/over/cache")),
+            ("XDG_RUNTIME_DIR", Some("/over/run")),
+        ],
+        || XdgBaseDirs::for_platform(Platform::MacOs),
+    );
+
+    assert_eq!(dirs.config_home, Path::new("/over/config"));
+    assert_eq!(dirs.data_home, Path::new("/over/data"));
+    assert_eq!(dirs.cache_home, Path::new("/over/cache"));
+    // XDG_RUNTIME_DIR wins over TMPDIR for the socket.
+    assert_eq!(dirs.runtime_dir, Path::new("/over/run"));
+}
+
+#[test]
+fn for_platform_linux_keeps_the_xdg_layout_through_env_resolution() {
+    let mut vars = cleared_xdg();
+    vars.push(("HOME", Some("/home/ada")));
+    vars.push(("TMPDIR", Some("/should/be/ignored/on/linux")));
+    let dirs = with_env(&vars, || XdgBaseDirs::for_platform(Platform::Linux));
+
+    assert_eq!(dirs.config_home, Path::new("/home/ada/.config"));
+    assert_eq!(dirs.data_home, Path::new("/home/ada/.local/share"));
+    assert_eq!(dirs.cache_home, Path::new("/home/ada/.cache"));
+    // Linux ignores TMPDIR and uses the home-relative runtime dir — proving the
+    // pre-port Default behaviour is preserved through the new env wrapper.
+    assert_eq!(dirs.runtime_dir, Path::new("/home/ada/.local/run/idiolect"));
 }
