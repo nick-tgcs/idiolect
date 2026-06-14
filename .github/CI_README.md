@@ -35,13 +35,28 @@ Jobs:
 - **coverage-map**: Documentation sync validation (needs rust-quick + fcitx5-quick)
 - **pr-validation-summary**: Final gate
 
-### 3. `release.yml` - Release Pipeline (Runs on version tags v*)
-**Builds and publishes release artifacts.**
+### 3. `release.yml` - Stable Release Pipeline (version tags `v*`)
+**Builds and publishes stable, versioned release artifacts.**
 
 Jobs:
-- **full-ci**: Reuses ci.yml workflow (must pass)
-- **build-release**: Builds release binaries and Debian package
-- **create-release**: Creates GitHub Release with artifacts
+- **full-ci**: Reuses `ci.yml` as a safety gate (must pass)
+- **build-release**: Builds release binaries and the Debian package
+- **create-release**: Creates the versioned GitHub Release with artifacts
+  (`idiolectd`, `idiolect-cli`, `idiolect-trainerctl`, and the `.deb` — there is
+  no bare `idiolect` binary; the CLI ships as `idiolect-cli`)
+
+### 3a. `release-main.yml` - Rolling Edge Release (every push to `main`)
+**Always keeps a downloadable build of `main` HEAD.**
+
+Runs on every push to `main` (and via manual `workflow_dispatch`). Reuses
+`ci.yml` as a gate (never ships a red build), then publishes a single rolling
+`edge` **prerelease**, moving the `edge` tag to the latest green commit. Stable,
+versioned releases still come only from `v*` tags via `release.yml`.
+
+Jobs: **full-ci** (reuses `ci.yml`) → **build-release** → **publish-edge**.
+
+> Both release workflows call `ci.yml` as a reusable workflow, which is why
+> `ci.yml` declares a `workflow_call` trigger.
 
 ### 4. `scheduled.yml` - Scheduled Checks
 **Nightly and weekly comprehensive runs.**

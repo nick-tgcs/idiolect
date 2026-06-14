@@ -1,9 +1,18 @@
-name: Release
+name: Release (main)
+
+# Rolling "edge" release built off every push to main. The tag-driven
+# `release.yml` still produces versioned, non-prerelease releases on `v*` tags;
+# this one keeps a single, always-current prerelease (`edge`) pointing at the
+# latest green main commit so there is always a downloadable build of HEAD.
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: true
 
 env:
   RUST_VERSION: "1.96.0"
@@ -11,7 +20,7 @@ env:
 
 jobs:
   # =========================================================================
-  # FULL CI (same as main branch CI)
+  # FULL CI GATE (same suite as the main-branch CI) — never ship a red build
   # =========================================================================
   full-ci:
     name: Full CI
@@ -19,7 +28,8 @@ jobs:
     secrets: inherit
 
   # =========================================================================
-  # BUILD RELEASE ARTIFACTS
+  # BUILD RELEASE ARTIFACTS (Linux). A macOS matrix job slots in here once the
+  # macOS port lands — see docs/future/009-macos-port.md.
   # =========================================================================
   build-release:
     name: Build Release Artifacts
@@ -52,7 +62,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev libasound2-dev libpulse-dev dpkg-dev
+          sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
 
       - name: Build FCITX5
         run: |
@@ -70,22 +80,6 @@ jobs:
       - name: Verify package
         run: bash ci/scripts/test-package-smoke.sh && bash ci/scripts/test-package-lifecycle.sh
 
-      # Stage into a flat dir before upload. upload-artifact@v4 preserves the
-      # directory structure relative to the least-common ancestor of its paths,
-      # so mixing target/release/* with target/package/*.deb would bury files
-      # under release/ and package/ and break the flat paths the release step
-      # expects. The `cp` of explicit binaries also fails the job loudly if a
-      # binary name ever drifts (bash runs with `set -e`).
-      - name: Stage release artifacts
-        run: |
-          mkdir -p dist
-          cp target/release/idiolectd \
-             target/release/idiolect-cli \
-             target/release/idiolect-trainerctl \
-             dist/
-          cp target/package/*.deb dist/
-          ls -l dist
-
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -93,15 +87,19 @@ jobs:
           # The `.deb` is the primary distributable; the loose binaries are a
           # convenience. (There is no bare `idiolect` binary — the CLI ships as
           # `idiolect-cli`.)
-          if-no-files-found: error
-          path: dist/
+          path: |
+            target/release/idiolectd
+            target/release/idiolect-cli
+            target/release/idiolect-trainerctl
+            target/package/*.deb
           retention-days: 30
 
   # =========================================================================
-  # CREATE GITHUB RELEASE
+  # PUBLISH ROLLING "edge" PRERELEASE — moves the `edge` tag to this commit and
+  # replaces the single prerelease so it always tracks the latest green main.
   # =========================================================================
-  create-release:
-    name: Create GitHub Release
+  publish-edge:
+    name: Publish edge prerelease
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [build-release]
@@ -114,15 +112,27 @@ jobs:
           name: release-artifacts
           path: release-artifacts
 
-      - name: Create release
+      # softprops won't move an *existing* tag via target_commitish, so retire
+      # the previous edge release+tag first; it is then recreated at this commit.
+      - name: Retire previous edge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete edge --cleanup-tag --yes -R "${{ github.repository }}" || true
+
+      - name: Publish/replace edge release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: edge
+          name: Edge (latest main)
+          body: |
+            Rolling prerelease built from the latest green commit on `main`
+            (`${{ github.sha }}`). For stable, versioned releases see the
+            `v*`-tagged releases.
+          prerelease: true
+          # Recreate the `edge` tag at this commit on each run.
+          target_commitish: ${{ github.sha }}
           files: |
             release-artifacts/idiolectd
             release-artifacts/idiolect-cli
             release-artifacts/idiolect-trainerctl
             release-artifacts/*.deb
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          draft: false
-          prerelease: false
