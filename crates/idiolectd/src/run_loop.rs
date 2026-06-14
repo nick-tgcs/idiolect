@@ -455,8 +455,12 @@ fn effective_translation_config(
 /// to it so a take can never end before one snippet pause completes.
 fn effective_vad_config(store: &SqliteMetadataStore, defaults: &VadConfig) -> VadConfig {
     let settings = store.get_all_tray_settings().unwrap_or_default();
-    let override_ms =
-        |key: &str, fallback: u32| settings.get(key).and_then(|v| v.parse().ok()).unwrap_or(fallback);
+    let override_ms = |key: &str, fallback: u32| {
+        settings
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(fallback)
+    };
 
     let post_roll_ms = override_ms("vad_post_roll_ms", defaults.post_roll_ms);
     let mut auto_stop_silence_ms =
@@ -489,9 +493,21 @@ fn apply_dictation_tray_action(
     type MsForIndex = fn(usize) -> Option<u32>;
     let knobs: [(&str, &str, MsForIndex); 4] = [
         ("settings:pause:", "vad_post_roll_ms", pause_ms_for_index),
-        ("settings:min_speech:", "vad_min_speech_ms", min_speech_ms_for_index),
-        ("settings:max_phrase:", "vad_max_utterance_ms", max_phrase_ms_for_index),
-        ("settings:auto_stop:", "vad_auto_stop_silence_ms", auto_stop_ms_for_index),
+        (
+            "settings:min_speech:",
+            "vad_min_speech_ms",
+            min_speech_ms_for_index,
+        ),
+        (
+            "settings:max_phrase:",
+            "vad_max_utterance_ms",
+            max_phrase_ms_for_index,
+        ),
+        (
+            "settings:auto_stop:",
+            "vad_auto_stop_silence_ms",
+            auto_stop_ms_for_index,
+        ),
     ];
     for (prefix, key, value_for_index) in knobs {
         if let Some(index) = parse_index_suffix(action, prefix) {
@@ -1050,8 +1066,7 @@ impl LiveStreamState {
     fn auto_stop_due(&self, threshold_ms: u32) -> bool {
         threshold_ms != 0
             && self.spoke
-            && self.silence_frames_since_speech * FRAME_DURATION_MS
-                >= threshold_ms as usize
+            && self.silence_frames_since_speech * FRAME_DURATION_MS >= threshold_ms as usize
     }
 
     /// Pushes one drained capture chunk through resample → frame → VAD →
@@ -1511,17 +1526,19 @@ fn finalize_streamed_take(
     // previewed snippet text rather than lose the take.
     let previewed = state.merged_text;
     let translation = effective_translation_config(store, &config.translation_config);
-    let final_text =
-        match crate::adapters::transcribe_translated(&config.adapter_profile, &translation, &segment)
-        {
-            Ok(draft) => choose_final_take_text(draft.text, previewed),
-            Err(error) => {
-                eprintln!(
+    let final_text = match crate::adapters::transcribe_translated(
+        &config.adapter_profile,
+        &translation,
+        &segment,
+    ) {
+        Ok(draft) => choose_final_take_text(draft.text, previewed),
+        Err(error) => {
+            eprintln!(
                     "whole-take transcription failed at stop; keeping the previewed snippet text: {error}"
                 );
-                previewed
-            }
-        };
+            previewed
+        }
+    };
     if final_text.trim().is_empty() {
         // Nothing decodable in the whole take (e.g. only noise): store nothing.
         return Ok(());
@@ -1651,7 +1668,11 @@ fn stop_live_and_transcribe(
             *active_session = Some(session);
             send_ipc_message(
                 stream,
-                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review, partial: false }),
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text,
+                    review,
+                    partial: false,
+                }),
             )?;
             // The mic is closed once the take stops, so the authoritative state is
             // "not recording" even while the preedit is pending review/commit.
@@ -1698,7 +1719,11 @@ fn start_fixture_oneshot(
             *active_session = Some(session);
             send_ipc_message(
                 stream,
-                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review, partial: false }),
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text,
+                    review,
+                    partial: false,
+                }),
             )?;
             // A fixture one-shot captures and transcribes instantly, so the mic is
             // never held open: the authoritative state stays "not recording".
@@ -1951,7 +1976,10 @@ fn edit_entry_via_ime(
     };
     send_ipc_message(
         stream,
-        &IpcMessage::EditHistory(EditHistory { id, text: entry.text }),
+        &IpcMessage::EditHistory(EditHistory {
+            id,
+            text: entry.text,
+        }),
     )
 }
 
@@ -2325,11 +2353,17 @@ mod tests {
     fn snippet_chunks_are_trimmed_and_joined_with_one_space() {
         use super::snippet_chunk;
         // First snippet: no joining space.
-        assert_eq!(snippet_chunk("", "restart traffic"), Some("restart traffic".to_owned()));
+        assert_eq!(
+            snippet_chunk("", "restart traffic"),
+            Some("restart traffic".to_owned())
+        );
         // Later snippets carry exactly one joining space — even when the decode
         // arrives whitespace-padded (a real take stored a double space because
         // a padded decode was glued verbatim).
-        assert_eq!(snippet_chunk("take", " so far "), Some(" so far".to_owned()));
+        assert_eq!(
+            snippet_chunk("take", " so far "),
+            Some(" so far".to_owned())
+        );
         // Empty or whitespace-only decodes contribute nothing — no bare space.
         assert_eq!(snippet_chunk("take", ""), None);
         assert_eq!(snippet_chunk("take", "   "), None);
@@ -2363,7 +2397,11 @@ mod tests {
         // Streamed take: the engine's correction window held only the last
         // snippet, so the fix lands on that suffix of the merged string.
         assert_eq!(
-            merge_tail_correction("restart traffic deploy nginx", Some("deploy nginx"), "deploy Nginx"),
+            merge_tail_correction(
+                "restart traffic deploy nginx",
+                Some("deploy nginx"),
+                "deploy Nginx"
+            ),
             "restart traffic deploy Nginx"
         );
         // Batch take: the window held the whole transcript.
@@ -2546,7 +2584,10 @@ mod tests {
 
             // The corrected text must be persisted so the tray lists the fix and a
             // re-edit starts from it — not left stale on the original transcript.
-            let entry = store.get_history_entry(id).expect("lookup").expect("exists");
+            let entry = store
+                .get_history_entry(id)
+                .expect("lookup")
+                .expect("exists");
             assert_eq!(entry.text, "restart Traefik");
         }
 
@@ -2554,8 +2595,7 @@ mod tests {
         fn apply_history_edit_returns_false_for_missing_id() {
             let (mut store, id) = store_with_entry("present");
 
-            let result =
-                apply_history_edit(&mut store, id + 999, "corrected").expect("no error");
+            let result = apply_history_edit(&mut store, id + 999, "corrected").expect("no error");
             assert!(!result, "should return false when entry not found");
         }
     }
@@ -2631,7 +2671,10 @@ mod tests {
             let mut state = LiveStreamState::new(&VadConfig::default());
             assert!(state.first_error_this_take("translation-unavailable"));
             assert!(!state.first_error_this_take("translation-unavailable"));
-            assert!(state.first_error_this_take("asr-unavailable"), "new code, new notification");
+            assert!(
+                state.first_error_this_take("asr-unavailable"),
+                "new code, new notification"
+            );
             let mut next_take = LiveStreamState::new(&VadConfig::default());
             assert!(next_take.first_error_this_take("translation-unavailable"));
         }
@@ -2674,14 +2717,23 @@ mod tests {
             for _ in 0..3 {
                 assert!(state.ingest(&silence_second).is_empty());
             }
-            assert!(!state.auto_stop_due(2_000), "pre-speech silence never stops the take");
+            assert!(
+                !state.auto_stop_due(2_000),
+                "pre-speech silence never stops the take"
+            );
 
             // Speak, then go quiet: the threshold now applies.
             state.ingest(&speech_pause_speech_fixture_16khz_mono());
-            assert!(!state.auto_stop_due(60_000), "long threshold not yet reached");
+            assert!(
+                !state.auto_stop_due(60_000),
+                "long threshold not yet reached"
+            );
             state.ingest(&silence_second);
             state.ingest(&silence_second);
-            assert!(state.auto_stop_due(2_000), "2s threshold crossed after speech");
+            assert!(
+                state.auto_stop_due(2_000),
+                "2s threshold crossed after speech"
+            );
             assert!(!state.auto_stop_due(0), "0 disables auto-stop entirely");
         }
     }
@@ -2733,9 +2785,7 @@ mod tests {
             assert!(
                 apply_dictation_tray_action(&mut store, "settings:max_phrase:2").expect("phrase")
             );
-            assert!(
-                apply_dictation_tray_action(&mut store, "settings:auto_stop:2").expect("stop")
-            );
+            assert!(apply_dictation_tray_action(&mut store, "settings:auto_stop:2").expect("stop"));
 
             let effective = effective_vad_config(&store, &defaults);
             assert_eq!(effective.post_roll_ms, 400);
@@ -2747,7 +2797,10 @@ mod tests {
             assert!(
                 apply_dictation_tray_action(&mut store, "settings:auto_stop:0").expect("never")
             );
-            assert_eq!(effective_vad_config(&store, &defaults).auto_stop_silence_ms, 0);
+            assert_eq!(
+                effective_vad_config(&store, &defaults).auto_stop_silence_ms,
+                0
+            );
         }
 
         #[test]
@@ -2758,8 +2811,12 @@ mod tests {
             // pause threshold instead of misbehaving.
             let mut store = store();
             let defaults = VadConfig::default();
-            store.set_tray_setting("vad_post_roll_ms", "2000").expect("set");
-            store.set_tray_setting("vad_auto_stop_silence_ms", "1000").expect("set");
+            store
+                .set_tray_setting("vad_post_roll_ms", "2000")
+                .expect("set");
+            store
+                .set_tray_setting("vad_auto_stop_silence_ms", "1000")
+                .expect("set");
 
             let effective = effective_vad_config(&store, &defaults);
             assert_eq!(effective.post_roll_ms, 2_000);
@@ -2770,7 +2827,9 @@ mod tests {
         fn corrupt_overrides_and_foreign_actions_are_safe() {
             let mut store = store();
             let defaults = VadConfig::default();
-            store.set_tray_setting("vad_post_roll_ms", "banana").expect("set");
+            store
+                .set_tray_setting("vad_post_roll_ms", "banana")
+                .expect("set");
 
             assert_eq!(
                 effective_vad_config(&store, &defaults).post_roll_ms,

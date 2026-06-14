@@ -63,7 +63,12 @@ impl SpecialTokens {
     #[must_use]
     pub fn transcription_prompt(&self) -> Vec<i32> {
         if self.multilingual {
-            vec![self.sot, self.language(0), self.transcribe, self.no_timestamps]
+            vec![
+                self.sot,
+                self.language(0),
+                self.transcribe,
+                self.no_timestamps,
+            ]
         } else {
             vec![self.sot, self.no_timestamps]
         }
@@ -234,13 +239,14 @@ impl<B: Backend> WhisperRuntime<B> {
                 device,
             ))
         };
-        let positional = |name: &str, rows: usize, cols: usize| -> Result<Tensor<B, 2>, GgmlError> {
-            let raw = model.tensor(name)?;
-            Ok(Tensor::from_data(
-                TensorData::new(raw.to_f32()?, [rows, cols]),
-                device,
-            ))
-        };
+        let positional =
+            |name: &str, rows: usize, cols: usize| -> Result<Tensor<B, 2>, GgmlError> {
+                let raw = model.tensor(name)?;
+                Ok(Tensor::from_data(
+                    TensorData::new(raw.to_f32()?, [rows, cols]),
+                    device,
+                ))
+            };
 
         let mut encoder_blocks = Vec::with_capacity(dims.n_audio_layer);
         for layer in 0..dims.n_audio_layer {
@@ -249,8 +255,14 @@ impl<B: Backend> WhisperRuntime<B> {
                 attn_ln: layer_norm(&format!("{p}.attn_ln"))?,
                 attn: attention(&format!("{p}.attn"))?,
                 mlp_ln: layer_norm(&format!("{p}.mlp_ln"))?,
-                mlp_up: linear(&format!("{p}.mlp.0.weight"), Some(&format!("{p}.mlp.0.bias")))?,
-                mlp_down: linear(&format!("{p}.mlp.2.weight"), Some(&format!("{p}.mlp.2.bias")))?,
+                mlp_up: linear(
+                    &format!("{p}.mlp.0.weight"),
+                    Some(&format!("{p}.mlp.0.bias")),
+                )?,
+                mlp_down: linear(
+                    &format!("{p}.mlp.2.weight"),
+                    Some(&format!("{p}.mlp.2.bias")),
+                )?,
             });
         }
         let mut decoder_blocks = Vec::with_capacity(dims.n_text_layer);
@@ -262,8 +274,14 @@ impl<B: Backend> WhisperRuntime<B> {
                 cross_attn_ln: layer_norm(&format!("{p}.cross_attn_ln"))?,
                 cross_attn: attention(&format!("{p}.cross_attn"))?,
                 mlp_ln: layer_norm(&format!("{p}.mlp_ln"))?,
-                mlp_up: linear(&format!("{p}.mlp.0.weight"), Some(&format!("{p}.mlp.0.bias")))?,
-                mlp_down: linear(&format!("{p}.mlp.2.weight"), Some(&format!("{p}.mlp.2.bias")))?,
+                mlp_up: linear(
+                    &format!("{p}.mlp.0.weight"),
+                    Some(&format!("{p}.mlp.0.bias")),
+                )?,
+                mlp_down: linear(
+                    &format!("{p}.mlp.2.weight"),
+                    Some(&format!("{p}.mlp.2.bias")),
+                )?,
             });
         }
 
@@ -342,10 +360,8 @@ impl<B: Backend> WhisperRuntime<B> {
     ) -> Tensor<B, 2> {
         let n = tokens.len();
         assert!(n <= self.dims.n_text_ctx, "sequence exceeds n_text_ctx");
-        let ids: Tensor<B, 1, Int> = Tensor::from_data(
-            TensorData::new(tokens.to_vec(), [n]),
-            &self.device,
-        );
+        let ids: Tensor<B, 1, Int> =
+            Tensor::from_data(TensorData::new(tokens.to_vec(), [n]), &self.device);
         let mut x = self.token_embedding.clone().select(0, ids)
             + self.decoder_positional.clone().narrow(0, 0, n);
 
@@ -488,14 +504,14 @@ fn attention<B: Backend>(
 
 /// whisper.cpp's GELU: the tanh approximation, not erf.
 fn gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
-    let inner = (x.clone() * (x.clone().powf_scalar(2.0) * 0.044_715 + 1.0))
-        * 0.797_884_560_802_865_4;
+    let inner =
+        (x.clone() * (x.clone().powf_scalar(2.0) * 0.044_715 + 1.0)) * 0.797_884_560_802_865_4;
     x * 0.5 * (inner.tanh() + 1.0)
 }
 
 fn gelu2<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
-    let inner = (x.clone() * (x.clone().powf_scalar(2.0) * 0.044_715 + 1.0))
-        * 0.797_884_560_802_865_4;
+    let inner =
+        (x.clone() * (x.clone().powf_scalar(2.0) * 0.044_715 + 1.0)) * 0.797_884_560_802_865_4;
     x * 0.5 * (inner.tanh() + 1.0)
 }
 
@@ -525,7 +541,11 @@ mod tests {
         assert_eq!(tokens.sot, 50_258);
         assert_eq!(tokens.transcribe, 50_359);
         assert_eq!(tokens.no_timestamps, 50_363);
-        assert_eq!(tokens.language(0), 50_259, "English is the first language token");
+        assert_eq!(
+            tokens.language(0),
+            50_259,
+            "English is the first language token"
+        );
         // Multilingual transcription prompt: [sot, lang, transcribe, not].
         assert_eq!(
             tokens.transcription_prompt(),

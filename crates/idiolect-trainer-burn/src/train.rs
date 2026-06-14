@@ -26,10 +26,8 @@ pub fn sequence_loss<B: AutodiffBackend>(
     let rows = logits.narrow(0, prompt_len - 1, n - prompt_len);
     let targets: Vec<i32> = tokens[prompt_len..n].to_vec();
     let target_count = targets.len();
-    let target_ids: Tensor<B, 2, Int> = Tensor::from_data(
-        TensorData::new(targets, [target_count, 1]),
-        &rows.device(),
-    );
+    let target_ids: Tensor<B, 2, Int> =
+        Tensor::from_data(TensorData::new(targets, [target_count, 1]), &rows.device());
     let log_probs = activation::log_softmax(rows, 1);
     let picked = log_probs.gather(1, target_ids);
     picked.mean().neg().unsqueeze()

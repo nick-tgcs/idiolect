@@ -232,11 +232,15 @@ fn auto_stop_defaults_off_and_must_exceed_the_snippet_pause() {
     // A nonzero value below the snippet pause threshold could end the take
     // before a single snippet ever completes — reject it.
     config.vad.auto_stop_silence_ms = config.vad.post_roll_ms - 1;
-    let error = config.validate().expect_err("sub-pause auto-stop must be rejected");
+    let error = config
+        .validate()
+        .expect_err("sub-pause auto-stop must be rejected");
     assert!(format!("{error}").contains("auto_stop_silence_ms"));
 
     config.vad.auto_stop_silence_ms = config.vad.post_roll_ms;
-    config.validate().expect("equal to the pause threshold is allowed");
+    config
+        .validate()
+        .expect("equal to the pause threshold is allowed");
 }
 
 #[test]

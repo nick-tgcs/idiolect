@@ -340,7 +340,11 @@ mod tests {
         // Stored text sharing NOTHING with a longer decode: the gap adds two
         // words for the one it loses — still below the omission threshold
         // (full-mismatch single-word records are variance, not drops).
-        assert!(!has_inserted_run(&words("deploy"), &words("restart traffic"), 2));
+        assert!(!has_inserted_run(
+            &words("deploy"),
+            &words("restart traffic"),
+            2
+        ));
         // But text that matches nothing AND lost nothing is a pure addition.
         assert!(has_inserted_run(&words("."), &words("restart traffic"), 2));
     }
@@ -348,14 +352,24 @@ mod tests {
     #[test]
     fn unproofread_candidates_are_retranscribed_on_any_material_difference() {
         assert_eq!(
-            decide("accepted_without_edit", "side cars", "side cars", " I don't want side cars. "),
+            decide(
+                "accepted_without_edit",
+                "side cars",
+                "side cars",
+                " I don't want side cars. "
+            ),
             RevalidationOutcome::Retranscribe {
                 text: "I don't want side cars.".to_owned()
             }
         );
         // Caps/punctuation variance alone is NOT material.
         assert_eq!(
-            decide("accepted_without_edit", "restart traffic", "restart traffic", " Restart traffic. "),
+            decide(
+                "accepted_without_edit",
+                "restart traffic",
+                "restart traffic",
+                " Restart traffic. "
+            ),
             RevalidationOutcome::Unchanged
         );
     }
@@ -364,7 +378,12 @@ mod tests {
     fn user_corrections_stay_unless_the_user_never_saw_the_words() {
         // Gold correction over text that matches the audio: untouchable.
         assert_eq!(
-            decide("accepted_with_edit", "restart traffic", "restart Traefik", "Restart traffic."),
+            decide(
+                "accepted_with_edit",
+                "restart traffic",
+                "restart Traefik",
+                "Restart traffic."
+            ),
             RevalidationOutcome::Unchanged
         );
         // The audio contains a dropped run the user never saw: untrainable.
@@ -388,7 +407,12 @@ mod tests {
         // A decode that is ONLY noise annotations is silence with a costume on:
         // "(mouse clicking)" must never become a training label.
         assert!(matches!(
-            decide("accepted_without_edit", "nothing", "nothing", "(mouse clicking)"),
+            decide(
+                "accepted_without_edit",
+                "nothing",
+                "nothing",
+                "(mouse clicking)"
+            ),
             RevalidationOutcome::Reject { .. }
         ));
     }

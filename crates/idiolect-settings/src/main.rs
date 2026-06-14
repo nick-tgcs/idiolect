@@ -47,9 +47,7 @@ impl Choice {
     }
 
     fn current_label(&self) -> &str {
-        self.options
-            .get(self.selected)
-            .map_or("", String::as_str)
+        self.options.get(self.selected).map_or("", String::as_str)
     }
 
     /// Select `index`; returns true when it changed and is a real option.
@@ -107,7 +105,8 @@ impl Model {
     /// Build from the daemon's state line. Unknown/missing fields fall back to
     /// the crate defaults so an older daemon still yields a usable window.
     fn from_json_line(line: &str) -> Self {
-        let state: serde_json::Value = serde_json::from_str(line).unwrap_or(serde_json::Value::Null);
+        let state: serde_json::Value =
+            serde_json::from_str(line).unwrap_or(serde_json::Value::Null);
         let pause_ms = u32_field(&state, "pause_ms", 700);
         let min_speech_ms = u32_field(&state, "min_speech_ms", 250);
         let max_phrase_ms = u32_field(&state, "max_phrase_ms", 30_000);
@@ -272,7 +271,10 @@ fn install_theme(ctx: &egui::Context) {
             TextStyle::Monospace,
             FontId::new(14.0, FontFamily::Monospace),
         ),
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
     ]
     .into();
 
@@ -323,7 +325,13 @@ struct Dismiss {
 
 impl Dismiss {
     /// Feed one frame's `focused`/window-position; returns true to close now.
-    fn poll(&mut self, focused: bool, pos: Option<(f32, f32)>, now: Instant, grace: Duration) -> bool {
+    fn poll(
+        &mut self,
+        focused: bool,
+        pos: Option<(f32, f32)>,
+        now: Instant,
+        grace: Duration,
+    ) -> bool {
         let moving = matches!(
             (self.last_pos, pos),
             (Some((ax, ay)), Some((bx, by))) if (ax - bx).abs() > 0.5 || (ay - by).abs() > 0.5
@@ -382,7 +390,10 @@ impl eframe::App for SettingsApp {
         // and not on the compositor's occasional transient blip.
         let focused = ctx.input(|i| i.focused);
         let pos = ctx.input(|i| i.viewport().outer_rect.map(|r| (r.min.x, r.min.y)));
-        if self.dismiss.poll(focused, pos, Instant::now(), DISMISS_GRACE) {
+        if self
+            .dismiss
+            .poll(focused, pos, Instant::now(), DISMISS_GRACE)
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if self.dismiss.pending() {
             // Keep re-evaluating the grace even while no further input arrives.
@@ -393,23 +404,31 @@ impl eframe::App for SettingsApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::same(18.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(18.0)),
+            )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Changes apply immediately. Click anywhere else to close.")
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Changes apply immediately. Click anywhere else to close.",
+                            )
                             .small()
                             .color(MUTED),
-                    );
-                    ui.add_space(6.0);
-                    self.dictation_section(ui);
-                    ui.add_space(14.0);
-                    self.translation_section(ui);
-                    ui.add_space(14.0);
-                    self.history_section(ui);
-                    ui.add_space(14.0);
-                    self.training_section(ui);
-                });
+                        );
+                        ui.add_space(6.0);
+                        self.dictation_section(ui);
+                        ui.add_space(14.0);
+                        self.translation_section(ui);
+                        ui.add_space(14.0);
+                        self.history_section(ui);
+                        ui.add_space(14.0);
+                        self.training_section(ui);
+                    });
             });
     }
 }
@@ -460,7 +479,10 @@ impl SettingsApp {
 
         let mut review = self.model.review_mode;
         if ui
-            .checkbox(&mut review, egui::RichText::new("Review before insert").strong())
+            .checkbox(
+                &mut review,
+                egui::RichText::new("Review before insert").strong(),
+            )
             .changed()
         {
             emit(&self.model.toggle_review());
@@ -802,10 +824,30 @@ mod tests {
             let mut d = Dismiss::default();
             let t0 = Instant::now();
             d.poll(true, Some((100.0, 100.0)), t0, GRACE);
-            d.poll(false, Some((130.0, 100.0)), t0 + Duration::from_millis(20), GRACE); // moving
-            d.poll(true, Some((160.0, 100.0)), t0 + Duration::from_millis(40), GRACE); // released
-            assert!(!d.poll(false, Some((160.0, 100.0)), t0 + Duration::from_millis(60), GRACE));
-            assert!(d.poll(false, Some((160.0, 100.0)), t0 + Duration::from_millis(500), GRACE));
+            d.poll(
+                false,
+                Some((130.0, 100.0)),
+                t0 + Duration::from_millis(20),
+                GRACE,
+            ); // moving
+            d.poll(
+                true,
+                Some((160.0, 100.0)),
+                t0 + Duration::from_millis(40),
+                GRACE,
+            ); // released
+            assert!(!d.poll(
+                false,
+                Some((160.0, 100.0)),
+                t0 + Duration::from_millis(60),
+                GRACE
+            ));
+            assert!(d.poll(
+                false,
+                Some((160.0, 100.0)),
+                t0 + Duration::from_millis(500),
+                GRACE
+            ));
         }
     }
 }

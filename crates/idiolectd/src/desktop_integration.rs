@@ -254,7 +254,10 @@ mod tests {
         // what left the review/retention windows matching nothing and showing a cog.
         let classes: Vec<&str> = WINDOWS.iter().map(|w| w.binary).collect();
         assert!(classes.contains(&"idiolect-review-dialog"), "{classes:?}");
-        assert!(classes.contains(&"idiolect-retention-dialog"), "{classes:?}");
+        assert!(
+            classes.contains(&"idiolect-retention-dialog"),
+            "{classes:?}"
+        );
         assert!(
             !classes.contains(&"idiolect-review"),
             "must be the binary name, not the app-id: {classes:?}"
@@ -288,7 +291,10 @@ mod tests {
 
         let icon = data_home.join("icons/hicolor/scalable/apps/idiolect.svg");
         assert!(icon.is_file(), "icon must be installed");
-        assert!(written.contains(&icon), "icon reported as written: {written:?}");
+        assert!(
+            written.contains(&icon),
+            "icon reported as written: {written:?}"
+        );
 
         for window in WINDOWS {
             let path = data_home

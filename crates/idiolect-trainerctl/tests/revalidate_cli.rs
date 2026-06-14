@@ -67,7 +67,11 @@ fn the_binary_revalidates_dry_by_default_and_writes_with_apply() {
         ])
         .output()
         .expect("binary should run");
-    assert!(dry.status.success(), "stderr: {}", String::from_utf8_lossy(&dry.stderr));
+    assert!(
+        dry.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
     let report: serde_json::Value =
         serde_json::from_slice(&dry.stdout).expect("json report on stdout");
     assert_eq!(report["scanned"], 1, "{report}");
@@ -94,7 +98,11 @@ fn the_binary_revalidates_dry_by_default_and_writes_with_apply() {
         ])
         .output()
         .expect("binary should run");
-    assert!(apply.status.success(), "stderr: {}", String::from_utf8_lossy(&apply.stderr));
+    assert!(
+        apply.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
     let report: serde_json::Value =
         serde_json::from_slice(&apply.stdout).expect("json report on stdout");
     assert_eq!(report["applied"], true, "{report}");

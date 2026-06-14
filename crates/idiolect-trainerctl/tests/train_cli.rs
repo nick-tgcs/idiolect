@@ -126,7 +126,10 @@ fn gpu_flag_on_a_cpu_only_build_fails_with_guidance() {
         ])
         .output()
         .expect("binary should run");
-    assert!(!run.status.success(), "--gpu must not silently fall back to CPU");
+    assert!(
+        !run.status.success(),
+        "--gpu must not silently fall back to CPU"
+    );
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
         stderr.contains("--features cuda"),

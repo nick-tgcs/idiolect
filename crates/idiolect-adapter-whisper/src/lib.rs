@@ -323,7 +323,9 @@ mod tests {
             .tokenize(" restart traffic")
             .expect("text should tokenize");
         assert!(!tokens.is_empty());
-        let text = adapter.detokenize(&tokens).expect("tokens should detokenize");
+        let text = adapter
+            .detokenize(&tokens)
+            .expect("tokens should detokenize");
         assert_eq!(text, " restart traffic");
     }
 

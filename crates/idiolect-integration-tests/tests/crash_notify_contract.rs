@@ -41,7 +41,10 @@ impl Stub {
         let path = self.dir.join("notify-recorder.sh");
         fs::write(
             &path,
-            format!("#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n", log.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                log.display()
+            ),
         )
         .expect("write notify recorder");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");

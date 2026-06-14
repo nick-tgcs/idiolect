@@ -712,7 +712,12 @@ mod tests {
         // The correction carries the snippet exactly as it was typed (joining
         // space included), so the daemon's suffix splice lines up.
         assert_eq!(last_correction(&s), Some(" deploy Nginx".to_owned()));
-        let commits = s.daemon.events.iter().filter(|e| e.starts_with("commit:")).count();
+        let commits = s
+            .daemon
+            .events
+            .iter()
+            .filter(|e| e.starts_with("commit:"))
+            .count();
         assert_eq!(commits, 0, "streamed takes are finalized daemon-side only");
     }
 

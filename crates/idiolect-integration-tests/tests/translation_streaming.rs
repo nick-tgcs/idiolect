@@ -68,7 +68,11 @@ fn snippets_stream_as_partials_and_finalize_as_one_session() {
     // stored recording for the whole take. Glued snippet previews are never
     // the stored truth.
     fixture.assert_single_committed_take(SNIPPET);
-    assert_eq!(fixture.stored_audio_count(), 1, "one merged recording per take");
+    assert_eq!(
+        fixture.stored_audio_count(),
+        1,
+        "one merged recording per take"
+    );
 }
 
 #[test]
@@ -180,7 +184,11 @@ fn review_mode_holds_the_whole_take_for_one_dialog() {
     drop(client);
     assert_daemon_exits_successfully(daemon);
     fixture.assert_single_committed_take(edited);
-    assert_eq!(fixture.stored_audio_count(), 1, "one merged recording per take");
+    assert_eq!(
+        fixture.stored_audio_count(),
+        1,
+        "one merged recording per take"
+    );
 }
 
 #[test]
@@ -395,7 +403,9 @@ impl DaemonFixture {
             idiolect_adapter_sqlite::SqliteMetadataStore::open_path(self.database_path())
                 .expect("seed store should open");
         store.migrate().expect("seed store should migrate");
-        store.set_tray_setting(key, value).expect("setting should persist");
+        store
+            .set_tray_setting(key, value)
+            .expect("setting should persist");
     }
 
     /// One take ⇒ exactly one history entry, committed, with `expected` text.
@@ -413,7 +423,9 @@ impl DaemonFixture {
     /// Counts stored source recordings under the daemon's audio root.
     fn stored_audio_count(&self) -> usize {
         fn walk(dir: &Path, count: &mut usize) {
-            let Ok(reader) = fs::read_dir(dir) else { return };
+            let Ok(reader) = fs::read_dir(dir) else {
+                return;
+            };
             for entry in reader.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -460,8 +472,10 @@ impl DaemonFixture {
                          printf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n",
                         self.root.join("translator-calls").display(),
                     ),
-                    None => "#!/bin/sh\nprintf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n"
-                        .to_owned(),
+                    None => {
+                        "#!/bin/sh\nprintf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n"
+                            .to_owned()
+                    }
                 };
                 fs::write(&path, body).expect("translator stub should be written");
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
@@ -666,7 +680,10 @@ impl DaemonClient {
             IpcMessage::PreeditUpdate(update) => {
                 assert_eq!(update.text, expected);
                 assert!(update.partial, "mid-take snippets must be partial");
-                assert!(!update.review, "direct-mode partials are typed, not review-held");
+                assert!(
+                    !update.review,
+                    "direct-mode partials are typed, not review-held"
+                );
             }
             other => panic!("expected partial PreeditUpdate({expected:?}), got {other:?}"),
         }

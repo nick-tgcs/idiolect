@@ -796,7 +796,10 @@ mod tests {
             let _ = std::fs::remove_file(&log);
             std::fs::write(
                 &script,
-                format!("#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n", log.display()),
+                format!(
+                    "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                    log.display()
+                ),
             )
             .expect("write recorder");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))

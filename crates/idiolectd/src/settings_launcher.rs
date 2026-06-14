@@ -123,7 +123,10 @@ mod tests {
         let TrayCallback::Activate(first) = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first forwarded action");
-        assert_eq!(first, "settings:pause:2", "stdout lines become tray actions");
+        assert_eq!(
+            first, "settings:pause:2",
+            "stdout lines become tray actions"
+        );
         let TrayCallback::Activate(second) = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("second forwarded action");
@@ -144,7 +147,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         launcher.open(String::new(), tx.clone());
         launcher.open(String::new(), tx.clone()); // ignored: still open
-        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "first spawn");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "first spawn"
+        );
         assert!(
             rx.recv_timeout(Duration::from_millis(700)).is_err(),
             "no second window while the first is open"

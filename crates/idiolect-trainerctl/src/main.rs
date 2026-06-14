@@ -172,7 +172,8 @@ fn run_revalidate(args: &[String]) -> Result<String, String> {
     if flags.json {
         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
     } else {
-        let mut lines = vec![format!(
+        let mut lines =
+            vec![format!(
             "scanned {} candidate(s): {} retranscribed, {} rejected, {} unchanged, {} skipped{}",
             report.scanned,
             report.retranscribed,

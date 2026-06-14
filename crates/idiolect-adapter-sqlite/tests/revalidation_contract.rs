@@ -68,12 +68,22 @@ fn rejected_candidates_leave_the_manifest_feed() {
     let poisoned_id = before[1].training_candidate_id;
 
     store
-        .reject_training_candidate(poisoned_id, "audio contains words the stored text never had")
+        .reject_training_candidate(
+            poisoned_id,
+            "audio contains words the stored text never had",
+        )
         .expect("rejection should persist");
 
     let after = store
         .training_candidates_for_manifest_v2("default")
         .expect("manifest feed should read");
-    assert_eq!(after.len(), 1, "the rejected candidate must not be trainable");
-    assert_eq!(after[0].training_candidate_id, before[0].training_candidate_id);
+    assert_eq!(
+        after.len(),
+        1,
+        "the rejected candidate must not be trainable"
+    );
+    assert_eq!(
+        after[0].training_candidate_id,
+        before[0].training_candidate_id
+    );
 }

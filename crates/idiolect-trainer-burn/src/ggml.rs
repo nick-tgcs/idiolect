@@ -467,9 +467,18 @@ mod tests {
 
         assert_eq!(model.hparams.n_vocab, 51_864, "tiny.en vocab");
         assert_eq!(model.hparams.n_mels, 80);
-        assert_eq!(model.filters.data.len(), (model.filters.n_mel * model.filters.n_fft) as usize);
-        assert!(model.tensors.iter().any(|t| t.name == "encoder.conv1.weight"));
-        assert!(model.tensors.iter().any(|t| t.name == "decoder.token_embedding.weight"));
+        assert_eq!(
+            model.filters.data.len(),
+            (model.filters.n_mel * model.filters.n_fft) as usize
+        );
+        assert!(model
+            .tensors
+            .iter()
+            .any(|t| t.name == "encoder.conv1.weight"));
+        assert!(model
+            .tensors
+            .iter()
+            .any(|t| t.name == "decoder.token_embedding.weight"));
 
         let rewritten = model.to_bytes();
         assert_eq!(

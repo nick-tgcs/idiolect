@@ -481,7 +481,12 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                             shared.run_session(|s| s.cancel_reviewed())
                         }
                     }
-                } else if shared.active_path.lock().expect("active_path mutex").is_some() {
+                } else if shared
+                    .active_path
+                    .lock()
+                    .expect("active_path mutex")
+                    .is_some()
+                {
                     // Direct (review-off) take with a focused context to type into.
                     // Re-assert focus on the window the user started dictating in and
                     // let it settle BEFORE committing — after a take the WM may not
@@ -592,7 +597,9 @@ fn restore_dictation_focus(
     target: Option<crate::focus::WindowId>,
 ) -> bool {
     let Some(window) = target else { return false };
-    dbg_edit(&format!("direct commit: restoring focus to window {window}"));
+    dbg_edit(&format!(
+        "direct commit: restoring focus to window {window}"
+    ));
     focus.restore(window);
     std::thread::sleep(FOCUS_SETTLE);
     true

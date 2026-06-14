@@ -123,7 +123,9 @@ mod tests {
 
     #[test]
     fn the_fft_matches_a_direct_dft() {
-        let signal: Vec<f32> = (0..400).map(|i| ((i * 7) % 13) as f32 / 13.0 - 0.5).collect();
+        let signal: Vec<f32> = (0..400)
+            .map(|i| ((i * 7) % 13) as f32 / 13.0 - 0.5)
+            .collect();
         let fast = fft(&signal);
         let slow = super::naive_dft(&signal);
         for (bin, (f, s)) in fast.iter().zip(slow.iter()).enumerate() {
@@ -146,6 +148,10 @@ mod tests {
         // All-silence: every value hits the same log floor, so after the
         // (v - (max-8) … +4)/4 normalization everything is (max+4)/4 with
         // max = -10 → -1.5.
-        assert!(mel.iter().all(|v| (*v - -1.5).abs() < 1e-6), "{:?}", &mel[..4]);
+        assert!(
+            mel.iter().all(|v| (*v - -1.5).abs() < 1e-6),
+            "{:?}",
+            &mel[..4]
+        );
     }
 }

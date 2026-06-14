@@ -273,8 +273,8 @@ impl ReviewApp {
 
         self.center(ctx);
         let mut action: Option<bool> = None; // Some(true)=insert, Some(false)=cancel
-        // Keys act only if the frame STARTED reviewable — a keystroke racing
-        // the `final` line must not confirm text the user never saw.
+                                             // Keys act only if the frame STARTED reviewable — a keystroke racing
+                                             // the `final` line must not confirm text the user never saw.
         if !self.listening && !finalized {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 action = Some(false);
@@ -300,8 +300,10 @@ impl ReviewApp {
                         ("Review dictation", TEXT)
                     };
                     ui.add(
-                        egui::Label::new(egui::RichText::new(title).heading().strong().color(color))
-                            .selectable(false),
+                        egui::Label::new(
+                            egui::RichText::new(title).heading().strong().color(color),
+                        )
+                        .selectable(false),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let hint = if self.listening {
@@ -371,9 +373,7 @@ impl ReviewApp {
                 } else {
                     "Edit it however you like — your fix is recorded for training."
                 };
-                ui.add(
-                    egui::Label::new(egui::RichText::new(blurb).color(MUTED)).selectable(false),
-                );
+                ui.add(egui::Label::new(egui::RichText::new(blurb).color(MUTED)).selectable(false));
                 ui.add_space(10.0);
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(self.listening)
@@ -475,7 +475,10 @@ mod tests {
         let (mut app, outcome, feed) = app();
         push(&feed, "append draft");
         run(&mut app, ctrl_enter());
-        assert!(!outcome.lock().unwrap().confirmed, "Ctrl+Enter ignored mid-take");
+        assert!(
+            !outcome.lock().unwrap().confirmed,
+            "Ctrl+Enter ignored mid-take"
+        );
         run(&mut app, key(egui::Key::Escape, egui::Modifiers::default()));
         assert!(app.listening, "Escape ignored mid-take");
         assert_eq!(app.text, "draft", "text survives");
@@ -489,7 +492,10 @@ mod tests {
         push(&feed, "final hello world");
         run(&mut app, egui::RawInput::default());
         assert!(!app.listening);
-        assert_eq!(app.text, "hello world", "merged final text replaces the draft");
+        assert_eq!(
+            app.text, "hello world",
+            "merged final text replaces the draft"
+        );
 
         app.text = "hello world!".to_owned(); // user edited the field
         run(&mut app, ctrl_enter());

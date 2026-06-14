@@ -89,7 +89,9 @@ impl<B: Backend> DecoderLora<B> {
         let mut pair = |scale: f32| LoraPair {
             a_t: Tensor::from_data(
                 TensorData::new(
-                    (0..state * config.rank).map(|_| next()).collect::<Vec<f32>>(),
+                    (0..state * config.rank)
+                        .map(|_| next())
+                        .collect::<Vec<f32>>(),
                     [state, config.rank],
                 ),
                 device,
@@ -153,7 +155,12 @@ impl<B: Backend> Adam<B> {
         }
     }
 
-    fn update(&mut self, index: usize, parameter: Tensor<B, 2>, gradient: Tensor<B, 2>) -> Tensor<B, 2> {
+    fn update(
+        &mut self,
+        index: usize,
+        parameter: Tensor<B, 2>,
+        gradient: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         let device = parameter.device();
         let shape = parameter.dims();
         while self.first_moment.len() <= index {
@@ -185,8 +192,7 @@ pub fn adam_step<B: AutodiffBackend>(
             for pair in [&mut attn.query, &mut attn.value].into_iter().flatten() {
                 for tensor in [&mut pair.a_t, &mut pair.b_t] {
                     if let Some(gradient) = tensor.grad(gradients) {
-                        let updated =
-                            optimizer.update(index, tensor.clone().inner(), gradient);
+                        let updated = optimizer.update(index, tensor.clone().inner(), gradient);
                         *tensor = Tensor::from_inner(updated).require_grad();
                     }
                     index += 1;
@@ -233,8 +239,18 @@ fn merge_pair<B: Backend>(
 ) -> Result<(), GgmlError> {
     // a_t is [in, r], b_t is [r, out]; ΔW row-major [out][in] matches the
     // ggml weight layout (ne = [in, out], `in` fastest).
-    let a_t = pair.a_t.clone().into_data().to_vec::<f32>().expect("f32 lora");
-    let b_t = pair.b_t.clone().into_data().to_vec::<f32>().expect("f32 lora");
+    let a_t = pair
+        .a_t
+        .clone()
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32 lora");
+    let b_t = pair
+        .b_t
+        .clone()
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32 lora");
     let [input_dim, rank] = pair.a_t.dims();
     let [_, output_dim] = pair.b_t.dims();
 

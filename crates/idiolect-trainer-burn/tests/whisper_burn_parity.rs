@@ -78,7 +78,13 @@ fn a_freshly_initialised_adapter_is_an_exact_identity() {
     let encoder_output: Tensor<Cpu, 2> =
         Tensor::ones([8, runtime.dims.n_audio_state], &device) * 0.01;
     let special = SpecialTokens::for_vocab(runtime.dims.n_vocab);
-    let tokens = [special.sot, special.no_timestamps, 1_000, 2_000, special.eot];
+    let tokens = [
+        special.sot,
+        special.no_timestamps,
+        1_000,
+        2_000,
+        special.eot,
+    ];
 
     let base = runtime.decoder_logits(&tokens, encoder_output.clone(), None);
     let lora = DecoderLora::<Cpu>::init(
@@ -90,7 +96,12 @@ fn a_freshly_initialised_adapter_is_an_exact_identity() {
     );
     let adapted = runtime.decoder_logits(&tokens, encoder_output, Some(&lora));
 
-    let difference = (base - adapted).abs().max().into_data().to_vec::<f32>().expect("scalar")[0];
+    let difference = (base - adapted)
+        .abs()
+        .max()
+        .into_data()
+        .to_vec::<f32>()
+        .expect("scalar")[0];
     assert!(
         difference < 1e-5,
         "zero-initialised LoRA must not move the logits (max diff {difference})"
@@ -135,7 +146,14 @@ fn an_overfitted_adapter_merges_into_a_model_the_engine_serves() {
     let mut last_loss = f32::NAN;
     for step in 0..60 {
         let encoded: Tensor<Train, 2> = Tensor::from_inner(encoded_inner.clone());
-        let loss = train_step(&trainer, encoded, &tokens, prompt_len, &mut lora, &mut optimizer);
+        let loss = train_step(
+            &trainer,
+            encoded,
+            &tokens,
+            prompt_len,
+            &mut lora,
+            &mut optimizer,
+        );
         if step == 0 {
             first_loss = loss;
         }
@@ -154,11 +172,16 @@ fn an_overfitted_adapter_merges_into_a_model_the_engine_serves() {
     merge_into_ggml(&lora, &mut merged).expect("merge applies");
     let dir = tempfile::tempdir().expect("temp dir");
     let merged_path = dir.path().join("tiny-personal.bin");
-    merged.write_file(&merged_path).expect("merged model writes");
+    merged
+        .write_file(&merged_path)
+        .expect("merged model writes");
 
     let engine =
         WhisperAsr::load(&merged_path, WhisperOptions::default()).expect("merged model loads");
-    let served = engine.transcribe(&audio).expect("merged model transcribes").text;
+    let served = engine
+        .transcribe(&audio)
+        .expect("merged model transcribes")
+        .text;
     assert_eq!(
         normalized_words(&served),
         normalized_words(target_text),

@@ -89,12 +89,13 @@ where
     B::Device: Default,
 {
     let device = B::Device::default();
-    let mut store =
-        SqliteMetadataStore::open_path(&flags.db).map_err(|error| error.to_string())?;
+    let mut store = SqliteMetadataStore::open_path(&flags.db).map_err(|error| error.to_string())?;
     store.migrate().map_err(|error| error.to_string())?;
     let audio_root = std::path::PathBuf::from(&flags.audio_root);
-    let audio_store =
-        FileAudioStore::new(audio_root.clone(), audio_root.with_file_name("decoded-cache"));
+    let audio_store = FileAudioStore::new(
+        audio_root.clone(),
+        audio_root.with_file_name("decoded-cache"),
+    );
 
     let base = GgmlModel::read_file(Path::new(&flags.base_model))
         .map_err(|error| format!("reading base model: {error}"))?;

@@ -590,8 +590,7 @@ mod tests {
         // Per-item tray tooltips are not supported by the DBusMenu protocol, so the
         // labels themselves must convey what Stop vs Cancel do: Stop transcribes and
         // inserts the text; Cancel throws the audio away.
-        let menu =
-            MenuUseCase::new().get_menu(RecordingState::Recording, &[], &Default::default());
+        let menu = MenuUseCase::new().get_menu(RecordingState::Recording, &[], &Default::default());
 
         assert_eq!(child(&menu, "start_recording").label, "Start Recording");
         assert_eq!(child(&menu, "stop_recording").label, "Stop & Insert");
@@ -605,11 +604,7 @@ mod tests {
         // actions, single-click toggles, and ONE "Settings…" entry that opens
         // the window where all multi-choice configuration lives.
         let history = vec![entry(1, "hello world", HistoryState::Committed)];
-        let menu = MenuUseCase::new().get_menu(
-            RecordingState::Idle,
-            &history,
-            &Default::default(),
-        );
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
 
         let settings = child(&menu, "settings:open");
         assert_eq!(settings.label, "Settings…");
@@ -899,8 +894,7 @@ mod tests {
     #[test]
     fn cancelled_entries_render_as_cancelled_label() {
         let history = vec![entry(1, "", HistoryState::Cancelled)];
-        let menu =
-            MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")
@@ -912,8 +906,7 @@ mod tests {
     }
 
     fn entry_submenu(history: &[HistoryEntry], entry_id: i64) -> Vec<TrayMenuItem> {
-        let menu =
-            MenuUseCase::new().get_menu(RecordingState::Idle, history, &Default::default());
+        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, history, &Default::default());
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")
@@ -925,7 +918,10 @@ mod tests {
             .iter()
             .find(|item| item.id == format!("history:{entry_id}"))
             .expect("entry item present");
-        let TrayMenuItemKind::Standard { submenu: Some(entry_sub) } = &entry_item.kind else {
+        let TrayMenuItemKind::Standard {
+            submenu: Some(entry_sub),
+        } = &entry_item.kind
+        else {
             panic!("entry item should have a submenu");
         };
         entry_sub.clone()
@@ -938,7 +934,10 @@ mod tests {
 
         let edit_item = child(&sub, "edit:42");
         assert_eq!(edit_item.label, "Edit…");
-        assert!(edit_item.enabled, "edit should be enabled for committed non-empty entry");
+        assert!(
+            edit_item.enabled,
+            "edit should be enabled for committed non-empty entry"
+        );
         assert!(
             matches!(edit_item.kind, TrayMenuItemKind::Standard { submenu: None }),
             "edit item should be Standard with no submenu"
@@ -957,7 +956,10 @@ mod tests {
 
         let edit_item = child(&sub, "edit:7");
         assert_eq!(edit_item.label, "Edit…");
-        assert!(!edit_item.enabled, "edit should be disabled for cancelled entry");
+        assert!(
+            !edit_item.enabled,
+            "edit should be disabled for cancelled entry"
+        );
     }
 
     #[test]
@@ -967,6 +969,9 @@ mod tests {
         let sub = entry_submenu(&history, 99);
 
         let edit_item = child(&sub, "edit:99");
-        assert!(!edit_item.enabled, "edit should be disabled when text is empty");
+        assert!(
+            !edit_item.enabled,
+            "edit should be disabled when text is empty"
+        );
     }
 }

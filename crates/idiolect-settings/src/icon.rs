@@ -119,9 +119,13 @@ mod tests {
         assert_eq!(corner_alpha, 0, "top-left corner must be transparent");
 
         // The glyph is actually drawn: some pixels are (near-)opaque accent.
-        let opaque_accent = icon.rgba.chunks_exact(4).any(|p| {
-            p[3] > 200 && p[0].abs_diff(ACCENT.0) < 24 && p[2].abs_diff(ACCENT.2) < 24
-        });
-        assert!(opaque_accent, "icon must contain the filled accent microphone");
+        let opaque_accent = icon
+            .rgba
+            .chunks_exact(4)
+            .any(|p| p[3] > 200 && p[0].abs_diff(ACCENT.0) < 24 && p[2].abs_diff(ACCENT.2) < 24);
+        assert!(
+            opaque_accent,
+            "icon must contain the filled accent microphone"
+        );
     }
 }

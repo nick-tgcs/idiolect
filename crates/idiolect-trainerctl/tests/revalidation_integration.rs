@@ -82,7 +82,8 @@ fn seed_candidate(
         .expect("audio should store");
 }
 
-fn fixture_transcriber() -> impl Fn(&idiolect_ports::audio::AudioSegment) -> Result<String, String> {
+fn fixture_transcriber() -> impl Fn(&idiolect_ports::audio::AudioSegment) -> Result<String, String>
+{
     let asr = WhisperAsr::load_fixture_model().expect("bundled fixture model should load");
     move |segment| {
         asr.transcribe(segment)
@@ -105,7 +106,12 @@ fn revalidation_repairs_rejects_and_keeps_the_right_candidates() {
     // never in front of them → the label is untrustworthy.
     seed_candidate(&mut store, &audio_store, ".", "deploy nginx");
     // C: trustworthy gold: raw matches the audio, the user's correction stands.
-    seed_candidate(&mut store, &audio_store, "restart traffic", "restart Traefik");
+    seed_candidate(
+        &mut store,
+        &audio_store,
+        "restart traffic",
+        "restart Traefik",
+    );
 
     let report = revalidate_user(
         &mut store,
@@ -125,7 +131,11 @@ fn revalidation_repairs_rejects_and_keeps_the_right_candidates() {
     let feed = store
         .training_candidates_for_manifest_v2("default")
         .expect("manifest feed should read");
-    assert_eq!(feed.len(), 2, "the poisoned correction left the feed: {feed:?}");
+    assert_eq!(
+        feed.len(),
+        2,
+        "the poisoned correction left the feed: {feed:?}"
+    );
     let repaired = &feed[0];
     let lowered = repaired.corrected_transcript.to_lowercase();
     assert!(
@@ -154,7 +164,10 @@ fn a_dry_run_reports_but_writes_nothing() {
         false,
     )
     .expect("dry run should run");
-    assert_eq!(report.retranscribed, 1, "the dry run still reports the repair");
+    assert_eq!(
+        report.retranscribed, 1,
+        "the dry run still reports the repair"
+    );
 
     let feed = store
         .training_candidates_for_manifest_v2("default")

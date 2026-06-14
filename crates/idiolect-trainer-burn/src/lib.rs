@@ -3,8 +3,8 @@
 pub mod ggml;
 pub mod lora;
 pub mod mel;
-mod trainer;
 pub mod train;
+mod trainer;
 pub mod whisper;
 
 pub use trainer::{BurnTrainer, BurnTrainerError};
