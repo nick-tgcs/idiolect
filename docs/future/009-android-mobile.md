@@ -388,7 +388,7 @@ crates/idiolect-adapters/android/        # mirrors the existing desktop/ subtree
   capture/   idiolect-adapter-android-audio   # AudioInputPort via AudioRecord
   ime/       idiolect-adapter-android-ime     # InputMethodPort over an FFI callback
 crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, binary container codec) ✅ exists
-crates/idiolect-sync-client/   # phone: outbox, ACK-then-delete
+crates/idiolect-sync-client/   # ✅ logic: build_batch (outbox→envelope) + confirm_shipped (ACK→reclaim)
 crates/idiolect-sync-server/   # PC: HTTP ingest hung off idiolectd; GET /model
 crates/idiolect-mobile-runtime/  # Android twin of idiolectd's run_loop (in-process, no socket)
 crates/idiolect-ffi/           # the ONE UniFFI facade; the only cdylib/.so; kept OUT of `members`

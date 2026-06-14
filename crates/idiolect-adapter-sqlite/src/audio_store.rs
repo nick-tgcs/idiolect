@@ -315,6 +315,17 @@ impl FileAudioStore {
         Self::read_file(&self.source_path_from_ref(audio_ref)?)
     }
 
+    /// Read the raw stored payload for a source-audio object key. The sync
+    /// client only needs the bytes (the IDOPUS1 container is self-describing),
+    /// so it reads by key without reconstructing codec metadata.
+    pub fn read_source_payload_by_key(
+        &self,
+        object_key: &str,
+    ) -> Result<Vec<u8>, FileAudioStoreError> {
+        let path = Self::path_from_key(&self.audio_root, object_key, AUDIO_KEY_PREFIX)?;
+        Self::read_file(&path)
+    }
+
     fn remove_decoded_cache(
         &self,
         cache_ref: &DecodedAudioCacheRef,

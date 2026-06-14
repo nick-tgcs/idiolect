@@ -300,7 +300,7 @@ New/changed crates (refines [009 §Concrete layout](009-android-mobile.md#concre
 ```
 crates/idiolect-application/src/use_cases/streaming.rs   # NEW: lifted orchestration (event-emitting, I/O-free)
 crates/idiolect-sync/            # ✅ DONE: shared wire types SyncLearning/SyncBatch + length-prefixed binary container codec
-crates/idiolect-sync-client/     # NEW phone: outbox, ACK-then-delete
+crates/idiolect-sync-client/     # ✅ DONE (logic): build_batch (outbox→envelope) + confirm_shipped (ACK→reclaim)
 crates/idiolect-sync-server/     # NEW PC: HTTP ingest + GET /model  (separate binary — see §9)
 crates/idiolect-mobile-runtime/  # NEW Android twin of run_loop (in-process; maps events→callbacks)
 crates/idiolect-ffi/             # NEW the ONE UniFFI facade; only cdylib/.so; kept OUT of workspace `members`
@@ -514,11 +514,16 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
 3. ✅ **S1 — done.** `TRAINING_STATUS_SYNCED` + `mark_synced_and_drop_audio`
    (delete-after-ship via the narrow `delete_source_audio_for`) + the
    `training_candidates_pending_sync` outbox; manifest feed excludes `synced`.
-4. **NEXT — S2 + M2 (parallelisable):** S2 = `idiolect-sync-server` (axum) +
-   `idiolect-sync-client` + an `idiolect-cli sync push`, validating the whole
-   protocol on one box before any Kotlin. M2 = lift the streaming orchestration
-   into `idiolect-application/streaming.rs`, rewire `run_loop`, prove
-   behaviour-neutral against the existing daemon tests.
+4. ✅ **S2 client half — done.** `idiolect-sync-client`: `build_batch`
+   (outbox → content-addressed `SyncBatchEnvelope`, round-trips the codec) +
+   `confirm_shipped` (ACK → `mark_synced_and_drop_audio` reclaim). Covered by
+   [sync_client.rs](crates/idiolect-integration-tests/tests/sync_client.rs).
+5. **NEXT — S2 server half + M2 (parallelisable):** S2 server =
+   `idiolect-sync-server` ingest (envelope → rows + audio in a second data-root,
+   idempotent on `(device_id, audio_digest)`) + an `idiolect-cli sync push`,
+   completing the one-box round-trip before any Kotlin. M2 = lift the streaming
+   orchestration into `idiolect-application/streaming.rs`, rewire `run_loop`,
+   prove behaviour-neutral against the existing daemon tests.
 
 ---
 

@@ -4271,6 +4271,8 @@ dependencies = [
  "idiolect-common",
  "idiolect-ipc",
  "idiolect-ports",
+ "idiolect-sync",
+ "idiolect-sync-client",
  "idiolect-test-support",
  "idiolect-trainerctl",
  "idiolectd",
@@ -4340,6 +4342,15 @@ dependencies = [
  "idiolect-common",
  "serde",
  "serde_json",
+ "thiserror 1.0.61",
+]
+
+[[package]]
+name = "idiolect-sync-client"
+version = "0.1.0"
+dependencies = [
+ "idiolect-adapter-sqlite",
+ "idiolect-sync",
  "thiserror 1.0.61",
 ]
 
