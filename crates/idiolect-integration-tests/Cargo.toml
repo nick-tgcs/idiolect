@@ -26,6 +26,7 @@ idiolect-ports = { path = "../idiolect-ports" }
 idiolect-application = { path = "../idiolect-application" }
 idiolect-sync = { path = "../idiolect-sync" }
 idiolect-sync-client = { path = "../idiolect-sync-client" }
+idiolect-sync-server = { path = "../idiolect-sync-server" }
 
 [dev-dependencies]
 idiolect-cli = { path = "../idiolect-cli" }

@@ -4273,6 +4273,7 @@ dependencies = [
  "idiolect-ports",
  "idiolect-sync",
  "idiolect-sync-client",
+ "idiolect-sync-server",
  "idiolect-test-support",
  "idiolect-trainerctl",
  "idiolectd",
@@ -4350,6 +4351,16 @@ name = "idiolect-sync-client"
 version = "0.1.0"
 dependencies = [
  "idiolect-adapter-sqlite",
+ "idiolect-sync",
+ "thiserror 1.0.61",
+]
+
+[[package]]
+name = "idiolect-sync-server"
+version = "0.1.0"
+dependencies = [
+ "idiolect-adapter-sqlite",
+ "idiolect-ports",
  "idiolect-sync",
  "thiserror 1.0.61",
 ]

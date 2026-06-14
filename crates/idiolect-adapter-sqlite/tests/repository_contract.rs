@@ -233,6 +233,45 @@ fn audio_digest_persists_and_reads_back() {
 }
 
 #[test]
+fn utterance_id_for_session_matches_the_link_row() {
+    let mut store = migrated_store();
+    let session = store.create_session(Some("hello")).expect("create");
+    let link = store
+        .session_utterance_link_for_test(session)
+        .expect("link query")
+        .expect("link exists");
+    assert_eq!(
+        store.utterance_id_for_session(session).expect("id"),
+        link.utterance_id,
+        "the production accessor must equal the stored utterance row id"
+    );
+}
+
+#[test]
+fn has_utterance_with_digest_reflects_set_audio_digest() {
+    let mut store = migrated_store();
+    let session = store.create_session(Some("hello")).expect("create");
+    let link = store
+        .session_utterance_link_for_test(session)
+        .expect("link query")
+        .expect("link exists");
+    let digest = idiolect_common::digest::audio_sha256_hex(b"payload");
+
+    assert!(!store
+        .has_utterance_with_digest("default", &digest)
+        .expect("query"));
+    store
+        .set_audio_digest(&link.utterance_id, &digest)
+        .expect("set digest");
+    assert!(store
+        .has_utterance_with_digest("default", &digest)
+        .expect("query"));
+    assert!(!store
+        .has_utterance_with_digest("default", "some-other-digest")
+        .expect("query"));
+}
+
+#[test]
 fn set_audio_digest_for_unknown_utterance_errors() {
     let store = migrated_store();
     let error = store

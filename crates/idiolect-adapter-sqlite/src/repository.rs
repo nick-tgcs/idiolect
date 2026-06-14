@@ -1401,6 +1401,33 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    /// The utterance row id for a session, derived purely from the session id
+    /// (no query) so callers that have just created a session can address its
+    /// audio without a round-trip. Matches the id written by `create_session`.
+    pub fn utterance_id_for_session(
+        &self,
+        session_id: ImeSessionId,
+    ) -> Result<String, SqliteStorageError> {
+        let session_key = Self::session_key(session_id)?;
+        Ok(Self::utterance_key(&session_key))
+    }
+
+    /// Whether any utterance for `user_id` already carries this content digest —
+    /// the content-addressed dedup the sync-server ingest uses to make a replayed
+    /// batch idempotent.
+    pub fn has_utterance_with_digest(
+        &self,
+        user_id: &str,
+        audio_digest: &str,
+    ) -> Result<bool, SqliteStorageError> {
+        let count: i64 = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM utterances WHERE user_id = ?1 AND audio_sha256 = ?2",
+            params![user_id, audio_digest],
+            |row| row.get(0),
+        ))?;
+        Ok(count > 0)
+    }
+
     /// Read back an utterance's stored audio digest. `None` means the column is
     /// still NULL (digest never populated). Test/inspection helper.
     pub fn audio_digest_for_test(

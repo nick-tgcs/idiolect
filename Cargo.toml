@@ -19,6 +19,7 @@ members = [
     "crates/idiolect-trainerctl",
     "crates/idiolect-sync",
     "crates/idiolect-sync-client",
+    "crates/idiolect-sync-server",
     "crates/idiolect-ml-core",
     "crates/idiolect-trainer-burn",
     "crates/idiolectd",

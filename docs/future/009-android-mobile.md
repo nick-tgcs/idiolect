@@ -389,7 +389,7 @@ crates/idiolect-adapters/android/        # mirrors the existing desktop/ subtree
   ime/       idiolect-adapter-android-ime     # InputMethodPort over an FFI callback
 crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, binary container codec) ✅ exists
 crates/idiolect-sync-client/   # ✅ logic: build_batch (outbox→envelope) + confirm_shipped (ACK→reclaim)
-crates/idiolect-sync-server/   # PC: HTTP ingest hung off idiolectd; GET /model
+crates/idiolect-sync-server/   # ✅ ingest logic (envelope→rows+audio, idempotent); HTTP/GET-model still TODO
 crates/idiolect-mobile-runtime/  # Android twin of idiolectd's run_loop (in-process, no socket)
 crates/idiolect-ffi/           # the ONE UniFFI facade; the only cdylib/.so; kept OUT of `members`
 
@@ -425,11 +425,12 @@ existing IBus/eframe caveats.
   + the outbox query `training_candidates_pending_sync` (`status = 'captured'`);
   the manifest feed now also excludes `synced`. Proven on desktop: audio dropped
   while row+transcript survive and the remaining captured candidate still trains.
-- **S2 — Transport + ingest on one box.** Stand up the HTTP ingest beside the
-  Unix listener; add an `idiolect-cli` subcommand that POSTs a batch from one
-  data-root to another over loopback/Tailscale and reclaims on ACK. E2E: capture
-  on box A → POST → `trainerctl revalidate`+`train` on box B yields a merged
-  `.bin`. **Validates the whole protocol before any Kotlin exists.**
+- **S2 — Transport + ingest on one box.** ✅ **Ingest logic + one-box round-trip
+  done in-process** (`idiolect-sync-server::ingest`, content-addressed idempotent;
+  `sync_round_trip.rs`: build → wire codec → ingest into a second data-root →
+  trainable candidates with audio intact → reclaim). **Remaining:** the HTTP hop
+  (axum `POST` beside the Unix listener) + an `idiolect-cli` push subcommand, and
+  extending the e2e through `trainerctl train` on box B to a merged `.bin`.
 - **S3 — Auth + pairing.** QR/code handshake → per-device bearer token,
   idempotency (`batch_id` + `(device_id,digest)` dedup), at-rest outbox encryption.
 

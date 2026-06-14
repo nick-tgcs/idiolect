@@ -301,7 +301,7 @@ New/changed crates (refines [009 §Concrete layout](009-android-mobile.md#concre
 crates/idiolect-application/src/use_cases/streaming.rs   # NEW: lifted orchestration (event-emitting, I/O-free)
 crates/idiolect-sync/            # ✅ DONE: shared wire types SyncLearning/SyncBatch + length-prefixed binary container codec
 crates/idiolect-sync-client/     # ✅ DONE (logic): build_batch (outbox→envelope) + confirm_shipped (ACK→reclaim)
-crates/idiolect-sync-server/     # NEW PC: HTTP ingest + GET /model  (separate binary — see §9)
+crates/idiolect-sync-server/     # ✅ DONE (ingest logic): envelope→rows+audio, idempotent. HTTP/GET-model still TODO (axum)
 crates/idiolect-mobile-runtime/  # NEW Android twin of run_loop (in-process; maps events→callbacks)
 crates/idiolect-ffi/             # NEW the ONE UniFFI facade; only cdylib/.so; kept OUT of workspace `members`
 android/                         # NEW Gradle project (sibling, NOT a crate)
@@ -361,11 +361,17 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   integration — audio file gone, row+transcript survive, synced candidate leaves
   both manifest and outbox while the un-synced one is untouched and still trains;
   unknown candidate errors. **Exit (met):** storage reclaim proven on desktop.
-- **S2 — Transport + ingest on one box.** `idiolect-sync-server` (axum) +
-  `idiolect-sync-client`; an `idiolect-cli sync push` subcommand. *Tests:* e2e —
-  capture in data-root A → POST over loopback/Tailscale → `trainerctl revalidate`
-  + `train` in data-root B yields a merged `.bin`; reclaim on ACK. **Exit:** the
-  whole protocol validated before any Kotlin exists.
+- **S2 — Transport + ingest on one box.** ✅ **Logic done; HTTP/CLI remaining.**
+  `idiolect-sync-client` (`build_batch`/`confirm_shipped`) + `idiolect-sync-server`
+  (`ingest`, content-addressed idempotent). The whole protocol is proven on one
+  box *in-process* by [sync_round_trip.rs](crates/idiolect-integration-tests/tests/sync_round_trip.rs):
+  capture+correct in data-root A → build → encode→decode (wire codec) → ingest into
+  data-root B → corrections land as trainable candidates with audio intact →
+  reclaim on A; replay is idempotent. **Remaining:** the actual HTTP transport
+  (axum `POST` + `GET /model`) and an `idiolect-cli sync push` — and (nice-to-have)
+  extending the e2e through `trainerctl train` on B to a merged `.bin`. **Exit
+  (partially met):** protocol logic validated before any Kotlin; only the network
+  hop is left.
 - **S3 — Auth + pairing + idempotency.** QR/code handshake → per-device bearer
   token; `(device_id, audio_digest)` dedup; at-rest outbox encryption.
   *Tests:* unit (token bind/verify), integration (replayed batch is idempotent,
@@ -518,12 +524,16 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    (outbox → content-addressed `SyncBatchEnvelope`, round-trips the codec) +
    `confirm_shipped` (ACK → `mark_synced_and_drop_audio` reclaim). Covered by
    [sync_client.rs](crates/idiolect-integration-tests/tests/sync_client.rs).
-5. **NEXT — S2 server half + M2 (parallelisable):** S2 server =
-   `idiolect-sync-server` ingest (envelope → rows + audio in a second data-root,
-   idempotent on `(device_id, audio_digest)`) + an `idiolect-cli sync push`,
-   completing the one-box round-trip before any Kotlin. M2 = lift the streaming
-   orchestration into `idiolect-application/streaming.rs`, rewire `run_loop`,
-   prove behaviour-neutral against the existing daemon tests.
+5. ✅ **S2 server ingest + one-box round-trip — done in-process.**
+   `idiolect-sync-server::ingest` + `sync_round_trip.rs` prove the whole protocol
+   (build → wire codec → ingest → trainable on B → reclaim on A; idempotent
+   replay) without any network library.
+6. **NEXT — choose:** (a) the **HTTP transport** for S2 (axum `POST`/`GET model`
+   + `idiolect-cli sync push`) — the one piece that adds a web-framework
+   dependency; or (b) **M2** — lift the streaming orchestration into
+   `idiolect-application/streaming.rs`, rewire `run_loop`, prove behaviour-neutral
+   against the existing daemon tests (no new deps, invasive refactor); or (c)
+   **S3** auth/pairing on the now-working protocol.
 
 ---
 
