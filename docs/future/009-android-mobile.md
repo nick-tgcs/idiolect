@@ -435,11 +435,14 @@ existing IBus/eframe caveats.
   idempotency (`batch_id` + `(device_id,digest)` dedup), at-rest outbox encryption.
 
 **Mobile track:**
-- **M0 — Build plumbing (the real cost).** cargo-ndk + NDK CMake; cross-compile
-  the brain + portable adapters to `aarch64-linux-android` (`cuda`/`vulkan` OFF);
-  bundle `libc++_shared`; disable LTO. **Verify the Android whisper-rs/ggml build
-  against the same fixture as the desktop `whisper_burn_parity` test** so the
-  tokenizer/decode doesn't drift (or training pairs become inconsistent).
+- **M0 — Build plumbing (the real cost).** ✅ **Cross-compile proven** (NDK r28 +
+  cargo-ndk): the brain + portable adapters build for `aarch64-linux-android` and
+  `x86_64-linux-android` via `scripts/android-cross-build.sh` (whisper.cpp, opus,
+  bundled SQLite, webrtc-vad all clean; `cuda`/`vulkan` OFF). A dead
+  `usearch`/`numkong` C++ dep was removed. **Still TODO:** `libc++_shared`
+  bundling + LTO-off release; and **verify the Android whisper-rs/ggml build
+  against the same fixture as the desktop parity test** (run on the emulator) so
+  the tokenizer/decode doesn't drift.
 - **M1 — Path provider + UniFFI facade.** `PathProvider` trait (XDG desktop impl,
   `filesDir` Android impl); `idiolect-ffi` exposing `toggle/commit/cancel/
   report_correction` + the `RecordingStatus`/`PreeditUpdate` callback flow;

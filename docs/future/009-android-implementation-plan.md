@@ -379,13 +379,21 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
 
 ### Mobile track
 
-- **M0 — Build plumbing (the real cost).** cargo-ndk + NDK r27; cross-compile the
-  brain + portable adapters to `aarch64`/`x86_64-linux-android` (`cuda`/`vulkan`
-  OFF); bundle `libc++_shared`; disable LTO. **Resolve the `opus-sys` NDK story
-  first** ([§8 spike](#8-risks--spikes)). *Tests:* a CI compile-only `aarch64`
-  job; an **instrumented parity test** that runs the desktop `whisper_*` fixture
-  through the cross-built `.so` and asserts identical tokens/decode. **Exit:**
-  the core runs on the emulator with byte-identical decode.
+- **M0 — Build plumbing (the real cost).** ✅ **Cross-compile proven.** With
+  **NDK r28** + cargo-ndk v4, the whole portable core builds for **both**
+  `aarch64-linux-android` (device) and `x86_64-linux-android` (emulator) via
+  [scripts/android-cross-build.sh](scripts/android-cross-build.sh) — whisper.cpp
+  (CMake), opus/`audiopus_sys` (CMake), bundled SQLite, and webrtc-vad all
+  cross-compile clean. **Both spikes retired** ([§8](#8-risks--spikes)):
+  `opus-sys` needed only the right NDK env (`ANDROID_NDK_ROOT`/`ANDROID_NDK`, not
+  just `_HOME`); whisper.cpp built in ~20 s with host libclang for bindgen. A dead
+  `usearch`/`numkong` C++ dep (via unused `sqlite-vector-rs` in the sqlite
+  adapter) was **removed** — it broke the Android C++ build and bloated desktop.
+  **Still TODO for M0 exit:** the `.so`/cdylib (lands with M1's FFI crate),
+  `libc++_shared` bundling, LTO-off release profile, a CI compile-only job, and
+  the **instrumented parity test** (run the desktop `whisper_*` fixture through the
+  cross-built core on the emulator → identical tokens). **Exit:** the core *runs*
+  on the emulator with byte-identical decode — build half done, run half next.
 - **M1 — PathProvider + UniFFI facade.** `idiolect-ffi` exposing
   `toggle/commit/cancel/report_correction/push_pcm_frame` + the
   `RecordingStatus/Preedit/InsertText/EditHistory` callback flow; Android path
@@ -528,25 +536,32 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    `idiolect-sync-server::ingest` + `sync_round_trip.rs` prove the whole protocol
    (build → wire codec → ingest → trainable on B → reclaim on A; idempotent
    replay) without any network library.
-6. **NEXT — choose:** (a) the **HTTP transport** for S2 (axum `POST`/`GET model`
-   + `idiolect-cli sync push`) — the one piece that adds a web-framework
-   dependency; or (b) **M2** — lift the streaming orchestration into
-   `idiolect-application/streaming.rs`, rewire `run_loop`, prove behaviour-neutral
-   against the existing daemon tests (no new deps, invasive refactor); or (c)
-   **S3** auth/pairing on the now-working protocol.
+6. ✅ **M0 build half — done.** The whole native core cross-compiles to
+   arm64-v8a + x86_64 via [scripts/android-cross-build.sh](scripts/android-cross-build.sh)
+   (NDK r28). Both build spikes retired; dead `usearch` C++ dep removed.
+7. **NEXT (dependency order, mobile track):** **M0 run half** — get the
+   cross-built core *running on the emulator* and decoding a fixture to identical
+   tokens (the real M0 exit), which also forces the first cdylib/`.so`. That sets
+   up **M1** (the UniFFI facade the Kotlin app loads). M2 (streaming lift) and the
+   S2 HTTP hop (axum) remain parallel tracks.
 
 ---
 
 ## 8. Risks & spikes
 
-- **`opus-sys` on NDK** *(spike first)* — `opus = "=0.3.1"`
-  ([Cargo.toml](Cargo.toml#L69)) pulls `opus-sys`, which may expect system libopus.
-  Confirm a vendored/`bundled` build cross-compiles under cargo-ndk; if not, swap
-  to a vendoring opus crate or add a build shim. **Blocks M0** — spike before
-  committing the build lane. (`rusqlite` bundled, `webrtc-vad` pure-Rust, and
-  `whisper-rs-sys` CMake are all expected-OK.)
-- **whisper.cpp aarch64-NDK build** — heaviest dep; CPU/NEON only. Build-plumbing
-  risk, not architectural (decode logic already feature-clean).
+- **`opus-sys` on NDK** ✅ *resolved* — `opus = "=0.3.1"` pulls `audiopus_sys`,
+  which **vendors** libopus and builds it via CMake. It cross-compiles fine under
+  cargo-ndk once the NDK env is complete (`ANDROID_NDK_ROOT`/`ANDROID_NDK`, not
+  just `ANDROID_NDK_HOME`). No system libopus, no shim needed.
+- **whisper.cpp aarch64-NDK build** ✅ *resolved* — `whisper-rs-sys` builds
+  whisper.cpp via CMake under the NDK in ~20 s (CPU/NEON, `cuda`/`vulkan` OFF);
+  bindgen uses host libclang. Built clean for both arm64 and x86_64.
+- **Dead `usearch`/`numkong` C++ dep** ✅ *resolved* — `sqlite-vector-rs` (an
+  **unused** dependency of the sqlite adapter) pulled `usearch`, whose `numkong`
+  header redeclares `syscall(...) noexcept` and clashes with Android's
+  `unistd.h`. Removed the dep entirely (no references anywhere); unblocks Android
+  and slims the desktop build. *Lesson:* audit transitive C++ deps before the
+  Android lane — a future `cargo machete`/unused-deps CI check would catch these.
 - **Deterministic mic in CI** — mitigated by the fixture capture seam (§6.2);
   real-mic injection stays a gated manual smoke.
 - **Pipeline drift** — mitigated structurally by the M2 lift (shared orchestration).
