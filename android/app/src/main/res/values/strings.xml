@@ -13,4 +13,8 @@
     <string name="setup_mic">Grant the microphone so idiolect can hear you.</string>
     <string name="setup_mic_cta">Grant microphone</string>
     <string name="setup_ready">idiolect is ready. Tap a text field and use the mic to dictate.</string>
+
+    <string name="fgs_channel">Dictation</string>
+    <string name="fgs_listening_title">idiolect is listening</string>
+    <string name="fgs_listening_text">Capturing audio for dictation</string>
 </resources>

@@ -10,6 +10,7 @@ import android.widget.FrameLayout
 import androidx.core.content.ContextCompat
 import org.idiolect.android.R
 import org.idiolect.android.audio.AndroidPcmSource
+import org.idiolect.android.audio.MicForegroundService
 import org.idiolect.ffi.IdiolectCore
 
 /**
@@ -76,6 +77,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     // --- ImeUiHost: the core's non-typing pushes ---
 
     override fun onRecordingChanged(recording: Boolean) {
+        // Hold the mic foreground service exactly while recording. This fires inside
+        // the core's toggle (before capture starts / after it stops), so the FGS is up
+        // before AudioRecord and down after it — and follows the single source of truth.
+        if (recording) MicForegroundService.start(this) else MicForegroundService.stop(this)
         micButton?.text = if (recording) recordingLabel() else idleLabel()
     }
 

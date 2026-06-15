@@ -3,6 +3,10 @@
 
     <!-- Dictation captures the microphone on-device. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- A mic foreground service holds capture; its notification is user-visible. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
@@ -33,5 +37,11 @@
                 android:name="android.view.im"
                 android:resource="@xml/method" />
         </service>
+
+        <!-- Holds the microphone (foreground, user-visible) for the duration of a take. -->
+        <service
+            android:name=".audio.MicForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>
