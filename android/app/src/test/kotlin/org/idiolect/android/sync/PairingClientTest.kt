@@ -7,22 +7,26 @@ import org.junit.Assert.assertThrows
 import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.nio.file.Files
 
 class PairingClientTest {
-    private lateinit var configFile: File
+    private lateinit var dir: File
 
     @Before
     fun setUp() {
-        // Created then deleted, so the device starts unconfigured (load() == null).
-        configFile = File.createTempFile("sync", ".config").also { it.delete() }
+        // A fresh empty dir, so the device starts unconfigured (load() == null).
+        dir = Files.createTempDirectory("pairing-client").toFile()
     }
 
     @After
     fun tearDown() {
-        configFile.delete()
+        dir.deleteRecursively()
     }
 
-    private fun config() = SyncConfig(configFile)
+    private fun config() = SecureSyncConfig(
+        urlFile = File(dir, SecureSyncConfig.URL_FILE_NAME),
+        tokenStore = PairingTokenStore(FakeEnvelope(), File(dir, PairingTokenStore.FILE_NAME)),
+    )
 
     @Test
     fun a_successful_pair_persists_the_endpoint_and_token() {

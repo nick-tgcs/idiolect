@@ -20,7 +20,7 @@ import org.idiolect.android.ime.IdiolectImeService
 import org.idiolect.android.model.HttpModelTransport
 import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
-import org.idiolect.android.sync.SyncConfig
+import org.idiolect.android.sync.SecureSyncConfig
 import org.idiolect.android.sync.SyncSettings
 import java.io.File
 import kotlin.concurrent.thread
@@ -125,8 +125,9 @@ class SetupActivity : Activity() {
                 }
             }.onSuccess {
                 // Remember the endpoint so the background sync worker can ship learnings
-                // back to the same PC (M6). S3's pairing flow will supersede this.
-                SyncConfig(File(filesDir, SyncConfig.FILE_NAME)).save(SyncSettings(url, token))
+                // back to the same PC (M6); the token is wrapped at rest by the AndroidKeyStore.
+                // S3's pairing flow will supersede the manual token with a paired one.
+                SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(url, token))
                 runOnUiThread { render() } // a model is installed now → Ready
             }.onFailure { error ->
                 runOnUiThread {

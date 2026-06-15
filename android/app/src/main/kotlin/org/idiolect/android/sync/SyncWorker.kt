@@ -15,7 +15,7 @@ import java.io.File
  * This is the **native boundary** — it opens its own short-lived [IdiolectCore] over the
  * same `filesDir` (no model loaded; `exportSyncBatch`/`confirmSynced` only touch the store
  * and audio), so it can't be host-tested. Everything it composes is, though: the drain
- * logic ([OutboxPump.drain]), the endpoint ([SyncConfig]), the id ([DeviceId]), the
+ * logic ([OutboxPump.drain]), the endpoint ([SecureSyncConfig]), the id ([DeviceId]), the
  * transport ([HttpSyncTransport]), and the scheduling ([SyncSchedulerTest]). The native
  * round-trip is proven by the Rust seam test and the emulator e2e.
  *
@@ -26,7 +26,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : Worker(context, p
     override fun doWork(): Result {
         val filesDir = applicationContext.filesDir
         // No endpoint paired yet → nothing to ship; succeed so the job isn't retried.
-        val settings = SyncConfig(File(filesDir, SyncConfig.FILE_NAME)).load() ?: return Result.success()
+        val settings = SecureSyncConfig.keystoreBacked(filesDir).load() ?: return Result.success()
         val deviceId = DeviceId(File(filesDir, DeviceId.FILE_NAME)).get()
 
         val historyKey = HistoryKey.load(File(filesDir, HistoryKey.FILE_NAME))

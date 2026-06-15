@@ -10,7 +10,7 @@ package org.idiolect.android.sync
  * (defaulting to [HttpPairingTransport]); tests inject a fake.
  */
 class PairingClient(
-    private val config: SyncConfig,
+    private val config: SecureSyncConfig,
     private val deviceId: String,
     private val transportFactory: (String) -> PairingTransport = ::HttpPairingTransport,
 ) {
