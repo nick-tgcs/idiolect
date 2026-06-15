@@ -434,19 +434,37 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
     `idiolect_application::use_cases::streaming`; `run_loop` imports it. Unit tests
     moved with it; daemon streaming integration tests pass unchanged (behaviour-
     neutral).
-  - **M2 part 2 — remaining.** Lift `LiveStreamState`/`handle_snippet`/
-    `pump_live_stream`/`finalize_streamed_take` into the application layer as a
-    **port-driven** orchestration: the state machine accumulates snippets +
-    finalizes the whole take, with the **decode/translate** step injected as a port
-    (the daemon injects `transcribe_translated`; Android injects whisper-on-device)
-    and snippet/finalize **emitted as events**. Then rewire both `run_loop` *and*
-    the M1 FFI facade's `deliver_transcript` onto it. (`StreamingResampler` is pure
-    DSP but desktop-leaning — Android's `AudioRecord` captures 16 kHz mono direct —
-    so it can stay daemon-side or move opportunistically.)
+  - ✅ **M2 part 2 — done (daemon).** `LiveStreamState`/`handle_snippet`/
+    `pump_live_stream`/`finalize_streamed_take` are lifted into
+    `idiolect_application::use_cases::streaming::StreamingTake` as a **port-driven**
+    orchestration: the state machine owns the segmenter, the merged-audio/-text
+    accumulators, the auto-stop clock, and the once-per-take error de-dup; the
+    **decode/translate** is injected via `TakeTranscriber` (the daemon binds
+    `transcribe_translated`) and the live feedback via `StreamObserver` (the daemon
+    pushes IPC + desktop notifications). `finalize` returns a `TakeOutcome` the edge
+    persists. The daemon's `LiveStreamState` is now a thin wrapper (resampler +
+    `VadAdapter` only) over it; behaviour-neutral — all eight `translation_streaming`
+    integration tests pass unchanged, plus 12 new orchestration unit tests.
+    (`StreamingResampler` stays daemon-side; Android's `AudioRecord` captures 16 kHz
+    mono direct.)
+  - **M2 part 2 — FFI wiring deferred to M3 (deliberate).** The FFI was *not*
+    rewired onto `StreamingTake` here: the orchestration creates the take's session
+    **at finalize with the whole-recording text** (the daemon model) and its ports
+    (`TakeTranscriber`, the VAD verdict) have **no Android implementations** until
+    M3 brings the on-device whisper ASR + VAD + audio-store adapters. Wiring it now
+    would bake a per-snippet session lifecycle into the facade that contradicts the
+    lifted orchestration. M3 wires `push_pcm_frame → StreamingTake::ingest →
+    on-device whisper `fold_snippet`/`finalize` → callback`; until then
+    `push_pcm_frame` buffers and `IdiolectCore::deliver_transcript` is the
+    test-driven transcript seam. The facade docs point at this seam.
 - **M3 — Audio + IME bring-up.** `idiolect-adapter-android-audio` (AudioRecord +
   JNI PCM push) + `idiolect-adapter-android-ime` (InputConnection callbacks);
   `MicForegroundService` (`foregroundServiceType=microphone`); `IdiolectImeService`
-  with the **voice mode** view + privacy gate. *Tests:* Robolectric on the service
+  with the **voice mode** view + privacy gate. **Also wires the FFI facade onto the
+  M2 `StreamingTake`** (the deferred M2 part-2 step): `push_pcm_frame →
+  StreamingTake::ingest`, an on-device whisper `TakeTranscriber` + a callback
+  `StreamObserver` driving `fold_snippet`/`finalize`, session created at finalize —
+  retiring the `deliver_transcript` seam. *Tests:* Robolectric on the service
   logic; Compose UI test on the input view states; **emulator e2e** (fixture
   audio → `commitText`, see [§6](#6-emulator--testing-strategy)).
 - **M4 — Edit mode + correction capture.** The QWERTY edit mode, the **one-tap

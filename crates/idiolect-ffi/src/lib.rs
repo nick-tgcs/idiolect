@@ -13,10 +13,17 @@
 //!
 //! The brain itself is reused unchanged: [`IdiolectCore`] drives
 //! [`DictationUseCase`] over a real [`SqliteMetadataStore`], exactly as the daemon
-//! does. The **streaming decode** (PCM → transcript) is deliberately *not* here —
-//! that orchestration is lifted into `idiolect-application` in M2 and will call
-//! [`IdiolectCore::deliver_transcript`]. Until then `push_pcm_frame` buffers the
-//! capture and the transcript-delivery seam is driven by tests.
+//! does. The **streaming decode** (PCM → snippets → transcript) is the shared
+//! `idiolect_application::use_cases::streaming::StreamingTake` orchestration that
+//! M2 lifted out of the daemon — the daemon already runs on it. M3 wires this
+//! facade onto the *same* orchestration: `push_pcm_frame` will feed
+//! `StreamingTake::ingest`, an on-device whisper `TakeTranscriber` and a callback
+//! `StreamObserver` will drive `fold_snippet`/`finalize`, and the take's session
+//! will be created at finalize with the whole-recording text (matching the
+//! daemon), not per snippet. That wiring waits for M3's Android audio/ASR/VAD
+//! adapters (the orchestration's ports have no Android implementations yet); until
+//! then `push_pcm_frame` buffers the capture and [`IdiolectCore::deliver_transcript`]
+//! is the test-driven transcript seam.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -147,8 +154,8 @@ struct Inner {
     last_commit: Option<(ImeSessionId, String)>,
     /// Monotonic source of per-operation idempotency keys.
     seq: u64,
-    /// Raw 16 kHz mono PCM captured for the active take. M2's decode worker drains
-    /// this; until then it proves capture plumbing without decoding.
+    /// Raw 16 kHz mono PCM captured for the active take. M3 feeds this through
+    /// `StreamingTake::ingest`; until then it proves capture plumbing without decoding.
     pcm: Vec<i16>,
 }
 
@@ -209,8 +216,8 @@ impl IdiolectCore {
         let mut inner = self.lock();
         if inner.recording {
             inner.recording = false;
-            // M2's decode worker consumes the captured take here (drain → decode →
-            // `deliver_transcript`); for now the buffer is simply released at stop.
+            // M3 consumes the captured take here (drain → `StreamingTake` ingest +
+            // finalize → commit); for now the buffer is simply released at stop.
             inner.pcm.clear();
             inner.callback.recording_status(false);
         } else {
@@ -352,12 +359,13 @@ impl IdiolectCore {
     }
 }
 
-// Non-`#[uniffi::export]` seams: callable as ordinary Rust (tests now, M2's lifted
-// streaming worker later) but not surfaced to Kotlin.
+// Non-`#[uniffi::export]` seams: callable as ordinary Rust (tests now, M3's
+// `StreamingTake`-driven decode later) but not surfaced to Kotlin.
 impl IdiolectCore {
     /// Hand a freshly decoded transcript to the active take as its live preedit —
-    /// what M2's streaming worker calls after draining `push_pcm_frame`. Mirrors
-    /// the desktop run-loop handing a transcript to `transcript_ready`.
+    /// the interim seam M3 replaces with `StreamingTake::fold_snippet`/`finalize`
+    /// once an on-device decoder exists. Mirrors the desktop run-loop handing a
+    /// transcript to `transcript_ready`.
     pub fn deliver_transcript(&self, text: &str) -> Result<(), FfiError> {
         let mut inner = self.lock();
         let existing = inner
@@ -385,7 +393,7 @@ impl IdiolectCore {
         Ok(())
     }
 
-    /// Number of PCM samples buffered for the active take (M2 drains this).
+    /// Number of PCM samples buffered for the active take (M3 drains this).
     #[must_use]
     pub fn buffered_frame_count(&self) -> usize {
         self.lock().pcm.len()
