@@ -9,6 +9,17 @@
         android:label="@string/app_name"
         android:supportsRtl="true">
 
+        <!-- Launcher / onboarding: enable + select the keyboard, grant the mic. -->
+        <activity
+            android:name=".setup.SetupActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <!-- The IME itself. BIND_INPUT_METHOD restricts binding to the system. -->
         <service
             android:name=".ime.IdiolectImeService"

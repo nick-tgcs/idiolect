@@ -5,4 +5,12 @@
     <string name="idiolect_mic_idle">Tap to dictate</string>
     <string name="idiolect_mic_recording">Listening… tap to stop</string>
     <string name="idiolect_mic_permission_required">Microphone permission is required to dictate</string>
+
+    <string name="setup_enable">Enable idiolect as a keyboard to start dictating.</string>
+    <string name="setup_enable_cta">Enable in settings</string>
+    <string name="setup_select">idiolect is enabled. Switch to it as your active keyboard.</string>
+    <string name="setup_select_cta">Choose keyboard</string>
+    <string name="setup_mic">Grant the microphone so idiolect can hear you.</string>
+    <string name="setup_mic_cta">Grant microphone</string>
+    <string name="setup_ready">idiolect is ready. Tap a text field and use the mic to dictate.</string>
 </resources>
