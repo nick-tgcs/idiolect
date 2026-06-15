@@ -36,6 +36,11 @@ android {
             isMinifyEnabled = false
         }
     }
+
+    // The native core is cross-compiled into build/android-ffi/jniLibs by the
+    // canonical scripts/android-ffi-build.sh (see cargoNdkJniLibs below), kept out of
+    // the source tree.
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("android-ffi/jniLibs"))
 }
 
 kotlin {
@@ -58,13 +63,16 @@ dependencies {
     androidTestImplementation(libs.androidx.test.runner)
 }
 
-// Cross-compile the native core into src/main/jniLibs before the APK packs JNI libs.
-// Only the APK path depends on this; unit tests (testDebugUnitTest) never trigger it.
+// Cross-compile the native core (arm64-v8a + x86_64) into build/android-ffi/jniLibs
+// via the canonical repo script, which sets the full NDK env, bundles libc++_shared.so
+// per ABI, and builds release. Only the APK path depends on this; unit tests
+// (testDebugUnitTest) never trigger it.
 val cargoNdkJniLibs by tasks.registering(Exec::class) {
-    description = "Cross-compile idiolect-ffi for Android ABIs into src/main/jniLibs."
-    workingDir = rootProject.projectDir
-    val abis = (project.findProperty("idiolect.abis") as String?) ?: "x86_64 arm64-v8a"
-    commandLine("bash", "build-jni.sh", abis, "release")
+    description = "Cross-compile idiolect-ffi for Android ABIs into build/android-ffi/jniLibs."
+    // The cargo workspace root (android/ is the Gradle root; its parent is the repo).
+    workingDir = rootProject.projectDir.parentFile
+    val outDir = layout.buildDirectory.dir("android-ffi").get().asFile.absolutePath
+    commandLine("bash", "scripts/android-ffi-build.sh", outDir, "--release")
 }
 
 tasks.matching { it.name.contains("JniLibFolders") }.configureEach {

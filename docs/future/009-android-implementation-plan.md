@@ -478,13 +478,37 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
     run under the core mutex — a re-entrancy contract is documented on the callback
     trait for now; lifting them out of the lock is M3 polish. Silence auto-stop is
     desktop-only until an on-device config surface exists.
-  - **M3 part 2 — Kotlin IME bring-up (next).** `idiolect-adapter-android-audio`
-    (AudioRecord + JNI PCM push) + `idiolect-adapter-android-ime` (InputConnection
-    callbacks); `MicForegroundService` (`foregroundServiceType=microphone`);
-    `IdiolectImeService` with the **voice mode** view + privacy gate, all against the
-    part-1 contract. *Tests:* Robolectric on the service logic; Compose UI test on
-    the input view states; **emulator e2e** (fixture audio → `commitText`, see
-    [§6](#6-emulator--testing-strategy)).
+  - ✅ **M3 part 2 — Kotlin IME bring-up — core path done & on-device-proven.**
+    Stood up the `android/` Gradle build (pure-JVM `:ffi` bindings module + AGP
+    `:app`) and wired the IME against the part-1 FFI contract, across six committed,
+    gate-green packages:
+    - **2a** (`6545f7c`) Gradle bring-up + Rust↔Kotlin bridge: UniFFI Kotlin
+      bindings generated from the crate at build time (library mode), `BridgeTest`
+      drives the real core over the bindings (3/3). Contract fix: `FfiError`'s
+      payload field renamed `message`→`detail` (UniFFI's error subclass collides
+      with `Throwable.message`).
+    - **2b** (`4f224e2`) AGP module + `IdiolectImeCallback` mapping callbacks →
+      `FieldEditor`/`ImeUiHost` (5/5).
+    - **2c** (`a1bdde9`) decoupled audio pipeline `PcmSource`/`PcmFrameQueue`/
+      `AudioCapture` — the queue keeps a blocking snippet decode off the capture
+      thread so the mic never drops samples (4/4).
+    - **2d** (`271b832`) `DictationController` thread orchestration; stop-and-drain
+      *before* the finalize toggle so no tail audio is lost, no join under the core
+      lock (4/4).
+    - **2e** (`e1272d1`) `IdiolectImeService` + framework seams
+      (`InputConnectionFieldEditor`, `AndroidPcmSource`) + manifest + `MicToggle`
+      (3/3); native packaging via `build-jni.sh` (cmake-android: whisper.cpp/opus/
+      sqlite all cross-compile under the NDK) → APK ships `libidiolect_ffi.so`.
+    - **2f** (`3511e6c`) **emulator e2e** `OnDeviceBridgeTest` — the cross-compiled
+      core loads & runs on android-33 x86_64 through jna@aar (3/3). Packaging fix:
+      ship the NDK `libc++_shared.so` per ABI (whisper links `c++_shared`).
+    - **Remaining M3-polish / UX (separable, mostly framework glue):**
+      `MicForegroundService` (`foregroundServiceType=microphone`); in-app mic
+      permission-request + IME-enable Activity (today the mic is grantable via
+      system Settings); a Compose voice-mode view (a working Button view ships
+      now); fixture-audio dictation e2e (`commitText`) once a model is on device
+      (depends on M5). Still owed from part 1: lift callbacks + decode out of the
+      core lock; silence auto-stop.
 - **M4 — Edit mode + correction capture.** The QWERTY edit mode, the **one-tap
   toggle**, the correction strip + tap-to-fix selecting the word range; wire fixes
   to `amend_correction` (incl. the `ime_text_history` projection). Crypto key →
@@ -630,9 +654,15 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    on-device: `push_pcm_frame → StreamingTake::ingest → fold_snippet/finalize →
    commit`, carrying the full-take-wins policy to the phone (the interim
    `deliver_transcript` seam is retired). See the M2 / M3-part-1 bullets in §5.
-9. **NEXT (dependency order, mobile track): M3 part 2 — the Kotlin IME** (the second
-   existential risk) against the part-1 FFI contract. The S2 HTTP hop (axum) remains
-   a parallel no-Kotlin track.
+9. ✅ **M3 part 2 — the Kotlin IME (the second existential risk) — core path done.**
+   The `android/` Gradle build + the IME wired against the part-1 FFI contract, six
+   gate-green packages (`6545f7c`…`3511e6c`), proven on the android-33 emulator
+   (`OnDeviceBridgeTest`). See the M3-part-2 bullet in §5 for the breakdown and the
+   separable polish/UX remainder.
+10. **NEXT (pick one): M3-polish/UX** (FGS + in-app permission/enable Activity +
+    Compose view + fixture-audio dictation e2e), **M4** (edit mode / correction
+    capture), **M5** (model management — unblocks real on-device dictation), or the
+    parallel no-Kotlin **S2 HTTP hop (axum)**.
 
 ---
 
