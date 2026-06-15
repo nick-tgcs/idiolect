@@ -10,7 +10,7 @@ name = "idiolect-recording-indicator"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["glow"] }
+eframe = { version = "0.34", default-features = false, features = ["glow"] }
 
 [lints]
 workspace = true
