@@ -4274,6 +4274,8 @@ dependencies = [
 name = "idiolect-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "http-body-util",
  "idiolect-adapter-cpal",
  "idiolect-adapter-fixture-asr",
  "idiolect-adapter-fixture-audio",
@@ -4297,6 +4299,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]

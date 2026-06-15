@@ -34,3 +34,7 @@ rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+# The M6 sync ingest HTTP hop is driven through the axum router via tower::oneshot.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
