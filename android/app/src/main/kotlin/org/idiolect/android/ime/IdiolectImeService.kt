@@ -17,7 +17,9 @@ import androidx.core.content.ContextCompat
 import org.idiolect.android.R
 import org.idiolect.android.audio.AndroidPcmSource
 import org.idiolect.android.audio.MicForegroundService
+import org.idiolect.android.crypto.HistoryKey
 import org.idiolect.ffi.IdiolectCore
+import java.io.File
 
 /**
  * The idiolect Android IME. Owns the on-device core for the life of the service, drives
@@ -49,7 +51,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     override fun onCreate() {
         super.onCreate()
         val callback = IdiolectImeCallback(editorProvider = ::fieldEditor, ui = this)
-        core = IdiolectCore(filesDir.absolutePath, callback)
+        // At-rest encryption of the history projection: a 32-byte key wrapped by the
+        // hardware-backed AndroidKeyStore, generated once under filesDir.
+        val historyKey = HistoryKey.load(File(filesDir, HistoryKey.FILE_NAME))
+        core = IdiolectCore(filesDir.absolutePath, historyKey, callback)
         controller = DictationController(
             sink = { frame -> core.pushPcmFrame(frame) },
             sourceFactory = { AndroidPcmSource() },

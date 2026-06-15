@@ -41,7 +41,7 @@ class BridgeTest {
 
     private fun newCore(callback: IdiolectInputMethod): IdiolectCore {
         val dir = Files.createTempDirectory("idiolect-bridge").toFile()
-        return IdiolectCore(dir.absolutePath, callback)
+        return IdiolectCore(dir.absolutePath, null, callback)
     }
 
     @Test
@@ -73,6 +73,19 @@ class BridgeTest {
         newCore(RecordingCallback()).use { core ->
             val history: List<HistoryItem> = core.recentHistory(10u)
             assertEquals("fresh store is empty", 0, history.size)
+        }
+    }
+
+    @Test
+    fun a_history_key_marshals_and_a_wrong_length_lifts_a_typed_error() {
+        val dir = Files.createTempDirectory("idiolect-key").toFile()
+        // A 32-byte ByteArray? key marshals across the FFI and opens the store.
+        IdiolectCore(dir.absolutePath, ByteArray(32) { 7 }, RecordingCallback()).use { core ->
+            assertEquals(0, core.recentHistory(10u).size)
+        }
+        // A wrong-length key surfaces the typed error, not a panic across the boundary.
+        assertThrows(FfiException.InvalidHistoryKey::class.java) {
+            IdiolectCore(dir.absolutePath, ByteArray(16), RecordingCallback())
         }
     }
 

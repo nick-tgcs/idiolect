@@ -105,6 +105,7 @@ fn new_core() -> (Arc<IdiolectCore>, RecordingCallback) {
     let callback = RecordingCallback::default();
     let core = IdiolectCore::new(
         dir.path().to_string_lossy().into_owned(),
+        None,
         Box::new(callback.clone()),
     )
     .expect("core should open");
@@ -196,6 +197,7 @@ fn a_committed_take_persists_the_training_pair_audio() {
     let dir = tempfile::tempdir().expect("tempdir");
     let core = IdiolectCore::new(
         dir.path().to_string_lossy().into_owned(),
+        None,
         Box::new(RecordingCallback::default()),
     )
     .expect("core should open");
@@ -494,6 +496,46 @@ fn a_history_edit_of_the_active_take_keeps_a_later_correction_from_stale_skip() 
     let history = core.recent_history(10).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].text, "foo");
+}
+
+/// With a history key supplied, the `ime_text_history` projection is encrypted at
+/// rest: reopening the store *without* the key yields ciphertext (not the plaintext),
+/// and reopening *with* it decrypts back. This is the Android analog of the desktop's
+/// at-rest history encryption (the key comes from the Keystore on device).
+#[test]
+fn a_history_key_encrypts_the_projection_at_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().to_string_lossy().into_owned();
+    let key = vec![7_u8; 32];
+
+    {
+        let core = IdiolectCore::new(data.clone(), Some(key.clone()), boxed_cb())
+            .expect("core should open");
+        dictate(&core, "secret words");
+        assert_eq!(core.recent_history(10).unwrap()[0].text, "secret words");
+    }
+    // Reopen WITHOUT the key: the stored text is ciphertext, not the plaintext.
+    {
+        let core = IdiolectCore::new(data.clone(), None, boxed_cb()).expect("core should open");
+        assert_ne!(core.recent_history(10).unwrap()[0].text, "secret words");
+    }
+    // Reopen WITH the key: it decrypts back to the plaintext.
+    {
+        let core = IdiolectCore::new(data, Some(key), boxed_cb()).expect("core should open");
+        assert_eq!(core.recent_history(10).unwrap()[0].text, "secret words");
+    }
+}
+
+#[test]
+fn a_wrong_length_history_key_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().to_string_lossy().into_owned();
+    // 16 bytes — not the required 32; must be a typed error, not a panic.
+    assert!(IdiolectCore::new(data, Some(vec![0_u8; 16]), boxed_cb()).is_err());
+}
+
+fn boxed_cb() -> Box<RecordingCallback> {
+    Box::new(RecordingCallback::default())
 }
 
 /// Every `.ogg` source recording beneath `root` (recursively).

@@ -37,6 +37,9 @@ idiolect-common = { path = "../idiolect-common" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-application = { path = "../idiolect-application" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+# At-rest encryption of the history projection (ChaCha20-Poly1305), keyed on device
+# from the Android Keystore. The cipher is reused unchanged from desktop.
+idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
 # On-device streaming: the live take folds snippets through the same VAD + Opus +
 # Whisper adapters the daemon uses (no `cuda` feature ⇒ CPU on the phone).
 idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }

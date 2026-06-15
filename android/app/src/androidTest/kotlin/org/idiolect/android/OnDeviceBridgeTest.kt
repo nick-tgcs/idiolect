@@ -2,6 +2,7 @@ package org.idiolect.android
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import org.idiolect.android.crypto.HistoryKey
 import org.idiolect.ffi.FfiException
 import org.idiolect.ffi.HistoryItem
 import org.idiolect.ffi.IdiolectCore
@@ -43,7 +44,7 @@ class OnDeviceBridgeTest {
     private fun newCore(callback: IdiolectInputMethod): IdiolectCore {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val dir = File(context.filesDir, "bridge-${System.nanoTime()}").apply { mkdirs() }
-        return IdiolectCore(dir.absolutePath, callback)
+        return IdiolectCore(dir.absolutePath, null, callback)
     }
 
     @Test
@@ -77,6 +78,18 @@ class OnDeviceBridgeTest {
             assertThrows(FfiException.HistoryEntryNotFound::class.java) {
                 core.historyEdited(424_242L, "no such row")
             }
+        }
+    }
+
+    @Test
+    fun the_core_opens_with_a_keystore_backed_history_key() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val dir = File(context.filesDir, "keyed-${System.nanoTime()}").apply { mkdirs() }
+        // Exercises the real AndroidKeyStore wrap/unwrap on the device.
+        val key = HistoryKey.load(File(dir, HistoryKey.FILE_NAME))
+        assertEquals(32, key.size)
+        IdiolectCore(dir.absolutePath, key, Recording()).use { core ->
+            assertTrue(core.recentHistory(10u).isEmpty())
         }
     }
 }

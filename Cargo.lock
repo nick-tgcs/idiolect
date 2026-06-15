@@ -4179,6 +4179,7 @@ version = "0.1.0"
 name = "idiolect-ffi"
 version = "0.1.0"
 dependencies = [
+ "idiolect-adapter-crypto",
  "idiolect-adapter-opus",
  "idiolect-adapter-sqlite",
  "idiolect-adapter-vad",

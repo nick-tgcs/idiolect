@@ -26,6 +26,7 @@
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use idiolect_adapter_crypto::ChaCha20Poly1305Cipher;
 use idiolect_adapter_opus::OpusCodec;
 use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore, SqliteStorageError};
 use idiolect_adapter_vad::VadAdapter;
@@ -67,6 +68,8 @@ pub enum FfiError {
     HistoryEntryNotFound { id: i64 },
     #[error("io error: {detail}")]
     Io { detail: String },
+    #[error("history key must be 32 bytes, got {len}")]
+    InvalidHistoryKey { len: u32 },
 }
 
 impl From<SqliteStorageError> for FfiError {
@@ -301,9 +304,16 @@ impl IdiolectCore {
     /// Open (or create) the on-device store under `data_dir` (the app's private
     /// `filesDir`) and wire the brain to `callback`. No speech model is loaded yet
     /// — call [`Self::load_model`] before dictation can produce text.
+    ///
+    /// `history_key`, when present, must be exactly 32 bytes and enables at-rest
+    /// encryption of the `ime_text_history` projection (`ChaCha20Poly1305`, reused
+    /// unchanged from desktop). On Android the key is unwrapped from the
+    /// hardware-backed Keystore; `null` leaves the projection plaintext (the prior
+    /// behaviour, and what the host seam tests use).
     #[uniffi::constructor]
     pub fn new(
         data_dir: String,
+        history_key: Option<Vec<u8>>,
         callback: Box<dyn IdiolectInputMethod>,
     ) -> Result<Arc<Self>, FfiError> {
         let paths = RootedPaths::new(data_dir);
@@ -320,6 +330,20 @@ impl IdiolectCore {
         }
         let mut store = SqliteMetadataStore::open_path(paths.database_path())?;
         store.migrate()?;
+        // Enable at-rest history encryption when a key is supplied (after migrate, as
+        // the daemon does). A wrong-length key is a typed error, never a panic.
+        let store = match history_key {
+            Some(key) => {
+                let key: [u8; 32] =
+                    key.as_slice()
+                        .try_into()
+                        .map_err(|_| FfiError::InvalidHistoryKey {
+                            len: key.len() as u32,
+                        })?;
+                store.with_history_cipher(Box::new(ChaCha20Poly1305Cipher::new(key)))
+            }
+            None => store,
+        };
         let callback: Arc<dyn IdiolectInputMethod> = Arc::from(callback);
         let dictation = DictationUseCase::new(
             CallbackInput {
