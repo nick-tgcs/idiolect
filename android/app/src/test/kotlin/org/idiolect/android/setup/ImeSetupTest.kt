@@ -13,11 +13,11 @@ class ImeSetupTest {
     fun a_disabled_keyboard_is_enabled_first_regardless_of_other_state() {
         assertEquals(
             ImeSetupStep.EnableKeyboard,
-            ImeSetup.nextStep(hasMicPermission = false, isEnabled = false, isSelected = false),
+            ImeSetup.nextStep(hasMicPermission = false, isEnabled = false, isSelected = false, hasModel = false),
         )
         assertEquals(
             ImeSetupStep.EnableKeyboard,
-            ImeSetup.nextStep(hasMicPermission = true, isEnabled = false, isSelected = true),
+            ImeSetup.nextStep(hasMicPermission = true, isEnabled = false, isSelected = true, hasModel = true),
         )
     }
 
@@ -25,7 +25,7 @@ class ImeSetupTest {
     fun an_enabled_but_unselected_keyboard_is_selected_next() {
         assertEquals(
             ImeSetupStep.SelectKeyboard,
-            ImeSetup.nextStep(hasMicPermission = true, isEnabled = true, isSelected = false),
+            ImeSetup.nextStep(hasMicPermission = true, isEnabled = true, isSelected = false, hasModel = true),
         )
     }
 
@@ -33,15 +33,23 @@ class ImeSetupTest {
     fun a_selected_keyboard_without_mic_permission_asks_for_the_microphone() {
         assertEquals(
             ImeSetupStep.GrantMicrophone,
-            ImeSetup.nextStep(hasMicPermission = false, isEnabled = true, isSelected = true),
+            ImeSetup.nextStep(hasMicPermission = false, isEnabled = true, isSelected = true, hasModel = true),
         )
     }
 
     @Test
-    fun everything_satisfied_is_ready() {
+    fun a_configured_keyboard_without_a_model_asks_to_download_one() {
+        assertEquals(
+            ImeSetupStep.DownloadModel,
+            ImeSetup.nextStep(hasMicPermission = true, isEnabled = true, isSelected = true, hasModel = false),
+        )
+    }
+
+    @Test
+    fun everything_satisfied_including_a_model_is_ready() {
         assertEquals(
             ImeSetupStep.Ready,
-            ImeSetup.nextStep(hasMicPermission = true, isEnabled = true, isSelected = true),
+            ImeSetup.nextStep(hasMicPermission = true, isEnabled = true, isSelected = true, hasModel = true),
         )
     }
 }

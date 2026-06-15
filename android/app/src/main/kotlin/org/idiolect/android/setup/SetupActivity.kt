@@ -12,10 +12,16 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import org.idiolect.android.R
 import org.idiolect.android.ime.IdiolectImeService
+import org.idiolect.android.model.HttpModelTransport
+import org.idiolect.android.model.ModelDownloader
+import org.idiolect.android.model.ModelStore
+import java.io.File
+import kotlin.concurrent.thread
 
 /**
  * The launcher / onboarding screen. It shows one CTA at a time — the next step from
@@ -26,10 +32,20 @@ import org.idiolect.android.ime.IdiolectImeService
 class SetupActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var cta: Button
+    private lateinit var urlField: EditText
+    private lateinit var tokenField: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         status = TextView(this).apply { textSize = 18f }
+        urlField = EditText(this).apply {
+            setHint(R.string.setup_model_url_hint)
+            visibility = ViewGroup.GONE
+        }
+        tokenField = EditText(this).apply {
+            setHint(R.string.setup_model_token_hint)
+            visibility = ViewGroup.GONE
+        }
         cta = Button(this)
         val pad = (24 * resources.displayMetrics.density).toInt()
         setContentView(
@@ -38,6 +54,8 @@ class SetupActivity : Activity() {
                 gravity = Gravity.CENTER
                 setPadding(pad, pad, pad, pad)
                 addView(status, lp())
+                addView(urlField, lp())
+                addView(tokenField, lp())
                 addView(cta, lp())
             },
         )
@@ -49,7 +67,7 @@ class SetupActivity : Activity() {
     }
 
     private fun render() {
-        when (ImeSetup.nextStep(hasMicPermission(), isEnabled(), isSelected())) {
+        when (ImeSetup.nextStep(hasMicPermission(), isEnabled(), isSelected(), hasModel())) {
             ImeSetupStep.EnableKeyboard -> bind(R.string.setup_enable, R.string.setup_enable_cta) {
                 startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
             }
@@ -59,8 +77,19 @@ class SetupActivity : Activity() {
             ImeSetupStep.GrantMicrophone -> bind(R.string.setup_mic, R.string.setup_mic_cta) {
                 requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
             }
+            ImeSetupStep.DownloadModel -> {
+                status.setText(R.string.setup_model)
+                urlField.visibility = ViewGroup.VISIBLE
+                tokenField.visibility = ViewGroup.VISIBLE
+                cta.visibility = ViewGroup.VISIBLE
+                cta.isEnabled = true
+                cta.setText(R.string.setup_model_cta)
+                cta.setOnClickListener { onDownloadTapped() }
+            }
             ImeSetupStep.Ready -> {
                 status.setText(R.string.setup_ready)
+                urlField.visibility = ViewGroup.GONE
+                tokenField.visibility = ViewGroup.GONE
                 cta.visibility = ViewGroup.GONE
             }
         }
@@ -68,10 +97,44 @@ class SetupActivity : Activity() {
 
     private fun bind(statusRes: Int, ctaRes: Int, action: () -> Unit) {
         status.setText(statusRes)
+        urlField.visibility = ViewGroup.GONE
+        tokenField.visibility = ViewGroup.GONE
         cta.visibility = ViewGroup.VISIBLE
+        cta.isEnabled = true
         cta.setText(ctaRes)
         cta.setOnClickListener { action() }
     }
+
+    /** Kick off the model download from the entered server URL + token, with progress. */
+    private fun onDownloadTapped() {
+        val url = urlField.text.toString().trim()
+        val token = tokenField.text.toString().trim()
+        if (url.isEmpty() || token.isEmpty()) {
+            status.setText(R.string.setup_model_need_details)
+            return
+        }
+        cta.isEnabled = false
+        val downloader = ModelDownloader(HttpModelTransport(url, token), modelStore())
+        thread(isDaemon = true, name = "idiolect-model-download") {
+            runCatching {
+                downloader.download { downloaded, total ->
+                    val pct = if (total > 0) (downloaded * 100 / total).toInt() else 0
+                    runOnUiThread { status.text = getString(R.string.setup_model_progress, pct) }
+                }
+            }.onSuccess {
+                runOnUiThread { render() } // a model is installed now → Ready
+            }.onFailure { error ->
+                runOnUiThread {
+                    status.text = getString(R.string.setup_model_error, error.message ?: "")
+                    cta.isEnabled = true
+                }
+            }
+        }
+    }
+
+    private fun hasModel(): Boolean = modelStore().active() != null
+
+    private fun modelStore() = ModelStore(File(filesDir, "models/whisper"))
 
     private fun hasMicPermission(): Boolean =
         checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED

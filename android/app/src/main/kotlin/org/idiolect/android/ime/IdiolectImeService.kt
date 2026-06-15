@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -18,8 +19,11 @@ import org.idiolect.android.R
 import org.idiolect.android.audio.AndroidPcmSource
 import org.idiolect.android.audio.MicForegroundService
 import org.idiolect.android.crypto.HistoryKey
+import org.idiolect.android.model.ModelStore
 import org.idiolect.ffi.IdiolectCore
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 /**
  * The idiolect Android IME. Owns the on-device core for the life of the service, drives
@@ -44,6 +48,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     private val presenter = VoiceModePresenter()
     private val mode = ModePresenter()
     private val main = Handler(Looper.getMainLooper())
+    private val modelStore by lazy { ModelStore(File(filesDir, "models/whisper")) }
+    private val modelLoadStarted = AtomicBoolean(false)
     private var root: FrameLayout? = null
     private var statusView: TextView? = null
     private var micButton: Button? = null
@@ -82,6 +88,27 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     /** The live field as a [FieldEditor], or `null` between fields. */
     private fun fieldEditor(): FieldEditor? =
         currentInputConnection?.let { InputConnectionFieldEditor(it) }
+
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        // Lazy model init on first focus (plan §1.2): load the installed model off the
+        // main thread, verifying its SHA-256 (M5a) before use. Until it loads, a take
+        // finalizes to nothing and the user is told a model is needed.
+        ensureModelLoaded()
+    }
+
+    private fun ensureModelLoaded() {
+        if (!modelLoadStarted.compareAndSet(false, true)) return
+        val model = modelStore.active()
+        if (model == null) {
+            modelLoadStarted.set(false) // retry on a later focus once one is installed
+            return
+        }
+        thread(isDaemon = true, name = "idiolect-model-load") {
+            runCatching { core.loadModelVerified(model.path, model.sha256) }
+                .onFailure { error -> onDictationError("couldn't load the model: ${error.message}") }
+        }
+    }
 
     override fun onCreateInputView(): View {
         val container = FrameLayout(this)
