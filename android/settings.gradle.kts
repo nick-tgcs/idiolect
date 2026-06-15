@@ -20,3 +20,4 @@ dependencyResolutionManagement {
 rootProject.name = "idiolect-android"
 
 include(":ffi")
+include(":app")
