@@ -20,6 +20,8 @@ import org.idiolect.android.ime.IdiolectImeService
 import org.idiolect.android.model.HttpModelTransport
 import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
+import org.idiolect.android.model.ModelTransport
+import org.idiolect.android.model.PublicModelTransport
 import org.idiolect.android.sync.SecureSyncConfig
 import org.idiolect.android.sync.SyncSettings
 import java.io.File
@@ -107,16 +109,26 @@ class SetupActivity : Activity() {
         cta.setOnClickListener { action() }
     }
 
-    /** Kick off the model download from the entered server URL + token, with progress. */
+    /** Route the form's two fields to a model source ([ModelSourceChoice]), then download it. */
     private fun onDownloadTapped() {
-        val url = urlField.text.toString().trim()
-        val token = tokenField.text.toString().trim()
-        if (url.isEmpty() || token.isEmpty()) {
-            status.setText(R.string.setup_model_need_details)
-            return
+        when (val choice = ModelSourceChoice.from(urlField.text.toString(), tokenField.text.toString())) {
+            ModelSourceChoice.NeedDetails -> status.setText(R.string.setup_model_need_details)
+            ModelSourceChoice.Public -> startDownload(PublicModelTransport.recommended(), pcEndpoint = null)
+            is ModelSourceChoice.Pc ->
+                startDownload(HttpModelTransport(choice.url, choice.token), pcEndpoint = choice)
         }
+    }
+
+    /**
+     * Download [transport]'s model with progress, then go Ready. Only a PC pull carries a
+     * [pcEndpoint] to remember (so the sync worker can ship learnings back, M6; the token
+     * is wrapped at rest by the AndroidKeyStore). The public path saves nothing: a phone
+     * with no prior pairing stays unpaired, and a previously-paired phone keeps its
+     * existing endpoint untouched.
+     */
+    private fun startDownload(transport: ModelTransport, pcEndpoint: ModelSourceChoice.Pc?) {
         cta.isEnabled = false
-        val downloader = ModelDownloader(HttpModelTransport(url, token), modelStore())
+        val downloader = ModelDownloader(transport, modelStore())
         thread(isDaemon = true, name = "idiolect-model-download") {
             runCatching {
                 downloader.download { downloaded, total ->
@@ -124,10 +136,9 @@ class SetupActivity : Activity() {
                     runOnUiThread { status.text = getString(R.string.setup_model_progress, pct) }
                 }
             }.onSuccess {
-                // Remember the endpoint so the background sync worker can ship learnings
-                // back to the same PC (M6); the token is wrapped at rest by the AndroidKeyStore.
-                // S3's pairing flow will supersede the manual token with a paired one.
-                SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(url, token))
+                pcEndpoint?.let {
+                    SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(it.url, it.token))
+                }
                 runOnUiThread { render() } // a model is installed now → Ready
             }.onFailure { error ->
                 runOnUiThread {
