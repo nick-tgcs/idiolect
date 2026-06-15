@@ -45,8 +45,25 @@ kotlin {
 dependencies {
     implementation(project(":ffi"))
     implementation(libs.androidx.core.ktx)
+    // JNA's Android AAR bundles the per-ABI jnidispatch the generated bindings load.
+    implementation(libs.jna) {
+        artifact { type = "aar" }
+    }
 
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.ext.junit)
+}
+
+// Cross-compile the native core into src/main/jniLibs before the APK packs JNI libs.
+// Only the APK path depends on this; unit tests (testDebugUnitTest) never trigger it.
+val cargoNdkJniLibs by tasks.registering(Exec::class) {
+    description = "Cross-compile idiolect-ffi for Android ABIs into src/main/jniLibs."
+    workingDir = rootProject.projectDir
+    val abis = (project.findProperty("idiolect.abis") as String?) ?: "x86_64 arm64-v8a"
+    commandLine("bash", "build-jni.sh", abis, "release")
+}
+
+tasks.matching { it.name.contains("JniLibFolders") }.configureEach {
+    dependsOn(cargoNdkJniLibs)
 }

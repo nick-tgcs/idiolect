@@ -53,8 +53,12 @@ kotlin {
 }
 
 dependencies {
-    api(libs.jna)
+    // JNA backs the generated bindings. `compileOnly` here keeps the host JAR off the
+    // app's Android runtime classpath — the app supplies the `@aar` (with per-ABI
+    // jnidispatch) instead. The host JVM tests get the JAR via `testImplementation`.
+    compileOnly(libs.jna)
     testImplementation(libs.junit)
+    testImplementation(libs.jna)
 }
 
 // The unit tests load `libidiolect_ffi.so` from the cargo target dir via JNA.

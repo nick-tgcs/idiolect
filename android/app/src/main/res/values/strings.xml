@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">idiolect</string>
+    <string name="ime_label">idiolect dictation</string>
+    <string name="idiolect_mic_idle">Tap to dictate</string>
+    <string name="idiolect_mic_recording">Listening… tap to stop</string>
+    <string name="idiolect_mic_permission_required">Microphone permission is required to dictate</string>
+</resources>

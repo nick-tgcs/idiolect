@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Input-method metadata referenced by the IdiolectImeService <meta-data>. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android">
+    <subtype
+        android:label="@string/ime_label"
+        android:imeSubtypeMode="keyboard" />
+</input-method>

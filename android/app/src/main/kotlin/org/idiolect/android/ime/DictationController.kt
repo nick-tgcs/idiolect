@@ -26,7 +26,7 @@ fun interface PcmSink {
 class DictationController(
     private val sink: PcmSink,
     private val sourceFactory: () -> PcmSource,
-) {
+) : CaptureControl {
     private var capture: Thread? = null
     private var pump: Thread? = null
     private var source: PcmSource? = null
@@ -37,7 +37,7 @@ class DictationController(
 
     /** Begin a take: open a source and spawn the capture + pump threads. Idempotent. */
     @Synchronized
-    fun start() {
+    override fun start() {
         if (source != null) return
         val queue = PcmFrameQueue()
         val src = sourceFactory()
@@ -57,7 +57,7 @@ class DictationController(
      * queue and drains the pump, then join both threads. Safe to call when idle.
      */
     @Synchronized
-    fun stop() {
+    override fun stop() {
         val src = source ?: return
         src.stop()
         capture?.join()

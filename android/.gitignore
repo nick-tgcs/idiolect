@@ -3,3 +3,5 @@
 local.properties
 *.iml
 .idea/
+# Cross-compiled native libs are produced by build-jni.sh (~100 MB); never checked in.
+app/src/main/jniLibs/
