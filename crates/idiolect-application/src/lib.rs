@@ -6,6 +6,7 @@ pub mod use_cases {
     pub mod maintenance;
     pub mod menu;
     pub mod segmentation;
+    pub mod streaming;
 }
 
 /// Returns this crate's package name for smoke tests.
