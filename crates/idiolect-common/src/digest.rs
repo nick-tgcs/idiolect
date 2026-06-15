@@ -20,7 +20,15 @@ use sha2::{Digest, Sha256};
 /// can never disagree on a digest for identical bytes.
 #[must_use]
 pub fn audio_sha256_hex(payload: &[u8]) -> String {
-    to_hex(&Sha256::digest(payload))
+    sha256_hex(payload)
+}
+
+/// Lowercase-hex SHA-256 of arbitrary bytes — the general-purpose digest the audio and
+/// file helpers are specialisations of. Used by the sync server to store a device bearer
+/// token only as its hash, so the on-disk token file cannot be replayed if it leaks.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
 }
 
 /// Lowercase-hex SHA-256 of a file's bytes, read incrementally so a multi-tens-of-MB
@@ -55,7 +63,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_sha256_hex, file_sha256_hex};
+    use super::{audio_sha256_hex, file_sha256_hex, sha256_hex};
 
     #[test]
     fn matches_a_known_sha256_vector() {
@@ -64,6 +72,16 @@ mod tests {
             audio_sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn sha256_hex_matches_the_known_vector_and_the_audio_specialisation() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // The audio helper is just a domain-named alias, so they must agree byte-for-byte.
+        assert_eq!(sha256_hex(b"token-xyz"), audio_sha256_hex(b"token-xyz"));
     }
 
     #[test]

@@ -19,6 +19,8 @@ axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Per-device bearer tokens (S3): random token material for the pairing handshake.
+uuid.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

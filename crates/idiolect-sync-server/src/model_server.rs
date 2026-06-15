@@ -22,16 +22,18 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-/// What model the server serves and the token that guards it.
+use crate::device_tokens::{authenticate, DeviceTokenStore};
+
+/// What model the server serves and the per-device token store that guards it (shared
+/// with the ingest server, so one device's token authenticates both endpoints).
 #[derive(Debug, Clone)]
 pub struct ModelServerConfig {
     /// Absolute path to the model `.bin` to serve.
     pub model_path: PathBuf,
     /// Stable identifier the client records (e.g. `base.en` or a personalised id).
     pub model_id: String,
-    /// Bearer token the client must present. S3 mints per-device tokens; v1 is a
-    /// single shared secret.
-    pub bearer_token: String,
+    /// The per-device bearer tokens the client must present one of (S3).
+    pub tokens: Arc<DeviceTokenStore>,
 }
 
 /// The served model's identity + integrity metadata, so the client knows what to
@@ -61,16 +63,8 @@ pub async fn serve(
     axum::serve(listener, model_router(config)).await
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
-}
-
 async fn manifest(State(config): State<Arc<ModelServerConfig>>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &config.bearer_token) {
+    if authenticate(&headers, &config.tokens).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let size = match std::fs::metadata(&config.model_path) {
@@ -90,7 +84,7 @@ async fn manifest(State(config): State<Arc<ModelServerConfig>>, headers: HeaderM
 }
 
 async fn download(State(config): State<Arc<ModelServerConfig>>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &config.bearer_token) {
+    if authenticate(&headers, &config.tokens).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let bytes = match std::fs::read(&config.model_path) {
@@ -178,6 +172,13 @@ mod tests {
 
     const TOKEN: &str = "test-token";
 
+    /// A token store with the known `TOKEN` bound, so tests keep asserting against it.
+    fn tokens(dir: &std::path::Path) -> Arc<DeviceTokenStore> {
+        let mut store = DeviceTokenStore::open(dir.join("tokens.json")).expect("tokens");
+        store.bind(TOKEN, "pixel", "default").expect("bind token");
+        Arc::new(store)
+    }
+
     fn fixture() -> (tempfile::TempDir, Arc<ModelServerConfig>, Vec<u8>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("model.bin");
@@ -186,7 +187,7 @@ mod tests {
         let config = Arc::new(ModelServerConfig {
             model_path: path,
             model_id: "base.en".to_owned(),
-            bearer_token: TOKEN.to_owned(),
+            tokens: tokens(dir.path()),
         });
         (dir, config, bytes)
     }
@@ -309,7 +310,7 @@ mod tests {
         let config = Arc::new(ModelServerConfig {
             model_path: dir.path().join("absent.bin"),
             model_id: "base.en".to_owned(),
-            bearer_token: TOKEN.to_owned(),
+            tokens: tokens(dir.path()),
         });
         let response = model_router(config)
             .oneshot(request("/v1/model", Some(TOKEN), None))

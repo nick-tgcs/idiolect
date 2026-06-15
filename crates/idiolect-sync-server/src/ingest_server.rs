@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -30,6 +30,7 @@ use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
 use idiolect_sync::decode_batch;
 use serde::Serialize;
 
+use crate::device_tokens::{authenticate, DeviceTokenStore};
 use crate::{ingest, SyncServerError};
 
 /// Cap a single uploaded batch. A personal outbox is small (opus is a few KB/s) but
@@ -39,11 +40,12 @@ const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;
 
 /// Shared state for the ingest server: the local store (mutated under a lock — a
 /// personal server serves ~one phone, so serialised ingest is fine) plus the audio
-/// store and the bearer token.
+/// store and the per-device token store (shared with the model server, so one device's
+/// token authenticates both endpoints).
 pub struct IngestServerState {
     store: Mutex<SqliteMetadataStore>,
     audio_store: FileAudioStore,
-    bearer_token: String,
+    tokens: Arc<DeviceTokenStore>,
 }
 
 impl IngestServerState {
@@ -52,12 +54,12 @@ impl IngestServerState {
     pub fn new(
         store: SqliteMetadataStore,
         audio_store: FileAudioStore,
-        bearer_token: String,
+        tokens: Arc<DeviceTokenStore>,
     ) -> Self {
         Self {
             store: Mutex::new(store),
             audio_store,
-            bearer_token,
+            tokens,
         }
     }
 }
@@ -86,20 +88,12 @@ pub async fn serve_ingest(
     axum::serve(listener, ingest_router(state)).await
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
-}
-
 async fn ingest_batch(
     State(state): State<Arc<IngestServerState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&headers, &state.bearer_token) {
+    if authenticate(&headers, &state.tokens).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let envelope = match decode_batch(body.as_ref()) {
@@ -129,7 +123,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{header, Request};
     use http_body_util::BodyExt;
     use idiolect_sync::{encode_batch, SyncBatch, SyncBatchEnvelope, SyncLearning};
     use tower::ServiceExt;
@@ -142,7 +136,10 @@ mod tests {
             SqliteMetadataStore::open_path(dir.path().join("idiolect.sqlite")).expect("open store");
         store.migrate().expect("migrate");
         let audio = FileAudioStore::new(dir.path().join("audio"), dir.path().join("decoded"));
-        let state = Arc::new(IngestServerState::new(store, audio, TOKEN.to_owned()));
+        // A token store with a known token bound, so the tests keep using `TOKEN`.
+        let mut tokens = DeviceTokenStore::open(dir.path().join("tokens.json")).expect("tokens");
+        tokens.bind(TOKEN, "pixel", "default").expect("bind token");
+        let state = Arc::new(IngestServerState::new(store, audio, Arc::new(tokens)));
         (dir, state)
     }
 

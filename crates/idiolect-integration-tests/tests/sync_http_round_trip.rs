@@ -22,6 +22,7 @@ use idiolect_ports::audio::EncodedAudio;
 use idiolect_ports::storage::{AudioStorePort, MetadataStorePort};
 use idiolect_sync::encode_batch;
 use idiolect_sync_client::{build_batch, confirm_shipped};
+use idiolect_sync_server::device_tokens::DeviceTokenStore;
 use idiolect_sync_server::ingest_server::{ingest_router, IngestServerState};
 use tower::ServiceExt;
 
@@ -49,18 +50,35 @@ async fn corrections_sync_phone_to_pc_over_http_then_reclaim() {
         b"opus-B",
     );
 
-    // The PC stands up its ingest server over the same data root the trainer reads.
+    // The PC stands up its ingest server over the same data root the trainer reads,
+    // guarded by a per-device token store with the phone's token bound.
     let pc = Fixture::new("pc");
+    let mut tokens = DeviceTokenStore::open(pc.root.join("device-tokens.json")).expect("tokens");
+    tokens.bind(TOKEN, "pixel", "default").expect("bind token");
     let pc_state = Arc::new(IngestServerState::new(
         pc.open_store(),
         pc.audio_store(),
-        TOKEN.to_owned(),
+        Arc::new(tokens),
     ));
 
     // Phone builds a batch and ships it over HTTP.
     let envelope =
         build_batch(&phone_store, &phone_audio, "default", "pixel", "batch-1").expect("build");
     let on_wire = encode_batch(&envelope).expect("encode");
+
+    // A wrong bearer token is rejected outright — nothing is ingested (S3).
+    let rejected = ingest_router(pc_state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sync")
+                .header(header::AUTHORIZATION, "Bearer not-the-token")
+                .body(Body::from(on_wire.clone()))
+                .expect("request"),
+        )
+        .await
+        .expect("router");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
     let (status, ack) = post_batch(pc_state.clone(), on_wire.clone()).await;
     assert_eq!(status, StatusCode::OK);
