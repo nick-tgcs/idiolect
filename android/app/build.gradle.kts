@@ -50,6 +50,7 @@ kotlin {
 dependencies {
     implementation(project(":ffi"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.work.runtime.ktx)
     // JNA's Android AAR bundles the per-ABI jnidispatch the generated bindings load.
     implementation(libs.jna) {
         artifact { type = "aar" }
@@ -58,6 +59,7 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.ext.junit)
+    testImplementation(libs.androidx.work.testing)
 
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)

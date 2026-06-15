@@ -20,6 +20,7 @@ import org.idiolect.android.audio.AndroidPcmSource
 import org.idiolect.android.audio.MicForegroundService
 import org.idiolect.android.crypto.HistoryKey
 import org.idiolect.android.model.ModelStore
+import org.idiolect.android.sync.SyncScheduler
 import org.idiolect.ffi.IdiolectCore
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -82,8 +83,16 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     /** Capture any in-field correction, then return to voice mode (showing fresh chips). */
     private fun captureCorrectionThenVoice() {
         correction.capture()
+        scheduleSync()
         showMode(KeyboardMode.Voice)
     }
+
+    /**
+     * Nudge the outbox toward the PC (M6). A no-op if nothing is pending or no endpoint is
+     * configured; WorkManager defers it until there's a network, and the scheduler's KEEP
+     * policy collapses a burst of corrections into one job.
+     */
+    private fun scheduleSync() = SyncScheduler.enqueue(this)
 
     /** The live field as a [FieldEditor], or `null` between fields. */
     private fun fieldEditor(): FieldEditor? =
@@ -269,8 +278,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     }
 
     override fun onFinishInput() {
-        // Field going away: capture any pending in-field correction before we lose it.
+        // Field going away: capture any pending in-field correction before we lose it,
+        // then nudge the outbox so the fresh learning ships when there's a network.
         correction.capture()
+        scheduleSync()
         super.onFinishInput()
     }
 

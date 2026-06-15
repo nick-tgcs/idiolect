@@ -31,4 +31,16 @@ class OutboxPump(
         source.confirmSynced(batch)
         return true
     }
+
+    /**
+     * Ship every pending batch, stopping when the outbox empties. Returns how many batches
+     * were shipped. A transport failure propagates (the remaining batches stay pending for
+     * the next run). [maxBatches] bounds the loop so a pathological outbox that never clears
+     * cannot spin forever — the worker just retries on its next scheduled run.
+     */
+    fun drain(maxBatches: Int = 64): Int {
+        var shipped = 0
+        while (shipped < maxBatches && pumpOnce()) shipped++
+        return shipped
+    }
 }

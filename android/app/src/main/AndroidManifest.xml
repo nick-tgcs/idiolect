@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Ship the learning outbox to the user's PC and pull the model back (M5/M6). -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- Dictation captures the microphone on-device. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- A mic foreground service holds capture; its notification is user-visible. -->
