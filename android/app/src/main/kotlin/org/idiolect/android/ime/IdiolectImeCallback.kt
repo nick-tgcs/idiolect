@@ -31,6 +31,9 @@ class IdiolectImeCallback(
 
     override fun commitText(text: String) {
         editorProvider()?.commitText(text)
+        // A take landed: tell the UI so it can build the correction strip. (A history
+        // reinsert uses insertText, which is not a fresh take and does not notify.)
+        ui.onCommit(text)
     }
 
     override fun cancelPreedit() {

@@ -18,4 +18,13 @@ interface FieldEditor {
 
     /** Delete the character before the cursor (`InputConnection.deleteSurroundingText`). */
     fun deleteBackward()
+
+    /** Select a char range in the field (`InputConnection.setSelection`) — for tap-to-fix. */
+    fun setSelection(start: Int, end: Int)
+
+    /**
+     * The entire current field text (`InputConnection.getTextBefore/Selected/After`) —
+     * the ground truth read back when capturing a correction. Main-thread only.
+     */
+    fun fieldText(): String
 }

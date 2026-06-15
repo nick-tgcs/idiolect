@@ -36,7 +36,26 @@ class InputConnectionFieldEditor(
         post { connection.deleteSurroundingText(1, 0) }
     }
 
+    // Tap-driven (already on the main thread) and synchronous: applied directly, not
+    // posted — `setSelection` must take effect before the mode swap, and `fieldText`
+    // must return a value.
+    override fun setSelection(start: Int, end: Int) {
+        connection.setSelection(start, end)
+    }
+
+    override fun fieldText(): String {
+        val before = connection.getTextBeforeCursor(MAX_FIELD_CHARS, 0) ?: ""
+        val selected = connection.getSelectedText(0) ?: ""
+        val after = connection.getTextAfterCursor(MAX_FIELD_CHARS, 0) ?: ""
+        return "$before$selected$after"
+    }
+
     private fun post(action: () -> Unit) {
         main.post(action)
+    }
+
+    private companion object {
+        // Generous cap for reading the whole field back; real dictation fields are tiny.
+        const val MAX_FIELD_CHARS = 100_000
     }
 }

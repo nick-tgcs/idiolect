@@ -9,6 +9,9 @@ interface ImeUiHost {
     /** Authoritative recording state changed (the single source of truth). */
     fun onRecordingChanged(recording: Boolean)
 
+    /** A take committed its text — seed the correction strip from it. */
+    fun onCommit(text: String)
+
     /** Open the review dialog seeded with a stored history entry. */
     fun onEditHistory(id: Long, text: String)
 

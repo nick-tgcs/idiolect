@@ -10,6 +10,7 @@ import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.content.ContextCompat
@@ -37,6 +38,7 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     private lateinit var mic: MicToggle
     private lateinit var controller: DictationController
     private lateinit var editKeyboard: EditKeyboard
+    private lateinit var correction: CorrectionCapture
     private val presenter = VoiceModePresenter()
     private val mode = ModePresenter()
     private val main = Handler(Looper.getMainLooper())
@@ -53,10 +55,23 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
             sourceFactory = { AndroidPcmSource() },
         )
         mic = MicToggle(core = CoreRecordingToggle(core), capture = controller)
+        correction = CorrectionCapture(
+            editor = ::fieldEditor,
+            reportCorrection = { core.reportCorrection(it) },
+            onEnterEdit = { showMode(KeyboardMode.Edit) },
+        )
         editKeyboard = EditKeyboard(
             editor = ::fieldEditor,
-            onSwitchToVoice = { showMode(KeyboardMode.Voice) },
+            // Leaving edit mode = done correcting: read the field back and record the
+            // raw→corrected pair before returning to voice.
+            onSwitchToVoice = { captureCorrectionThenVoice() },
         )
+    }
+
+    /** Capture any in-field correction, then return to voice mode (showing fresh chips). */
+    private fun captureCorrectionThenVoice() {
+        correction.capture()
+        showMode(KeyboardMode.Voice)
     }
 
     /** The live field as a [FieldEditor], or `null` between fields. */
@@ -112,11 +127,32 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(pad, pad, pad, pad)
+            buildCorrectionStrip()?.let { addView(it, wrap()) }
             addView(status, wrap())
             addView(micKey, wrap())
             addView(editKey, wrap())
             addView(switchKey, wrap())
         }
+    }
+
+    /**
+     * The post-take correction strip: the committed words as tappable chips. Tapping a
+     * chip selects that word's range and flips to edit mode so the next keystroke
+     * replaces it (plan §1.4). `null` when there is no committed take yet.
+     */
+    private fun buildCorrectionStrip(): View? {
+        val chips = correction.currentChips()
+        if (chips.isEmpty()) return null
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        chips.forEachIndexed { index, chip ->
+            row.addView(
+                Button(this).apply {
+                    text = chip.text
+                    setOnClickListener { correction.selectWord(index) }
+                },
+            )
+        }
+        return HorizontalScrollView(this).apply { addView(row) }
     }
 
     /** The tap-only QWERTY (state in [editKeyboard]; this is the declared GUI seam). */
@@ -192,8 +228,23 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
         main.post { render(status) }
     }
 
+    override fun onCommit(text: String) {
+        // Seed the correction strip from the committed take (fires under the core lock,
+        // so the strip render is marshalled to the main thread). Refresh the voice view
+        // if it's showing, so the new chips appear.
+        correction.onTakeCommitted(text)
+        main.post { if (mode.current() == KeyboardMode.Voice) showMode(KeyboardMode.Voice) }
+    }
+
+    override fun onFinishInput() {
+        // Field going away: capture any pending in-field correction before we lose it.
+        correction.capture()
+        super.onFinishInput()
+    }
+
     override fun onEditHistory(id: Long, text: String) {
-        // The review dialog lands in a later increment (M4).
+        // The review/history screen is the companion Activity's job (plan §1.6), not the
+        // IME input view — nothing to do here.
     }
 
     override fun onDictationError(message: String) {

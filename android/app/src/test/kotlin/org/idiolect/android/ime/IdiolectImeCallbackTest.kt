@@ -17,11 +17,14 @@ class IdiolectImeCallbackTest {
         override fun commitText(text: String) { ops.add("commit:$text") }
         override fun finishComposingText() { ops.add("finish") }
         override fun deleteBackward() { ops.add("delete") }
+        override fun setSelection(start: Int, end: Int) { ops.add("select:$start:$end") }
+        override fun fieldText(): String = ""
     }
 
     private class RecordingUi : ImeUiHost {
         val ops = mutableListOf<String>()
         override fun onRecordingChanged(recording: Boolean) { ops.add("recording:$recording") }
+        override fun onCommit(text: String) { ops.add("commit:$text") }
         override fun onEditHistory(id: Long, text: String) { ops.add("editHistory:$id:$text") }
         override fun onDictationError(message: String) { ops.add("error:$message") }
     }
@@ -45,6 +48,15 @@ class IdiolectImeCallbackTest {
         cb.commitText("done.")
         cb.insertText("snippet")
         assertEquals(listOf("commit:done.", "commit:snippet"), editor.ops)
+    }
+
+    @Test
+    fun a_take_commit_also_notifies_the_ui_but_a_history_reinsert_does_not() {
+        val ui = RecordingUi()
+        val cb = callback(RecordingEditor(), ui)
+        cb.commitText("the take")
+        cb.insertText("old history") // reinsertion is not a fresh take to correct
+        assertEquals(listOf("commit:the take"), ui.ops)
     }
 
     @Test
@@ -78,8 +90,9 @@ class IdiolectImeCallbackTest {
         cb.commitText("y")
         cb.cancelPreedit()
         cb.insertText("z")
-        // UI pushes are independent of the field and still fire.
+        // UI pushes are independent of the field and still fire — including the take
+        // commit (the field op is the no-op, not the UI notification).
         cb.recordingStatus(true)
-        assertEquals(listOf("recording:true"), ui.ops)
+        assertEquals(listOf("commit:y", "recording:true"), ui.ops)
     }
 }

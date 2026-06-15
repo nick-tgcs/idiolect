@@ -17,6 +17,8 @@ class EditKeyboardTest {
         override fun commitText(text: String) { ops.add("commit:$text") }
         override fun finishComposingText() { ops.add("finish") }
         override fun deleteBackward() { ops.add("delete") }
+        override fun setSelection(start: Int, end: Int) { ops.add("select:$start:$end") }
+        override fun fieldText(): String = ""
     }
 
     private fun a() = Key.Character("a", "A")
