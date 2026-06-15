@@ -25,11 +25,27 @@ export CMAKE_SYSTEM_VERSION=21
 profile_flag=()
 [ "$PROFILE" = "release" ] && profile_flag=("--release")
 
+# whisper.cpp links the NDK's shared libc++ (cargo:rustc-link-lib=dylib=c++_shared),
+# so libidiolect_ffi.so NEEDs libc++_shared.so at runtime — it must ship alongside.
+NDK_SYSROOT_LIB="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
+abi_triple() {
+  case "$1" in
+    x86_64) echo x86_64-linux-android ;;
+    arm64-v8a) echo aarch64-linux-android ;;
+    armeabi-v7a) echo arm-linux-androideabi ;;
+    x86) echo i686-linux-android ;;
+    *) echo "unknown abi: $1" >&2; return 1 ;;
+  esac
+}
+
 for abi in $ABIS; do
   echo ">>> building idiolect-ffi for $abi ($PROFILE)"
   CMAKE_ANDROID_ARCH_ABI="$abi" \
     cargo ndk -t "$abi" -o "$JNILIBS" "${profile_flag[@]}" \
     build -p idiolect-ffi --manifest-path "$WORKSPACE/Cargo.toml"
+  # Stage the matching libc++_shared.so next to it.
+  triple="$(abi_triple "$abi")"
+  cp -f "$NDK_SYSROOT_LIB/$triple/libc++_shared.so" "$JNILIBS/$abi/libc++_shared.so"
 done
 
 echo ">>> staged:"
