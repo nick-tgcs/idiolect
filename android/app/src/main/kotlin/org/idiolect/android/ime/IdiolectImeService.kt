@@ -3,10 +3,14 @@ package org.idiolect.android.ime
 import android.Manifest
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
-import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.core.content.ContextCompat
 import org.idiolect.android.R
 import org.idiolect.android.audio.AndroidPcmSource
@@ -18,14 +22,18 @@ import org.idiolect.ffi.IdiolectCore
  * one-tap dictation through [MicToggle]/[DictationController], and renders the core's
  * push callbacks into the focused field via [IdiolectImeCallback].
  *
- * Recording state is the core's to decide: this service waits for
- * [ImeUiHost.onRecordingChanged] to paint the mic indicator rather than flipping it
- * optimistically (the daemon's single-source-of-truth model).
+ * The voice-mode view is a status line + a mic key + a keyboard-switch handoff. Its
+ * status comes from [VoiceModePresenter]; recording state is the core's to decide, so
+ * the view waits for [ImeUiHost.onRecordingChanged] rather than flipping optimistically
+ * (the daemon's single-source-of-truth model).
  */
 class IdiolectImeService : InputMethodService(), ImeUiHost {
     private lateinit var core: IdiolectCore
     private lateinit var mic: MicToggle
     private lateinit var controller: DictationController
+    private val presenter = VoiceModePresenter()
+    private val main = Handler(Looper.getMainLooper())
+    private var statusView: TextView? = null
     private var micButton: Button? = null
 
     override fun onCreate() {
@@ -45,19 +53,25 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     }
 
     override fun onCreateInputView(): View {
-        val button = Button(this).apply {
-            text = idleLabel()
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val status = TextView(this).apply { textSize = 16f }
+        val micKey = Button(this).apply {
             setOnClickListener { onMicTapped() }
         }
-        micButton = button
-        return FrameLayout(this).apply {
-            addView(
-                button,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { gravity = Gravity.CENTER },
-            )
+        val switchKey = Button(this).apply {
+            text = getString(R.string.voice_switch_keyboard)
+            setOnClickListener { switchAwayFromIme() }
+        }
+        statusView = status
+        micButton = micKey
+        render(presenter.status())
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(pad, pad, pad, pad)
+            addView(status, wrap())
+            addView(micKey, wrap())
+            addView(switchKey, wrap())
         }
     }
 
@@ -68,6 +82,13 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
             return
         }
         mic.onTap()
+    }
+
+    /** The `🌐` handoff: switch to the user's other keyboard (e.g. for editing). */
+    private fun switchAwayFromIme() {
+        if (!switchToNextInputMethod(false)) {
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+        }
     }
 
     private fun hasMicPermission(): Boolean =
@@ -81,7 +102,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
         // the core's toggle (before capture starts / after it stops), so the FGS is up
         // before AudioRecord and down after it — and follows the single source of truth.
         if (recording) MicForegroundService.start(this) else MicForegroundService.stop(this)
-        micButton?.text = if (recording) recordingLabel() else idleLabel()
+        val status = presenter.onRecordingChanged(recording)
+        main.post { render(status) }
     }
 
     override fun onEditHistory(id: Long, text: String) {
@@ -89,7 +111,9 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
     }
 
     override fun onDictationError(message: String) {
-        // A proper status line lands in a later increment; never crash on a failed take.
+        // Surface in the status line (held back until the take stops); never crash.
+        val status = presenter.onError(message)
+        main.post { render(status) }
     }
 
     override fun onDestroy() {
@@ -98,9 +122,22 @@ class IdiolectImeService : InputMethodService(), ImeUiHost {
         super.onDestroy()
     }
 
-    private fun idleLabel() = getString(R.string.idiolect_mic_idle)
+    private fun render(status: VoiceStatus) {
+        val (label, statusText) = when (status) {
+            is VoiceStatus.Idle -> getString(R.string.idiolect_mic_idle) to ""
+            is VoiceStatus.Listening ->
+                getString(R.string.idiolect_mic_recording) to getString(R.string.voice_listening)
+            is VoiceStatus.Error ->
+                getString(R.string.idiolect_mic_idle) to status.message
+        }
+        micButton?.text = label
+        statusView?.text = statusText
+    }
 
-    private fun recordingLabel() = getString(R.string.idiolect_mic_recording)
+    private fun wrap() = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+    ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = 12 }
 
     /** Adapts [IdiolectCore] to the [RecordingToggle] the mic key drives. */
     private class CoreRecordingToggle(private val core: IdiolectCore) : RecordingToggle {
