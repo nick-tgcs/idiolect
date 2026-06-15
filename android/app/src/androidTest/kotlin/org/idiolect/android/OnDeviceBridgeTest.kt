@@ -92,4 +92,15 @@ class OnDeviceBridgeTest {
             assertTrue(core.recentHistory(10u).isEmpty())
         }
     }
+
+    @Test
+    fun load_model_verified_surfaces_a_typed_error_on_device() {
+        // The M5 verify-at-load surface is reachable on the cross-compiled core: an
+        // absent model file fails the integrity check as a typed FfiException, not a crash.
+        newCore(Recording()).use { core ->
+            assertThrows(FfiException::class.java) {
+                core.loadModelVerified("/no/such/model.bin", "0".repeat(64))
+            }
+        }
+    }
 }

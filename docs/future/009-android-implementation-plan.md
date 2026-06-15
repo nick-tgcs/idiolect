@@ -546,10 +546,34 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
     drive the strip from actual speech needs a model (**M5**); a Compose rewrite of both
     views (the View-based ones ship now); and from part 1, lifting callbacks + decode out
     of the core lock + the privacy-gate silence auto-stop.
-- **M5 — Model management.** Authenticated model download (progress/resume) from
-  the user's PC; Zip-Slip hardening; per-file SHA-256 at extract **and** every
-  load; lazy model init on first focus; model switch (tiny/base/small). *Tests:*
-  Rust unit on verify/extract (tamper → reject); instrumented download/resume.
+- ✅ **M5 — Model management — done.** A model now travels end to end: the PC serves
+  it, the phone downloads + verifies + installs it, and the IME verify-loads it on
+  focus so dictation produces text. Four gate-green packages:
+  - **M5a** (`a7c883c`) `idiolect_common::digest::file_sha256_hex` (streaming) +
+    `IdiolectCore::load_model_verified(path, sha256)` → `FfiError::ModelIntegrity` on
+    mismatch (the "verify at every load" contract; the unverified `load_model` stays
+    for the fixture). Rust seam tests: encrypted-at-rest round-trip is M4; here, the
+    fixture's pinned digest loads, a tampered one is rejected.
+  - **M5b** (`6ba2533`) desktop **axum `GET /model`** in idiolect-sync-server
+    (desktop-only — axum never links into the `.so`): bearer-guarded manifest
+    ({id,sha256,size}) + Range-aware bytes (resume → 206; out-of-bounds → 416) +
+    `serve()` + a thin env-configured binary. 7 router tests via tower oneshot.
+  - **M5c-i** (`81ae6cd`) Android **download** logic: `ModelStore` (atomic install +
+    active-model record), `ModelDownloader` (manifest → resume-from-`.bin.part` →
+    SHA-256 verify → atomic install; mismatch discards + throws), `HttpModelTransport`
+    (HttpURLConnection, bearer + Range, no third-party dep), `Sha256`/`ModelManifest`.
+    16 host tests incl. the real transport against a raw-`ServerSocket` HTTP server.
+  - **M5c-ii** (`7d53ea5`) **lazy load on first focus** (off-main, re-verifies the
+    digest) + onboarding `DownloadModel` step (URL+token entry, live progress %).
+  - **Scope notes:** v1 models are a single `.bin` (whisper ggml / the merged trainer
+    output), so **Zip-Slip-safe extraction is deferred** until a real multi-file bundle
+    format exists — adding a zip dep + extraction for one file would be invented attack
+    surface (contra the GrapheneOS minimal-deps ethos). **Model-switch UI** (tiny/base/
+    small picker) is deferred too — `ModelStore`/`load_model_verified` already support
+    multiple models by id; only the picker UI is missing. The server URL+token come from
+    manual entry until **S3 pairing** lands. *On device:* `OnDeviceBridgeTest` proves the
+    cross-compiled core + the `load_model_verified` surface (5/5); the full
+    server↔emulator download is a gated manual/M6 e2e.
 - **M6 — Sync round-trip.** `idiolect-sync-client` outbox pump via `WorkManager`
   over Tailscale with delete-after-ACK; PC runs `trainerctl` unchanged;
   `GET /model` pulls the personalised `.bin`; atomic swap on next focus. *Tests:*
@@ -693,10 +717,14 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
     correction strip + tap-to-fix, and capture→`report_correction` (a fix is a training
     pair), plus AndroidKeyStore-keyed at-rest history encryption. Three gate-green
     packages (`c8c69cd`, `138198b`, `fccb826`). See the M4 bullet in §5.
-11. **NEXT (pick one): M5** (model management — unblocks REAL on-device dictation; the
-    download leans on the PC transport), the parallel no-Kotlin **S2 HTTP hop (axum)**
-    (unblocks model-pull + sync), or **M6** (sync round-trip). Deferred polish: Compose
-    rewrite, callbacks/decode out of the core lock, silence auto-stop.
+11. ✅ **M5 — model management — done.** Verify-at-load (M5a) + axum `GET /model` (M5b)
+    + Android download/verify/install + lazy-load + onboarding step (M5c). Four gate-green
+    packages (`a7c883c`, `6ba2533`, `81ae6cd`, `7d53ea5`). See the M5 bullet in §5.
+12. **NEXT (pick one): M6** (sync round-trip — outbox push via `WorkManager` + the axum
+    **POST ingest** half, completing the learning loop PC→phone; the GET-model half is
+    done), **S3** (auth/pairing — replaces the manual URL+token with a QR/token handshake),
+    or deferred polish (Compose rewrite, model-switch picker, callbacks/decode out of the
+    core lock, silence auto-stop, Zip-Slip-safe bundles).
 
 ---
 
