@@ -448,11 +448,12 @@ existing IBus/eframe caveats.
   TODO (M3 APK packaging).
 - ✅ **M1 — Path provider + UniFFI facade — done.** `PathProvider` trait
   (`XdgPaths` desktop, `RootedPaths` Android `filesDir`) in `idiolect-common`;
-  `idiolect-ffi` (UniFFI 0.31) exposes `IdiolectCore` (toggle/commit/cancel/
-  report_correction/push_pcm_frame + history ops) and the `IdiolectInputMethod`
+  `idiolect-ffi` (UniFFI 0.31) exposes `IdiolectCore` (toggle/push_pcm_frame/cancel/
+  report_correction/load_model + history ops) and the `IdiolectInputMethod`
   callback (recording_status/show_preedit/update_preedit/commit_text/cancel_preedit/
-  insert_text/edit_history), driving the unchanged `DictationUseCase` over a real
-  `SqliteMetadataStore`. 8 host seam tests green; cdylib cross-builds to both ABIs
+  insert_text/edit_history/dictation_error), driving the unchanged `DictationUseCase`
+  over a real `SqliteMetadataStore`. (M3 part 1 wired the live streaming take onto
+  this facade; see the build plan.) Host seam tests green; cdylib cross-builds to both ABIs
   with Kotlin bindings. **Divergences from "Concrete layout" below:** `idiolect-ffi`
   is kept **in** the workspace `members` (host-buildable ⇒ covered by the
   `--workspace` gates) and carries its **own** `[lints]` (UniFFI's generated

@@ -1019,6 +1019,11 @@ impl SqliteMetadataStore {
                 &session_key,
             ));
         }
+        // Allocate the next event index for this session rather than a fixed `1`,
+        // so a session can be corrected more than once (repeated in-field fixes, or
+        // a history edit followed by an in-field correction) without colliding on
+        // UNIQUE(session_id, event_index) — and so the correction never clashes with
+        // a take's earlier preedit-change events either.
         backend_result(transaction.execute(
             "INSERT INTO ime_edit_events(
                 session_id,
@@ -1028,10 +1033,12 @@ impl SqliteMetadataStore {
                 event_index,
                 event_type,
                 timestamp_ms
-             ) VALUES (
-                ?1, ?1, ?2, ?3, 1, 'post_commit_correction',
-                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-             )",
+             )
+             SELECT
+                ?1, ?1, ?2, ?3,
+                COALESCE((SELECT MAX(event_index) FROM ime_edit_events WHERE session_id = ?1), 0) + 1,
+                'post_commit_correction',
+                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
             params![session_key, committed_text, corrected_text],
         ))?;
         backend_result(transaction.execute(
@@ -2535,6 +2542,47 @@ mod amend_correction_tests {
             )
         );
         assert_eq!(post_commit_edits(&store, &key), 1);
+    }
+
+    #[test]
+    fn a_session_can_be_corrected_more_than_once() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("restart traffic"))
+            .expect("create");
+        store
+            .commit_session(session, "restart traffic", "commit-1")
+            .expect("commit");
+        let key = SqliteMetadataStore::session_key(session).expect("key");
+
+        // Two successive corrections of the same take must not collide on
+        // UNIQUE(session_id, event_index) — the edit index is allocated, not fixed.
+        store
+            .amend_correction(session, "restart traffic", "restart Traefik")
+            .expect("first amend");
+        store
+            .amend_correction(session, "restart Traefik", "restart Traefik v2")
+            .expect("second amend");
+
+        // Both corrections are logged, and the candidate + history reflect the latest
+        // (raw ASR preserved across re-corrections).
+        assert_eq!(post_commit_edits(&store, &key), 2);
+        assert_eq!(
+            candidate(&store, &key),
+            (
+                "restart traffic".to_owned(),
+                "restart Traefik v2".to_owned(),
+                "accepted_with_edit".to_owned()
+            )
+        );
+        let entry = store
+            .recent_history(10)
+            .expect("recent")
+            .into_iter()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.text, "restart Traefik v2");
     }
 
     #[test]

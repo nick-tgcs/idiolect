@@ -401,20 +401,21 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   bundling `libc++_shared` in the APK, an LTO-off release profile, and the CI
   jobs (compile-only + emulator).
 - ✅ **M1 — PathProvider + UniFFI facade — done.** `idiolect-ffi` (UniFFI 0.31,
-  proc-macro mode) exposes `IdiolectCore` (`toggle/commit/cancel/report_correction/
-  push_pcm_frame` + `recent_history/history_edited/reinsert_history/
+  proc-macro mode) exposes `IdiolectCore` (`toggle/push_pcm_frame/cancel/
+  report_correction/load_model` + `recent_history/history_edited/reinsert_history/
   open_history_edit/is_recording`) and the `IdiolectInputMethod` callback
   (`recording_status/show_preedit/update_preedit/commit_text/cancel_preedit/
-  insert_text/edit_history`). It drives the **unchanged** `DictationUseCase` over a
-  real `SqliteMetadataStore` — the in-process collapse of the daemon's socket IPC.
+  insert_text/edit_history/dictation_error`). It drives the **unchanged**
+  `DictationUseCase` over a real `SqliteMetadataStore` — the in-process collapse of
+  the daemon's socket IPC.
   `PathProvider` (`config.rs`): `XdgPaths` (desktop) + `RootedPaths` (Android
   `filesDir`). The cdylib cross-compiles to **arm64-v8a + x86_64** with bundled
   `libc++_shared.so` and generated Kotlin bindings
   ([android-ffi-build.sh](scripts/android-ffi-build.sh)) — the `.so` M0 deferred.
-  *Tests:* 8 host **seam** tests through the exported surface + the callback trait
+  *Tests:* host **seam** tests through the exported surface + the callback trait
   against a real SQLite store, plus `PathProvider`/`storage_mut` unit+contract
-  tests. Streaming decode (PCM→text) is deliberately **out** (M2): `push_pcm_frame`
-  buffers and `IdiolectCore::deliver_transcript` is the M2 hook (test-driven now).
+  tests. (At M1 the streaming decode was out, behind an interim `deliver_transcript`
+  seam; M3 part 1 retired it by wiring `push_pcm_frame` onto `StreamingTake`.)
   **Two deliberate divergences from [009](009-android-mobile.md):** (a) `idiolect-ffi`
   is **in** the workspace `members` (it is host-buildable pure-Rust+UniFFI, so the
   mandatory `cargo test/clippy --workspace` gates cover the seam); only the
@@ -447,26 +448,43 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
     integration tests pass unchanged, plus 12 new orchestration unit tests.
     (`StreamingResampler` stays daemon-side; Android's `AudioRecord` captures 16 kHz
     mono direct.)
-  - **M2 part 2 — FFI wiring deferred to M3 (deliberate).** The FFI was *not*
-    rewired onto `StreamingTake` here: the orchestration creates the take's session
-    **at finalize with the whole-recording text** (the daemon model) and its ports
-    (`TakeTranscriber`, the VAD verdict) have **no Android implementations** until
-    M3 brings the on-device whisper ASR + VAD + audio-store adapters. Wiring it now
-    would bake a per-snippet session lifecycle into the facade that contradicts the
-    lifted orchestration. M3 wires `push_pcm_frame → StreamingTake::ingest →
-    on-device whisper `fold_snippet`/`finalize` → callback`; until then
-    `push_pcm_frame` buffers and `IdiolectCore::deliver_transcript` is the
-    test-driven transcript seam. The facade docs point at this seam.
-- **M3 — Audio + IME bring-up.** `idiolect-adapter-android-audio` (AudioRecord +
-  JNI PCM push) + `idiolect-adapter-android-ime` (InputConnection callbacks);
-  `MicForegroundService` (`foregroundServiceType=microphone`); `IdiolectImeService`
-  with the **voice mode** view + privacy gate. **Also wires the FFI facade onto the
-  M2 `StreamingTake`** (the deferred M2 part-2 step): `push_pcm_frame →
-  StreamingTake::ingest`, an on-device whisper `TakeTranscriber` + a callback
-  `StreamObserver` driving `fold_snippet`/`finalize`, session created at finalize —
-  retiring the `deliver_transcript` seam. *Tests:* Robolectric on the service
-  logic; Compose UI test on the input view states; **emulator e2e** (fixture
-  audio → `commitText`, see [§6](#6-emulator--testing-strategy)).
+  - **M2 part 2 — FFI wiring was deferred to M3, now done** (see M3 part 1 below).
+    It was deferred out of M2 deliberately because the orchestration creates the
+    take's session **at finalize with the whole-recording text** (the daemon model)
+    and its ports (`TakeTranscriber`, the VAD verdict) had no Android
+    implementations until M3.
+- **M3 — Audio + IME bring-up.** Split into the pure-Rust FFI wiring (gate-covered)
+  and the Kotlin IME (new toolchain).
+  - ✅ **M3 part 1 — FFI facade wired onto `StreamingTake` (the deferred M2 step) —
+    done.** `idiolect-ffi` now drives a live take through the shared orchestration:
+    `push_pcm_frame → StreamingTake::ingest` (16 kHz mono direct, real
+    `idiolect-adapter-vad` WebRTC verdict) → `fold_snippet` pushing live partial
+    preedits; `toggle`-to-stop flushes the tail, `finalize` decodes the WHOLE
+    recording once (the *streaming-drops-words* guardrail), and the take persists as
+    **one session + Opus recording + sha256 digest** (the training-pair audio)
+    before `commit_text`. `load_model` swaps in an on-device `WhisperTakeTranscriber`
+    (CPU). The interim `deliver_transcript`/`commit()`/`buffered_frame_count` seams
+    were **retired**; a new `dictation_error` callback surfaces decode failures.
+    Sound `Send` for the `!Send` WebRTC `Vad` via a mutex-guarded `SendVad` wrapper;
+    `utterance_id_for_session` lifted to `idiolect-common` (shared with the daemon);
+    `impl TakeTranscriber for Box<T>` added. *Tests (host, all green):* 17 seam tests
+    (scripted-decoder lifecycle, multi-snippet preedit accumulation, stop-decode
+    fallback, no-model warn-once, training-pair Opus persistence, correction guards,
+    history-edit↔correction interleave) **plus a real on-device Whisper e2e** that
+    decodes the speech fixture through the full path; + the lifted helpers' unit
+    tests. Adversarially reviewed (5 lenses); the review also caught a real shared
+    `amend_correction` bug (hard-coded edit-event index → couldn't correct a take
+    twice), now fixed for both front-ends. **Deferred (tracked):** callbacks/decode
+    run under the core mutex — a re-entrancy contract is documented on the callback
+    trait for now; lifting them out of the lock is M3 polish. Silence auto-stop is
+    desktop-only until an on-device config surface exists.
+  - **M3 part 2 — Kotlin IME bring-up (next).** `idiolect-adapter-android-audio`
+    (AudioRecord + JNI PCM push) + `idiolect-adapter-android-ime` (InputConnection
+    callbacks); `MicForegroundService` (`foregroundServiceType=microphone`);
+    `IdiolectImeService` with the **voice mode** view + privacy gate, all against the
+    part-1 contract. *Tests:* Robolectric on the service logic; Compose UI test on
+    the input view states; **emulator e2e** (fixture audio → `commitText`, see
+    [§6](#6-emulator--testing-strategy)).
 - **M4 — Edit mode + correction capture.** The QWERTY edit mode, the **one-tap
   toggle**, the correction strip + tap-to-fix selecting the word range; wire fixes
   to `amend_correction` (incl. the `ime_text_history` projection). Crypto key →
@@ -606,12 +624,15 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    ([android-ffi-build.sh](scripts/android-ffi-build.sh)). `PathProvider`
    (`XdgPaths`/`RootedPaths`) added. See the M1 bullet in §5 for the two deliberate
    divergences (crate **in** `members`; own `[lints]` for UniFFI's generated unsafe).
-8. **NEXT (dependency order, mobile track): M2 — lift the streaming orchestration**
-   into `idiolect-application/streaming.rs` and rewire the desktop `run_loop` onto
-   it (proves behaviour-neutral); the lifted worker becomes the real caller of
-   `IdiolectCore::deliver_transcript`, carrying the full-take-wins policy to the
-   phone. The S2 HTTP hop (axum) remains a parallel no-Kotlin track. M3 (the actual
-   Kotlin IME — the second existential risk) follows M2.
+8. ✅ **M2 — streaming orchestration lifted; M3 part 1 — FFI wired onto it.** The
+   `StreamingTake` orchestration moved into `idiolect-application/streaming.rs` (the
+   desktop `run_loop` rewired behaviour-neutral), and `idiolect-ffi` now drives it
+   on-device: `push_pcm_frame → StreamingTake::ingest → fold_snippet/finalize →
+   commit`, carrying the full-take-wins policy to the phone (the interim
+   `deliver_transcript` seam is retired). See the M2 / M3-part-1 bullets in §5.
+9. **NEXT (dependency order, mobile track): M3 part 2 — the Kotlin IME** (the second
+   existential risk) against the part-1 FFI contract. The S2 HTTP hop (axum) remains
+   a parallel no-Kotlin track.
 
 ---
 

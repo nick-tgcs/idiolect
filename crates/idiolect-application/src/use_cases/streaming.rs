@@ -127,6 +127,17 @@ pub trait TakeTranscriber {
     fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure>;
 }
 
+/// Lets a boxed transcriber be used wherever a `TakeTranscriber` is expected. The
+/// mobile facade holds the decoder behind a `Box<dyn TakeTranscriber + Send>` (the
+/// concrete engine is swapped in once a model is loaded), so the take's
+/// generic [`StreamingTake::fold_snippet`]/[`StreamingTake::finalize`] must accept
+/// the box directly.
+impl<T: TakeTranscriber + ?Sized> TakeTranscriber for Box<T> {
+    fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+        (**self).transcribe(samples_f32_mono)
+    }
+}
+
 /// A failed decode: a stable `code` (for once-per-take de-duplication) and a
 /// human-readable `message` (for the journal / notification body).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -707,6 +718,27 @@ mod take_tests {
                 );
             }
             TakeOutcome::Silent => panic!("expected the previewed fallback"),
+        }
+    }
+
+    #[test]
+    fn a_boxed_transcriber_drives_fold_and_finalize() {
+        // The mobile facade holds the decoder as `Box<dyn TakeTranscriber + Send>`;
+        // it must drive the take exactly like a concrete one.
+        let mut take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
+        let mut transcriber: Box<dyn TakeTranscriber + Send> =
+            Box::new(ScriptedTranscriber::new([ok("restart traffic")]));
+
+        take.fold_snippet(&mut transcriber, &mut observer, snippet())
+            .expect("fold");
+        assert_eq!(observer.committed, ["restart traffic"]);
+
+        let mut finalize: Box<dyn TakeTranscriber + Send> =
+            Box::new(ScriptedTranscriber::new([ok("restart traffic")]));
+        match take.finalize(&mut finalize) {
+            TakeOutcome::Speech(finalized) => assert_eq!(finalized.final_text, "restart traffic"),
+            TakeOutcome::Silent => panic!("expected a take"),
         }
     }
 

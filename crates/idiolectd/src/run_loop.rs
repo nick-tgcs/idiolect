@@ -1203,7 +1203,7 @@ fn persist_session(
     let session_id = store
         .create_session(Some(text))
         .map_err(|error| RunLoopError::storage("create session", error))?;
-    let utterance_id = utterance_id_for_session(session_id)?;
+    let utterance_id = idiolect_common::ids::utterance_id_for_session(session_id);
     audio_store
         .write_source_audio(user_id, &utterance_id, encoded)
         .map_err(|error| RunLoopError::audio_store("write source audio", error))?;
@@ -1773,15 +1773,6 @@ fn cancel_uncommitted_active_session(
         .map_err(|error| RunLoopError::storage("cancel session", error))?;
     active.finalized = true;
     Ok(())
-}
-
-fn utterance_id_for_session(session_id: ImeSessionId) -> Result<String, RunLoopError> {
-    Ok(format!(
-        "utterance:{}",
-        serde_json::to_string(&session_id)
-            .map_err(RunLoopError::serialization)?
-            .trim_matches('"')
-    ))
 }
 
 fn idempotency_key(prefix: &str, session_id: ImeSessionId) -> Result<String, RunLoopError> {
