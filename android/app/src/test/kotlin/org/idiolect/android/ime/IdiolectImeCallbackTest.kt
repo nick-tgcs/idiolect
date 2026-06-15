@@ -16,6 +16,7 @@ class IdiolectImeCallbackTest {
         override fun setComposingText(text: String) { ops.add("compose:$text") }
         override fun commitText(text: String) { ops.add("commit:$text") }
         override fun finishComposingText() { ops.add("finish") }
+        override fun deleteBackward() { ops.add("delete") }
     }
 
     private class RecordingUi : ImeUiHost {

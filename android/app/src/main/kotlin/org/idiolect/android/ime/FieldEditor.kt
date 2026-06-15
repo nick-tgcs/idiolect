@@ -15,4 +15,7 @@ interface FieldEditor {
 
     /** Clear the preedit without committing (`InputConnection.finishComposingText`). */
     fun finishComposingText()
+
+    /** Delete the character before the cursor (`InputConnection.deleteSurroundingText`). */
+    fun deleteBackward()
 }

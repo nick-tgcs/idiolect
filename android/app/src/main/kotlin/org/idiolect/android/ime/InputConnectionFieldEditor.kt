@@ -32,6 +32,10 @@ class InputConnectionFieldEditor(
         post { connection.finishComposingText() }
     }
 
+    override fun deleteBackward() {
+        post { connection.deleteSurroundingText(1, 0) }
+    }
+
     private fun post(action: () -> Unit) {
         main.post(action)
     }
