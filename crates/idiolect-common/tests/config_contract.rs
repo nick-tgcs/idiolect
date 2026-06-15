@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use idiolect_common::config::{
-    check_socket_path_len, max_socket_path_len, resolve_xdg_paths, IdiolectConfig, Platform,
-    XdgBaseDirs,
+    check_socket_path_len, max_socket_path_len, resolve_xdg_paths, IdiolectConfig, PathProvider,
+    Platform, RootedPaths, XdgBaseDirs, XdgPaths,
 };
 
 const MASTER_PLAN_TOML: &str = r#"
@@ -536,4 +536,33 @@ fn for_platform_linux_keeps_the_xdg_layout_through_env_resolution() {
     // Linux ignores TMPDIR and uses the home-relative runtime dir — proving the
     // pre-port Default behaviour is preserved through the new env wrapper.
     assert_eq!(dirs.runtime_dir, Path::new("/home/ada/.local/run/idiolect"));
+}
+
+#[test]
+fn path_provider_is_usable_through_a_trait_object() {
+    // The daemon and the FFI facade both hold a `&dyn PathProvider`; the desktop
+    // and Android impls must be interchangeable behind that seam.
+    let android: Box<dyn PathProvider> =
+        Box::new(RootedPaths::new("/data/user/0/dev.idiolect/files"));
+    let xdg =
+        XdgBaseDirs::platform_defaults(Platform::Linux, Path::new("/home/ada"), Path::new("/tmp"));
+    let desktop: Box<dyn PathProvider> = Box::new(XdgPaths::new(xdg));
+
+    for provider in [&android, &desktop] {
+        // The database always lives directly under the provider's data dir,
+        // regardless of how that dir was resolved.
+        assert_eq!(
+            provider.database_path(),
+            provider.data_dir().join("idiolect.db")
+        );
+        assert_eq!(provider.audio_dir(), provider.data_dir().join("audio"));
+    }
+    assert_eq!(
+        android.data_dir(),
+        Path::new("/data/user/0/dev.idiolect/files")
+    );
+    assert_eq!(
+        desktop.data_dir(),
+        Path::new("/home/ada/.local/share/idiolect")
+    );
 }

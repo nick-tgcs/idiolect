@@ -54,6 +54,7 @@ core_crates=(
   idiolect-sync
   idiolect-sync-client
   idiolect-sync-server
+  idiolect-ffi
 )
 
 pkg_args=()

@@ -443,12 +443,21 @@ existing IBus/eframe caveats.
   *executes* on the x86_64 emulator (`scripts/android-emulator-test.sh`, 25 groups
   green) including the **real whisper decode** (whisper.cpp transcribing the
   fixture on-device; same assertion passes host + device = no tokenizer/decode
-  drift). **Still TODO:** `libc++_shared` bundling in the APK + LTO-off release
-  (rolls into M1/M3).
-- **M1 — Path provider + UniFFI facade.** `PathProvider` trait (XDG desktop impl,
-  `filesDir` Android impl); `idiolect-ffi` exposing `toggle/commit/cancel/
-  report_correction` + the `RecordingStatus`/`PreeditUpdate` callback flow;
-  unit-test through the UniFFI seam against fixture adapters.
+  drift). `libc++_shared` per-ABI bundling now handled by
+  [android-ffi-build.sh](scripts/android-ffi-build.sh) (M1); LTO-off release still
+  TODO (M3 APK packaging).
+- ✅ **M1 — Path provider + UniFFI facade — done.** `PathProvider` trait
+  (`XdgPaths` desktop, `RootedPaths` Android `filesDir`) in `idiolect-common`;
+  `idiolect-ffi` (UniFFI 0.31) exposes `IdiolectCore` (toggle/commit/cancel/
+  report_correction/push_pcm_frame + history ops) and the `IdiolectInputMethod`
+  callback (recording_status/show_preedit/update_preedit/commit_text/cancel_preedit/
+  insert_text/edit_history), driving the unchanged `DictationUseCase` over a real
+  `SqliteMetadataStore`. 8 host seam tests green; cdylib cross-builds to both ABIs
+  with Kotlin bindings. **Divergences from "Concrete layout" below:** `idiolect-ffi`
+  is kept **in** the workspace `members` (host-buildable ⇒ covered by the
+  `--workspace` gates) and carries its **own** `[lints]` (UniFFI's generated
+  scaffolding emits `unsafe`, which the workspace `forbid(unsafe_code)` cannot
+  allow-away; hand-written code stays safe).
 - **M2 — Lift streaming orchestration.** Move `LiveStreamState`/`handle_snippet`/
   `finalize_streamed_take`/`choose_final_take_text` from `idiolectd/run_loop.rs`
   **up into `idiolect-application`** (shared = no Android re-implementation =

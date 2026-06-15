@@ -1,0 +1,42 @@
+[package]
+name = "idiolect-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The single UniFFI facade the Android app loads: a `cdylib` (the `.so`) plus an
+# `rlib` so the workspace test/clippy gates exercise the seam on the host. UniFFI's
+# generated scaffolding emits `unsafe`, which the workspace's `forbid(unsafe_code)`
+# could not allow-away, so this crate sets its own lints (below) — all *hand-written*
+# code here stays safe; the unsafe lives only in UniFFI's generated component.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints.rust]
+warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[dependencies]
+uniffi = { version = "=0.31.1", features = ["cli"] }
+thiserror.workspace = true
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ports = { path = "../idiolect-ports" }
+idiolect-application = { path = "../idiolect-application" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+
+[dev-dependencies]
+tempfile.workspace = true

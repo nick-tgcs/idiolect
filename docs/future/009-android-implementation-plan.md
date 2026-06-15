@@ -400,10 +400,28 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   level.** Housekeeping still owed (rolls into M1/M3): the actual cdylib/`.so`,
   bundling `libc++_shared` in the APK, an LTO-off release profile, and the CI
   jobs (compile-only + emulator).
-- **M1 — PathProvider + UniFFI facade.** `idiolect-ffi` exposing
-  `toggle/commit/cancel/report_correction/push_pcm_frame` + the
-  `RecordingStatus/Preedit/InsertText/EditHistory` callback flow; Android path
-  injection. *Tests:* unit through the UniFFI seam against fixture adapters.
+- ✅ **M1 — PathProvider + UniFFI facade — done.** `idiolect-ffi` (UniFFI 0.31,
+  proc-macro mode) exposes `IdiolectCore` (`toggle/commit/cancel/report_correction/
+  push_pcm_frame` + `recent_history/history_edited/reinsert_history/
+  open_history_edit/is_recording`) and the `IdiolectInputMethod` callback
+  (`recording_status/show_preedit/update_preedit/commit_text/cancel_preedit/
+  insert_text/edit_history`). It drives the **unchanged** `DictationUseCase` over a
+  real `SqliteMetadataStore` — the in-process collapse of the daemon's socket IPC.
+  `PathProvider` (`config.rs`): `XdgPaths` (desktop) + `RootedPaths` (Android
+  `filesDir`). The cdylib cross-compiles to **arm64-v8a + x86_64** with bundled
+  `libc++_shared.so` and generated Kotlin bindings
+  ([android-ffi-build.sh](scripts/android-ffi-build.sh)) — the `.so` M0 deferred.
+  *Tests:* 8 host **seam** tests through the exported surface + the callback trait
+  against a real SQLite store, plus `PathProvider`/`storage_mut` unit+contract
+  tests. Streaming decode (PCM→text) is deliberately **out** (M2): `push_pcm_frame`
+  buffers and `IdiolectCore::deliver_transcript` is the M2 hook (test-driven now).
+  **Two deliberate divergences from [009](009-android-mobile.md):** (a) `idiolect-ffi`
+  is **in** the workspace `members` (it is host-buildable pure-Rust+UniFFI, so the
+  mandatory `cargo test/clippy --workspace` gates cover the seam); only the
+  genuinely Android-only adapters (M3) stay out. (b) UniFFI's generated scaffolding
+  emits `unsafe`, which the workspace `forbid(unsafe_code)` cannot allow-away, so
+  the crate sets its **own** `[lints]` (deny-warnings, no `forbid`) — all
+  hand-written code there is still safe.
 - **M2 — Lift streaming orchestration.** Execute [§3.3](#3-what-must-change-on-the-desktop-first-and-benefits-desktop)
   into `idiolect-application/streaming.rs`; rewire desktop `run_loop` onto it
   (proves the refactor is behaviour-neutral). *Tests:* the existing daemon
@@ -547,12 +565,20 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    on the emulator incl. real whisper decode ([android-emulator-test.sh](scripts/android-emulator-test.sh),
    25 groups green). Spikes retired; dead `usearch` removed. The existential
    "can it run on the phone?" risk is **answered: yes.**
-7. **NEXT (dependency order, mobile track): M1 — the UniFFI facade** (`idiolect-ffi`):
-   the single `cdylib` the Kotlin app loads, exposing toggle/commit/cancel/
-   report-correction/push-PCM + the RecordingStatus/Preedit/InsertText callbacks,
-   tested through the UniFFI seam against fixture adapters. This also produces the
-   real `.so` (M0 housekeeping). M2 (streaming lift) and the S2 HTTP hop (axum)
-   remain parallel no-Kotlin tracks.
+7. ✅ **M1 — the UniFFI facade — done.** `idiolect-ffi` (UniFFI 0.31) exposes
+   `IdiolectCore` + the `IdiolectInputMethod` callback, driving the unchanged
+   `DictationUseCase` over a real `SqliteMetadataStore` — the in-process collapse
+   of the daemon socket. 8 host seam tests green; the cdylib cross-compiles to
+   arm64-v8a + x86_64 with bundled `libc++_shared` and generated Kotlin bindings
+   ([android-ffi-build.sh](scripts/android-ffi-build.sh)). `PathProvider`
+   (`XdgPaths`/`RootedPaths`) added. See the M1 bullet in §5 for the two deliberate
+   divergences (crate **in** `members`; own `[lints]` for UniFFI's generated unsafe).
+8. **NEXT (dependency order, mobile track): M2 — lift the streaming orchestration**
+   into `idiolect-application/streaming.rs` and rewire the desktop `run_loop` onto
+   it (proves behaviour-neutral); the lifted worker becomes the real caller of
+   `IdiolectCore::deliver_transcript`, carrying the full-take-wins policy to the
+   phone. The S2 HTTP hop (axum) remains a parallel no-Kotlin track. M3 (the actual
+   Kotlin IME — the second existential risk) follows M2.
 
 ---
 
