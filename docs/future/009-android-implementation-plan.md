@@ -428,6 +428,21 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
   streaming tests must pass unchanged against the lifted module; new unit tests
   on the event stream (esp. the full-take-wins logic). **Exit:** desktop green on
   the shared orchestration; *streaming-drops-words* covered by a regression test.
+  - ✅ **M2 part 1 — done.** The **pure** decision logic (`is_noise_transcript`,
+    `snippet_chunk`, `choose_final_take_text`, `merge_tail_correction` — the
+    streaming-drops-words guardrail) is now in
+    `idiolect_application::use_cases::streaming`; `run_loop` imports it. Unit tests
+    moved with it; daemon streaming integration tests pass unchanged (behaviour-
+    neutral).
+  - **M2 part 2 — remaining.** Lift `LiveStreamState`/`handle_snippet`/
+    `pump_live_stream`/`finalize_streamed_take` into the application layer as a
+    **port-driven** orchestration: the state machine accumulates snippets +
+    finalizes the whole take, with the **decode/translate** step injected as a port
+    (the daemon injects `transcribe_translated`; Android injects whisper-on-device)
+    and snippet/finalize **emitted as events**. Then rewire both `run_loop` *and*
+    the M1 FFI facade's `deliver_transcript` onto it. (`StreamingResampler` is pure
+    DSP but desktop-leaning — Android's `AudioRecord` captures 16 kHz mono direct —
+    so it can stay daemon-side or move opportunistically.)
 - **M3 — Audio + IME bring-up.** `idiolect-adapter-android-audio` (AudioRecord +
   JNI PCM push) + `idiolect-adapter-android-ime` (InputConnection callbacks);
   `MicForegroundService` (`foregroundServiceType=microphone`); `IdiolectImeService`
