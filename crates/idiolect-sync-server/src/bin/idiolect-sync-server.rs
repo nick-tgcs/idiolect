@@ -1,7 +1,9 @@
-//! The personal model/sync server binary. It serves the model (`GET /model`, M5)
-//! and — when a local store + audio root are configured — the learning ingest
-//! endpoint (`POST /v1/sync`, M6) on the same port, both authenticating against one
-//! shared per-device token store (S3). Configured from the environment:
+//! The personal model/sync server binary. It serves the model (`GET /model`, M5),
+//! the device-pairing handshake (`POST /v1/pair`, S3) and — when a local store +
+//! audio root are configured — the learning ingest endpoint (`POST /v1/sync`, M6) on
+//! the same port. The model and ingest endpoints authenticate against one shared
+//! per-device token store (S3); pairing issues the tokens. Configured from the
+//! environment:
 //!
 //!   IDIOLECT_MODEL_PATH   the model `.bin` to serve (required)
 //!   IDIOLECT_SYNC_TOKEN   a shared bearer token bound to a "default-device" on start
@@ -13,18 +15,23 @@
 //!   IDIOLECT_DB_PATH      local metadata store; enables ingest (with AUDIO_ROOT)
 //!   IDIOLECT_AUDIO_ROOT   source-audio root; enables ingest (with DB_PATH)
 //!
+//! Pass `--pair` to mint a one-time pairing code (printed to stdout, valid 10 minutes)
+//! that a new device redeems at `POST /v1/pair` to earn its own bearer token. The code
+//! lives only in memory, so a restart invalidates it (re-run with `--pair`).
+//!
 //! Point `IDIOLECT_DB_PATH`/`IDIOLECT_AUDIO_ROOT` at the same db + audio root you
 //! pass `trainerctl --db/--audio-root`, so ingested learnings land where the trainer
 //! reads them. The decoded cache is the `decoded-cache` sibling of the audio root,
 //! matching `trainerctl`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
 use idiolect_sync_server::device_tokens::DeviceTokenStore;
 use idiolect_sync_server::ingest_server::{ingest_router, IngestServerState};
 use idiolect_sync_server::model_server::{model_router, ModelServerConfig};
+use idiolect_sync_server::pairing::{group, pair_router, system_now, PairingServerState};
 
 #[tokio::main]
 async fn main() {
@@ -36,18 +43,37 @@ async fn main() {
         }
     };
 
-    // One shared per-device token store guards both the model and ingest endpoints (S3).
+    // One shared per-device token store guards the model and ingest endpoints; the
+    // pairing endpoint mutates it, so it lives behind a Mutex (S3).
     let tokens = match open_tokens(&settings) {
-        Ok(tokens) => Arc::new(tokens),
+        Ok(tokens) => Arc::new(Mutex::new(tokens)),
         Err(message) => {
             eprintln!("idiolect-sync-server: {message}");
             std::process::exit(2);
         }
     };
-    if tokens.device_count() == 0 {
+
+    // `--pair` mints a one-time code against the live, in-memory pairing state the
+    // `/v1/pair` route serves, so the code the operator reads is exactly the one the
+    // device's POST will match.
+    let pair_mode = std::env::args().skip(1).any(|arg| arg == "--pair");
+    let pairing = Arc::new(PairingServerState::new(Arc::clone(&tokens)));
+    if pair_mode {
+        let code = pairing.generate_code(system_now());
+        println!("pairing code: {}", group(&code));
         eprintln!(
-            "idiolect-sync-server: WARNING no devices paired — set IDIOLECT_SYNC_TOKEN or \
-             pair a device; all requests will be rejected until then"
+            "idiolect-sync-server: pairing code valid for 10 minutes — enter it on the device"
+        );
+    }
+
+    let paired_devices = tokens
+        .lock()
+        .expect("token store mutex poisoned")
+        .device_count();
+    if paired_devices == 0 && !pair_mode {
+        eprintln!(
+            "idiolect-sync-server: WARNING no devices paired — re-run with --pair to mint a \
+             pairing code (or set IDIOLECT_SYNC_TOKEN); all requests are rejected until then"
         );
     }
 
@@ -56,7 +82,8 @@ async fn main() {
         model_path: settings.model_path.clone(),
         model_id: settings.model_id.clone(),
         tokens: Arc::clone(&tokens),
-    }));
+    }))
+    .merge(pair_router(Arc::clone(&pairing)));
 
     // The M6 ingest half is opt-in: enabled only when the local store + audio root
     // are configured, so the M5 model-only deployment keeps working unchanged.
@@ -138,7 +165,7 @@ fn open_tokens(settings: &Settings) -> Result<DeviceTokenStore, String> {
 /// `Ok(None)` when neither is set (the model-only server); errors if only one is set
 /// or the store can't be opened/migrated.
 fn ingest_state_from_env(
-    tokens: Arc<DeviceTokenStore>,
+    tokens: Arc<Mutex<DeviceTokenStore>>,
 ) -> Result<Option<IngestServerState>, String> {
     match (
         std::env::var("IDIOLECT_DB_PATH").ok(),

@@ -12,7 +12,7 @@
 //! per manifest request); that is intentionally simple — concurrency is ~one phone.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -32,8 +32,9 @@ pub struct ModelServerConfig {
     pub model_path: PathBuf,
     /// Stable identifier the client records (e.g. `base.en` or a personalised id).
     pub model_id: String,
-    /// The per-device bearer tokens the client must present one of (S3).
-    pub tokens: Arc<DeviceTokenStore>,
+    /// The per-device bearer tokens the client must present one of (S3); shared (and
+    /// mutated by pairing) with the ingest + pairing routers, hence behind a `Mutex`.
+    pub tokens: Arc<Mutex<DeviceTokenStore>>,
 }
 
 /// The served model's identity + integrity metadata, so the client knows what to
@@ -64,8 +65,11 @@ pub async fn serve(
 }
 
 async fn manifest(State(config): State<Arc<ModelServerConfig>>, headers: HeaderMap) -> Response {
-    if authenticate(&headers, &config.tokens).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    {
+        let tokens = config.tokens.lock().expect("token store mutex poisoned");
+        if authenticate(&headers, &tokens).is_none() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     let size = match std::fs::metadata(&config.model_path) {
         Ok(meta) => meta.len(),
@@ -84,8 +88,11 @@ async fn manifest(State(config): State<Arc<ModelServerConfig>>, headers: HeaderM
 }
 
 async fn download(State(config): State<Arc<ModelServerConfig>>, headers: HeaderMap) -> Response {
-    if authenticate(&headers, &config.tokens).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    {
+        let tokens = config.tokens.lock().expect("token store mutex poisoned");
+        if authenticate(&headers, &tokens).is_none() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     let bytes = match std::fs::read(&config.model_path) {
         Ok(bytes) => bytes,
@@ -173,10 +180,10 @@ mod tests {
     const TOKEN: &str = "test-token";
 
     /// A token store with the known `TOKEN` bound, so tests keep asserting against it.
-    fn tokens(dir: &std::path::Path) -> Arc<DeviceTokenStore> {
+    fn tokens(dir: &std::path::Path) -> Arc<Mutex<DeviceTokenStore>> {
         let mut store = DeviceTokenStore::open(dir.join("tokens.json")).expect("tokens");
         store.bind(TOKEN, "pixel", "default").expect("bind token");
-        Arc::new(store)
+        Arc::new(Mutex::new(store))
     }
 
     fn fixture() -> (tempfile::TempDir, Arc<ModelServerConfig>, Vec<u8>) {

@@ -21,6 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 # Per-device bearer tokens (S3): random token material for the pairing handshake.
 uuid.workspace = true
+# Whitens the v4 UUID into a uniform pairing code (the raw UUID version/variant bytes
+# are not uniform), and hashes codes/tokens at rest.
+sha2.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

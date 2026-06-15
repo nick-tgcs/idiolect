@@ -7,9 +7,10 @@
 //! deterministically via `tower::ServiceExt::oneshot`; [`serve_ingest`] is the thin
 //! socket glue. Desktop-only: `axum` is never linked into the Android `.so`.
 //!
-//! Bearer-token authenticated — a single shared secret for v1; S3 replaces the
-//! constant-compare with a per-device token → device/user lookup (the same change
-//! the model server's `authorized` will take, so the two should share it then).
+//! Bearer-token authenticated via the shared per-device [`DeviceTokenStore`] (S3): the
+//! same [`authenticate`] entry point the model and pairing routers gate on, so one
+//! device's token authenticates every endpoint. A device earns its token through the
+//! pairing handshake (see [`crate::pairing`]).
 //!
 //! The request body is the length-prefixed sync container
 //! (`application/vnd.idiolect.sync.v1`, see [`idiolect_sync::codec`]); the response is
@@ -45,7 +46,7 @@ const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;
 pub struct IngestServerState {
     store: Mutex<SqliteMetadataStore>,
     audio_store: FileAudioStore,
-    tokens: Arc<DeviceTokenStore>,
+    tokens: Arc<Mutex<DeviceTokenStore>>,
 }
 
 impl IngestServerState {
@@ -54,7 +55,7 @@ impl IngestServerState {
     pub fn new(
         store: SqliteMetadataStore,
         audio_store: FileAudioStore,
-        tokens: Arc<DeviceTokenStore>,
+        tokens: Arc<Mutex<DeviceTokenStore>>,
     ) -> Self {
         Self {
             store: Mutex::new(store),
@@ -93,8 +94,20 @@ async fn ingest_batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if authenticate(&headers, &state.tokens).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    {
+        // Drop the token guard before locking the metadata store below, so the two
+        // mutexes are never held at once (no lock-order hazard with the pairing path).
+        //
+        // S3 single-tenant scope (deliberate): the authenticated `DeviceIdentity` is used
+        // only as an auth gate here; we do not yet bind the ingest to it. Every device maps
+        // to user_id "default" today, so trusting the batch's own device_id/user_id is
+        // equivalent. Binding ingest to the authenticated identity (and per-device
+        // `(device_id, audio_digest)` dedup) is the next S3 slice — when a second user can
+        // exist, this must reject a batch whose user_id != the token's.
+        let tokens = state.tokens.lock().expect("token store mutex poisoned");
+        if authenticate(&headers, &tokens).is_none() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     let envelope = match decode_batch(body.as_ref()) {
         Ok(envelope) => envelope,
@@ -139,7 +152,11 @@ mod tests {
         // A token store with a known token bound, so the tests keep using `TOKEN`.
         let mut tokens = DeviceTokenStore::open(dir.path().join("tokens.json")).expect("tokens");
         tokens.bind(TOKEN, "pixel", "default").expect("bind token");
-        let state = Arc::new(IngestServerState::new(store, audio, Arc::new(tokens)));
+        let state = Arc::new(IngestServerState::new(
+            store,
+            audio,
+            Arc::new(Mutex::new(tokens)),
+        ));
         (dir, state)
     }
 

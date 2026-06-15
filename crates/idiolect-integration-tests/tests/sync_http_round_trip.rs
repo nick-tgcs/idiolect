@@ -11,7 +11,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -58,7 +58,7 @@ async fn corrections_sync_phone_to_pc_over_http_then_reclaim() {
     let pc_state = Arc::new(IngestServerState::new(
         pc.open_store(),
         pc.audio_store(),
-        Arc::new(tokens),
+        Arc::new(Mutex::new(tokens)),
     ));
 
     // Phone builds a batch and ships it over HTTP.

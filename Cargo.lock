@@ -4388,6 +4388,7 @@ dependencies = [
  "idiolect-sync",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 1.0.61",
  "tokio",
