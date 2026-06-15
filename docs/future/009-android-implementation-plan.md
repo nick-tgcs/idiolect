@@ -518,12 +518,34 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
       dictation e2e (`commitText`) needs a model on device (depends on M5); a
       Compose rewrite of the voice view (the View-based one ships now); and, from
       part 1, lifting callbacks + decode out of the core lock + silence auto-stop.
-- **M4 — Edit mode + correction capture.** The QWERTY edit mode, the **one-tap
-  toggle**, the correction strip + tap-to-fix selecting the word range; wire fixes
-  to `amend_correction` (incl. the `ime_text_history` projection). Crypto key →
-  Keystore. *Tests:* Compose UI test for the toggle + tap-to-fix; integration that
-  a fix produces a correct raw→corrected candidate; the history-projection
-  regression test.
+- ✅ **M4 — Edit mode + correction capture — done.** The learning loop on the phone:
+  correcting a mistake now *is* a training pair. Three gate-green packages:
+  - **4a** (`c8c69cd`) edit mode + the symmetric one-tap toggle: one surface, two
+    modes that swap in place inside a single root view — the voice view gains an `⌨`
+    flip to edit; the edit view is a tap-only QWERTY (`KeyboardLayout`/`EditKeyboard`
+    with one-shot shift) whose `🎤` flips back. Pure logic host-tested (`ModePresenter`,
+    layout, key reducer); `FieldEditor` gained `deleteBackward` (12 tests).
+  - **4b** (`138198b`) the **crux**: post-take **correction strip** of tappable word
+    chips (`CorrectionStrip.words` → exact char ranges); a tap selects the word's range
+    (`setSelection`) and flips to edit so the next keystroke replaces it; leaving edit
+    reads the **whole field** back and records the raw→corrected pair via the core's
+    `report_correction` — only when the text changed (the ground-truth-from-the-field
+    model). Reuses the existing `amend_correction` path, which already updates the
+    `ime_text_history` projection. `CorrectionCapture` + `commitText→onCommit` host-
+    tested (9 tests).
+  - **4c** (`fccb826`) **at-rest history encryption.** `IdiolectCore::new` gains
+    an optional 32-byte `history_key` and wires `with_history_cipher` (ChaCha20-Poly1305,
+    reused unchanged); a wrong length is a typed `FfiError`. The key is sourced on device
+    from the **AndroidKeyStore**: a hardware-backed AES-256-GCM KEK wraps a CSPRNG ChaCha
+    key persisted in `filesDir` (`KeystoreEnvelope`/`HistoryKeyStore`/`HistoryKey`) — AOSP
+    only, GrapheneOS-safe. *Tests:* Rust seam — encrypted-at-rest round-trip (reopen
+    without the key ⇒ ciphertext; with it ⇒ plaintext) + wrong-length rejected; Kotlin
+    host — generate-once/persist-wrapped/reload (fake envelope); FFI-boundary key
+    marshalling + typed error; on-device — real Keystore wrap/unwrap opens a keyed core.
+  - **Still remaining (cross-milestone / out of M4 scope):** real on-device dictation to
+    drive the strip from actual speech needs a model (**M5**); a Compose rewrite of both
+    views (the View-based ones ship now); and from part 1, lifting callbacks + decode out
+    of the core lock + the privacy-gate silence auto-stop.
 - **M5 — Model management.** Authenticated model download (progress/resume) from
   the user's PC; Zip-Slip hardening; per-file SHA-256 at extract **and** every
   load; lazy model init on first focus; model switch (tiny/base/small). *Tests:*
@@ -663,15 +685,18 @@ Pure-Rust, TDD, desktop-benefiting — startable immediately, no Android toolcha
    on-device: `push_pcm_frame → StreamingTake::ingest → fold_snippet/finalize →
    commit`, carrying the full-take-wins policy to the phone (the interim
    `deliver_transcript` seam is retired). See the M2 / M3-part-1 bullets in §5.
-9. ✅ **M3 part 2 — the Kotlin IME (the second existential risk) — core path done.**
-   The `android/` Gradle build + the IME wired against the part-1 FFI contract, six
-   gate-green packages (`6545f7c`…`3511e6c`), proven on the android-33 emulator
-   (`OnDeviceBridgeTest`). See the M3-part-2 bullet in §5 for the breakdown and the
-   separable polish/UX remainder.
-10. **NEXT (pick one): M3-polish/UX** (FGS + in-app permission/enable Activity +
-    Compose view + fixture-audio dictation e2e), **M4** (edit mode / correction
-    capture), **M5** (model management — unblocks real on-device dictation), or the
-    parallel no-Kotlin **S2 HTTP hop (axum)**.
+9. ✅ **M3 — the Kotlin IME (the second existential risk) — done incl. polish.**
+   The `android/` Gradle build + the IME wired against the part-1 FFI contract, nine
+   gate-green packages (`6545f7c`…`6c8ad48`) + docs, proven on the android-33 emulator
+   (`OnDeviceBridgeTest`). See the M3 bullets in §5.
+10. ✅ **M4 — edit mode + correction capture — done.** One surface / two modes, the
+    correction strip + tap-to-fix, and capture→`report_correction` (a fix is a training
+    pair), plus AndroidKeyStore-keyed at-rest history encryption. Three gate-green
+    packages (`c8c69cd`, `138198b`, `fccb826`). See the M4 bullet in §5.
+11. **NEXT (pick one): M5** (model management — unblocks REAL on-device dictation; the
+    download leans on the PC transport), the parallel no-Kotlin **S2 HTTP hop (axum)**
+    (unblocks model-pull + sync), or **M6** (sync round-trip). Deferred polish: Compose
+    rewrite, callbacks/decode out of the core lock, silence auto-stop.
 
 ---
 
