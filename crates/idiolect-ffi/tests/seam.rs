@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use idiolect_application::use_cases::streaming::{TakeTranscriber, TranscribeFailure};
-use idiolect_ffi::{IdiolectCore, IdiolectInputMethod};
+use idiolect_ffi::{FfiError, IdiolectCore, IdiolectInputMethod};
 use idiolect_ports::audio::AudioSegment;
 use idiolect_test_support::fixtures::{
     speech_and_silence_fixture_16khz_mono, speech_pause_speech_fixture_16khz_mono,
@@ -353,6 +353,29 @@ fn load_model_rejects_a_missing_file() {
     assert!(core
         .load_model("/no/such/idiolect-model.bin".to_owned())
         .is_err());
+}
+
+/// SHA-256 of the committed `ggml-tiny.en.bin` fixture (`sha256sum`).
+const FIXTURE_MODEL_SHA256: &str =
+    "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+
+#[test]
+fn load_model_verified_accepts_a_matching_digest() {
+    let (core, _cb) = new_core();
+    core.load_model_verified(fixture_model_path(), FIXTURE_MODEL_SHA256.to_owned())
+        .expect("a model whose digest matches should load");
+}
+
+#[test]
+fn load_model_verified_rejects_a_tampered_digest() {
+    let (core, _cb) = new_core();
+    let err = core
+        .load_model_verified(fixture_model_path(), "0".repeat(64))
+        .expect_err("a digest mismatch must be rejected, not loaded");
+    assert!(
+        matches!(err, FfiError::ModelIntegrity { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]

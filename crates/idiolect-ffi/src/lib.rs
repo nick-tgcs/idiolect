@@ -70,6 +70,8 @@ pub enum FfiError {
     Io { detail: String },
     #[error("history key must be 32 bytes, got {len}")]
     InvalidHistoryKey { len: u32 },
+    #[error("model integrity check failed: expected {expected}, got {actual}")]
+    ModelIntegrity { expected: String, actual: String },
 }
 
 impl From<SqliteStorageError> for FfiError {
@@ -371,9 +373,33 @@ impl IdiolectCore {
         }))
     }
 
-    /// Load the on-device speech model from `model_path` (a verified file under the
-    /// app's private storage). Until this succeeds, a take finalizes to nothing and
-    /// the user is told a model is needed. M5 (model management) supplies the file.
+    /// Verify the model file's SHA-256 against `expected_sha256` (lowercase hex), then
+    /// load it. This is the **production** entry point: it enforces the M5
+    /// "per-file SHA-256 at every load" contract, so a corrupted or substituted model
+    /// can never be loaded. (The unverified [`Self::load_model`] is for tests/fixtures.)
+    pub fn load_model_verified(
+        &self,
+        model_path: String,
+        expected_sha256: String,
+    ) -> Result<(), FfiError> {
+        let actual = idiolect_common::digest::file_sha256_hex(&model_path).map_err(|error| {
+            FfiError::Io {
+                detail: format!("hash model: {error}"),
+            }
+        })?;
+        if !actual.eq_ignore_ascii_case(&expected_sha256) {
+            return Err(FfiError::ModelIntegrity {
+                expected: expected_sha256,
+                actual,
+            });
+        }
+        self.load_model(model_path)
+    }
+
+    /// Load the on-device speech model from `model_path` **without** integrity
+    /// verification. Prefer [`Self::load_model_verified`] in production; this exists for
+    /// the committed test fixture and the missing-file guard. Until a model loads, a
+    /// take finalizes to nothing and the user is told a model is needed.
     pub fn load_model(&self, model_path: String) -> Result<(), FfiError> {
         let asr = WhisperAsr::load(model_path, WhisperOptions::default()).map_err(|error| {
             FfiError::Io {
