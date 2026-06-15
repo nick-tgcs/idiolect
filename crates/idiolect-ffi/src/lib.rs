@@ -55,20 +55,24 @@ const I16_FULL_SCALE: f32 = 32_768.0;
 /// the Kotlin side gets a typed failure rather than a panic across the FFI.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
-    #[error("storage error: {message}")]
-    Storage { message: String },
+    // The error variants' payload field is `detail`, not `message`: UniFFI generates
+    // each variant as a `kotlin.Exception` subclass, and a field named `message`
+    // collides with `Throwable.message` (the generated `override val message` then
+    // fails to compile). `detail` carries the same string.
+    #[error("storage error: {detail}")]
+    Storage { detail: String },
     #[error("no active dictation take")]
     NoActiveTake,
     #[error("history entry {id} not found")]
     HistoryEntryNotFound { id: i64 },
-    #[error("io error: {message}")]
-    Io { message: String },
+    #[error("io error: {detail}")]
+    Io { detail: String },
 }
 
 impl From<SqliteStorageError> for FfiError {
     fn from(error: SqliteStorageError) -> Self {
         Self::Storage {
-            message: error.to_string(),
+            detail: error.to_string(),
         }
     }
 }
@@ -311,7 +315,7 @@ impl IdiolectCore {
             decoded_cache_dir.clone(),
         ] {
             std::fs::create_dir_all(&dir).map_err(|error| FfiError::Io {
-                message: error.to_string(),
+                detail: error.to_string(),
             })?;
         }
         let mut store = SqliteMetadataStore::open_path(paths.database_path())?;
@@ -349,7 +353,7 @@ impl IdiolectCore {
     pub fn load_model(&self, model_path: String) -> Result<(), FfiError> {
         let asr = WhisperAsr::load(model_path, WhisperOptions::default()).map_err(|error| {
             FfiError::Io {
-                message: format!("load model: {error}"),
+                detail: format!("load model: {error}"),
             }
         })?;
         self.install_transcriber(Box::new(WhisperTakeTranscriber { asr }));
@@ -623,7 +627,7 @@ impl Inner {
         }
         let segment = segment_from_samples(&finalized.merged_samples);
         let encoded = self.codec.encode(&segment).map_err(|error| FfiError::Io {
-            message: format!("encode audio: {error}"),
+            detail: format!("encode audio: {error}"),
         })?;
         let session_id = self
             .dictation
@@ -633,7 +637,7 @@ impl Inner {
         self.audio_store
             .write_source_audio(&self.user_id, &utterance_id, &encoded)
             .map_err(|error| FfiError::Io {
-                message: format!("write audio: {error}"),
+                detail: format!("write audio: {error}"),
             })?;
         let digest = idiolect_common::digest::audio_sha256_hex(&encoded.payload);
         self.dictation
