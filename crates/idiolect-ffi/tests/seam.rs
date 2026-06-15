@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use idiolect_application::use_cases::streaming::{TakeTranscriber, TranscribeFailure};
 use idiolect_ffi::{FfiError, IdiolectCore, IdiolectInputMethod};
 use idiolect_ports::audio::AudioSegment;
+use idiolect_sync::decode_batch;
 use idiolect_test_support::fixtures::{
     speech_and_silence_fixture_16khz_mono, speech_pause_speech_fixture_16khz_mono,
 };
@@ -555,6 +556,58 @@ fn a_wrong_length_history_key_is_rejected() {
     let data = dir.path().to_string_lossy().into_owned();
     // 16 bytes — not the required 32; must be a typed error, not a panic.
     assert!(IdiolectCore::new(data, Some(vec![0_u8; 16]), boxed_cb()).is_err());
+}
+
+#[test]
+fn export_sync_batch_is_empty_when_the_outbox_is_empty() {
+    let (core, _cb) = new_core();
+    // Nothing captured yet: there is nothing to ship, so the pump gets an empty
+    // batch (its cheap "skip the network" signal) rather than an encoded no-op.
+    let bytes = core
+        .export_sync_batch("pixel".to_owned(), "batch-1".to_owned())
+        .unwrap();
+    assert!(
+        bytes.is_empty(),
+        "an empty outbox exports no batch: {bytes:?}"
+    );
+}
+
+#[test]
+fn export_then_confirm_ships_a_corrected_take_and_reclaims_it() {
+    let (core, _cb) = new_core();
+    // A dictated take that the user then corrects is a raw→corrected learning.
+    dictate(&core, "restart trafic");
+    core.report_correction("restart traffic".to_owned())
+        .unwrap();
+
+    // Export encodes it as the on-the-wire sync container the phone POSTs.
+    let bytes = core
+        .export_sync_batch("pixel".to_owned(), "batch-1".to_owned())
+        .unwrap();
+    assert!(!bytes.is_empty(), "a corrected take should export");
+    let envelope = decode_batch(&bytes).expect("export decodes to a batch");
+    assert_eq!(envelope.batch.device_id, "pixel");
+    assert_eq!(envelope.batch.batch_id, "batch-1");
+    assert_eq!(envelope.batch.learnings.len(), 1);
+    let learning = &envelope.batch.learnings[0];
+    assert_eq!(learning.raw_transcript, "restart trafic");
+    assert_eq!(learning.corrected_transcript, "restart traffic");
+    // Its audio rides content-addressed by digest.
+    assert!(
+        envelope.audio.contains_key(&learning.audio_digest),
+        "the learning's audio is carried by digest"
+    );
+
+    // Once the PC acks, confirming drains the outbox (delete-after-ACK): a second
+    // export now finds nothing pending.
+    core.confirm_synced(bytes).unwrap();
+    let after = core
+        .export_sync_batch("pixel".to_owned(), "batch-2".to_owned())
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "the outbox is drained after confirm: {after:?}"
+    );
 }
 
 fn boxed_cb() -> Box<RecordingCallback> {

@@ -37,6 +37,11 @@ idiolect-common = { path = "../idiolect-common" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-application = { path = "../idiolect-application" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+# Learning-sync (M6): the outbox→wire codec and the transport-free phone client
+# (build_batch / confirm_shipped) exposed through the FFI so the Kotlin WorkManager
+# pump can ship learnings and reclaim after the PC's ACK.
+idiolect-sync = { path = "../idiolect-sync" }
+idiolect-sync-client = { path = "../idiolect-sync-client" }
 # At-rest encryption of the history projection (ChaCha20-Poly1305), keyed on device
 # from the Android Keystore. The cipher is reused unchanged from desktop.
 idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }

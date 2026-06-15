@@ -4250,6 +4250,8 @@ dependencies = [
  "idiolect-application",
  "idiolect-common",
  "idiolect-ports",
+ "idiolect-sync",
+ "idiolect-sync-client",
  "idiolect-test-support",
  "tempfile",
  "thiserror 1.0.61",

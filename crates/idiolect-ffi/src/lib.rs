@@ -42,6 +42,8 @@ use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
 use idiolect_ports::input_method::InputMethodPort;
 use idiolect_ports::storage::{AudioStorePort, HistoryEntry, HistoryState, MetadataStorePort};
+use idiolect_sync::{decode_batch, encode_batch};
+use idiolect_sync_client::{build_batch, confirm_shipped, SyncClientError};
 
 uniffi::setup_scaffolding!();
 
@@ -78,6 +80,19 @@ impl From<SqliteStorageError> for FfiError {
     fn from(error: SqliteStorageError) -> Self {
         Self::Storage {
             detail: error.to_string(),
+        }
+    }
+}
+
+impl From<SyncClientError> for FfiError {
+    fn from(error: SyncClientError) -> Self {
+        match error {
+            SyncClientError::Storage(error) => Self::Storage {
+                detail: error.to_string(),
+            },
+            SyncClientError::Audio(error) => Self::Io {
+                detail: error.to_string(),
+            },
         }
     }
 }
@@ -541,6 +556,57 @@ impl IdiolectCore {
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.lock().recording
+    }
+
+    /// Export the local sync outbox — captured, not-yet-shipped raw→corrected
+    /// learnings plus their content-addressed audio — as the on-the-wire sync
+    /// container bytes the phone `POST`s to `/v1/sync`. Returns an **empty** vec when
+    /// nothing is pending, so the WorkManager pump can cheaply skip a no-op sync
+    /// rather than ship an encoded empty batch. `device_id` scopes server-side dedup;
+    /// `batch_id` makes a re-POST idempotent (the caller mints a fresh one per
+    /// attempt — re-export after a failed POST is safe, the server dedups by digest).
+    pub fn export_sync_batch(
+        &self,
+        device_id: String,
+        batch_id: String,
+    ) -> Result<Vec<u8>, FfiError> {
+        let inner = self.lock();
+        let envelope = build_batch(
+            inner.dictation.storage(),
+            &inner.audio_store,
+            &inner.user_id,
+            &device_id,
+            &batch_id,
+        )?;
+        if envelope.batch.learnings.is_empty() {
+            return Ok(Vec::new());
+        }
+        encode_batch(&envelope).map_err(|error| FfiError::Io {
+            detail: format!("encode sync batch: {error}"),
+        })
+    }
+
+    /// After the PC acks a batch as durably stored, reclaim local storage for it:
+    /// flip each shipped learning to `synced` and drop its on-device audio
+    /// (delete-after-ACK). `batch` is the exact bytes [`Self::export_sync_batch`]
+    /// returned and the phone POSTed; on a `200` every learning in it is stored
+    /// (accepted or already-present), so the whole batch is safe to reclaim.
+    pub fn confirm_synced(&self, batch: Vec<u8>) -> Result<(), FfiError> {
+        let envelope = decode_batch(&batch).map_err(|error| FfiError::Io {
+            detail: format!("decode sync batch: {error}"),
+        })?;
+        let mut inner = self.lock();
+        let Inner {
+            dictation,
+            audio_store,
+            ..
+        } = &mut *inner;
+        confirm_shipped(
+            dictation.storage_mut(),
+            audio_store,
+            &envelope.batch.learnings,
+        )?;
+        Ok(())
     }
 }
 
