@@ -502,13 +502,22 @@ mirroring the IBus/eframe caveats). Gates stay green throughout:
     - **2f** (`3511e6c`) **emulator e2e** `OnDeviceBridgeTest` — the cross-compiled
       core loads & runs on android-33 x86_64 through jna@aar (3/3). Packaging fix:
       ship the NDK `libc++_shared.so` per ABI (whisper links `c++_shared`).
-    - **Remaining M3-polish / UX (separable, mostly framework glue):**
-      `MicForegroundService` (`foregroundServiceType=microphone`); in-app mic
-      permission-request + IME-enable Activity (today the mic is grantable via
-      system Settings); a Compose voice-mode view (a working Button view ships
-      now); fixture-audio dictation e2e (`commitText`) once a model is on device
-      (depends on M5). Still owed from part 1: lift callbacks + decode out of the
-      core lock; silence auto-stop.
+    - ✅ **M3 polish — done** (three more gate-green packages):
+      - **2g** (`d84c93a`) launcher `SetupActivity` onboarding: one CTA at a time
+        from a pure `ImeSetup.nextStep` (enable → select → grant mic → ready),
+        re-evaluated each resume (4/4).
+      - **2h** (`0827ee5`) `MicForegroundService` (`foregroundServiceType=
+        microphone`) held while recording, ongoing notification (the privacy
+        contract), wired to the authoritative `recordingStatus`; Robolectric
+        verifies it goes foreground (1/1).
+      - **2i** (`6c8ad48`) voice-mode view: status line + mic key + `🌐`
+        keyboard-switch handoff; `VoiceModePresenter` reduces recording/error
+        pushes into a `VoiceStatus` (error held back mid-take, surfaced on stop),
+        UI marshalled to main (5/5).
+    - **Still remaining (cross-milestone / out of M3 scope):** a fixture-audio
+      dictation e2e (`commitText`) needs a model on device (depends on M5); a
+      Compose rewrite of the voice view (the View-based one ships now); and, from
+      part 1, lifting callbacks + decode out of the core lock + silence auto-stop.
 - **M4 — Edit mode + correction capture.** The QWERTY edit mode, the **one-tap
   toggle**, the correction strip + tap-to-fix selecting the word range; wire fixes
   to `amend_correction` (incl. the `ime_text_history` projection). Crypto key →
