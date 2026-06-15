@@ -15,6 +15,8 @@ use idiolect_ports::audio::EncodedAudio;
 use idiolect_ports::storage::{AudioStorePort, MetadataStorePort};
 use idiolect_sync::SyncBatchEnvelope;
 
+pub mod model_server;
+
 /// The PC's local user. `SqliteMetadataStore::create_session` writes rows under
 /// this id, so ingest must address audio and dedup under the same one.
 const INGEST_USER_ID: &str = "default";
