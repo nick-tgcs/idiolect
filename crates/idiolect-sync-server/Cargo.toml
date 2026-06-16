@@ -24,8 +24,16 @@ uuid.workspace = true
 # Whitens the v4 UUID into a uniform pairing code (the raw UUID version/variant bytes
 # are not uniform), and hashes codes/tokens at rest.
 sha2.workspace = true
+# Renders the one-time pairing code as a scannable QR for `--pair`. Encoder only — no
+# image/svg/pic features (we rasterise to forced-colour terminal half-blocks ourselves).
+qrcode = { version = "=0.14.1", default-features = false }
+# Percent-encodes the base URL into the pairing URI the QR carries (Android decodes it).
+percent-encoding = "=2.3.2"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
 tempfile.workspace = true
+# An independent QR reader, so the pairing-QR round-trip test decodes what we encode
+# (default features off: we feed a greyscale buffer, not the `image` crate's types).
+rqrr = { version = "=0.10.1", default-features = false }

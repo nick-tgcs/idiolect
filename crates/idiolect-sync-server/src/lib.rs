@@ -19,6 +19,7 @@ pub mod device_tokens;
 pub mod ingest_server;
 pub mod model_server;
 pub mod pairing;
+pub mod pairing_qr;
 
 /// The PC's local user. `SqliteMetadataStore::create_session` writes rows under
 /// this id, so ingest must address audio and dedup under the same one.

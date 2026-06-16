@@ -14,9 +14,13 @@
 //!   IDIOLECT_SYNC_ADDR    bind address (default: 127.0.0.1:8765)
 //!   IDIOLECT_DB_PATH      local metadata store; enables ingest (with AUDIO_ROOT)
 //!   IDIOLECT_AUDIO_ROOT   source-audio root; enables ingest (with DB_PATH)
+//!   IDIOLECT_PAIR_URL     externally-reachable base URL embedded in the pairing QR
+//!                         (default: http://<IDIOLECT_SYNC_ADDR>); set this to the tailnet
+//!                         address the phone can actually reach, not the loopback bind
 //!
-//! Pass `--pair` to mint a one-time pairing code (printed to stdout, valid 10 minutes)
-//! that a new device redeems at `POST /v1/pair` to earn its own bearer token. The code
+//! Pass `--pair` to mint a one-time pairing code and print it as a scannable QR — plus the
+//! grouped code and URL to type by hand — to stdout, valid 10 minutes. A new device scans
+//! or enters it and redeems at `POST /v1/pair` to earn its own bearer token. The code
 //! lives only in memory, so a restart invalidates it (re-run with `--pair`).
 //!
 //! Point `IDIOLECT_DB_PATH`/`IDIOLECT_AUDIO_ROOT` at the same db + audio root you
@@ -31,7 +35,8 @@ use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
 use idiolect_sync_server::device_tokens::DeviceTokenStore;
 use idiolect_sync_server::ingest_server::{ingest_router, IngestServerState};
 use idiolect_sync_server::model_server::{model_router, ModelServerConfig};
-use idiolect_sync_server::pairing::{group, pair_router, system_now, PairingServerState};
+use idiolect_sync_server::pairing::{pair_router, system_now, PairingServerState};
+use idiolect_sync_server::pairing_qr::pairing_announcement;
 
 #[tokio::main]
 async fn main() {
@@ -53,16 +58,20 @@ async fn main() {
         }
     };
 
+    let addr = std::env::var("IDIOLECT_SYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_owned());
+
     // `--pair` mints a one-time code against the live, in-memory pairing state the
     // `/v1/pair` route serves, so the code the operator reads is exactly the one the
-    // device's POST will match.
+    // device's POST will match. It is shown as a scannable QR (the QR carries the base URL
+    // + code so one scan pairs) plus the typed-by-hand fallback.
     let pair_mode = std::env::args().skip(1).any(|arg| arg == "--pair");
     let pairing = Arc::new(PairingServerState::new(Arc::clone(&tokens)));
     if pair_mode {
         let code = pairing.generate_code(system_now());
-        println!("pairing code: {}", group(&code));
+        let base_url = pair_base_url(std::env::var("IDIOLECT_PAIR_URL").ok(), &addr);
+        print!("{}", pairing_announcement(&base_url, &code));
         eprintln!(
-            "idiolect-sync-server: pairing code valid for 10 minutes — enter it on the device"
+            "idiolect-sync-server: pairing code valid for 10 minutes — scan the QR or enter it on the device"
         );
     }
 
@@ -99,7 +108,6 @@ async fn main() {
         }
     };
 
-    let addr = std::env::var("IDIOLECT_SYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_owned());
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -187,5 +195,38 @@ fn ingest_state_from_env(
             "set BOTH IDIOLECT_DB_PATH and IDIOLECT_AUDIO_ROOT to enable sync ingest, or neither"
                 .to_owned(),
         ),
+    }
+}
+
+/// The base URL to embed in the pairing QR. An explicit `IDIOLECT_PAIR_URL` (the operator's
+/// tailnet address the phone can reach) wins, trimmed of a trailing slash; otherwise fall
+/// back to the bind address — correct for same-host testing, but usually not reachable from
+/// a phone, so `--pair` documents setting `IDIOLECT_PAIR_URL`.
+fn pair_base_url(explicit: Option<String>, bind_addr: &str) -> String {
+    match explicit {
+        Some(url) if !url.trim().is_empty() => url.trim().trim_end_matches('/').to_owned(),
+        _ => format!("http://{bind_addr}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pair_base_url;
+
+    #[test]
+    fn an_explicit_pair_url_wins_and_is_trimmed() {
+        assert_eq!(
+            pair_base_url(Some("http://100.64.0.7:8765/".to_owned()), "127.0.0.1:8765"),
+            "http://100.64.0.7:8765",
+        );
+    }
+
+    #[test]
+    fn a_blank_or_absent_pair_url_falls_back_to_the_bind_address() {
+        assert_eq!(pair_base_url(None, "0.0.0.0:8765"), "http://0.0.0.0:8765");
+        assert_eq!(
+            pair_base_url(Some("   ".to_owned()), "127.0.0.1:8765"),
+            "http://127.0.0.1:8765",
+        );
     }
 }
