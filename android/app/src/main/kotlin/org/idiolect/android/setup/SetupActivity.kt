@@ -1,7 +1,6 @@
 package org.idiolect.android.setup
 
 import android.Manifest
-import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -15,6 +14,10 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import org.idiolect.android.R
 import org.idiolect.android.ime.IdiolectImeService
 import org.idiolect.android.model.HttpModelTransport
@@ -22,6 +25,9 @@ import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
 import org.idiolect.android.model.ModelTransport
 import org.idiolect.android.model.PublicModelTransport
+import org.idiolect.android.sync.DeviceId
+import org.idiolect.android.sync.PairingClient
+import org.idiolect.android.sync.ScanPairing
 import org.idiolect.android.sync.SecureSyncConfig
 import org.idiolect.android.sync.SyncSettings
 import java.io.File
@@ -32,16 +38,34 @@ import kotlin.concurrent.thread
  * [ImeSetup] — and re-evaluates on each resume, so returning from system settings or
  * the IME picker advances the flow. Pure framework glue around [ImeSetup] (unit-tested
  * separately); validated end to end by the emulator e2e.
+ *
+ * On the model step the user can either type their PC's URL + token by hand or **scan the
+ * PC's pairing QR** ([ScanPairing], host-tested): a scan exchanges the one-time code for a
+ * per-device token and then pulls the model from the now-paired PC. The camera capture and
+ * the activity-result plumbing have no headless seam, so they are covered by the manual
+ * emulator e2e, not a unit test.
  */
-class SetupActivity : Activity() {
+class SetupActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var cta: Button
+    private lateinit var scanButton: Button
     private lateinit var urlField: EditText
     private lateinit var tokenField: EditText
+
+    /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */
+    private val scanLauncher: ActivityResultLauncher<ScanOptions> =
+        registerForActivityResult(ScanContract()) { result ->
+            result.contents?.let { onScanned(it) }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         status = TextView(this).apply { textSize = 18f }
+        scanButton = Button(this).apply {
+            setText(R.string.setup_scan_cta)
+            visibility = ViewGroup.GONE
+            setOnClickListener { onScanTapped() }
+        }
         urlField = EditText(this).apply {
             setHint(R.string.setup_model_url_hint)
             visibility = ViewGroup.GONE
@@ -58,6 +82,7 @@ class SetupActivity : Activity() {
                 gravity = Gravity.CENTER
                 setPadding(pad, pad, pad, pad)
                 addView(status, lp())
+                addView(scanButton, lp())
                 addView(urlField, lp())
                 addView(tokenField, lp())
                 addView(cta, lp())
@@ -83,6 +108,8 @@ class SetupActivity : Activity() {
             }
             ImeSetupStep.DownloadModel -> {
                 status.setText(R.string.setup_model)
+                scanButton.visibility = ViewGroup.VISIBLE
+                scanButton.isEnabled = true
                 urlField.visibility = ViewGroup.VISIBLE
                 tokenField.visibility = ViewGroup.VISIBLE
                 cta.visibility = ViewGroup.VISIBLE
@@ -92,6 +119,7 @@ class SetupActivity : Activity() {
             }
             ImeSetupStep.Ready -> {
                 status.setText(R.string.setup_ready)
+                scanButton.visibility = ViewGroup.GONE
                 urlField.visibility = ViewGroup.GONE
                 tokenField.visibility = ViewGroup.GONE
                 cta.visibility = ViewGroup.GONE
@@ -101,6 +129,7 @@ class SetupActivity : Activity() {
 
     private fun bind(statusRes: Int, ctaRes: Int, action: () -> Unit) {
         status.setText(statusRes)
+        scanButton.visibility = ViewGroup.GONE
         urlField.visibility = ViewGroup.GONE
         tokenField.visibility = ViewGroup.GONE
         cta.visibility = ViewGroup.VISIBLE
@@ -119,6 +148,47 @@ class SetupActivity : Activity() {
         }
     }
 
+    /** Launch the QR scanner; zxing handles the camera-permission prompt and the preview. */
+    private fun onScanTapped() {
+        scanLauncher.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt(getString(R.string.setup_scan_prompt))
+                .setBeepEnabled(false)
+                .setOrientationLocked(false),
+        )
+    }
+
+    /**
+     * A pairing QR was decoded: exchange its one-time code for a per-device token off the UI
+     * thread ([ScanPairing] persists the endpoint), then pull the model from the now-paired
+     * PC by reusing the PC download path. A malformed QR or a rejected code surfaces as an
+     * error and leaves the form (and the scan button) usable.
+     */
+    private fun onScanned(contents: String) {
+        cta.isEnabled = false
+        scanButton.isEnabled = false
+        status.setText(R.string.setup_pairing)
+        thread(isDaemon = true, name = "idiolect-pair") {
+            runCatching { ScanPairing(pairingClient()).pairFromScan(contents) }
+                .onSuccess { endpoint ->
+                    runOnUiThread {
+                        startDownload(
+                            HttpModelTransport(endpoint.baseUrl, endpoint.token),
+                            ModelSourceChoice.Pc(endpoint.baseUrl, endpoint.token),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    runOnUiThread {
+                        status.text = getString(R.string.setup_pairing_error, error.message ?: "")
+                        cta.isEnabled = true
+                        scanButton.isEnabled = true
+                    }
+                }
+        }
+    }
+
     /**
      * Download [transport]'s model with progress, then go Ready. Only a PC pull carries a
      * [pcEndpoint] to remember (so the sync worker can ship learnings back, M6; the token
@@ -128,6 +198,7 @@ class SetupActivity : Activity() {
      */
     private fun startDownload(transport: ModelTransport, pcEndpoint: ModelSourceChoice.Pc?) {
         cta.isEnabled = false
+        scanButton.isEnabled = false
         val downloader = ModelDownloader(transport, modelStore())
         thread(isDaemon = true, name = "idiolect-model-download") {
             runCatching {
@@ -144,10 +215,17 @@ class SetupActivity : Activity() {
                 runOnUiThread {
                     status.text = getString(R.string.setup_model_error, error.message ?: "")
                     cta.isEnabled = true
+                    scanButton.isEnabled = true
                 }
             }
         }
     }
+
+    /** The PC pairing client: the keystore-backed sync config and this install's device id. */
+    private fun pairingClient() = PairingClient(
+        SecureSyncConfig.keystoreBacked(filesDir),
+        DeviceId(File(filesDir, DeviceId.FILE_NAME)).get(),
+    )
 
     private fun hasModel(): Boolean = modelStore().active() != null
 

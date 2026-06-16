@@ -50,7 +50,10 @@ kotlin {
 dependencies {
     implementation(project(":ffi"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity)
     implementation(libs.androidx.work.runtime.ktx)
+    // Camera QR scanning for device pairing (FOSS, no Google Play Services).
+    implementation(libs.zxing.android.embedded)
     // JNA's Android AAR bundles the per-ABI jnidispatch the generated bindings load.
     implementation(libs.jna) {
         artifact { type = "aar" }

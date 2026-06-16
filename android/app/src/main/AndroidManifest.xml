@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Dictation captures the microphone on-device. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Scan the PC's pairing QR to enrol without typing the code by hand. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- A camera is only needed for the optional QR pairing, not for dictation. -->
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <!-- A mic foreground service holds capture; its notification is user-visible. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />

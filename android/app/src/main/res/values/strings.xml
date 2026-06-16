@@ -19,6 +19,10 @@
     <string name="setup_model_need_details">Enter both the server URL and pairing token, or leave both blank for the recommended model.</string>
     <string name="setup_model_progress">Downloading model… %1$d%%</string>
     <string name="setup_model_error">Download failed: %1$s</string>
+    <string name="setup_scan_cta">Scan QR to pair with PC</string>
+    <string name="setup_scan_prompt">Point at the QR shown by: idiolect-sync-server --pair</string>
+    <string name="setup_pairing">Pairing with your PC…</string>
+    <string name="setup_pairing_error">Pairing failed: %1$s</string>
     <string name="setup_ready">idiolect is ready. Tap a text field and use the mic to dictate.</string>
 
     <string name="fgs_channel">Dictation</string>
