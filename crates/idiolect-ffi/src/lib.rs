@@ -277,6 +277,11 @@ struct SendVad(VadAdapter);
 unsafe impl Send for SendVad {}
 
 /// Mutable state behind the [`IdiolectCore`] mutex.
+/// Default cap on captured (not-yet-shipped) source audio: 1 GiB. The oldest
+/// captures are evicted past this so a phone that never pairs doesn't grow without
+/// bound. Overridable via [`IdiolectCore::set_audio_storage_cap_bytes`].
+const DEFAULT_AUDIO_STORAGE_CAP_BYTES: u64 = 1_073_741_824;
+
 struct Inner {
     /// Drives `create_session`/`commit`/`cancel` over the real store and, through
     /// its [`CallbackInput`], the field-typing callbacks.
@@ -308,6 +313,9 @@ struct Inner {
     last_commit: Option<(ImeSessionId, String)>,
     /// Monotonic source of per-commit idempotency keys.
     seq: u64,
+    /// Cap on captured (not-yet-shipped) source audio; the oldest captures are
+    /// evicted after each take to keep on-device audio under this many bytes.
+    audio_storage_cap_bytes: u64,
 }
 
 /// The in-process core the Android app holds for the life of the IME service.
@@ -384,8 +392,16 @@ impl IdiolectCore {
                 preedit_started: false,
                 last_commit: None,
                 seq: 0,
+                audio_storage_cap_bytes: DEFAULT_AUDIO_STORAGE_CAP_BYTES,
             }),
         }))
+    }
+
+    /// Override the captured-audio storage cap (bytes). A future settings screen
+    /// calls this; until then the default (1 GiB, [`DEFAULT_AUDIO_STORAGE_CAP_BYTES`])
+    /// applies. Takes effect on the next finalized take.
+    pub fn set_audio_storage_cap_bytes(&self, bytes: u64) {
+        self.lock().audio_storage_cap_bytes = bytes;
     }
 
     /// Verify the model file's SHA-256 against `expected_sha256` (lowercase hex), then
@@ -764,6 +780,14 @@ impl Inner {
         self.dictation
             .commit(session_id, &finalized.final_text, &key)?;
         self.last_commit = Some((session_id, finalized.final_text));
+        // Reclaim the oldest captured audio if this take pushed us over the cap, so a
+        // phone that never pairs (audio is only dropped after a sync ACK) stays bounded.
+        let cap = self.audio_storage_cap_bytes;
+        self.dictation.storage_mut().evict_captured_audio_over_cap(
+            &self.user_id,
+            cap,
+            &self.audio_store,
+        )?;
         Ok(())
     }
 }

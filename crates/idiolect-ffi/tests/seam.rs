@@ -610,6 +610,51 @@ fn export_then_confirm_ships_a_corrected_take_and_reclaims_it() {
     );
 }
 
+#[test]
+fn the_storage_cap_evicts_oldest_captured_audio_after_each_take() {
+    // Manage the dir locally so we can inspect the on-disk recordings.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let core = IdiolectCore::new(
+        dir.path().to_string_lossy().into_owned(),
+        None,
+        Box::new(RecordingCallback::default()),
+    )
+    .expect("core should open");
+
+    // One take establishes the per-recording size; cap to that so only the newest
+    // recording can ever fit. (The first take ran under the default 1 GiB cap.)
+    dictate(&core, "first take");
+    let one = std::fs::metadata(&ogg_files(&dir.path().join("audio"))[0])
+        .expect("stat recording")
+        .len();
+    core.set_audio_storage_cap_bytes(one);
+
+    dictate(&core, "second take");
+    dictate(&core, "third take");
+
+    // The cap runs on every finalize, so only the newest recording survives on disk…
+    let recordings = ogg_files(&dir.path().join("audio"));
+    assert_eq!(
+        recordings.len(),
+        1,
+        "the cap keeps only the newest recording: {recordings:?}"
+    );
+
+    // …while every transcript stays in history (only audio was reclaimed, not the record).
+    let history: Vec<String> = core
+        .recent_history(10)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    for take in ["first take", "second take", "third take"] {
+        assert!(
+            history.contains(&take.to_owned()),
+            "history keeps {take}: {history:?}"
+        );
+    }
+}
+
 fn boxed_cb() -> Box<RecordingCallback> {
     Box::new(RecordingCallback::default())
 }

@@ -35,6 +35,11 @@ const TRAINING_STATUS_CAPTURED: &str = "captured";
 /// but it leaves the manifest feed (no audio to train on) and the sync outbox
 /// (already shipped). Freeform `TEXT` column — no migration needed.
 const TRAINING_STATUS_SYNCED: &str = "synced";
+/// A captured candidate whose source audio was reclaimed by the storage cap before
+/// it could be shipped. Like `synced` the row + transcript survive (history is
+/// preserved) but it leaves the sync outbox — without audio it can never train, and
+/// shipping it would send a learning with no bytes. Freeform `TEXT`, no migration.
+const TRAINING_STATUS_EVICTED: &str = "evicted";
 const CAPTURE_QUALITY_LIVE: &str = "live";
 const CANCEL_PAYLOAD: &str = "cancelled";
 const DEFAULT_USER_ID: &str = "default";
@@ -1386,6 +1391,56 @@ impl SqliteMetadataStore {
             .delete_source_audio_for(&user_id, &utterance_id)
             .map_err(SqliteStorageError::audio_delete)?;
         Ok(())
+    }
+
+    /// Storage cap: reclaim the **oldest** captured audio until the total on-disk
+    /// source audio for `user_id` fits within `cap_bytes`. Each reclaimed candidate
+    /// has its source audio deleted and its status flipped to `evicted` — keeping
+    /// the row + transcript (so dictation history survives) while removing it from
+    /// the sync outbox, so a later pairing never ships a learning whose audio is
+    /// gone. Returns the number of candidates evicted; `cap_bytes == 0` evicts all
+    /// captured audio.
+    ///
+    /// Oldest-first by candidate id (= capture order). Per candidate it mirrors
+    /// [`Self::mark_synced_and_drop_audio`]'s flip-status-then-delete ordering, so a
+    /// crash leaves an `evicted` row with a harmless stale file the next prune reaps.
+    /// Only captured (pending) audio is counted — `synced`/`evicted` candidates have
+    /// already dropped theirs.
+    pub fn evict_captured_audio_over_cap(
+        &mut self,
+        user_id: &str,
+        cap_bytes: u64,
+        audio_store: &FileAudioStore,
+    ) -> Result<u64, SqliteStorageError> {
+        // Oldest-first (the pending query orders by candidate id) with each
+        // candidate's current on-disk audio size.
+        let pending = self.training_candidates_pending_sync(user_id)?;
+        let mut sized = Vec::with_capacity(pending.len());
+        let mut total: u64 = 0;
+        for candidate in pending {
+            let size = audio_store
+                .source_audio_size_by_key(&candidate.audio_object_key)
+                .map_err(SqliteStorageError::audio_delete)?;
+            total = total.saturating_add(size);
+            sized.push((candidate, size));
+        }
+
+        let mut evicted = 0;
+        for (candidate, size) in sized {
+            if total <= cap_bytes {
+                break;
+            }
+            backend_result(self.connection.execute(
+                "UPDATE training_candidates SET status = ?1 WHERE id = ?2",
+                params![TRAINING_STATUS_EVICTED, candidate.training_candidate_id],
+            ))?;
+            audio_store
+                .delete_source_audio_for(&candidate.user_id, &candidate.utterance_id)
+                .map_err(SqliteStorageError::audio_delete)?;
+            total = total.saturating_sub(size);
+            evicted += 1;
+        }
+        Ok(evicted)
     }
 
     /// Persist the content digest (lowercase-hex SHA-256 of the encoded audio
