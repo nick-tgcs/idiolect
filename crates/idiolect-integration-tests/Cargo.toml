@@ -30,6 +30,9 @@ idiolect-sync-server = { path = "../idiolect-sync-server" }
 
 [dev-dependencies]
 idiolect-cli = { path = "../idiolect-cli" }
+# The M6 capstone parses the served model bytes back as ggml; trainer-burn is
+# already in the graph via idiolect-trainerctl, so this adds no extra build.
+idiolect-trainer-burn = { path = "../idiolect-trainer-burn" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

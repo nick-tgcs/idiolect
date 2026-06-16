@@ -1,7 +1,10 @@
 //! `trainerctl train`: LoRA-trains the Burn whisper decoder on the user's
 //! cleaned training candidates and emits a MERGED ggml model as the artifact.
-//! Nothing is applied — the daemon keeps serving its configured model until a
-//! human (or the promotion gate, once wired) switches `asr.model`.
+//! By default nothing is applied (the artifact is just a file); pass `--serve
+//! <path>` to atomically install it into the live model slot the running model
+//! server reads per request, so the phone pulls the improved model with no
+//! restart (the M6 round-trip's last hop). Gating that swap behind the promotion
+//! policy (`evaluate_promotion`) is the next step — it needs the eval harness.
 //!
 //! Pipeline per candidate: stored Opus audio → 16 kHz samples → log-mel →
 //! frozen encoder (computed once, cached across epochs) → teacher-forced
@@ -44,6 +47,10 @@ pub struct TrainFlags {
     pub rank: usize,
     pub max_samples: Option<usize>,
     pub gpu: bool,
+    /// When set, atomically install the merged artifact into this live model slot
+    /// (the path the running model server reads per request), so the phone pulls the
+    /// improved model with no server restart. `None` leaves the live slot untouched.
+    pub serve: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +67,8 @@ pub struct TrainReport {
     pub holdout_loss_after: f32,
     pub output: String,
     pub applied: bool,
+    /// The live model slot the artifact was installed into (`--serve`), if any.
+    pub served: Option<String>,
 }
 
 struct Example<B: Backend> {
@@ -265,6 +274,16 @@ where
         .write_file(Path::new(&flags.output))
         .map_err(|error| format!("writing artifact: {error}"))?;
 
+    // `--serve` installs the artifact into the live model slot the running model
+    // server reads per request, so the phone pulls the improved model with no restart.
+    let served = match &flags.serve {
+        Some(slot) => {
+            install_atomically(Path::new(&flags.output), Path::new(slot))?;
+            Some(slot.clone())
+        }
+        None => None,
+    };
+
     Ok(TrainReport {
         backend: backend.to_owned(),
         usable_samples: training.len() + holdout.len(),
@@ -277,6 +296,98 @@ where
         holdout_loss_before,
         holdout_loss_after,
         output: flags.output.clone(),
-        applied: false,
+        applied: served.is_some(),
+        served,
     })
+}
+
+/// Atomically install `artifact` at `dest`, the live model slot the running model
+/// server reads per request: stage a copy in a temp sibling of `dest` (same
+/// directory, hence same filesystem), then `rename` it over `dest`. The rename is
+/// atomic, so a concurrent reader sees the whole old file or the whole new file —
+/// never a partial write. `GgmlModel::write_file` truncates then writes, so writing
+/// the model straight into the slot would briefly expose a torn model to the phone.
+fn install_atomically(artifact: &Path, dest: &Path) -> Result<(), String> {
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| format!("serve path has no file name: {}", dest.display()))?;
+    let mut staging_name = file_name.to_os_string();
+    staging_name.push(format!(".tmp.{}", std::process::id()));
+    let staging = dest.with_file_name(staging_name);
+    std::fs::copy(artifact, &staging).map_err(|error| {
+        format!(
+            "staging {} -> {}: {error}",
+            artifact.display(),
+            staging.display()
+        )
+    })?;
+    std::fs::rename(&staging, dest).map_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        format!("installing {}: {error}", dest.display())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_atomically;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
+        let dir = std::env::temp_dir().join(format!(
+            "idiolect-install-{tag}-{}-{}",
+            std::process::id(),
+            now.as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn install_replaces_the_live_slot_and_leaves_no_staging_temp() {
+        let dir = scratch("replace");
+        let artifact = dir.join("personal.bin");
+        let dest = dir.join("served-model.bin");
+        fs::write(&artifact, b"NEW-MERGED-MODEL").expect("write artifact");
+        fs::write(&dest, b"OLD-SERVED-MODEL").expect("write old served");
+
+        install_atomically(&artifact, &dest).expect("install succeeds");
+
+        assert_eq!(
+            fs::read(&dest).expect("read dest"),
+            b"NEW-MERGED-MODEL",
+            "the live slot now holds the freshly produced artifact"
+        );
+        assert!(
+            artifact.exists(),
+            "the artifact is copied, not moved — it stays as the durable record"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging temp is renamed into place, not left behind: {leftovers:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_creates_the_live_slot_when_it_is_absent() {
+        let dir = scratch("create");
+        let artifact = dir.join("personal.bin");
+        let dest = dir.join("served-model.bin");
+        fs::write(&artifact, b"FRESH-MODEL").expect("write artifact");
+
+        install_atomically(&artifact, &dest).expect("install succeeds");
+
+        assert_eq!(fs::read(&dest).expect("read dest"), b"FRESH-MODEL");
+        fs::remove_dir_all(&dir).ok();
+    }
 }

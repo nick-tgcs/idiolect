@@ -104,6 +104,85 @@ fn training_emits_a_loadable_merged_artifact_without_applying_it() {
     assert_eq!(merged.tensors.len(), base.tensors.len());
 }
 
+/// `--serve <path>` additionally installs the merged artifact into the live model
+/// slot the running model server reads per request — atomically, so a concurrent
+/// `GET /v1/model` never sees the torn write `GgmlModel::write_file` would produce.
+/// This is the PC-side swap that lets the phone pull the improved model with no
+/// server restart (the M6 round-trip's last hop).
+#[test]
+fn training_with_serve_atomically_installs_the_merged_model_into_the_live_slot() {
+    let root = fixture_root("serve");
+    let db = root.join("idiolect.sqlite");
+    {
+        let mut store = SqliteMetadataStore::open_path(&db).expect("store should open");
+        store.migrate().expect("store should migrate");
+        let audio_store = FileAudioStore::new(root.join("audio"), root.join("decoded"));
+        seed_take(&mut store, &audio_store, "restart traffic");
+        seed_take(&mut store, &audio_store, "restart traffic please");
+    }
+    let output = root.join("personal.bin");
+    // The live slot starts as the model the server serves today (a copy of the base).
+    let served = root.join("served-model.bin");
+    fs::copy(base_model_path(), &served).expect("seed the live slot");
+    let served_before =
+        idiolect_common::digest::file_sha256_hex(&served).expect("digest the old served model");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_idiolect-trainerctl"))
+        .args([
+            "train",
+            "--db",
+            db.to_str().expect("utf8"),
+            "--audio-root",
+            root.join("audio").to_str().expect("utf8"),
+            "--base-model",
+            base_model_path().to_str().expect("utf8"),
+            "--output",
+            output.to_str().expect("utf8"),
+            "--serve",
+            served.to_str().expect("utf8"),
+            "--epochs",
+            "1",
+            "--max-samples",
+            "2",
+        ])
+        .output()
+        .expect("binary should run");
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&run.stdout).expect("json report on stdout");
+    assert_eq!(report["applied"], true, "{report}");
+    assert_eq!(
+        report["served"],
+        served.to_str().expect("utf8"),
+        "the report records the live slot it installed into: {report}"
+    );
+
+    // The live slot now holds exactly the freshly produced artifact...
+    let served_after =
+        idiolect_common::digest::file_sha256_hex(&served).expect("digest the new served model");
+    let artifact_digest =
+        idiolect_common::digest::file_sha256_hex(&output).expect("digest the artifact");
+    assert_eq!(
+        served_after, artifact_digest,
+        "the live slot is byte-identical to the produced artifact"
+    );
+    // ...which differs from what was served before (training changed the weights)...
+    assert_ne!(
+        served_after, served_before,
+        "the served model actually changed — the phone would pull something new"
+    );
+    // ...and it is a structurally valid whisper model with the base dims.
+    let merged = GgmlModel::read_file(&served).expect("served slot parses as ggml");
+    let base = GgmlModel::read_file(&base_model_path()).expect("base parses");
+    assert_eq!(merged.hparams, base.hparams);
+    assert_eq!(merged.tensors.len(), base.tensors.len());
+}
+
 /// Builds WITHOUT the `cuda` feature must reject `--gpu` with a clear error
 /// rather than silently training on the CPU. (Compiled out on cuda builds —
 /// there the flag is real; actual GPU execution has no headless CI seam.)

@@ -4295,6 +4295,7 @@ dependencies = [
  "idiolect-sync-client",
  "idiolect-sync-server",
  "idiolect-test-support",
+ "idiolect-trainer-burn",
  "idiolect-trainerctl",
  "idiolectd",
  "rusqlite",

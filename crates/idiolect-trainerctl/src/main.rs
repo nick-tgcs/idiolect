@@ -83,6 +83,7 @@ fn run_train_cli(args: &[String]) -> Result<String, String> {
         rank: 8,
         max_samples: None,
         gpu: false,
+        serve: None,
     };
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -92,6 +93,7 @@ fn run_train_cli(args: &[String]) -> Result<String, String> {
             "--user" => flags.user = value(&mut iter, "--user")?,
             "--base-model" => flags.base_model = value(&mut iter, "--base-model")?,
             "--output" => flags.output = value(&mut iter, "--output")?,
+            "--serve" => flags.serve = Some(value(&mut iter, "--serve")?),
             "--epochs" => {
                 flags.epochs = value(&mut iter, "--epochs")?
                     .parse()
