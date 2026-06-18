@@ -2,8 +2,8 @@ package org.idiolect.android.ime
 
 /**
  * The UI-facing side of the core's push callbacks — everything that is not direct
- * field editing. Implemented by the IME service to drive its mic indicator, open the
- * review dialog, and surface decode failures.
+ * field editing. Implemented by the IME service to drive its mic indicator, seed the
+ * correction strip, and surface decode failures.
  */
 interface ImeUiHost {
     /** Authoritative recording state changed (the single source of truth). */
@@ -11,6 +11,20 @@ interface ImeUiHost {
 
     /** A take committed its text — seed the correction strip from it. */
     fun onCommit(text: String)
+
+    /**
+     * Whether review mode (👁) is on: a finished take should be reviewed/edited before it
+     * lands in the field, rather than typed directly. Read once per take commit.
+     */
+    fun isReviewEnabled(): Boolean
+
+    /**
+     * Review mode intercepted a finished take: open the centred review surface for [text].
+     * The take is already persisted (audio + raw transcript + a history id); the user edits
+     * it with their own keyboard, the edit is recorded as a training pair, and the approved
+     * text is typed into the field when it refocuses.
+     */
+    fun onReviewRequested(text: String)
 
     /** Open the review dialog seeded with a stored history entry. */
     fun onEditHistory(id: Long, text: String)

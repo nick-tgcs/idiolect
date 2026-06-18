@@ -30,6 +30,24 @@
     <string name="fgs_listening_text">Capturing audio for dictation</string>
 
     <string name="voice_listening">Listening…</string>
-    <string name="voice_edit_mode">⌨ Edit</string>
-    <string name="voice_switch_keyboard">🌐 Switch keyboard</string>
+    <string name="voice_transcribing">Transcribing…</string>
+    <string name="voice_continuous">● Continuous — tap to stop</string>
+    <string name="voice_idle_hint">Hold to talk · double-tap for continuous</string>
+    <string name="voice_mic_desc">Dictation microphone</string>
+    <!-- ⌨ hands the field to the user's own keyboard (system IME switch) — idiolect never
+         renders its own typing keyboard. 👁 opens the review dialog before a take lands. -->
+    <string name="voice_strip_keyboard">Switch to your keyboard</string>
+    <string name="voice_strip_review">Review before insert</string>
+
+    <string name="review_title">Review dictation</string>
+    <string name="review_hint">Edit it with your keyboard — your fix is recorded for training.</string>
+    <string name="review_insert">Insert</string>
+    <string name="review_cancel">Cancel</string>
+
+    <!-- The accessibility service that types the reviewed correction straight into the app. -->
+    <string name="accessibility_label">idiolect instant insert</string>
+    <string name="accessibility_description">Lets idiolect place your reviewed dictation into the text field you were typing in, so a correction you make with your own keyboard lands automatically. idiolect only uses this to know where to insert — it reads nothing else.</string>
+    <!-- Shown in the review card when instant insert isn't enabled yet. -->
+    <string name="review_enable_insert">Turn on instant insert so your fix lands in the app automatically.</string>
+    <string name="review_enable_cta">Enable</string>
 </resources>

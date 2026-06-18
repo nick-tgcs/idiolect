@@ -303,6 +303,11 @@ struct Inner {
     streaming_config: StreamingConfig,
     /// Authoritative recording state — the single source of truth (§ daemon).
     recording: bool,
+    /// Whether the live take is in continuous mode: each phrase (between pauses) is
+    /// committed into the field as the speaker pauses and the mic stays open, vs the
+    /// one-shot take that commits the whole recording once at stop. Set by
+    /// [`IdiolectCore::start_continuous`], cleared when recording stops.
+    continuous: bool,
     /// The live take while recording.
     take: Option<StreamingTake>,
     /// The full preedit accumulated for the current take (for `setComposingText`).
@@ -311,8 +316,6 @@ struct Inner {
     preedit_started: bool,
     /// The most recently committed take, for an in-place [`IdiolectCore::report_correction`].
     last_commit: Option<(ImeSessionId, String)>,
-    /// Monotonic source of per-commit idempotency keys.
-    seq: u64,
     /// Cap on captured (not-yet-shipped) source audio; the oldest captures are
     /// evicted after each take to keep on-device audio under this many bytes.
     audio_storage_cap_bytes: u64,
@@ -387,11 +390,11 @@ impl IdiolectCore {
                 vad: SendVad(VadAdapter::new()),
                 streaming_config: streaming_config_from(&VadConfig::default()),
                 recording: false,
+                continuous: false,
                 take: None,
                 preedit: String::new(),
                 preedit_started: false,
                 last_commit: None,
-                seq: 0,
                 audio_storage_cap_bytes: DEFAULT_AUDIO_STORAGE_CAP_BYTES,
             }),
         }))
@@ -432,10 +435,17 @@ impl IdiolectCore {
     /// the committed test fixture and the missing-file guard. Until a model loads, a
     /// take finalizes to nothing and the user is told a model is needed.
     pub fn load_model(&self, model_path: String) -> Result<(), FfiError> {
-        let asr = WhisperAsr::load(model_path, WhisperOptions::default()).map_err(|error| {
-            FfiError::Io {
-                detail: format!("load model: {error}"),
-            }
+        // On-device decode tuned for latency: use the phone's cores (the default of 1
+        // leaves a multi-core device mostly idle on the compute-bound matmuls) and
+        // greedy decoding (`beam_size: 1`) — both are the dominant levers for how fast a
+        // take finalizes. The desktop daemon keeps its own (beam-search) configuration.
+        let options = WhisperOptions {
+            n_threads: on_device_decode_threads(),
+            beam_size: 1,
+            ..WhisperOptions::default()
+        };
+        let asr = WhisperAsr::load(model_path, options).map_err(|error| FfiError::Io {
+            detail: format!("load model: {error}"),
         })?;
         self.install_transcriber(Box::new(WhisperTakeTranscriber { asr }));
         Ok(())
@@ -450,9 +460,30 @@ impl IdiolectCore {
         if inner.recording {
             inner.stop_recording()
         } else {
+            inner.continuous = false;
             inner.start_recording();
             Ok(())
         }
+    }
+
+    /// Begin a **continuous** take (the mic's double-tap gesture): each phrase is
+    /// committed into the field as the speaker pauses and the mic stays open, until a
+    /// plain [`Self::toggle`]/stop closes it (finalizing the last phrase). A stray call
+    /// while already recording is ignored.
+    pub fn start_continuous(&self) -> Result<(), FfiError> {
+        let mut inner = self.lock();
+        if inner.recording {
+            return Ok(());
+        }
+        inner.continuous = true;
+        inner.start_recording();
+        Ok(())
+    }
+
+    /// Whether the live take is in continuous mode (drives the mic's "● Continuous" look).
+    #[must_use]
+    pub fn is_continuous(&self) -> bool {
+        self.lock().continuous
     }
 
     /// Push one buffer of captured 16 kHz mono PCM (the mic FGS → JNI hot path)
@@ -476,6 +507,7 @@ impl IdiolectCore {
         }
         inner.take = None;
         inner.recording = false;
+        inner.continuous = false;
         let had_preedit = inner.preedit_started;
         inner.preedit.clear();
         inner.preedit_started = false;
@@ -673,9 +705,44 @@ impl Inner {
             .iter()
             .map(|s| f32::from(*s) / I16_FULL_SCALE)
             .collect();
+
+        // Ingest returns owned snippet audio, so the take borrow is released before the
+        // per-snippet work below — which, in continuous mode, needs all of `self` to
+        // commit a phrase after each pause.
+        let snippets = {
+            let Inner { take, vad, .. } = self;
+            let Some(take) = take.as_mut() else {
+                return Err(FfiError::NoActiveTake);
+            };
+            take.ingest(&samples, |frame| {
+                vad.0.is_speech_frame(frame).unwrap_or(false)
+            })
+        };
+
+        for snippet in snippets {
+            self.fold_one(snippet)?;
+            // Continuous: a pause completed this snippet — commit the phrase now and keep
+            // the mic open. One-shot mode just keeps the preview; it commits once at stop.
+            if self.continuous {
+                let outcome = {
+                    let Inner {
+                        take, transcriber, ..
+                    } = self;
+                    let Some(take) = take.as_mut() else {
+                        return Err(FfiError::NoActiveTake);
+                    };
+                    take.finalize_phrase(transcriber)
+                };
+                self.commit_phrase(outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold one pause-completed snippet into the live take's preview preedit.
+    fn fold_one(&mut self, snippet: Vec<f32>) -> Result<(), FfiError> {
         let Inner {
             take,
-            vad,
             transcriber,
             callback,
             preedit,
@@ -685,21 +752,26 @@ impl Inner {
         let Some(take) = take.as_mut() else {
             return Err(FfiError::NoActiveTake);
         };
-        let snippets = take.ingest(&samples, |frame| {
-            vad.0.is_speech_frame(frame).unwrap_or(false)
-        });
-        for snippet in snippets {
-            let mut observer = CallbackObserver {
-                callback: callback.as_ref(),
-                preedit,
-                started: preedit_started,
-            };
-            // The observer is infallible (callback forwarding cannot fail).
-            match take.fold_snippet(transcriber, &mut observer, snippet) {
-                Ok(()) => {}
-                Err(infallible) => match infallible {},
-            }
+        let mut observer = CallbackObserver {
+            callback: callback.as_ref(),
+            preedit,
+            started: preedit_started,
+        };
+        // The observer is infallible (callback forwarding cannot fail).
+        match take.fold_snippet(transcriber, &mut observer, snippet) {
+            Ok(()) => {}
+            Err(infallible) => match infallible {},
         }
+        Ok(())
+    }
+
+    /// Commit one finalized phrase (continuous mode) into the field and reset the live
+    /// preview so the next phrase starts fresh — WITHOUT touching the recording state, so
+    /// the mic stays open. Each phrase is its own session (its own idempotency key).
+    fn commit_phrase(&mut self, outcome: TakeOutcome) -> Result<(), FfiError> {
+        self.finalize_outcome(outcome)?;
+        self.preedit.clear();
+        self.preedit_started = false;
         Ok(())
     }
 
@@ -733,6 +805,7 @@ impl Inner {
         let outcome = take.finalize(&mut self.transcriber);
         let result = self.finalize_outcome(outcome);
         self.recording = false;
+        self.continuous = false;
         self.preedit.clear();
         self.preedit_started = false;
         self.callback.recording_status(false);
@@ -775,8 +848,12 @@ impl Inner {
         self.dictation
             .storage_mut()
             .set_audio_digest(&utterance_id, &digest)?;
-        self.seq += 1;
-        let key = format!("ffi-stream-final-{}", self.seq);
+        // Key the finalize idempotency by the take's unique, persisted session (via its
+        // stable utterance id) — never an in-memory counter. A per-process counter resets
+        // to 0 on every restart, so the first take after a restart would reuse `...-1` and
+        // collide with the persisted idempotency ledger (a conflict that crashes the IME).
+        // This mirrors the daemon, which keys this commit by `session_id`.
+        let key = format!("ffi-stream-final:{utterance_id}");
         self.dictation
             .commit(session_id, &finalized.final_text, &key)?;
         self.last_commit = Some((session_id, finalized.final_text));
@@ -810,6 +887,18 @@ fn streaming_config_from(vad: &VadConfig) -> StreamingConfig {
     }
 }
 
+/// Decode threads for on-device whisper. [`WhisperOptions`]'s default of one thread
+/// pins inference to a single core, leaving a multi-core phone mostly idle during the
+/// compute-bound matmuls that dominate a take's cost. Use the device's available
+/// parallelism instead, capped to a sane band so we neither pin to one core nor wildly
+/// oversubscribe (extra threads past the physical cores only add fork/join overhead).
+fn on_device_decode_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+        .unwrap_or(4)
+        .clamp(1, 8)
+}
+
 /// Wrap raw 16 kHz mono samples as an [`AudioSegment`] for decode/encode.
 fn segment_from_samples(samples_f32_mono: &[f32]) -> AudioSegment {
     let duration_ms =
@@ -824,9 +913,33 @@ fn segment_from_samples(samples_f32_mono: &[f32]) -> AudioSegment {
 
 #[cfg(test)]
 mod tests {
-    use super::{segment_from_samples, FfiError, HistoryItem, STREAM_SAMPLE_RATE_HZ};
+    use super::{
+        on_device_decode_threads, segment_from_samples, FfiError, HistoryItem,
+        STREAM_SAMPLE_RATE_HZ,
+    };
     use idiolect_common::ids::ImeSessionId;
     use idiolect_ports::storage::{HistoryEntry, HistoryState};
+
+    #[test]
+    fn on_device_decode_threads_uses_available_cores_not_a_single_thread() {
+        let threads = on_device_decode_threads();
+        assert!(
+            (1..=8).contains(&threads),
+            "threads must stay in [1, 8]: {threads}"
+        );
+        // The whole point of this helper is to not pin whisper to one core. On any
+        // multi-core host (every CI runner) it must pick more than one decode thread —
+        // a regression to the hard-coded `n_threads: 1` would trip this.
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        if cores > 1 {
+            assert!(
+                threads > 1,
+                "on a {cores}-core machine whisper must use more than one decode thread, got {threads}",
+            );
+        }
+    }
 
     #[test]
     fn history_item_maps_state_to_committed_flag() {

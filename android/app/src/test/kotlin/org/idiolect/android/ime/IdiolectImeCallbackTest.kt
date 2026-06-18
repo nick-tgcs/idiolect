@@ -21,10 +21,12 @@ class IdiolectImeCallbackTest {
         override fun fieldText(): String = ""
     }
 
-    private class RecordingUi : ImeUiHost {
+    private class RecordingUi(private val review: Boolean = false) : ImeUiHost {
         val ops = mutableListOf<String>()
         override fun onRecordingChanged(recording: Boolean) { ops.add("recording:$recording") }
         override fun onCommit(text: String) { ops.add("commit:$text") }
+        override fun isReviewEnabled(): Boolean = review
+        override fun onReviewRequested(text: String) { ops.add("review:$text") }
         override fun onEditHistory(id: Long, text: String) { ops.add("editHistory:$id:$text") }
         override fun onDictationError(message: String) { ops.add("error:$message") }
     }
@@ -57,6 +59,28 @@ class IdiolectImeCallbackTest {
         cb.commitText("the take")
         cb.insertText("old history") // reinsertion is not a fresh take to correct
         assertEquals(listOf("commit:the take"), ui.ops)
+    }
+
+    @Test
+    fun in_review_mode_a_take_is_routed_to_review_not_typed_into_the_field() {
+        val editor = RecordingEditor()
+        val ui = RecordingUi(review = true)
+        val cb = callback(editor, ui)
+        cb.commitText("dictated text")
+        // The take is NOT typed and NOT seeded as chips — it goes to the review surface.
+        assertEquals(emptyList<String>(), editor.ops)
+        assertEquals(listOf("review:dictated text"), ui.ops)
+    }
+
+    @Test
+    fun a_history_reinsert_still_types_even_in_review_mode() {
+        val editor = RecordingEditor()
+        val ui = RecordingUi(review = true)
+        val cb = callback(editor, ui)
+        // insertText is a history reinsertion, not a fresh take — review never intercepts it.
+        cb.insertText("old entry")
+        assertEquals(listOf("commit:old entry"), editor.ops)
+        assertEquals(emptyList<String>(), ui.ops)
     }
 
     @Test

@@ -1,9 +1,20 @@
 // The idiolect Android IME app. Depends on the pure-JVM `:ffi` bindings module for
 // the Rust core. JVM unit tests (`testDebugUnitTest`) run the IME logic on the host
 // JVM (no emulator); Robolectric covers the thin Android-framework seams.
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+}
+
+// Release signing for personal sideload. Credentials live in android/keystore.properties
+// (git-ignored, see .gitignore). When the file is absent — e.g. on CI or a fresh
+// checkout without the secret — the release build is left unsigned rather than failing,
+// so the workspace stays buildable everywhere.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -31,9 +42,21 @@ android {
         unitTests.isIncludeAndroidResources = true
     }
 
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         named("release") {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
@@ -66,6 +89,7 @@ dependencies {
 
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.uiautomator)
 }
 
 // Cross-compile the native core (arm64-v8a + x86_64) into build/android-ffi/jniLibs

@@ -13,10 +13,15 @@ class AudioCapture(
     /**
      * Start the source, relay each read into the queue, and — always, even on error —
      * stop the source and close the queue so the consumer terminates.
+     *
+     * This is the capture thread's whole body, so it must never throw: a mic failure
+     * (`AudioRecord` in a bad state — seen on emulators) would otherwise crash the entire
+     * IME process. Any source error just ends the take cleanly with whatever was captured;
+     * the queue is always closed so the pump thread terminates and `stop()`'s join can't hang.
      */
     fun run() {
-        source.start()
         try {
+            source.start()
             val buffer = ShortArray(bufferSamples)
             while (true) {
                 val read = source.read(buffer)
@@ -24,8 +29,10 @@ class AudioCapture(
                 // Copy exactly what was read so a short read never relays stale tail.
                 queue.offer(buffer.copyOf(read))
             }
+        } catch (e: Exception) {
+            // Mic/source failure mid-take: end the take rather than crash the capture thread.
         } finally {
-            source.stop()
+            runCatching { source.stop() }
             queue.close()
         }
     }

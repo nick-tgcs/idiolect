@@ -193,6 +193,44 @@ fn a_streamed_take_previews_a_partial_then_commits_the_whole_take() {
 }
 
 #[test]
+fn finalize_idempotency_key_survives_a_process_restart_over_the_same_store() {
+    // The take-finalize idempotency key must be unique per *session*, never a
+    // per-process in-memory counter. A real phone restarts the IME process freely
+    // (the system kills and respawns it); the SQLite store and its idempotency ledger
+    // persist across that, but an in-memory counter resets to 0. So the first take of
+    // every run would reuse the same key (`...-1`) with different text, and the
+    // persisted ledger rejects that as a conflict — crashing the dictation thread.
+    //
+    // Reproduce by dictating across two cores over the SAME data dir (a restart):
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().into_owned();
+
+    let core1 = IdiolectCore::new(path.clone(), None, Box::new(RecordingCallback::default()))
+        .expect("core1 opens");
+    dictate(&core1, "first take");
+    drop(core1);
+
+    // Restart: a fresh core over the same persisted store (any in-memory seq resets).
+    let core2 = IdiolectCore::new(path.clone(), None, Box::new(RecordingCallback::default()))
+        .expect("core2 opens");
+    core2.install_transcriber(Box::new(FixedTranscriber("second take".to_owned())));
+    core2.toggle().expect("mic on");
+    push_audio(&core2, &speech_and_silence_fixture_16khz_mono());
+    // The finalize must NOT raise an idempotency conflict against the first run's key.
+    core2
+        .toggle()
+        .expect("second take finalizes without an idempotency conflict after restart");
+
+    // Both takes are persisted in the shared store.
+    let history = core2.recent_history(10).expect("history");
+    assert_eq!(
+        history.len(),
+        2,
+        "both takes persist across the restart: {history:?}"
+    );
+}
+
+#[test]
 fn a_committed_take_persists_the_training_pair_audio() {
     // Manage the dir locally so we can inspect the on-disk recording.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -282,6 +320,45 @@ fn push_pcm_frame_is_rejected_unless_a_take_is_recording() {
 
     core.cancel().unwrap();
     assert!(core.push_pcm_frame(vec![0; 160]).is_err());
+}
+
+#[test]
+fn continuous_commits_each_phrase_at_a_pause_and_keeps_the_mic_open() {
+    let (core, cb) = new_core();
+    // A fixed decode decouples the assertion from the exact snippet count the VAD
+    // segments; we only care that each phrase commits and the mic stays open.
+    core.install_transcriber(Box::new(FixedTranscriber("phrase".to_owned())));
+
+    core.start_continuous().unwrap();
+    assert!(core.is_recording());
+
+    // This clip pauses mid-stream: in continuous mode the first phrase is committed
+    // AT that pause — before we stop — and recording continues.
+    push_audio(&core, &speech_pause_speech_fixture_16khz_mono());
+
+    let mid = cb.events();
+    assert!(
+        mid.iter().any(|e| e.starts_with("commit_text")),
+        "a phrase commits at the pause, before any stop: {mid:?}"
+    );
+    assert!(
+        !mid.iter().any(|e| e == "recording_status:false"),
+        "the mic must not stop mid-stream in continuous mode: {mid:?}"
+    );
+    assert!(core.is_recording(), "still recording across the pause");
+
+    // Stop: the final (un-paused) phrase commits and the mic closes exactly once.
+    core.toggle().unwrap();
+    let all = cb.events();
+    let commits = all.iter().filter(|e| e.starts_with("commit_text")).count();
+    assert!(
+        commits >= 2,
+        "each phrase commits — at least two total: {all:?}"
+    );
+    assert_eq!(all.last().expect("events"), "recording_status:false");
+    assert!(!core.is_recording());
+    // Two phrases ⇒ two persisted sessions (one per phrase).
+    assert!(core.recent_history(10).unwrap().len() >= 2);
 }
 
 #[test]
@@ -607,6 +684,33 @@ fn export_then_confirm_ships_a_corrected_take_and_reclaims_it() {
     assert!(
         after.is_empty(),
         "the outbox is drained after confirm: {after:?}"
+    );
+}
+
+#[test]
+fn a_reviewed_correction_by_id_ships_as_a_training_pair() {
+    // The Android review flow (👁): a finished take is reviewed and edited in a dialog, and
+    // the edit is recorded against that take's history id via `history_edited` — the path the
+    // ReviewActivity drives. Capturing this pair is the whole point, so prove it reaches the
+    // sync container the phone POSTs to the PC, exactly like an in-field correction.
+    let (core, _cb) = new_core();
+    dictate(&core, "restart trafic");
+    let id = core.recent_history(10).unwrap()[0].id;
+    core.history_edited(id, "restart traffic".to_owned())
+        .unwrap();
+
+    let bytes = core
+        .export_sync_batch("pixel".to_owned(), "batch-1".to_owned())
+        .unwrap();
+    assert!(!bytes.is_empty(), "a reviewed take should export");
+    let envelope = decode_batch(&bytes).expect("export decodes to a batch");
+    assert_eq!(envelope.batch.learnings.len(), 1);
+    let learning = &envelope.batch.learnings[0];
+    assert_eq!(learning.raw_transcript, "restart trafic");
+    assert_eq!(learning.corrected_transcript, "restart traffic");
+    assert!(
+        envelope.audio.contains_key(&learning.audio_digest),
+        "the reviewed learning's audio rides along by digest"
     );
 }
 

@@ -302,16 +302,32 @@ impl StreamingTake {
     /// decode fails or hears nothing. An empty take (no audio), or one that
     /// decodes to nothing, is [`TakeOutcome::Silent`].
     #[must_use]
-    pub fn finalize<T: TakeTranscriber>(self, transcriber: &mut T) -> TakeOutcome {
-        if self.merged_samples.is_empty() {
+    pub fn finalize<T: TakeTranscriber>(mut self, transcriber: &mut T) -> TakeOutcome {
+        // Ending the take is finalizing its one (and only) phrase.
+        self.finalize_phrase(transcriber)
+    }
+
+    /// Closes the CURRENT phrase and re-opens the take for the next one: the same
+    /// authoritative whole-phrase decode as [`Self::finalize`] (whole-recording decode,
+    /// fallback to glued previews, [`TakeOutcome::Silent`] when empty/noise), but the
+    /// accumulators and per-phrase error de-dupe reset IN PLACE so dictation continues.
+    /// Continuous mode calls this at each pause; one-shot dictation calls [`Self::finalize`]
+    /// once at stop. The segmenter and frame buffer are left intact (a pause has already
+    /// returned the segmenter to idle), so the next phrase picks up cleanly.
+    #[must_use]
+    pub fn finalize_phrase<T: TakeTranscriber>(&mut self, transcriber: &mut T) -> TakeOutcome {
+        let merged_samples = core::mem::take(&mut self.merged_samples);
+        let previewed = core::mem::take(&mut self.merged_text);
+        let last_snippet_text = self.last_snippet_text.take();
+        // Re-arm per-phrase state: each phrase is independent (own error budget, own
+        // auto-stop clock) so one phrase's glitch can't mute or auto-stop the next.
+        self.notified_error = None;
+        self.spoke = false;
+        self.silence_frames_since_speech = 0;
+
+        if merged_samples.is_empty() {
             return TakeOutcome::Silent;
         }
-        let Self {
-            merged_samples,
-            merged_text: previewed,
-            last_snippet_text,
-            ..
-        } = self;
         let (final_text, fallback_reason) = match transcriber.transcribe(&merged_samples) {
             Ok(text) => (choose_final_take_text(text, previewed), None),
             Err(failure) => (previewed, Some(failure.message)),
@@ -749,6 +765,66 @@ mod take_tests {
             take.finalize(&mut ScriptedTranscriber::new([])),
             TakeOutcome::Silent
         );
+    }
+
+    // --- finalize_phrase: continuous mode commits each phrase as the speaker pauses,
+    // then keeps the SAME take open for the next phrase (vs finalize, which ends the
+    // take). Each phrase is still an authoritative whole-phrase decode. ---
+
+    #[test]
+    fn finalize_phrase_decodes_the_phrase_then_keeps_the_take_open_for_the_next() {
+        let mut take = StreamingTake::new(&config());
+        let mut transcriber = ScriptedTranscriber::new([
+            ok("restart"),         // phrase 1 snippet preview
+            ok("restart traffic"), // phrase 1 whole-phrase decode
+            ok("deploy"),          // phrase 2 snippet preview
+            ok("deploy nginx"),    // phrase 2 whole-phrase decode
+        ]);
+        let mut observer = RecordingObserver::default();
+
+        // Phrase 1: a pause-completed snippet, then the phrase boundary.
+        take.fold_snippet(&mut transcriber, &mut observer, snippet())
+            .expect("fold");
+        match take.finalize_phrase(&mut transcriber) {
+            TakeOutcome::Speech(f) => assert_eq!(f.final_text, "restart traffic"),
+            TakeOutcome::Silent => panic!("expected phrase 1 speech"),
+        }
+
+        // The take is reusable: phrase 2's text must NOT carry phrase 1's words
+        // (the accumulators reset at the boundary).
+        take.fold_snippet(&mut transcriber, &mut observer, snippet())
+            .expect("fold");
+        match take.finalize_phrase(&mut transcriber) {
+            TakeOutcome::Speech(f) => assert_eq!(f.final_text, "deploy nginx"),
+            TakeOutcome::Silent => panic!("expected phrase 2 speech"),
+        }
+    }
+
+    #[test]
+    fn finalize_phrase_with_no_audio_is_silent_and_decodes_nothing() {
+        let mut take = StreamingTake::new(&config());
+        // An empty scripted transcriber: if finalize_phrase tried to decode an empty
+        // phrase it would panic ("called more times than scripted").
+        let mut transcriber = ScriptedTranscriber::new([]);
+        assert_eq!(take.finalize_phrase(&mut transcriber), TakeOutcome::Silent);
+    }
+
+    #[test]
+    fn finalize_phrase_re_arms_the_once_per_phrase_failure_notice() {
+        // A decode failure is surfaced at most once per *phrase*: after the boundary
+        // the same code may notify again (continuous can't go silent after one glitch).
+        let mut take = StreamingTake::new(&config());
+        let mut transcriber =
+            ScriptedTranscriber::new([Err(failure("decode")), Err(failure("decode"))]);
+        let mut observer = RecordingObserver::default();
+
+        take.fold_snippet(&mut transcriber, &mut observer, snippet())
+            .expect("fold");
+        let _ = take.finalize_phrase(&mut transcriber); // Silent (failed fold kept no audio)
+        take.fold_snippet(&mut transcriber, &mut observer, snippet())
+            .expect("fold");
+
+        assert_eq!(observer.failures.len(), 2, "each phrase re-arms the notice");
     }
 
     #[test]

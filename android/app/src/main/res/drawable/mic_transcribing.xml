@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Transcribing mic: a neutral grey disc (a thin progress bar shows above it). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@color/idiolect_slate2" />
+</shape>

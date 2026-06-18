@@ -30,6 +30,13 @@ class IdiolectImeCallback(
     }
 
     override fun commitText(text: String) {
+        // Review mode (👁): hand the finished take to the centred review surface instead of
+        // typing it — the user edits it with their own keyboard and the edit is captured as
+        // a training pair. The take is already persisted, so nothing is lost.
+        if (ui.isReviewEnabled()) {
+            ui.onReviewRequested(text)
+            return
+        }
         editorProvider()?.commitText(text)
         // A take landed: tell the UI so it can build the correction strip. (A history
         // reinsert uses insertText, which is not a fresh take and does not notify.)

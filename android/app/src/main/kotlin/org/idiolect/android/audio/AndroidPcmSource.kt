@@ -30,6 +30,13 @@ class AndroidPcmSource : PcmSource {
             ENCODING,
             bufferBytes,
         )
+        // If the recorder couldn't initialise (no usable mic — happens on emulators),
+        // release it and fail clearly rather than calling startRecording() on a dead object.
+        // AudioCapture catches this and ends the take cleanly instead of crashing.
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.release()
+            throw IllegalStateException("AudioRecord failed to initialise (state=${recorder.state})")
+        }
         recorder.startRecording()
         record = recorder
     }
@@ -43,8 +50,12 @@ class AndroidPcmSource : PcmSource {
 
     override fun stop() {
         record?.let { recorder ->
-            recorder.stop()
-            recorder.release()
+            // AudioRecord.stop() throws IllegalStateException if the recorder errored or was
+            // never initialised; never let that escape (it runs on both the capture thread
+            // and the main thread via DictationController.stop()). Always release the native
+            // buffer regardless.
+            runCatching { recorder.stop() }
+            runCatching { recorder.release() }
         }
         record = null
     }

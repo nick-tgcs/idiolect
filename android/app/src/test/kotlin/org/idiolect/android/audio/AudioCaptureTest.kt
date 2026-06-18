@@ -71,6 +71,46 @@ class AudioCaptureTest {
         assertEquals(listOf("start", "stop"), source.events)
     }
 
+    /** A source that fails on start() — e.g. AudioRecord in a bad state on some emulators. */
+    private class FailingStartSource : PcmSource {
+        override fun start() = throw IllegalStateException("mic unavailable")
+        override fun read(into: ShortArray): Int = 0
+        override fun stop() = Unit
+    }
+
+    /** A source that reads fine but throws on stop() (AudioRecord.stop in an error state). */
+    private class FailingStopSource(private val chunks: List<ShortArray>) : PcmSource {
+        private var index = 0
+        override fun start() = Unit
+        override fun read(into: ShortArray): Int {
+            if (index >= chunks.size) return 0
+            chunks[index++].copyInto(into)
+            return chunks[index - 1].size
+        }
+        override fun stop() = throw IllegalStateException("AudioRecord.stop in bad state")
+    }
+
+    @Test
+    fun capture_ends_cleanly_and_closes_the_queue_when_the_source_fails_to_start() {
+        val queue = PcmFrameQueue()
+        // Must NOT propagate (an uncaught throw on the capture thread crashes the whole IME).
+        AudioCapture(FailingStartSource(), queue, bufferSamples = 8).run()
+        // And the queue must be closed so the pump thread terminates (stop()'s join won't hang).
+        val got = mutableListOf<List<Short>>()
+        queue.consume { got.add(it.toList()) }
+        assertTrue("no frames captured when start failed", got.isEmpty())
+    }
+
+    @Test
+    fun capture_does_not_crash_when_stop_throws_and_still_delivers_what_it_read() {
+        val queue = PcmFrameQueue()
+        // A throwing stop() (the real AndroidPcmSource emulator crash) must not propagate.
+        AudioCapture(FailingStopSource(listOf(shortArrayOf(1, 2))), queue, bufferSamples = 8).run()
+        val got = mutableListOf<List<Short>>()
+        queue.consume { got.add(it.toList()) }
+        assertEquals(listOf(listOf<Short>(1, 2)), got)
+    }
+
     @Test
     fun capture_copies_only_the_samples_actually_read() {
         // A short read (fewer samples than the buffer) must not leak stale tail bytes.

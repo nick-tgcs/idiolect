@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Ship the learning outbox to the user's PC and pull the model back (M5/M6). -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -13,6 +14,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Auto-return after a reviewed Insert: idiolect re-selects itself as the active IME so the
+         mic comes back without a manual keyboard switch. Android won't let an app pick an IME
+         without this; it is NOT auto-granted for a sideloaded app — grant it once via
+         `adb shell pm grant <pkg> android.permission.WRITE_SECURE_SETTINGS`. Without the grant the
+         feature degrades to a one-tap return on the system IME switcher. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="false"
@@ -29,6 +37,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The centred "Review dictation" surface (the 👁 flow): a translucent window over
+             the host app, edited with the user's own keyboard. Not exported. -->
+        <activity
+            android:name=".ime.ReviewActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:windowSoftInputMode="stateVisible|adjustResize" />
 
         <!-- The IME itself. BIND_INPUT_METHOD restricts binding to the system. -->
         <service
@@ -49,5 +66,21 @@
             android:name=".audio.MicForegroundService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- "Instant insert": the only API that can type the reviewed correction into the
+             user's app while their own keyboard is active (the 👁 flow). Opt-in, user-enabled
+             in Accessibility settings; dictation works without it. -->
+        <service
+            android:name=".accessibility.IdiolectAccessibilityService"
+            android:exported="false"
+            android:label="@string/accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service" />
+        </service>
     </application>
 </manifest>

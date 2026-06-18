@@ -493,6 +493,9 @@ fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, Ru
             gpu_device: 0,
             language: profile.asr_language.clone(),
             n_threads: profile.asr_threads,
+            // The desktop keeps beam search (the default): it has the GPU/CPU headroom
+            // for the small accuracy gain. The mobile facade opts into greedy instead.
+            beam_size: WhisperOptions::default().beam_size,
         };
         eprintln!(
             "whisper: loading model {} (gpu={})",

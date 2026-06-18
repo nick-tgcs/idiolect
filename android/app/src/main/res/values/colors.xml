@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  idiolect brand palette (matches the desktop tray/review-dialog: accent periwinkle on
+  slate greys). Used by the voice keyboard's circular mic + control strip.
+-->
+<resources>
+    <color name="idiolect_accent">#7c83fd</color>
+    <color name="idiolect_accent_bright">#a6abff</color>
+    <color name="idiolect_live">#eb5757</color>
+    <color name="idiolect_bg">#16171e</color>
+    <color name="idiolect_panel">#1b1e27</color>
+    <color name="idiolect_strip">#272b36</color>
+    <color name="idiolect_surface">#1f212b</color>
+    <color name="idiolect_field">#101117</color>
+    <color name="idiolect_slate">#333845</color>
+    <color name="idiolect_slate2">#454b5c</color>
+    <color name="idiolect_text">#e5e7f0</color>
+    <color name="idiolect_grey">#c7cad3</color>
+    <color name="idiolect_muted">#8c90a1</color>
+
+    <!-- glow halo (accent at low alpha) painted behind the listening mic -->
+    <color name="idiolect_accent_glow">#3d7c83fd</color>
+    <!-- glow halo (live red at low alpha) painted behind the continuous mic -->
+    <color name="idiolect_live_glow">#3deb5757</color>
+
+    <!-- mic glyph tints, semantic names so VoiceVisuals reads cleanly -->
+    <color name="mic_glyph_idle">#7c83fd</color>
+    <color name="mic_glyph_active">#ffffff</color>
+</resources>
