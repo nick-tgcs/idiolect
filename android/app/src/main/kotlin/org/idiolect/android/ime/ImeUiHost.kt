@@ -19,6 +19,14 @@ interface ImeUiHost {
     fun isReviewEnabled(): Boolean
 
     /**
+     * Live partial transcript during a review-mode take. In review mode the words must NOT be
+     * typed into the host field (they'd land in the target app, then get clawed back) — they
+     * stream onto idiolect's own review surface instead. An empty [text] clears the surface
+     * (a cancelled preedit). Only called when [isReviewEnabled] is true for the take.
+     */
+    fun onLivePreedit(text: String)
+
+    /**
      * Review mode intercepted a finished take: open the centred review surface for [text].
      * The take is already persisted (audio + raw transcript + a history id); the user edits
      * it with their own keyboard, the edit is recorded as a training pair, and the approved

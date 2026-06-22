@@ -1,17 +1,20 @@
 package org.idiolect.android.ime
 
 /**
- * The pure rule for the value that selects idiolect as the active IME — written to
- * `Settings.Secure.DEFAULT_INPUT_METHOD` by [ReviewActivity] after Insert so the mic returns
- * without a manual keyboard switch (the auto-return path; needs a one-time WRITE_SECURE_SETTINGS
- * grant, see [ReviewActivity.returnToIdiolect]).
+ * Picks idiolect's IME id — exactly as the framework registered it — from the enabled-IME list,
+ * so the value written to `Settings.Secure.DEFAULT_INPUT_METHOD` (to pull the active keyboard
+ * back to idiolect after a reviewed Insert) is one the framework recognises.
  *
- * It must match what the framework stores: the *fully-qualified* flattened component
- * `pkg/full.Class` (the same string `ComponentName(pkg, cls).flattenToString()` produces — note
- * it is NOT abbreviated to `pkg/.Class`). Kept here, free of Android types, so it can be
- * unit-tested ([ImeSelectionTest]) on the JVM.
+ * The id MUST be the framework's own: its `flattenToShortString` form, which abbreviates a class
+ * under its own package to a leading dot (`pkg/.ime.Class`). Reconstructing the *long* form
+ * `pkg/pkg.ime.Class` — the original mistake here — makes InputMethodManagerService reject it as
+ * "Unknown id" and the IME switch silently fails (so the mic never comes back). Taking the id
+ * straight from `InputMethodManager.enabledInputMethodList` sidesteps the format question
+ * entirely. Pure of Android types so it's unit-tested ([ImeSelectionTest]); the framework call
+ * that supplies the list is the thin boundary on [org.idiolect.android.accessibility]'s service.
  */
 object ImeSelection {
-    fun idiolectImeId(packageName: String, serviceClass: String): String =
-        "$packageName/$serviceClass"
+    /** idiolect's enabled-IME id (the framework's own short-form string), or null if not enabled. */
+    fun idiolectImeId(enabled: List<EnabledKeyboard>, ownPackage: String): String? =
+        enabled.firstOrNull { it.packageName == ownPackage }?.id
 }

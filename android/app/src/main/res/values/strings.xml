@@ -24,6 +24,8 @@
     <string name="setup_pairing">Pairing with your PC…</string>
     <string name="setup_pairing_error">Pairing failed: %1$s</string>
     <string name="setup_ready">idiolect is ready. Tap a text field and use the mic to dictate.</string>
+    <string name="setup_tagline">On-device voice dictation</string>
+    <string name="setup_step">Step %1$d of %2$d</string>
 
     <string name="fgs_channel">Dictation</string>
     <string name="fgs_listening_title">idiolect is listening</string>
@@ -32,12 +34,53 @@
     <string name="voice_listening">Listening…</string>
     <string name="voice_transcribing">Transcribing…</string>
     <string name="voice_continuous">● Continuous — tap to stop</string>
+    <string name="voice_holding">● Recording — release to send</string>
     <string name="voice_idle_hint">Hold to talk · double-tap for continuous</string>
     <string name="voice_mic_desc">Dictation microphone</string>
     <!-- ⌨ hands the field to the user's own keyboard (system IME switch) — idiolect never
-         renders its own typing keyboard. 👁 opens the review dialog before a take lands. -->
+         renders its own typing keyboard. 👁 opens the review dialog before a take lands.
+         ⚙ opens the settings screen (pairing, dictation modes, model, storage). -->
     <string name="voice_strip_keyboard">Switch to your keyboard</string>
     <string name="voice_strip_review">Review before insert</string>
+    <string name="voice_strip_settings">Settings</string>
+
+    <!-- Settings screen (reached via the ⚙ on the mic strip). -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_section_connection">Connect to PC</string>
+    <string name="settings_not_connected">Not connected</string>
+    <string name="settings_connected">Paired ✓</string>
+    <string name="settings_scan_cta">Scan QR to pair</string>
+    <string name="settings_scan_hint">On your PC run:\nidiolect-sync-server --pair</string>
+    <string name="settings_manual_link">Enter address manually</string>
+    <string name="settings_manual_url_hint">PC URL (e.g. http://10.0.2.2:8765, --no-tls)</string>
+    <string name="settings_manual_token_hint">Pairing token</string>
+    <string name="settings_manual_connect">Connect</string>
+    <string name="settings_manual_incomplete">Enter both the PC URL and a pairing token.</string>
+    <string name="settings_endpoint">PC endpoint</string>
+    <string name="settings_pin_verified">Pinned certificate ✓ verified by QR</string>
+    <string name="settings_pin_cleartext">Not pinned · cleartext (--no-tls)</string>
+    <string name="settings_repair">Re-pair (scan)</string>
+    <string name="settings_unpair">Unpair</string>
+    <string name="settings_pairing">Pairing with your PC…</string>
+    <string name="settings_pairing_error">Pairing failed: %1$s</string>
+    <string name="settings_section_model">Speech model</string>
+    <string name="settings_section_dictation">Dictation</string>
+    <string name="settings_review_label">Review before insert</string>
+    <string name="settings_review_sub">Open each take to edit before it lands</string>
+    <string name="settings_continuous_label">Continuous on double-tap</string>
+    <string name="settings_continuous_sub">Double-tap the mic to dictate hands-free</string>
+    <string name="settings_section_learning">Learning</string>
+    <string name="settings_ship_label">Ship corrections to your PC</string>
+    <string name="settings_ship_sub">Your edits train your own model at home</string>
+    <string name="settings_section_audio">Audio on device</string>
+    <string name="settings_audio_sub">Captured audio; the oldest is evicted at the cap</string>
+    <string name="settings_section_system">System</string>
+    <string name="settings_system_keyboard">Keyboard</string>
+    <string name="settings_system_mic">Microphone</string>
+    <string name="settings_enabled">Enabled ✓</string>
+    <string name="settings_not_enabled">Not enabled — tap to fix</string>
+    <string name="settings_granted">Granted ✓</string>
+    <string name="settings_not_granted">Not granted — tap to fix</string>
 
     <string name="review_title">Review dictation</string>
     <string name="review_hint">Edit it with your keyboard — your fix is recorded for training.</string>

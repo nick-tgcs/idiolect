@@ -6,6 +6,13 @@ sealed interface VoiceStatus {
     data object Listening : VoiceStatus
 
     /**
+     * Press-and-hold (press-to-talk) is recording: the mic shows the red "release to send"
+     * look. Distinct from [Listening] (a single-tap take) so the red is specific to a hold,
+     * set the instant the hold gesture is recognised and held until the hold is released.
+     */
+    data object Holding : VoiceStatus
+
+    /**
      * The take was stopped and the whole-take decode is running (off the UI thread).
      * Shown the instant the user stops, so the mic gives immediate feedback rather than
      * looking stuck on "Listening…" until the seconds-long decode commits.
@@ -45,6 +52,13 @@ class VoiceModePresenter {
      * recording state itself still comes from the core); cleared when recording stops.
      */
     private var continuous = false
+
+    /**
+     * Set the moment a press-and-hold is recognised (the mic's hold gesture), before the
+     * core's `recording_status(true)` arrives — so the mic flips to the red [VoiceStatus.Holding]
+     * look at once. Cleared when recording stops or a continuous take is requested.
+     */
+    private var holding = false
     private var error: String? = null
 
     @Synchronized
@@ -54,8 +68,11 @@ class VoiceModePresenter {
         // decode + commit — so by the time either edge arrives the transcribe is over.
         if (recording) error = null
         transcribing = false
-        // Recording stopped → the continuous take is over.
-        if (!recording) continuous = false
+        // Recording stopped → the continuous/hold take is over (don't let the red stick).
+        if (!recording) {
+            continuous = false
+            holding = false
+        }
         return status()
     }
 
@@ -66,10 +83,21 @@ class VoiceModePresenter {
         return status()
     }
 
+    /** The user pressed-and-held the mic: show the red press-to-talk look at once. */
+    @Synchronized
+    fun onHoldStarted(): VoiceStatus {
+        holding = true
+        error = null
+        transcribing = false
+        return status()
+    }
+
     /** The user double-tapped to enter continuous mode: show it at once. */
     @Synchronized
     fun onContinuousStarted(): VoiceStatus {
         continuous = true
+        // A hold can't also be continuous — the explicit continuous intent supersedes it.
+        holding = false
         error = null
         transcribing = false
         return status()
@@ -87,6 +115,7 @@ class VoiceModePresenter {
         return when {
             transcribing -> VoiceStatus.Transcribing
             continuous -> VoiceStatus.Continuous
+            holding -> VoiceStatus.Holding
             recording -> VoiceStatus.Listening
             currentError != null -> VoiceStatus.Error(currentError)
             else -> VoiceStatus.Idle

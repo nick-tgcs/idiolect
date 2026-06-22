@@ -26,6 +26,8 @@ import org.idiolect.android.audio.MicForegroundService
 import org.idiolect.android.core.CoreCallbackRouter
 import org.idiolect.android.core.IdiolectCoreHost
 import org.idiolect.android.model.ModelStore
+import org.idiolect.android.settings.SettingsActivity
+import org.idiolect.android.settings.SettingsStore
 import org.idiolect.android.sync.SyncScheduler
 import org.idiolect.ffi.IdiolectCore
 import java.io.File
@@ -42,8 +44,8 @@ import kotlin.concurrent.thread
  * hands the field to the user's *own* keyboard via the system IME switch (the `⌨` button,
  * see [SwitchToYourKeyboard]). The `👁` toggle is review mode: a finished take opens the
  * centred [ReviewActivity] (edited with the user's keyboard, the edit captured as a training
- * pair) before it lands. So the view is just a status line + a circular mic + a two-button
- * control strip.
+ * pair) before it lands. So the view is just a status line + a circular mic + a control strip
+ * (⌨ switch-keyboard · 👁 review · ⚙ settings).
  *
  * Voice status comes from [VoiceModePresenter]; recording state is the core's to decide,
  * so the view waits for [ImeUiHost.onRecordingChanged] rather than flipping optimistically
@@ -62,12 +64,18 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // take (seconds of whisper). One thread keeps taps ordered; shut down in onDestroy.
     private val toggleExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "idiolect-mic-toggle") }
     private val modelStore by lazy { ModelStore(File(filesDir, "models/whisper")) }
+    // Persisted dictation/sync toggles set on the settings screen (⚙). Read here so the strip's
+    // 👁 default, the double-tap-for-continuous gesture, and outbox shipping honour the user's choice.
+    private val settingsStore by lazy { SettingsStore.under(filesDir) }
     private val modelLoadStarted = AtomicBoolean(false)
     private var root: FrameLayout? = null
     private var statusView: TextView? = null
     private var micButton: ImageButton? = null
     private var progressBar: ProgressBar? = null
     private var reviewButton: ImageButton? = null
+    // The in-surface review card that shows the live transcript while a review-mode take runs
+    // (review on ⇒ words never touch the host field — they stream here). GONE when empty.
+    private var liveCard: TextView? = null
     // 👁 review mode: OFF = the take lands in the field directly; ON = a finished take opens
     // the centred review surface first. Toggled on the UI thread, read on the core's callback
     // thread (commitText) → @Volatile.
@@ -108,14 +116,22 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             // edit is captured when idiolect regains focus (onStartInputView).
             onEnterEdit = { switchToYourKeyboard() },
         )
+        // Start the 👁 toggle from the persisted default (set on the settings screen). A tiny
+        // flag-file read; the toggle is read later on the callback thread, so seed it now.
+        reviewEnabled = settingsStore.reviewByDefault()
     }
 
     /**
      * Nudge the outbox toward the PC (M6). A no-op if nothing is pending or no endpoint is
      * configured; WorkManager defers it until there's a network, and the scheduler's KEEP
      * policy collapses a burst of corrections into one job.
+     *
+     * Gated by the "Ship corrections to your PC" setting (⚙): when off, corrections are still
+     * captured locally — just not shipped, so they accumulate in the outbox until it's re-enabled.
      */
-    private fun scheduleSync() = SyncScheduler.enqueue(this)
+    private fun scheduleSync() {
+        if (settingsStore.shipCorrections()) SyncScheduler.enqueue(this)
+    }
 
     /** The live field as a [FieldEditor], or `null` between fields. */
     private fun fieldEditor(): FieldEditor? =
@@ -158,7 +174,19 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         val container = FrameLayout(this)
         root = container
         renderVoiceSurface()
+        // Render live partials onto whatever live card is currently built (it's rebuilt on each
+        // surface render, so the listener reads the field rather than capturing a stale view).
+        // push() arrives on the core's callback thread → marshal to main.
+        LiveReview.bind { text -> main.post { showLiveCard(text) } }
         return container
+    }
+
+    /** Show/hide the in-surface review card with the current live transcript. */
+    private fun showLiveCard(text: String) {
+        liveCard?.apply {
+            this.text = text
+            visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+        }
     }
 
     /** (Re)build the one-and-only surface — the mic view — in place (no new window). */
@@ -171,6 +199,7 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         micButton = null
         progressBar = null
         reviewButton = null
+        liveCard = null
         container.addView(buildVoiceView())
     }
 
@@ -211,6 +240,20 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             }
         }
         micButton = micKey
+
+        // The live review card: while review mode is on, the streaming transcript shows here
+        // (never in the host field). Styled like the review dialog's field; hidden when empty.
+        val live = TextView(this).apply {
+            textSize = 15f
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 2
+            background = ContextCompat.getDrawable(this@IdiolectImeService, R.drawable.review_field_bg)
+            setPadding(dp(12), dp(11), dp(12), dp(11))
+            setTextColor(ContextCompat.getColor(this@IdiolectImeService, R.color.idiolect_text))
+            visibility = View.GONE
+        }
+        liveCard = live
+
         render(presenter.status())
         val stage = FrameLayout(this).apply {
             addView(micKey, FrameLayout.LayoutParams(dp(92), dp(92), Gravity.CENTER))
@@ -232,6 +275,13 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             )
             addView(status, wrap())
             addView(
+                live,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(8) },
+            )
+            addView(
                 stage,
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -241,7 +291,7 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         }
     }
 
-    /** The rounded control-strip pill: ⌨ switch-to-your-keyboard · 👁 review-before-insert. */
+    /** The rounded control-strip pill: ⌨ switch-to-your-keyboard · 👁 review-before-insert · ⚙ settings. */
     private fun buildControlStrip(): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -259,6 +309,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         ) { toggleReview() }
         reviewButton = review
         row.addView(review, stripLp())
+        row.addView(
+            stripButton(R.drawable.ic_settings, R.string.voice_strip_settings, lit = false) { openSettings() },
+            stripLp(),
+        )
         return row
     }
 
@@ -290,7 +344,15 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     private fun toggleReview() {
         reviewEnabled = !reviewEnabled
         reviewButton?.let { paintStripButton(it, reviewEnabled) }
+        // The 👁 strip toggle and the settings "Review before insert" switch are one setting:
+        // persist the flip so it sticks across service teardowns (keyboard switches) and shows
+        // through on the settings screen. Off the UI thread — it's a file write.
+        val persist = reviewEnabled
+        thread(isDaemon = true, name = "idiolect-pref-review") { settingsStore.setReviewByDefault(persist) }
     }
+
+    /** Open the settings screen (⚙ on the strip): pairing, dictation modes, model, storage. */
+    private fun openSettings() = SettingsActivity.launch(this)
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
@@ -333,10 +395,20 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     /** Maps recognised gestures onto the mic + presenter (see [MicGestureRecognizer]). */
     private val micGestures = object : MicGestures {
-        override fun onHoldStart() = startTake()
+        // Press-to-talk: show the red Holding look at once (before the core confirms recording),
+        // then open the mic. A single tap deliberately does NOT — it stays the accent Listening.
+        override fun onHoldStart() {
+            render(presenter.onHoldStarted())
+            startTake()
+        }
         override fun onHoldEnd() = stopTake()
         override fun onSingleTap() = if (isRecordingUi()) stopTake() else startTake()
-        override fun onDoubleTap() = if (isRecordingUi()) stopTake() else startContinuous()
+        override fun onDoubleTap() = when {
+            isRecordingUi() -> stopTake()
+            // "Continuous on double-tap" (⚙) off ⇒ a double-tap is just a one-shot take.
+            settingsStore.continuousOnDoubleTap() -> startContinuous()
+            else -> startTake()
+        }
     }
 
     private val recognizer = MicGestureRecognizer(micGestures, gestureClock)
@@ -344,7 +416,9 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     /** Whether the UI currently shows a live take — read from the presenter, never the core
      * (which would block the UI thread behind a decode). */
     private fun isRecordingUi(): Boolean =
-        presenter.status().let { it is VoiceStatus.Listening || it is VoiceStatus.Continuous }
+        presenter.status().let {
+            it is VoiceStatus.Listening || it is VoiceStatus.Holding || it is VoiceStatus.Continuous
+        }
 
     /** Start a one-shot take (a hold, or a tap from idle). */
     private fun startTake() {
@@ -432,6 +506,13 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     override fun isReviewEnabled(): Boolean = reviewEnabled && !takeIsContinuous
 
+    override fun onLivePreedit(text: String) {
+        // Review mode: the live partials stream onto idiolect's own review card via the channel
+        // (never the host field). Fires on the core's callback thread; the bound listener marshals
+        // the render to the main thread.
+        LiveReview.push(text)
+    }
+
     override fun onReviewRequested(text: String) {
         // A finished take, with review on. The take is already persisted with a history id;
         // open the centred review surface for it and DON'T type it into the host field. This
@@ -442,6 +523,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
                 setComposingText("")
                 finishComposingText()
             }
+            // Hide the in-surface live card; the seeded review dialog now takes over.
+            LiveReview.reset()
         }
         // The history lookup decrypts the on-disk store — do it off the callback/main thread
         // (on main it stalled the dialog open by ~hundreds of ms), then launch from main. A
@@ -487,6 +570,7 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         super.onDestroy()
         controller.stop()
         toggleExecutor.shutdown()
+        LiveReview.bind(null) // stop streaming live partials to this dying surface
         router.unbind(imeCallback) // stop routing core pushes to this dying IME
         coreClosed = true
         // Drop our reference. The core only closes if nothing else holds it — the review
@@ -501,6 +585,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
                 getString(R.string.voice_idle_hint) to R.color.idiolect_muted
             is VoiceStatus.Listening ->
                 getString(R.string.voice_listening) to R.color.idiolect_accent_bright
+            is VoiceStatus.Holding ->
+                getString(R.string.voice_holding) to R.color.idiolect_live
             is VoiceStatus.Continuous ->
                 getString(R.string.voice_continuous) to R.color.idiolect_live
             is VoiceStatus.Transcribing ->

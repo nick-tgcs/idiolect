@@ -125,4 +125,58 @@ class VoiceModePresenterTest {
         val presenter = VoiceModePresenter()
         assertEquals(VoiceStatus.Listening, presenter.onRecordingChanged(true))
     }
+
+    // --- Holding: press-and-hold (press-to-talk) gets the red mic the instant the hold is
+    // recognised, held across the core's recording confirmation, until release stops it.
+    // A single-tap take stays the accent Listening look — the red is *specific* to a hold. ---
+
+    @Test
+    fun a_hold_shows_the_red_holding_state_immediately() {
+        val presenter = VoiceModePresenter()
+        assertEquals(VoiceStatus.Holding, presenter.onHoldStarted())
+    }
+
+    @Test
+    fun holding_survives_the_cores_recording_confirmation() {
+        val presenter = VoiceModePresenter()
+        presenter.onHoldStarted()
+        // startTake() pushes recording_status(true) after the gesture; it must NOT downgrade
+        // to Listening (else the red flickers to accent the moment capture starts).
+        assertEquals(VoiceStatus.Holding, presenter.onRecordingChanged(true))
+    }
+
+    @Test
+    fun a_single_tap_take_is_listening_not_holding() {
+        val presenter = VoiceModePresenter()
+        // No onHoldStarted(): a lone tap-initiated take is the accent Listening look, not red.
+        assertEquals(VoiceStatus.Listening, presenter.onRecordingChanged(true))
+    }
+
+    @Test
+    fun releasing_a_hold_shows_transcribing_then_idle() {
+        val presenter = VoiceModePresenter()
+        presenter.onHoldStarted()
+        presenter.onRecordingChanged(true)
+        // Release requests stop: the red flips to grey-transcribing while the decode runs.
+        assertEquals(VoiceStatus.Transcribing, presenter.onStopRequested())
+        assertEquals(VoiceStatus.Idle, presenter.onRecordingChanged(false))
+    }
+
+    @Test
+    fun holding_clears_when_recording_stops_so_the_red_is_not_sticky() {
+        val presenter = VoiceModePresenter()
+        presenter.onHoldStarted()
+        presenter.onRecordingChanged(true)
+        presenter.onRecordingChanged(false)
+        // A later plain take must not inherit the red.
+        assertEquals(VoiceStatus.Listening, presenter.onRecordingChanged(true))
+    }
+
+    @Test
+    fun continuous_overrides_a_stray_holding_flag() {
+        val presenter = VoiceModePresenter()
+        presenter.onHoldStarted()
+        // A hold can't also be continuous; the explicit continuous intent wins.
+        assertEquals(VoiceStatus.Continuous, presenter.onContinuousStarted())
+    }
 }

@@ -23,6 +23,8 @@ object VoiceVisuals {
             MicVisual(R.drawable.mic_idle, R.color.mic_glyph_idle, showProgress = false)
         VoiceStatus.Listening ->
             MicVisual(R.drawable.mic_listening, R.color.mic_glyph_active, showProgress = false)
+        VoiceStatus.Holding ->
+            MicVisual(R.drawable.mic_holding, R.color.mic_glyph_active, showProgress = false)
         VoiceStatus.Continuous ->
             MicVisual(R.drawable.mic_continuous, R.color.mic_glyph_active, showProgress = false)
         VoiceStatus.Transcribing ->

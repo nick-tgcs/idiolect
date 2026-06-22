@@ -1,7 +1,11 @@
 package org.idiolect.android.sync
 
-/** The outcome of pairing from a scan: the paired endpoint and its per-device token. */
-data class PairedEndpoint(val baseUrl: String, val token: String)
+/**
+ * The outcome of pairing from a scan: the paired endpoint, its per-device token, and — under
+ * TLS (the default) — the cert [pin] the QR carried, so the caller's follow-on model pull
+ * reaches the same pinned cert.
+ */
+data class PairedEndpoint(val baseUrl: String, val token: String, val pin: String? = null)
 
 /**
  * Turns a scanned pairing QR into a paired device: parse the [PairingUri], then exchange
@@ -16,7 +20,7 @@ data class PairedEndpoint(val baseUrl: String, val token: String)
 class ScanPairing(private val pairingClient: PairingClient) {
     fun pairFromScan(scanned: String): PairedEndpoint {
         val pairing = PairingUri.parse(scanned)
-        val response = pairingClient.pair(pairing.baseUrl, pairing.code)
-        return PairedEndpoint(pairing.baseUrl, response.token)
+        val response = pairingClient.pair(pairing.baseUrl, pairing.code, pairing.pin)
+        return PairedEndpoint(pairing.baseUrl, response.token, pairing.pin)
     }
 }

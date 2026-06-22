@@ -34,7 +34,7 @@ class SyncWorker(context: Context, params: WorkerParameters) : Worker(context, p
         return try {
             val pump = OutboxPump(
                 source = CoreSyncSource(core),
-                transport = HttpSyncTransport(settings.baseUrl, settings.token),
+                transport = HttpSyncTransport(settings.baseUrl, settings.token, settings.pin),
                 deviceId = deviceId,
             )
             pump.drain()

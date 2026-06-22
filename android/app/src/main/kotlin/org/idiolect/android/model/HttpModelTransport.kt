@@ -1,19 +1,25 @@
 package org.idiolect.android.model
 
+import org.idiolect.android.sync.applyPinning
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * [ModelTransport] over HTTP to the user's PC (`idiolect-sync-server`, M5b). Uses
+ * [ModelTransport] over HTTP(S) to the user's PC (`idiolect-sync-server`, M5b). Uses
  * `HttpURLConnection` (no third-party dependency — keeps the APK lean and FOSS for
  * GrapheneOS), sends the bearer token, and asks for a byte Range to resume. This is a
  * thin framework seam; the orchestration it serves is host-tested via a fake, and the
  * seam itself is covered by a host test against an in-JVM HTTP server.
+ *
+ * Under TLS (the default) the paired [pin] is applied via [applyPinning], so the model is
+ * pulled only from the pinned cert; a cleartext (`--no-tls`) endpoint passes a null [pin].
+ * The separate public-CDN download stays on system trust via `PublicModelTransport`.
  */
 class HttpModelTransport(
     private val baseUrl: String,
     private val token: String,
+    private val pin: String? = null,
     private val connectTimeoutMs: Int = 15_000,
     private val readTimeoutMs: Int = 60_000,
 ) : ModelTransport {
@@ -56,6 +62,7 @@ class HttpModelTransport(
 
     private fun open(path: String): HttpURLConnection {
         val connection = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
+        applyPinning(connection, pin)
         connection.connectTimeout = connectTimeoutMs
         connection.readTimeout = readTimeoutMs
         connection.setRequestProperty("Authorization", "Bearer $token")

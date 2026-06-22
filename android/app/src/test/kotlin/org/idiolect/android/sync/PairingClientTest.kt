@@ -26,15 +26,16 @@ class PairingClientTest {
     private fun config() = SecureSyncConfig(
         urlFile = File(dir, SecureSyncConfig.URL_FILE_NAME),
         tokenStore = PairingTokenStore(FakeEnvelope(), File(dir, PairingTokenStore.FILE_NAME)),
+        pinFile = File(dir, SecureSyncConfig.PIN_FILE_NAME),
     )
 
     @Test
-    fun a_successful_pair_persists_the_endpoint_and_token() {
+    fun a_successful_cleartext_pair_persists_the_endpoint_and_token() {
         val transport = RecordingTransport(PairingResponse("tok-xyz", "pixel-7a", "default"))
         val config = config()
-        val client = PairingClient(config, "pixel-7a") { transport }
+        val client = PairingClient(config, "pixel-7a") { _, _ -> transport }
 
-        val response = client.pair("http://pc.local:8765", "GOODCODE")
+        val response = client.pair("http://pc.local:8765", "GOODCODE", pin = null)
 
         assertEquals("tok-xyz", response.token)
         assertEquals("the code reached the transport", "GOODCODE", transport.requestedCode)
@@ -42,11 +43,28 @@ class PairingClientTest {
         val saved = config.load()!!
         assertEquals("http://pc.local:8765", saved.baseUrl)
         assertEquals("tok-xyz", saved.token)
+        assertNull("a cleartext pair persists no pin", saved.pin)
+    }
+
+    @Test
+    fun a_pinned_pair_hands_the_pin_to_the_transport_and_persists_it() {
+        // TLS (the default): the pin from the QR must reach the transport (so it pins the
+        // handshake) and be persisted (so later syncs re-pin the same cert).
+        val transport = RecordingTransport(PairingResponse("tok-xyz", "pixel-7a", "default"))
+        val config = config()
+        var builtPin: String? = "UNSET"
+        val client = PairingClient(config, "pixel-7a") { _, pin -> builtPin = pin; transport }
+        val pin = "deadbeef".repeat(8)
+
+        client.pair("https://10.0.2.2:8765", "GOODCODE", pin)
+
+        assertEquals("the pin reached the transport factory", pin, builtPin)
+        assertEquals("the pin is persisted for later syncs", pin, config.load()!!.pin)
     }
 
     @Test
     fun a_failed_pair_persists_nothing() {
-        val client = PairingClient(config(), "pixel") {
+        val client = PairingClient(config(), "pixel") { _, _ ->
             object : PairingTransport {
                 override fun requestToken(code: String, deviceId: String): PairingResponse =
                     throw IllegalArgumentException("pairing failed: HTTP 401")
@@ -54,7 +72,7 @@ class PairingClientTest {
         }
 
         assertThrows(IllegalArgumentException::class.java) {
-            client.pair("http://pc.local:8765", "WRONGCOD")
+            client.pair("http://pc.local:8765", "WRONGCOD", pin = null)
         }
         assertNull("a rejected code leaves the device unconfigured", config().load())
     }

@@ -26,6 +26,7 @@ class IdiolectImeCallbackTest {
         override fun onRecordingChanged(recording: Boolean) { ops.add("recording:$recording") }
         override fun onCommit(text: String) { ops.add("commit:$text") }
         override fun isReviewEnabled(): Boolean = review
+        override fun onLivePreedit(text: String) { ops.add("live:$text") }
         override fun onReviewRequested(text: String) { ops.add("review:$text") }
         override fun onEditHistory(id: Long, text: String) { ops.add("editHistory:$id:$text") }
         override fun onDictationError(message: String) { ops.add("error:$message") }
@@ -35,12 +36,29 @@ class IdiolectImeCallbackTest {
         IdiolectImeCallback(editorProvider = { editor }, ui = ui)
 
     @Test
-    fun live_preedit_maps_to_set_composing_text() {
+    fun live_preedit_maps_to_set_composing_text_when_review_is_off() {
         val editor = RecordingEditor()
-        val cb = callback(editor, RecordingUi())
+        val ui = RecordingUi(review = false)
+        val cb = callback(editor, ui)
         cb.showPreedit("hel")
         cb.updatePreedit("hello")
+        // Review off: the live partials type into the host field, as before. (User's rule:
+        // "into the target text box / app if review is not enabled".)
         assertEquals(listOf("compose:hel", "compose:hello"), editor.ops)
+        assertEquals(emptyList<String>(), ui.ops)
+    }
+
+    @Test
+    fun live_preedit_streams_to_the_review_surface_not_the_field_when_review_is_on() {
+        val editor = RecordingEditor()
+        val ui = RecordingUi(review = true)
+        val cb = callback(editor, ui)
+        cb.showPreedit("hel")
+        cb.updatePreedit("hello")
+        // Review on: the host field is NEVER touched — the words stream onto idiolect's own
+        // review surface. (User's rule: "into the review dialog if it is enabled".)
+        assertEquals(emptyList<String>(), editor.ops)
+        assertEquals(listOf("live:hel", "live:hello"), ui.ops)
     }
 
     @Test
@@ -84,11 +102,22 @@ class IdiolectImeCallbackTest {
     }
 
     @Test
-    fun cancel_preedit_finishes_composing() {
+    fun cancel_preedit_finishes_composing_when_review_is_off() {
         val editor = RecordingEditor()
-        val cb = callback(editor, RecordingUi())
+        val cb = callback(editor, RecordingUi(review = false))
         cb.cancelPreedit()
         assertEquals(listOf("finish"), editor.ops)
+    }
+
+    @Test
+    fun cancel_preedit_clears_the_review_surface_not_the_field_when_review_is_on() {
+        val editor = RecordingEditor()
+        val ui = RecordingUi(review = true)
+        val cb = callback(editor, ui)
+        cb.cancelPreedit()
+        // Nothing touches the host field; the live surface is cleared with an empty push.
+        assertEquals(emptyList<String>(), editor.ops)
+        assertEquals(listOf("live:"), ui.ops)
     }
 
     @Test

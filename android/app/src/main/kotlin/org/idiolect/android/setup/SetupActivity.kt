@@ -5,17 +5,24 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
+import androidx.core.content.ContextCompat
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import org.idiolect.android.R
@@ -25,8 +32,10 @@ import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
 import org.idiolect.android.model.ModelTransport
 import org.idiolect.android.model.PublicModelTransport
+import org.idiolect.android.settings.SettingsActivity
 import org.idiolect.android.sync.DeviceId
 import org.idiolect.android.sync.PairingClient
+import org.idiolect.android.sync.PairingDeepLink
 import org.idiolect.android.sync.ScanPairing
 import org.idiolect.android.sync.SecureSyncConfig
 import org.idiolect.android.sync.SyncSettings
@@ -35,9 +44,12 @@ import kotlin.concurrent.thread
 
 /**
  * The launcher / onboarding screen. It shows one CTA at a time — the next step from
- * [ImeSetup] — and re-evaluates on each resume, so returning from system settings or
- * the IME picker advances the flow. Pure framework glue around [ImeSetup] (unit-tested
- * separately); validated end to end by the emulator e2e.
+ * [ImeSetup] — and re-evaluates on each resume, so returning from system settings or the IME
+ * picker advances the flow. The look matches the rest of idiolect (the mic logo + dark
+ * periwinkle palette of the voice keyboard / [SettingsActivity]), with an [OnboardingProgress]
+ * step indicator so the four gates read as a guided flow rather than a bare line of text.
+ * Pure framework glue around [ImeSetup] / [OnboardingProgress] (unit-tested separately);
+ * validated end to end by the emulator e2e.
  *
  * On the model step the user can either type their PC's URL + token by hand or **scan the
  * PC's pairing QR** ([ScanPairing], host-tested): a scan exchanges the one-time code for a
@@ -51,6 +63,9 @@ class SetupActivity : ComponentActivity() {
     private lateinit var scanButton: Button
     private lateinit var urlField: EditText
     private lateinit var tokenField: EditText
+    private lateinit var stepRow: LinearLayout
+    private lateinit var stepLabel: TextView
+    private val dots = mutableListOf<View>()
 
     /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */
     private val scanLauncher: ActivityResultLauncher<ScanOptions> =
@@ -60,34 +75,83 @@ class SetupActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        status = TextView(this).apply { textSize = 18f }
-        scanButton = Button(this).apply {
-            setText(R.string.setup_scan_cta)
-            visibility = ViewGroup.GONE
-            setOnClickListener { onScanTapped() }
+        val bg = color(R.color.idiolect_bg)
+        window.setBackgroundDrawable(ColorDrawable(bg))
+        window.statusBarColor = bg
+
+        status = TextView(this).apply {
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(color(R.color.idiolect_grey))
         }
-        urlField = EditText(this).apply {
-            setHint(R.string.setup_model_url_hint)
-            visibility = ViewGroup.GONE
+        scanButton = secondary(R.string.setup_scan_cta) { onScanTapped() }.apply { visibility = View.GONE }
+        urlField = field(R.string.setup_model_url_hint).apply { visibility = View.GONE }
+        tokenField = field(R.string.setup_model_token_hint).apply { visibility = View.GONE }
+        cta = primary("") {}
+
+        buildDots()
+        stepLabel = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setTextColor(color(R.color.idiolect_muted))
         }
-        tokenField = EditText(this).apply {
-            setHint(R.string.setup_model_token_hint)
-            visibility = ViewGroup.GONE
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.review_card_bg)
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            addView(status, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(scanButton, inCardLp())
+            addView(urlField, inCardLp())
+            addView(tokenField, inCardLp())
+            addView(cta, inCardLp())
         }
-        cta = Button(this)
-        val pad = (24 * resources.displayMetrics.density).toInt()
-        setContentView(
-            LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(pad, pad, pad, pad)
-                addView(status, lp())
-                addView(scanButton, lp())
-                addView(urlField, lp())
-                addView(tokenField, lp())
-                addView(cta, lp())
-            },
-        )
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(bg)
+            setPadding(dp(24), dp(40), dp(24), dp(28))
+            addView(logo(), LinearLayout.LayoutParams(dp(92), dp(92)))
+            addView(wordmark(), topMargin(dp(16)))
+            addView(tagline(), topMargin(dp(4)))
+            addView(stepRow, topMargin(dp(22)))
+            addView(stepLabel, topMargin(dp(8)))
+            addView(card, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(22) })
+        }
+        setContentView(ScrollView(this).apply { setBackgroundColor(bg); addView(root) })
+
+        // A pairing link the activity was launched with enrols straight away (camera-free).
+        handleDeepLink(intent)
+    }
+
+    /** A new `idiolect://pair` link arriving while setup is already open (singleTop). */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    /**
+     * Route an `idiolect://pair?u=…&c=…` link (the same URI the PC's QR encodes; the normal
+     * MAIN/LAUNCHER launch or any other URL is ignored). A first enrolment is handled here
+     * ([onScanned]) so it also pulls the model; but on an **already-paired** device a re-pair
+     * belongs on the ⚙ settings screen — a lean endpoint/token/pin swap shown in context, with
+     * no redundant model re-download — so we forward the same link there ([PairingRouter]).
+     */
+    private fun handleDeepLink(intent: Intent?) {
+        val scanned = PairingDeepLink.fromIntentData(intent?.dataString)
+        val alreadyPaired = SecureSyncConfig.keystoreBacked(filesDir).load() != null
+        when (PairingRouter.route(isPairingLink = scanned != null, alreadyPaired = alreadyPaired)) {
+            PairingLinkRoute.Settings ->
+                startActivity(
+                    Intent(this, SettingsActivity::class.java)
+                        .setData(intent?.data)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            PairingLinkRoute.Onboarding -> onScanned(scanned!!)
+            PairingLinkRoute.Ignore -> Unit
+        }
     }
 
     override fun onResume() {
@@ -96,7 +160,9 @@ class SetupActivity : ComponentActivity() {
     }
 
     private fun render() {
-        when (ImeSetup.nextStep(hasMicPermission(), isEnabled(), isSelected(), hasModel())) {
+        val step = ImeSetup.nextStep(hasMicPermission(), isEnabled(), isSelected(), hasModel())
+        renderProgress(step)
+        when (step) {
             ImeSetupStep.EnableKeyboard -> bind(R.string.setup_enable, R.string.setup_enable_cta) {
                 startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
             }
@@ -108,31 +174,47 @@ class SetupActivity : ComponentActivity() {
             }
             ImeSetupStep.DownloadModel -> {
                 status.setText(R.string.setup_model)
-                scanButton.visibility = ViewGroup.VISIBLE
+                scanButton.visibility = View.VISIBLE
                 scanButton.isEnabled = true
-                urlField.visibility = ViewGroup.VISIBLE
-                tokenField.visibility = ViewGroup.VISIBLE
-                cta.visibility = ViewGroup.VISIBLE
+                urlField.visibility = View.VISIBLE
+                tokenField.visibility = View.VISIBLE
+                cta.visibility = View.VISIBLE
                 cta.isEnabled = true
                 cta.setText(R.string.setup_model_cta)
                 cta.setOnClickListener { onDownloadTapped() }
             }
             ImeSetupStep.Ready -> {
                 status.setText(R.string.setup_ready)
-                scanButton.visibility = ViewGroup.GONE
-                urlField.visibility = ViewGroup.GONE
-                tokenField.visibility = ViewGroup.GONE
-                cta.visibility = ViewGroup.GONE
+                scanButton.visibility = View.GONE
+                urlField.visibility = View.GONE
+                tokenField.visibility = View.GONE
+                cta.visibility = View.GONE
             }
         }
     }
 
+    /** Light up the step dots and label for [step]; hidden once everything's set up. */
+    private fun renderProgress(step: ImeSetupStep) {
+        if (step == ImeSetupStep.Ready) {
+            stepRow.visibility = View.GONE
+            stepLabel.visibility = View.GONE
+            return
+        }
+        val (done, total) = OnboardingProgress.of(step)
+        stepRow.visibility = View.VISIBLE
+        stepLabel.visibility = View.VISIBLE
+        dots.forEachIndexed { index, dot ->
+            dot.background = oval(if (index < done) R.color.idiolect_accent else R.color.idiolect_slate)
+        }
+        stepLabel.text = getString(R.string.setup_step, done + 1, total)
+    }
+
     private fun bind(statusRes: Int, ctaRes: Int, action: () -> Unit) {
         status.setText(statusRes)
-        scanButton.visibility = ViewGroup.GONE
-        urlField.visibility = ViewGroup.GONE
-        tokenField.visibility = ViewGroup.GONE
-        cta.visibility = ViewGroup.VISIBLE
+        scanButton.visibility = View.GONE
+        urlField.visibility = View.GONE
+        tokenField.visibility = View.GONE
+        cta.visibility = View.VISIBLE
         cta.isEnabled = true
         cta.setText(ctaRes)
         cta.setOnClickListener { action() }
@@ -144,7 +226,10 @@ class SetupActivity : ComponentActivity() {
             ModelSourceChoice.NeedDetails -> status.setText(R.string.setup_model_need_details)
             ModelSourceChoice.Public -> startDownload(PublicModelTransport.recommended(), pcEndpoint = null)
             is ModelSourceChoice.Pc ->
-                startDownload(HttpModelTransport(choice.url, choice.token), pcEndpoint = choice)
+                startDownload(
+                    HttpModelTransport(choice.url, choice.token, choice.pin),
+                    pcEndpoint = choice,
+                )
         }
     }
 
@@ -174,8 +259,8 @@ class SetupActivity : ComponentActivity() {
                 .onSuccess { endpoint ->
                     runOnUiThread {
                         startDownload(
-                            HttpModelTransport(endpoint.baseUrl, endpoint.token),
-                            ModelSourceChoice.Pc(endpoint.baseUrl, endpoint.token),
+                            HttpModelTransport(endpoint.baseUrl, endpoint.token, endpoint.pin),
+                            ModelSourceChoice.Pc(endpoint.baseUrl, endpoint.token, endpoint.pin),
                         )
                     }
                 }
@@ -208,7 +293,7 @@ class SetupActivity : ComponentActivity() {
                 }
             }.onSuccess {
                 pcEndpoint?.let {
-                    SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(it.url, it.token))
+                    SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(it.url, it.token, it.pin))
                 }
                 runOnUiThread { render() } // a model is installed now → Ready
             }.onFailure { error ->
@@ -246,12 +331,91 @@ class SetupActivity : ComponentActivity() {
 
     private fun imm() = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
 
-    private fun lp() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-    ).apply { gravity = Gravity.CENTER; topMargin = 24 }
+    // --- View builders (the idiolect look: mic logo + periwinkle accent on dark slate) -------
+
+    /** The idiolect mark: the mic glyph, white on an accent disc. */
+    private fun logo(): View = ImageView(this).apply {
+        setImageResource(R.drawable.ic_mic)
+        imageTintList = ContextCompat.getColorStateList(this@SetupActivity, R.color.mic_glyph_active)
+        background = oval(R.color.idiolect_accent)
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
+        setPadding(dp(22), dp(22), dp(22), dp(22))
+    }
+
+    private fun wordmark(): View = TextView(this).apply {
+        text = getString(R.string.app_name)
+        textSize = 28f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(color(R.color.idiolect_text))
+        gravity = Gravity.CENTER
+    }
+
+    private fun tagline(): View = TextView(this).apply {
+        setText(R.string.setup_tagline)
+        textSize = 14f
+        setTextColor(color(R.color.idiolect_muted))
+        gravity = Gravity.CENTER
+    }
+
+    private fun buildDots() {
+        stepRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        repeat(OnboardingProgress.TOTAL_GATES) {
+            val dot = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(9), dp(9)).apply {
+                    marginStart = dp(5); marginEnd = dp(5)
+                }
+            }
+            dots.add(dot)
+            stepRow.addView(dot)
+        }
+    }
+
+    private fun primary(text: String, onClick: () -> Unit): Button = Button(this).apply {
+        this.text = text
+        isAllCaps = false
+        setTextColor(color(R.color.mic_glyph_active))
+        background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.review_btn_insert)
+        setOnClickListener { onClick() }
+    }
+
+    private fun secondary(textRes: Int, onClick: () -> Unit): Button = Button(this).apply {
+        setText(textRes)
+        isAllCaps = false
+        setTextColor(color(R.color.idiolect_text))
+        background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.strip_pill)
+        setOnClickListener { onClick() }
+    }
+
+    private fun field(hintRes: Int): EditText = EditText(this).apply {
+        setHint(hintRes)
+        textSize = 14f
+        setTextColor(color(R.color.idiolect_text))
+        setHintTextColor(color(R.color.idiolect_muted))
+        background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.review_field_bg)
+        setPadding(dp(10), dp(10), dp(10), dp(10))
+    }
+
+    /** An oval drawable filled with [colorRes] — the logo disc and the step dots. */
+    private fun oval(colorRes: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color(colorRes))
+    }
+
+    private fun color(res: Int) = ContextCompat.getColor(this, res)
+
+    private fun inCardLp() = LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(12) }
+
+    private fun topMargin(margin: Int) =
+        LinearLayout.LayoutParams(WRAP, WRAP).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = margin }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private companion object {
         const val REQ_MIC = 1
+        const val MATCH = LinearLayout.LayoutParams.MATCH_PARENT
+        const val WRAP = LinearLayout.LayoutParams.WRAP_CONTENT
     }
 }

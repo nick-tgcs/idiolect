@@ -7,7 +7,6 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
-import org.idiolect.android.ime.ImeSelection
 import org.idiolect.android.ime.PendingInsert
 import org.idiolect.android.ime.ReviewActivity
 import org.junit.After
@@ -44,9 +43,15 @@ class ImeReturnE2eTest {
     private val device: UiDevice get() = UiDevice.getInstance(instrumentation)
     private val targetContext get() = instrumentation.targetContext
 
-    private val idiolectIme by lazy {
-        ImeSelection.idiolectImeId(targetContext.packageName, "${targetContext.packageName}.ime.IdiolectImeService")
-    }
+    /**
+     * idiolect's IME id in the framework's own short form (`pkg/.ime.Class`) — the form
+     * `ime enable/set` and `DEFAULT_INPUT_METHOD` recognise (the long form is rejected as
+     * "Unknown id"). Used as a literal here, exactly as the sibling [VoiceKeyboardE2eTest]
+     * does, because the short id is deterministic for this package and is needed *before*
+     * idiolect is enabled (so it can't be read back from the enabled-IME list yet).
+     */
+    private val idiolectIme: String
+        get() = "${targetContext.packageName}/.ime.IdiolectImeService"
 
     private var originalDefaultIme: String? = null
 

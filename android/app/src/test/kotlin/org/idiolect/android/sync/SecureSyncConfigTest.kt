@@ -22,6 +22,7 @@ class SecureSyncConfigTest {
     private fun config(dir: File) = SecureSyncConfig(
         urlFile = File(dir, SecureSyncConfig.URL_FILE_NAME),
         tokenStore = PairingTokenStore(FakeEnvelope(), File(dir, PairingTokenStore.FILE_NAME)),
+        pinFile = File(dir, SecureSyncConfig.PIN_FILE_NAME),
     )
 
     @Test
@@ -29,6 +30,31 @@ class SecureSyncConfigTest {
         val config = newConfig()
         config.save(SyncSettings("https://pc.local:8443", "secret-token"))
         assertEquals(SyncSettings("https://pc.local:8443", "secret-token"), config.load())
+    }
+
+    @Test
+    fun the_pin_round_trips_for_a_tls_endpoint() {
+        val config = newConfig()
+        val pin = "deadbeef".repeat(8) // 64 hex chars, like a real SPKI fingerprint
+        config.save(SyncSettings("https://10.0.2.2:8765", "secret-token", pin))
+        assertEquals(SyncSettings("https://10.0.2.2:8765", "secret-token", pin), config.load())
+        assertEquals(pin, config.load()?.pin)
+    }
+
+    @Test
+    fun a_cleartext_endpoint_loads_with_a_null_pin() {
+        val config = newConfig()
+        config.save(SyncSettings("http://10.0.2.2:8765", "secret-token")) // --no-tls, no pin
+        assertNull("a cleartext endpoint has no pin", config.load()?.pin)
+    }
+
+    @Test
+    fun resaving_without_a_pin_clears_a_previously_pinned_one() {
+        // Re-pairing a now-cleartext endpoint must not keep pinning the old TLS cert.
+        val config = newConfig()
+        config.save(SyncSettings("https://pc:1", "t1", "aa".repeat(32)))
+        config.save(SyncSettings("http://pc:2", "t2"))
+        assertNull("the stale pin must be cleared on a cleartext re-save", config.load()?.pin)
     }
 
     @Test
@@ -61,5 +87,25 @@ class SecureSyncConfigTest {
             "the token must be wrapped on disk, not in the clear",
             tokenBytes.contentEquals("secret-token".toByteArray(Charsets.UTF_8)),
         )
+    }
+
+    @Test
+    fun clearing_unpairs_and_wipes_every_endpoint_file() {
+        // Unpair from the settings screen: the URL, the pin, AND the wrapped token must all go,
+        // so the device reads as unconfigured and no stale credential or pin survives.
+        val dir = Files.createTempDirectory("secure-sync").toFile()
+        val config = config(dir)
+        config.save(SyncSettings("https://10.0.2.2:8765", "secret-token", "ab".repeat(32)))
+        config.clear()
+        assertNull("a cleared endpoint reads as unpaired", config.load())
+        assertFalse("the URL file is gone", File(dir, SecureSyncConfig.URL_FILE_NAME).exists())
+        assertFalse("the pin file is gone", File(dir, SecureSyncConfig.PIN_FILE_NAME).exists())
+        assertFalse("the wrapped token file is gone", File(dir, PairingTokenStore.FILE_NAME).exists())
+    }
+
+    @Test
+    fun clearing_an_already_unpaired_device_is_a_no_op() {
+        // Tapping Unpair with nothing paired must not throw.
+        newConfig().clear()
     }
 }

@@ -1,10 +1,8 @@
 package org.idiolect.android.ime
 
-import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
 import android.provider.Settings
@@ -117,17 +115,25 @@ class ReviewActivity : Activity() {
             text = getString(R.string.review_cancel)
             setTextColor(ContextCompat.getColor(this@ReviewActivity, R.color.idiolect_muted))
             background = null
+            isAllCaps = false
+            textSize = 14f
+            stateListAnimator = null
+            gravity = Gravity.CENTER
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(14), dp(10), dp(14), dp(10))
             setOnClickListener { finish() }
         }
         val insert = Button(this).apply {
             text = getString(R.string.review_insert)
-            setTextColor(Color.WHITE)
-            background = ContextCompat.getDrawable(this@ReviewActivity, R.drawable.review_btn_insert)
+            styleAccentPill()
             setOnClickListener { onInsert(historyId, raw, field.text.toString()) }
         }
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
             addView(cancel)
             addView(insert, LinearLayout.LayoutParams(WRAP, WRAP).apply { leftMargin = dp(8) })
         }
@@ -157,8 +163,7 @@ class ReviewActivity : Activity() {
         }
         val enable = Button(this).apply {
             text = getString(R.string.review_enable_cta)
-            setTextColor(Color.WHITE)
-            background = ContextCompat.getDrawable(this@ReviewActivity, R.drawable.review_btn_insert)
+            styleAccentPill()
             setOnClickListener {
                 startActivity(
                     Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
@@ -189,35 +194,17 @@ class ReviewActivity : Activity() {
             if (instantInsertEnabled()) {
                 // Hand the text to the accessibility service, which types it into the field the
                 // moment it regains focus after this dialog closes — no keyboard switch needed.
+                // That same focus event is also where idiolect re-selects itself as the active
+                // IME so the mic returns (see IdiolectAccessibilityService.restoreIdiolectIme):
+                // it can't be done from here, because writing the IME setting while this review
+                // field is still focused makes idiolect re-bind it and bounce straight back off.
                 InjectQueue(File(filesDir, IdiolectAccessibilityService.PENDING_FILE)).put(toInsert)
             } else {
                 // Service off: fall back to insert-on-return (idiolect types it on next focus).
                 PendingInsert.set(toInsert)
             }
         }
-        returnToIdiolect()
         finish()
-    }
-
-    /**
-     * Pull the active IME back to idiolect's mic, so the user can dictate again without manually
-     * switching keyboards (the auto-return they asked for). Android forbids an app from selecting
-     * an IME without [Manifest.permission.WRITE_SECURE_SETTINGS] — a deliberate anti-hijack rule
-     * — so this is a no-op unless that permission was granted once via `adb pm grant`; without it
-     * the user returns to idiolect with a single tap on the system IME switcher (the fallback).
-     * With instant insert on, the accessibility service still injects on the field's focus event
-     * regardless of which IME is active, so the text lands either way.
-     */
-    private fun returnToIdiolect() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_SECURE_SETTINGS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            return
-        }
-        val ime = ImeSelection.idiolectImeId(packageName, IdiolectImeService::class.java.name)
-        runCatching {
-            Settings.Secure.putString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD, ime)
-        }
     }
 
     /** Whether idiolect's instant-insert accessibility service is enabled right now. */
@@ -225,6 +212,29 @@ class ReviewActivity : Activity() {
         Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES),
         "$packageName/${IdiolectAccessibilityService::class.java.name}",
     )
+
+    /**
+     * Style an accent "pill" button (Insert, Enable) so the label sits centred with real
+     * breathing room. A bare [Button] keeps the platform `buttonStyle`: ALL-CAPS text, an
+     * elevation `stateListAnimator`, a 48dp `minHeight`, and a ~4dp background inset the flat
+     * pill never fills — together they cram the label against the rounded corners (the
+     * "poorly formatted" look). We drop those defaults and let explicit padding size the pill.
+     */
+    private fun Button.styleAccentPill() {
+        background = ContextCompat.getDrawable(this@ReviewActivity, R.drawable.review_btn_insert)
+        setTextColor(Color.WHITE)
+        isAllCaps = false
+        textSize = 14f
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+        stateListAnimator = null
+        elevation = 0f
+        gravity = Gravity.CENTER
+        minWidth = 0
+        minimumWidth = 0
+        minHeight = 0
+        minimumHeight = 0
+        setPadding(dp(22), dp(10), dp(22), dp(10))
+    }
 
     private fun lp() = LinearLayout.LayoutParams(MATCH, WRAP)
 

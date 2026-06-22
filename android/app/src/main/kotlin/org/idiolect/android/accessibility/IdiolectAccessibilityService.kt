@@ -1,9 +1,16 @@
 package org.idiolect.android.accessibility
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.inputmethod.InputMethodManager
+import org.idiolect.android.ime.EnabledKeyboard
+import org.idiolect.android.ime.ImeReturn
+import org.idiolect.android.ime.ImeSelection
 import java.io.File
 
 /**
@@ -43,6 +50,42 @@ class IdiolectAccessibilityService : AccessibilityService() {
         if (target == null || !inject(target, pending)) {
             // No field yet (or the set failed) — keep it queued for the next focus event.
             queue.put(pending)
+            return
+        }
+        // The reviewed text just landed in the host field — pull the active keyboard back to
+        // idiolect's mic so the user can dictate again without a manual keyboard switch.
+        // This MUST happen here, not from the review dialog: the dialog handed the field to the
+        // user's own keyboard (which persistently makes *that* the default IME), and writing the
+        // setting back while the review field is still focused only makes idiolect re-bind it and
+        // hand back off — the default bounces straight back and the mic never returns. By this
+        // focus event the dialog is gone and a host field has focus, so the rewrite sticks.
+        restoreIdiolectIme()
+    }
+
+    /**
+     * Re-select idiolect as the default IME so the mic returns after a reviewed Insert. Android
+     * forbids an app from selecting an IME without [Manifest.permission.WRITE_SECURE_SETTINGS] (a
+     * deliberate anti-hijack rule) — a one-time `adb pm grant`; without it this is a silent no-op
+     * and the user returns to idiolect via the system IME switcher. [ImeReturn] skips the write
+     * when idiolect is already active.
+     */
+    private fun restoreIdiolectIme() {
+        if (checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val imm = getSystemService(InputMethodManager::class.java) ?: return
+        // Use the framework's OWN id for idiolect's IME (its short flattenToShortString form),
+        // taken straight from the enabled list — a reconstructed long-form id is rejected by
+        // InputMethodManagerService as "Unknown id" and the switch silently fails (mic never
+        // returns). Null means idiolect isn't an enabled IME, so there's nothing to switch to.
+        val enabled = imm.enabledInputMethodList.map { EnabledKeyboard(it.id, it.packageName) }
+        val idiolect = ImeSelection.idiolectImeId(enabled, packageName) ?: return
+        val current = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+        if (!ImeReturn.shouldRestore(current, idiolect)) return
+        runCatching {
+            Settings.Secure.putString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD, idiolect)
         }
     }
 

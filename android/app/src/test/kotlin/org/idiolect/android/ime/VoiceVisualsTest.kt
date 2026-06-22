@@ -39,6 +39,14 @@ class VoiceVisualsTest {
     }
 
     @Test
+    fun holding_is_the_red_press_to_talk_mic_with_a_white_glyph() {
+        val v = VoiceVisuals.forStatus(VoiceStatus.Holding)
+        assertEquals(R.drawable.mic_holding, v.backgroundRes)
+        assertEquals(R.color.mic_glyph_active, v.glyphTintRes)
+        assertFalse(v.showProgress)
+    }
+
+    @Test
     fun transcribing_is_grey_and_shows_the_progress_bar() {
         val v = VoiceVisuals.forStatus(VoiceStatus.Transcribing)
         assertEquals(R.drawable.mic_transcribing, v.backgroundRes)
@@ -57,6 +65,7 @@ class VoiceVisualsTest {
         val backgrounds = listOf(
             VoiceStatus.Idle,
             VoiceStatus.Listening,
+            VoiceStatus.Holding,
             VoiceStatus.Continuous,
             VoiceStatus.Transcribing,
             VoiceStatus.Error("x"),

@@ -28,6 +28,11 @@ class PairingTokenStore(
         tokenFile.takeIf { it.exists() }
             ?.let { envelope.unwrap(it.readBytes()).toString(Charsets.UTF_8) }
 
+    /** Wipe the at-rest token (unpairing). A no-op when nothing was saved. */
+    fun clear() {
+        tokenFile.delete()
+    }
+
     companion object {
         const val FILE_NAME = "sync.token.enc"
 

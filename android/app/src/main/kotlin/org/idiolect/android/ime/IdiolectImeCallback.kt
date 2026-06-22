@@ -21,11 +21,20 @@ class IdiolectImeCallback(
 ) : IdiolectInputMethod {
     override fun recordingStatus(recording: Boolean) = ui.onRecordingChanged(recording)
 
-    override fun showPreedit(text: String) {
-        editorProvider()?.setComposingText(text)
-    }
+    override fun showPreedit(text: String) = onPreedit(text)
 
-    override fun updatePreedit(text: String) {
+    override fun updatePreedit(text: String) = onPreedit(text)
+
+    /**
+     * Route a live partial. In review mode (👁) the words must NOT touch the host field — they
+     * stream onto idiolect's own review surface (`ui.onLivePreedit`); otherwise they type into
+     * the field as composing text. Same gating as [commitText], so the two stay consistent.
+     */
+    private fun onPreedit(text: String) {
+        if (ui.isReviewEnabled()) {
+            ui.onLivePreedit(text)
+            return
+        }
         editorProvider()?.setComposingText(text)
     }
 
@@ -44,6 +53,12 @@ class IdiolectImeCallback(
     }
 
     override fun cancelPreedit() {
+        // Symmetry with [onPreedit]: in review mode the live surface is what's showing the
+        // partials, so clear it (empty push) instead of the host field's composing region.
+        if (ui.isReviewEnabled()) {
+            ui.onLivePreedit("")
+            return
+        }
         editorProvider()?.finishComposingText()
     }
 

@@ -46,4 +46,22 @@ class PairingTokenStoreTest {
         PairingTokenStore(FakeEnvelope(), file).save("new")
         assertEquals("new", PairingTokenStore(FakeEnvelope(), file).load())
     }
+
+    @Test
+    fun clear_removes_the_token_so_a_later_load_is_null() {
+        // Unpairing must wipe the at-rest token, not just the endpoint URL — a leftover
+        // wrapped token would let a re-paired-elsewhere device still authenticate.
+        val file = tempTokenFile()
+        val store = PairingTokenStore(FakeEnvelope(), file)
+        store.save("tok-secret")
+        store.clear()
+        assertNull("the token is gone after clear", store.load())
+        assertFalse("the wrapped token file is deleted", file.exists())
+    }
+
+    @Test
+    fun clear_is_a_no_op_when_nothing_was_saved() {
+        // Unpairing an already-unpaired device must not throw.
+        PairingTokenStore(FakeEnvelope(), tempTokenFile()).clear()
+    }
 }

@@ -8,14 +8,29 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
-// Release signing for personal sideload. Credentials live in android/keystore.properties
-// (git-ignored, see .gitignore). When the file is absent — e.g. on CI or a fresh
-// checkout without the secret — the release build is left unsigned rather than failing,
-// so the workspace stays buildable everywhere.
+// Release signing. CI passes credentials via environment (KEYSTORE_PATH / KEYSTORE_PASSWORD /
+// KEY_ALIAS / KEY_PASSWORD) — mirroring the WhisperVault release workflow; local sideload builds
+// read android/keystore.properties (git-ignored, see .gitignore). When neither is present the
+// release build is left unsigned rather than failing, so the workspace stays buildable everywhere.
 val keystorePropsFile = rootProject.file("keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
+val envStoreFile: String? = System.getenv("KEYSTORE_PATH")
+val releaseStoreFile: java.io.File? = when {
+    envStoreFile != null -> file(envStoreFile)
+    keystorePropsFile.exists() -> rootProject.file(keystoreProps.getProperty("storeFile"))
+    else -> null
+}
+val releaseStorePassword: String? = System.getenv("KEYSTORE_PASSWORD") ?: keystoreProps.getProperty("storePassword")
+val releaseKeyAlias: String? = System.getenv("KEY_ALIAS") ?: keystoreProps.getProperty("keyAlias")
+val releaseKeyPassword: String? = System.getenv("KEY_PASSWORD") ?: keystoreProps.getProperty("keyPassword")
+
+// ABIs packaged into the APK and cross-compiled for the native core. Default: both the device
+// (arm64-v8a) and the emulator (x86_64), so the x86_64 e2e keeps working locally. The release
+// workflow ships ARM only via -PandroidAbis=arm64-v8a (the only supported device target).
+val androidAbis: List<String> = (project.findProperty("androidAbis") as String? ?: "arm64-v8a,x86_64")
+    .split(',', ' ').map { it.trim() }.filter { it.isNotEmpty() }
 
 android {
     namespace = "org.idiolect.android"
@@ -27,9 +42,15 @@ android {
         // Android, so a modern floor is fine.
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // Stamped by the release workflow from the CalVer tag (-PappVersionName / -PappVersionCode);
+        // these literals are the local-build fallback.
+        versionCode = (project.findProperty("appVersionCode") as String?)?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("appVersionName") as String?) ?: "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Package only the selected ABIs (see androidAbis) — filters the jniLibs the
+        // cargoNdkJniLibs task produces down to what this build actually ships.
+        ndk { abiFilters.addAll(androidAbis) }
     }
 
     compileOptions {
@@ -40,15 +61,22 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
         unitTests.isIncludeAndroidResources = true
+        // HttpPairingTransportTlsTest stands up a real SSLServerSocket; the JDK's server-side
+        // TLS handshake reflects into java.net, which JDK 17+ strong encapsulation blocks
+        // ("does not opens java.net to unnamed module") unless we open the package to the test
+        // JVM. Without this the pinned-TLS host test fails intermittently on a cold fork.
+        unitTests.all {
+            it.jvmArgs("--add-opens=java.base/java.net=ALL-UNNAMED")
+        }
     }
 
     signingConfigs {
-        if (keystorePropsFile.exists()) {
+        if (releaseStoreFile != null) {
             create("release") {
-                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
-                storePassword = keystoreProps.getProperty("storePassword")
-                keyAlias = keystoreProps.getProperty("keyAlias")
-                keyPassword = keystoreProps.getProperty("keyPassword")
+                storeFile = releaseStoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -101,6 +129,9 @@ val cargoNdkJniLibs by tasks.registering(Exec::class) {
     // The cargo workspace root (android/ is the Gradle root; its parent is the repo).
     workingDir = rootProject.projectDir.parentFile
     val outDir = layout.buildDirectory.dir("android-ffi").get().asFile.absolutePath
+    // Cross-compile only the ABIs this build ships (see androidAbis) — ARM only in the release
+    // workflow, both locally so the x86_64 emulator e2e still has a native library to load.
+    environment("ANDROID_ABIS", androidAbis.joinToString(" "))
     commandLine("bash", "scripts/android-ffi-build.sh", outDir, "--release")
 }
 

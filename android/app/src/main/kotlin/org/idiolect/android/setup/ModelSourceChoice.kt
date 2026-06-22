@@ -9,8 +9,13 @@ sealed interface ModelSourceChoice {
     /** Both fields blank → the zero-config, integrity-pinned public model (PC-less path). */
     data object Public : ModelSourceChoice
 
-    /** Both fields filled → pull from the user's PC and remember the endpoint for sync. */
-    data class Pc(val url: String, val token: String) : ModelSourceChoice
+    /**
+     * Both fields filled → pull from the user's PC and remember the endpoint for sync. The
+     * [pin] is the server cert's SPKI fingerprint carried by a pairing scan (TLS, the
+     * default); manual URL+token entry leaves it null (cleartext, or an unpinned `https` the
+     * transport will refuse).
+     */
+    data class Pc(val url: String, val token: String, val pin: String? = null) : ModelSourceChoice
 
     /** Exactly one field filled → a half-typed PC form; prompt for the missing one. */
     data object NeedDetails : ModelSourceChoice

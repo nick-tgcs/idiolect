@@ -19,6 +19,25 @@ object InjectionTargeting {
  * of which process the service is bound in.
  */
 object AccessibilityServices {
-    fun isListed(enabledSetting: String?, component: String): Boolean =
-        enabledSetting?.split(':')?.any { it == component } == true
+    fun isListed(enabledSetting: String?, component: String): Boolean {
+        val target = canonical(component)
+        return enabledSetting?.split(':')?.any { canonical(it) == target } == true
+    }
+
+    /**
+     * Resolve a flattened `pkg/class` component to its long form. Android stores enabled
+     * services with [android.content.ComponentName.flattenToShortString], which abbreviates a
+     * class under its own package to a leading dot (`pkg/.Sub.Class`); the dialog asks with the
+     * long form (`pkg/pkg.Sub.Class`). Expanding the leading dot makes both compare equal, so a
+     * service enabled via system settings is recognised. Entries without a `/` pass through
+     * unchanged (never equal to a real component).
+     */
+    private fun canonical(flattened: String): String {
+        val slash = flattened.indexOf('/')
+        if (slash < 0) return flattened
+        val pkg = flattened.substring(0, slash)
+        val cls = flattened.substring(slash + 1)
+        val fullClass = if (cls.startsWith(".")) pkg + cls else cls
+        return "$pkg/$fullClass"
+    }
 }

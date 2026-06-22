@@ -4,19 +4,25 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * [PairingTransport] over HTTP to the user's PC (`idiolect-sync-server`'s `POST
+ * [PairingTransport] over HTTP(S) to the user's PC (`idiolect-sync-server`'s `POST
  * /v1/pair`, S3). Uses `HttpURLConnection` (no third-party dependency — keeps the APK
  * lean and FOSS for GrapheneOS), mirroring [HttpSyncTransport]. The route is *not*
  * bearer-authenticated — the one-time code is the credential — and a successful pair
  * returns `201 Created` with the per-device token.
+ *
+ * Under TLS (the default) the [pin] from the pairing QR is applied via [applyPinning], so the
+ * code and the issued token only ever cross a connection to the cert the user scanned; a
+ * cleartext (`--no-tls`) endpoint passes a null [pin].
  */
 class HttpPairingTransport(
     private val baseUrl: String,
+    private val pin: String? = null,
     private val connectTimeoutMs: Int = 15_000,
     private val readTimeoutMs: Int = 30_000,
 ) : PairingTransport {
     override fun requestToken(code: String, deviceId: String): PairingResponse {
         val connection = URL(baseUrl.trimEnd('/') + "/v1/pair").openConnection() as HttpURLConnection
+        applyPinning(connection, pin)
         connection.connectTimeout = connectTimeoutMs
         connection.readTimeout = readTimeoutMs
         connection.requestMethod = "POST"

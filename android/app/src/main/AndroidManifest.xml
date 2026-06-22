@@ -22,30 +22,64 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- Pairing, learning-sync and the model pull default to PINNED HTTPS: the sync server
+         presents a persisted self-signed cert and the phone pins its SPKI fingerprint, carried
+         out-of-band in the pairing QR and applied by CertPin / applyPinning. The server's
+         optional cleartext mode (for deployments already inside a tailnet or a localhost onion
+         tunnel, where TLS is redundant) speaks plain http to the user's OWN machine instead;
+         targetSdk >= 28 blocks cleartext by default, so we opt in to keep that fallback working.
+         This does NOT loosen the public model download: PublicModelTransport enforces https in
+         code, independent of this flag. -->
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
 
-        <!-- Launcher / onboarding: enable + select the keyboard, grant the mic. -->
+        <!-- Launcher / onboarding: enable + select the keyboard, grant the mic.
+             singleTop so an `idiolect://pair` deep link delivered while setup is already open
+             arrives via onNewIntent on the existing instance, not a second copy. -->
         <activity
             android:name=".setup.SetupActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Camera-free pairing: a tapped/fired idiolect://pair?u=…&amp;c=… link (the same
+                 URI the PC pairing QR encodes) drives enrolment without scanning. This is the
+                 hermetic, adb-automatable path the emulator e2e fires. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="idiolect" android:host="pair" />
+            </intent-filter>
         </activity>
 
         <!-- The centred "Review dictation" surface (the 👁 flow): a translucent window over
-             the host app, edited with the user's own keyboard. Not exported. -->
+             the host app, edited with the user's own keyboard. Not exported.
+             Empty taskAffinity is load-bearing: launched NEW_TASK from the IME service, it must
+             NOT join idiolect's own app task (which may have SetupActivity open) — otherwise on
+             dismiss it leaves idiolect's app foreground instead of returning to the host app the
+             user was dictating into. With no affinity it overlays the host app and returns to it. -->
         <activity
             android:name=".ime.ReviewActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:windowSoftInputMode="stateVisible|adjustResize" />
+
+        <!-- The settings screen, opened from the ⚙ on the mic strip (not exported; launched
+             only from our own IME). Pairing/unpairing, dictation modes, model, storage. -->
+        <activity
+            android:name=".settings.SettingsActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:label="@string/settings_title" />
 
         <!-- The IME itself. BIND_INPUT_METHOD restricts binding to the system. -->
         <service
@@ -73,6 +107,7 @@
         <service
             android:name=".accessibility.IdiolectAccessibilityService"
             android:exported="false"
+            android:icon="@drawable/ic_mic"
             android:label="@string/accessibility_label"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
