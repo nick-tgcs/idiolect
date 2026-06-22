@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -107,11 +108,18 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        // A unique root per fixture. process::id() + nanos alone can collide across
+        // parallel tests that read the clock at the same instant (seen under coverage
+        // instrumentation: two tests shared one SQLite db and raced migrate/cleanup,
+        // surfacing "schema_migrations already exists" / "readonly database"), so a
+        // process-wide counter makes collisions impossible by construction.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
         let root = std::env::temp_dir().join(format!(
-            "idiolect-pairing-{}-{}",
+            "idiolect-pairing-{}-{}-{}",
             std::process::id(),
-            now.as_nanos()
+            now.as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&root).expect("fixture root");
         let tokens = DeviceTokenStore::open(root.join("device-tokens.json")).expect("tokens");
