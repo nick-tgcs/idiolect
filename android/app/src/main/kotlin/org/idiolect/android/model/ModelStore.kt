@@ -1,6 +1,7 @@
 package org.idiolect.android.model
 
 import java.io.File
+import java.io.IOException
 
 /**
  * The on-device model store: model files live under [root] (the app's private
@@ -21,10 +22,19 @@ class ModelStore(private val root: File) {
     fun install(id: String, sha256: String, temp: File): InstalledModel {
         root.mkdirs()
         val dest = modelFile(id)
-        dest.delete()
+        // Atomic replace — never delete the existing model first. rename() overwrites the
+        // destination in a single step (same filesystem), so the old model stays fully in
+        // place until the new file is durably there; a crash in this window can never leave
+        // `active` pointing at a missing or half-written model.
         if (!temp.renameTo(dest)) {
-            // Cross-filesystem fallback (rename can fail across mounts).
-            temp.copyTo(dest, overwrite = true)
+            // rename can't span mounts: stage a full copy ON the destination's filesystem,
+            // then atomically swap it in. The old model is untouched until that final rename.
+            val staging = File(dest.parentFile, "$id.bin.staging")
+            temp.copyTo(staging, overwrite = true)
+            if (!staging.renameTo(dest)) {
+                staging.delete()
+                throw IOException("could not install model $id: atomic replace failed")
+            }
             temp.delete()
         }
         val model = InstalledModel(id, sha256, dest.absolutePath)

@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
@@ -40,5 +41,31 @@ class ModelStoreTest {
         store.install("base.en", "deadbeef", File(root, "p").apply { writeBytes(byteArrayOf(1)) })
         store.modelFile("base.en").delete()
         assertNull("a stale active record without its file is not active", store.active())
+    }
+
+    @Test
+    fun install_keeps_the_existing_model_when_the_replacement_is_unavailable() {
+        // Durability: installing over an existing model must not destroy it before the
+        // replacement is in place. A re-install whose source never materialized (aborted
+        // or partial download) must fail WITHOUT leaving `active` pointing at a missing
+        // file. The crash-mid-rename window itself isn't reachable deterministically
+        // on-device, so the durability contract is pinned here at the unit level via an
+        // absent replacement source.
+        val (store, root) = newStore()
+        store.install("base.en", "old", File(root, "old.part").apply { writeBytes("OLD-MODEL".toByteArray()) })
+        assertEquals("OLD-MODEL", store.modelFile("base.en").readText())
+
+        val missing = File(root, "missing.part")
+        assertFalse("precondition: the replacement source is absent", missing.exists())
+        try {
+            store.install("base.en", "new", missing)
+            fail("install over an absent source must not silently succeed")
+        } catch (expected: Exception) {
+            // expected — the replacement could not be placed
+        }
+
+        assertTrue("the existing model survives a failed replace", store.isInstalled("base.en"))
+        assertEquals("OLD-MODEL", store.modelFile("base.en").readText())
+        assertEquals("base.en", store.active()?.id)
     }
 }
