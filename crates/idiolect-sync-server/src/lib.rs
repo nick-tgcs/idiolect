@@ -20,6 +20,31 @@ pub mod ingest_server;
 pub mod model_server;
 pub mod pairing;
 pub mod pairing_qr;
+pub mod tls;
+
+use std::sync::Arc;
+
+use ingest_server::{ingest_router, IngestServerState};
+use model_server::{model_router, ModelServerConfig};
+use pairing::{pair_router, PairingServerState};
+
+/// Compose the full sync server: the model endpoints (M5), the pairing handshake (S3),
+/// and — when `ingest` is configured — the learning-ingest endpoint (M6), all on one
+/// router sharing the per-device token store. This is the single source of truth for
+/// the app's shape: the `idiolect-sync-server` binary serves exactly this, and the
+/// `tests/pairing_over_http.rs` integration test stands up exactly this on a real
+/// socket, so the wire contract the phone/emulator hits is the one under test.
+pub fn build_app(
+    model: Arc<ModelServerConfig>,
+    pairing: Arc<PairingServerState>,
+    ingest: Option<Arc<IngestServerState>>,
+) -> axum::Router {
+    let mut app = model_router(model).merge(pair_router(pairing));
+    if let Some(state) = ingest {
+        app = app.merge(ingest_router(state));
+    }
+    app
+}
 
 /// The PC's local user. `SqliteMetadataStore::create_session` writes rows under
 /// this id, so ingest must address audio and dedup under the same one.

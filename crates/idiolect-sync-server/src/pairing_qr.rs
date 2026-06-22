@@ -29,14 +29,19 @@ use crate::pairing::group;
 /// to isolate the symbol from surrounding terminal text.
 const QUIET_ZONE: usize = 4;
 
-/// Build the pairing URI a scan delivers: `idiolect://pair?u=<base>&c=<code>`. The base
-/// URL is percent-encoded (it carries `:` and `/`) so the query is unambiguous; the code
-/// is from the pairing alphabet (`[0-9A-Z]` minus ambiguous letters) and needs none. The
-/// Android `PairingUri.parse` is the exact inverse — keep the two in lockstep.
+/// Build the pairing URI a scan delivers: `idiolect://pair?u=<base>&c=<code>`, with an
+/// optional `&f=<fingerprint>` when the server serves TLS (the default). The base URL is
+/// percent-encoded (it carries `:` and `/`) so the query is unambiguous; the code is from
+/// the pairing alphabet (`[0-9A-Z]` minus ambiguous letters) and the fingerprint is
+/// lowercase hex, so both are URL-safe and appended raw. The fingerprint is the SHA-256 of
+/// the server cert's DER `SubjectPublicKeyInfo` — the phone pins it (TOFU keyed by this
+/// out-of-band scan), defeating a LAN MITM against the self-signed cert. The Android
+/// `PairingUri.parse` is the exact inverse — keep the two in lockstep.
 #[must_use]
-pub fn pairing_uri(base_url: &str, code: &str) -> String {
+pub fn pairing_uri(base_url: &str, code: &str, fingerprint: Option<&str>) -> String {
     let encoded = utf8_percent_encode(base_url, NON_ALPHANUMERIC);
-    format!("idiolect://pair?u={encoded}&c={code}")
+    let pin = fingerprint.map(|fp| format!("&f={fp}")).unwrap_or_default();
+    format!("idiolect://pair?u={encoded}&c={code}{pin}")
 }
 
 /// Encode `data` as a QR and return its dark-module matrix (row-major, `true` = dark) and
@@ -95,15 +100,25 @@ pub fn render_qr(data: &str) -> Result<String, String> {
     Ok(render_dense(&bordered, side))
 }
 
-/// The full `--pair` announcement: the scannable QR plus the typed-by-hand fallback (the
-/// clean URL and the grouped code), so a device with no camera can still pair. On the rare
-/// encode failure the QR line degrades to a note and the fallback still stands.
+/// The full `--pair` announcement: the scannable QR, the actual pairing link as copyable
+/// text, and the typed-by-hand fallback (the clean URL and the grouped code), so a device
+/// with no camera can still pair — by tapping the link or typing the code. When TLS is on
+/// (the default), `fingerprint` is `Some`, so the QR/link carry the `&f=` pin one scan
+/// delivers and the fallback prints it for out-of-band verification; `--no-tls` passes
+/// `None`. On the rare encode failure the QR line degrades to a note and the rest stands.
+///
+/// The printed `link:` is byte-identical to what the QR encodes ([`pairing_uri`]): it's the
+/// same deep link, just rendered as text so it can be tapped from a message on a real phone,
+/// or pasted for headless/emulator testing — not a second mechanism.
 #[must_use]
-pub fn pairing_announcement(base_url: &str, code: &str) -> String {
-    let uri = pairing_uri(base_url, code);
+pub fn pairing_announcement(base_url: &str, code: &str, fingerprint: Option<&str>) -> String {
+    let uri = pairing_uri(base_url, code, fingerprint);
     let qr = render_qr(&uri).unwrap_or_else(|error| format!("(QR unavailable: {error})\n"));
+    let pin_line = fingerprint
+        .map(|fp| format!("  pin:  {fp}\n"))
+        .unwrap_or_default();
     format!(
-        "Pair a device — scan this QR with the idiolect app:\n\n{qr}\n…or enter these by hand:\n  URL:  {base_url}\n  code: {grouped}\n",
+        "Pair a device — scan this QR with the idiolect app:\n\n{qr}\n…or tap this link on the phone (the same thing the QR encodes):\n  {uri}\n\n…or enter these by hand:\n  URL:  {base_url}\n  code: {grouped}\n{pin_line}",
         grouped = group(code),
     )
 }
@@ -115,10 +130,26 @@ mod tests {
     #[test]
     fn the_pairing_uri_percent_encodes_the_base_and_appends_the_raw_code() {
         // This exact literal is the cross-language contract: Android's `PairingUri.parse`
-        // must invert it byte for byte. `.` `:` `/` are all percent-encoded.
+        // must invert it byte for byte. `.` `:` `/` are all percent-encoded. With no pin
+        // (the `--no-tls` fallback) there is no trailing `&f=`.
         assert_eq!(
-            pairing_uri("http://10.0.2.2:8765", "ABCD1234"),
+            pairing_uri("http://10.0.2.2:8765", "ABCD1234", None),
             "idiolect://pair?u=http%3A%2F%2F10%2E0%2E2%2E2%3A8765&c=ABCD1234",
+        );
+    }
+
+    #[test]
+    fn the_pairing_uri_appends_the_spki_fingerprint_when_pinned() {
+        // With TLS on (the default), the QR also carries `&f=<hex sha256 of the server's
+        // DER SubjectPublicKeyInfo>` so the phone can pin the self-signed cert it is about
+        // to talk to. The fingerprint is lowercase hex — URL-safe, so it needs no
+        // percent-encoding and is simply appended. Android's `PairingUri.parse` reads `f`.
+        let fingerprint = "0123456789abcdef".repeat(4); // 64 hex chars, like a real sha256
+        assert_eq!(
+            pairing_uri("https://10.0.2.2:8765", "ABCD1234", Some(&fingerprint)),
+            format!(
+                "idiolect://pair?u=https%3A%2F%2F10%2E0%2E2%2E2%3A8765&c=ABCD1234&f={fingerprint}"
+            ),
         );
     }
 
@@ -126,7 +157,7 @@ mod tests {
     fn the_pairing_uri_round_trips_through_a_naive_decoder() {
         // A tiny inverse of `pairing_uri`, proving the format is self-consistent (the real
         // inverse is the host-tested Kotlin `PairingUri.parse`).
-        let uri = pairing_uri("https://pc.example:443", "7K9MP2QW");
+        let uri = pairing_uri("https://pc.example:443", "7K9MP2QW", None);
         let query = uri.strip_prefix("idiolect://pair?").expect("scheme + path");
         let mut base = None;
         let mut code = None;
@@ -159,6 +190,54 @@ mod tests {
         );
         assert!(matrix.iter().any(|&dark| dark), "finder patterns are dark");
         assert!(matrix.iter().any(|&dark| !dark), "data modules vary");
+    }
+
+    #[test]
+    fn the_announcement_carries_the_pin_when_tls_is_on() {
+        // TLS on (the default): the QR encodes `u`+`c`+`f`, and the human-readable fallback
+        // also prints the pin so the operator can verify it out-of-band.
+        let fingerprint = "0123456789abcdef".repeat(4);
+        let announcement =
+            pairing_announcement("https://10.0.2.2:8765", "ABCD1234", Some(&fingerprint));
+        assert!(
+            announcement.contains('\u{2580}'),
+            "the scannable QR is present"
+        );
+        assert!(
+            announcement.contains("https://10.0.2.2:8765"),
+            "the URL is printed for manual entry"
+        );
+        assert!(announcement.contains("ABCD-1234"), "the code is grouped");
+        assert!(
+            announcement.contains(&fingerprint),
+            "the pin is shown for verification: {announcement}"
+        );
+    }
+
+    #[test]
+    fn the_announcement_prints_the_tappable_link_verbatim() {
+        // The QR already carries the pairing URI, but a headless/emulator operator — or anyone
+        // sharing the link to *tap* on a phone instead of scanning — needs it as copyable text,
+        // not only as a QR. The printed link must be byte-identical to what the QR encodes
+        // (pairing_uri), so a scan and a tap enrol the same device the same way.
+        let fingerprint = "0123456789abcdef".repeat(4);
+        let uri = pairing_uri("https://10.0.2.2:8765", "ABCD1234", Some(&fingerprint));
+        let announcement =
+            pairing_announcement("https://10.0.2.2:8765", "ABCD1234", Some(&fingerprint));
+        assert!(
+            announcement.contains(&uri),
+            "the announcement prints the exact pairing link the QR encodes: {announcement}"
+        );
+    }
+
+    #[test]
+    fn the_announcement_omits_the_pin_without_tls() {
+        // `--no-tls`: cleartext fallback, no fingerprint to carry or show.
+        let announcement = pairing_announcement("http://10.0.2.2:8765", "ABCD1234", None);
+        assert!(
+            !announcement.to_lowercase().contains("pin"),
+            "no pin line in the cleartext fallback: {announcement}"
+        );
     }
 
     #[test]

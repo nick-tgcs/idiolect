@@ -36,7 +36,7 @@ fn rasterise(dark: &[bool], width: usize, scale: usize, quiet: usize) -> (usize,
 fn the_rendered_qr_decodes_back_to_the_exact_pairing_uri() {
     let base = "http://100.64.0.7:8765";
     let code = "7K9MP2QW";
-    let uri = pairing_uri(base, code);
+    let uri = pairing_uri(base, code, None);
 
     let (dark, width) = qr_matrix(&uri).expect("encode the pairing URI as a QR");
     let (w, h, pixels) = rasterise(&dark, width, 8, 4);
@@ -57,7 +57,7 @@ fn the_announcement_carries_a_scannable_qr_and_a_typeable_fallback() {
     let base = "http://100.64.0.7:8765";
     // The raw 8-char code the pairing state mints; the announcement groups it for reading.
     let code = "7K9MP2QW";
-    let announcement = pairing_announcement(base, code);
+    let announcement = pairing_announcement(base, code, None);
 
     // The QR block (forced-colour half blocks) is present for scanning...
     assert!(
