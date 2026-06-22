@@ -43,16 +43,23 @@ kotlin_dir="$out_dir/kotlin"
 mkdir -p "$jni_dir" "$kotlin_dir"
 
 # --- 1. Cross-build the cdylib into a jniLibs layout -----------------------
-echo "Building libidiolect_ffi.so for arm64-v8a + x86_64 (API $api)..."
-cargo ndk -t arm64-v8a -t x86_64 --platform "$api" -o "$jni_dir" \
+# ABIs come from ANDROID_ABIS (space- or comma-separated); default both the device
+# (arm64-v8a) and the emulator (x86_64). The release workflow sets ANDROID_ABIS=arm64-v8a.
+IFS=', ' read -r -a abis <<< "${ANDROID_ABIS:-arm64-v8a x86_64}"
+target_flags=()
+for abi in "${abis[@]}"; do target_flags+=(-t "$abi"); done
+echo "Building libidiolect_ffi.so for ${abis[*]} (API $api)..."
+cargo ndk "${target_flags[@]}" --platform "$api" -o "$jni_dir" \
   build -p idiolect-ffi "$@"
 
 # --- 2. Bundle the NDK's libc++_shared.so per ABI -------------------------
 # whisper.cpp links it dynamically; without it the app crashes at load.
 declare -A abi_triple=( [arm64-v8a]=aarch64-linux-android [x86_64]=x86_64-linux-android )
 sysroot_lib="$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
-for abi in "${!abi_triple[@]}"; do
-  src="$sysroot_lib/${abi_triple[$abi]}/libc++_shared.so"
+for abi in "${abis[@]}"; do
+  triple="${abi_triple[$abi]:-}"
+  [[ -n "$triple" ]] || { echo "warn: no known triple for ABI $abi; skipping libc++_shared.so" >&2; continue; }
+  src="$sysroot_lib/$triple/libc++_shared.so"
   if [[ -f "$src" && -d "$jni_dir/$abi" ]]; then
     cp "$src" "$jni_dir/$abi/libc++_shared.so"
     echo "bundled libc++_shared.so for $abi"
