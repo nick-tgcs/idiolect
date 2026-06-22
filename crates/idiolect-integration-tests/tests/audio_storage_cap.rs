@@ -110,6 +110,48 @@ fn cap_above_total_evicts_nothing() {
     assert!(exists(&audio_store, &bravo));
 }
 
+/// Regression (Codex P2): a cap eviction deletes a capture's source audio and
+/// flips its status to `evicted`, so the *local training manifest* must exclude
+/// it too — otherwise training pulls a candidate whose audio no longer exists and
+/// yields a missing/unusable sample. Sibling of the sync-outbox exclusion asserted
+/// in `cap_evicts_oldest_captured_audio_and_keeps_history`; `evicted` only arises
+/// through real eviction, so it is exercised here at the integration level (the
+/// `NOT IN` exclusion mechanism itself is unit-covered in `revalidation_contract`).
+#[test]
+fn cap_evicts_candidates_out_of_the_training_manifest() {
+    let fixture = Fixture::new("evict-manifest");
+    let mut store = fixture.open_store();
+    let audio_store = fixture.audio_store();
+
+    let (_a, alpha) = seed_session(&mut store, &audio_store, "alpha take");
+    let (_b, _bravo) = seed_session(&mut store, &audio_store, "bravo take");
+    let (_c, charlie) = seed_session(&mut store, &audio_store, "charlie take");
+
+    // Cap that admits only the newest capture (all three encode to one size).
+    let one = audio_store
+        .source_audio_size_by_key(&charlie.object_key)
+        .expect("size");
+    let evicted = store
+        .evict_captured_audio_over_cap("default", one, &audio_store)
+        .expect("eviction runs");
+    assert_eq!(evicted, 2, "the two oldest captures are evicted");
+    assert!(!exists(&audio_store, &alpha), "oldest audio is reclaimed");
+
+    // The manifest feed must list ONLY the surviving capture — never an evicted
+    // candidate, whose source audio has already been reclaimed.
+    let manifest: Vec<String> = store
+        .training_candidates_for_manifest_v2("default")
+        .expect("manifest feed")
+        .into_iter()
+        .map(|c| c.corrected_transcript)
+        .collect();
+    assert_eq!(
+        manifest,
+        vec!["charlie take".to_owned()],
+        "evicted candidates (audio gone) must be excluded from the training manifest",
+    );
+}
+
 fn exists(audio_store: &FileAudioStore, audio_ref: &AudioObjectRef) -> bool {
     audio_store
         .source_audio_exists_for_test(audio_ref)

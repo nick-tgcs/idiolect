@@ -1215,13 +1215,17 @@ impl SqliteMetadataStore {
     }
 
     /// Candidates eligible for a training manifest: everything except `rejected`
-    /// (untrustworthy text) and `synced` (audio dropped after shipping, so there
-    /// is nothing left to train on locally).
+    /// (untrustworthy text), `synced` (audio dropped after shipping), and `evicted`
+    /// (source audio reclaimed by the storage cap). The latter two no longer have
+    /// local audio to train on, so feeding them would yield missing/unusable samples.
     pub fn training_candidates_for_manifest_v2(
         &self,
         user_id: &str,
     ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
-        self.collect_candidates(user_id, "tc.status NOT IN ('rejected', 'synced')")
+        self.collect_candidates(
+            user_id,
+            "tc.status NOT IN ('rejected', 'synced', 'evicted')",
+        )
     }
 
     /// The sync outbox: candidates captured locally but not yet shipped to the
