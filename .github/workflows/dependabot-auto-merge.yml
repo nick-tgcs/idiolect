@@ -1,0 +1,57 @@
+name: Dependabot auto-merge
+
+# Turns on auto-merge for Dependabot's PRs. GitHub then merges each PR the moment
+# ALL required status checks pass — branch protection on develop AND main requires
+# "All Checks Passed" + "PR Validation Summary" — and holds it open otherwise. So a
+# bump that breaks the build (e.g. a major version with API changes) simply never
+# merges: CI is the gate, exactly as intended — "if all PR validation passes, the
+# bump is put in automatically." No human step in the happy path.
+#
+# Why `pull_request` (not `pull_request_target`): the `permissions:` block below
+# elevates the otherwise read-only Dependabot GITHUB_TOKEN just enough to set the
+# PR's auto-merge flag. The dependency code itself is never executed with secrets.
+#
+# Where it must live: for `pull_request`, the workflow runs from the PR's base
+# branch, and Dependabot cuts its branches from the branch it targets. Once the
+# retargeted .github/dependabot.yml reaches the default branch (main), Dependabot
+# targets `develop`, branches are cut from develop, and this file (present there)
+# runs. Keep it on both develop and main.
+#
+# Config-only CI plumbing; verified out-of-band (no unit/integration/e2e seam),
+# the same exemption noted on release.yml / android-release.yml.
+
+on: pull_request
+
+permissions:
+  contents: write # allow the eventual auto-merge commit
+  pull-requests: write # allow setting the PR's auto-merge flag
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only Dependabot's own PRs. `user.login` is the PR *author*, so a human PR
+    # that merely touches a dependency is left untouched.
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge (squash)
+        # Squash → one clean "chore(deps): bump …" commit on the base branch.
+        # Every update type is auto-merged once checks pass, INCLUDING majors,
+        # because CI is the safety net. To instead require a manual look at major
+        # bumps, add to this step:
+        #   if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
