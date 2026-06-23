@@ -35,7 +35,7 @@ percent-encoding = "=2.3.2"
 # We terminate TLS with tokio-rustls and serve the same `axum::Router` over it via the
 # exact hyper-util loop `axum::serve` uses internally (axum 0.7 has no pluggable listener,
 # and axum-server 0.7 won't build against this workspace's pinned hyper stack).
-rcgen = "=0.13.2"
+rcgen = "=0.14.8"
 rustls = "=0.23.23"
 rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.1"
@@ -52,4 +52,4 @@ rqrr = { version = "=0.10.1", default-features = false }
 # Android X509TrustManager: trust the self-signed server iff the presented leaf's DER
 # SubjectPublicKeyInfo SHA-256 equals the pinned fingerprint. `x509-parser` pulls that
 # SPKI out of the cert the server presents, exactly as `cert.publicKey.encoded` does on Android.
-x509-parser = "=0.16.0"
+x509-parser = "=0.18.1"
