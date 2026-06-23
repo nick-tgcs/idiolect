@@ -1,0 +1,275 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>idiolect — desktop app (cross-platform sync & training)</title><style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  :root{
+    --accent:#7c83fd; --accent-bright:#a6abff; --live:#eb5757; --ok:#3ddc97;
+    --bg:#16171e; --panel:#1b1e27; --strip:#272b36; --surface:#1f212b;
+    --field:#101117; --slate:#333845; --slate2:#454b5c;
+    --text:#e5e7f0; --grey:#c7cad3; --muted:#8c90a1;
+  }
+  body{ background:#0d0e12; font-family:'Roboto','Segoe UI',sans-serif; padding:30px; color:var(--grey); }
+  h1{ font-size:18px; font-weight:600; color:var(--text); margin-bottom:6px; }
+  .legend{ color:var(--muted); font-size:12.5px; margin-bottom:24px; line-height:1.75; max-width:1180px; }
+  .legend b{ color:var(--accent-bright); font-weight:600; }
+  .grid{ display:flex; flex-wrap:wrap; gap:34px 26px; align-items:flex-start; }
+  .panel{ width:440px; }
+  .cap{ font-size:13.5px; margin-bottom:11px; font-weight:600; color:var(--grey); }
+  .cap small{ display:block; color:var(--muted); font-weight:400; font-size:11.5px; margin-top:2px; line-height:1.5; }
+
+  /* ---- desktop window chrome ---- */
+  .win{ width:440px; background:var(--bg); border-radius:13px; overflow:hidden;
+        box-shadow:0 14px 54px rgba(0,0,0,.62); border:1px solid #ffffff0f; display:flex; flex-direction:column; }
+  .titlebar{ height:42px; background:var(--panel); display:flex; align-items:center; gap:10px; padding:0 13px; border-bottom:1px solid #ffffff0d; flex:0 0 auto; }
+  .lights{ display:flex; gap:7px; } .lights i{ width:11px; height:11px; border-radius:50%; display:block; }
+  .lights .r{ background:#ec6a5e; } .lights .y{ background:#f4bf4f; } .lights .g{ background:#61c554; }
+  .brand{ display:flex; align-items:center; gap:8px; flex:1; justify-content:center; color:var(--text); font-weight:600; font-size:13px; }
+  .brand .dot{ width:11px; height:11px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 3px #7c83fd33; }
+  .gear{ width:18px; height:18px; fill:var(--muted); cursor:default; }
+  .body{ padding:16px 16px 14px; display:flex; flex-direction:column; gap:14px; }
+
+  /* section card */
+  .card{ background:var(--panel); border:1px solid #ffffff12; border-radius:13px; padding:14px; }
+  .card>.lbl{ color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.7px; margin:0 1px 11px; font-weight:700; }
+
+  /* device rows */
+  .dev{ display:flex; align-items:center; gap:11px; padding:10px 0; border-top:1px solid #ffffff0d; }
+  .dev:first-of-type{ border-top:0; padding-top:2px; }
+  .dev .pic{ width:30px; height:30px; border-radius:8px; background:var(--surface); display:flex; align-items:center; justify-content:center; font-size:15px; }
+  .dev .nm{ flex:1; } .dev .nm b{ display:block; color:var(--text); font-size:13px; font-weight:500; } .dev .nm small{ color:var(--muted); font-size:11px; }
+  .dev .un{ color:var(--muted); font-size:11.5px; }
+
+  /* accent + secondary buttons */
+  .big{ display:flex; align-items:center; justify-content:center; gap:9px; background:var(--accent); color:#fff;
+        font-size:13.5px; font-weight:600; padding:12px; border-radius:10px; box-shadow:0 4px 16px #7c83fd3a; margin-top:12px; }
+  .big.compact{ margin-top:0; }
+  .big svg{ width:18px; height:18px; fill:#fff; }
+  .btnrow{ display:flex; gap:8px; margin-top:12px; }
+  .btn{ flex:1; text-align:center; border-radius:9px; padding:10px; font-size:12.5px; font-weight:600; }
+  .btn.sec{ background:var(--surface); color:var(--grey); border:1px solid #ffffff14; }
+  .btn.dng{ background:#2a1c1f; color:#e7837f; border:1px solid #e7837f33; }
+  .btn.accent{ background:var(--accent); color:#fff; box-shadow:0 4px 16px #7c83fd3a; }
+
+  .pill{ font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:11px; }
+  .pill.off{ background:#3a3030; color:#e0a44a; } .pill.on{ background:#11362a; color:var(--ok); }
+
+  .lead{ color:var(--text); font-size:13.5px; font-weight:500; }
+  .sub{ color:var(--muted); font-size:11.5px; margin-top:4px; }
+
+  /* auto-train toggle row */
+  .auto{ display:flex; align-items:center; gap:10px; margin-top:14px; padding-top:13px; border-top:1px solid #ffffff0d; }
+  .auto .tx{ flex:1; color:var(--grey); font-size:12.5px; } .auto .tx b{ color:var(--text); font-weight:500; }
+  .sw{ width:38px; height:22px; border-radius:11px; background:var(--slate); position:relative; flex:0 0 auto; }
+  .sw.on{ background:var(--accent); } .sw>i{ position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; } .sw.on>i{ left:18px; }
+  .num{ background:var(--field); border:1px solid #ffffff14; border-radius:7px; color:var(--text); font-size:12px; padding:5px 9px; min-width:42px; text-align:center; }
+  .dim{ opacity:.45; }
+
+  /* window footer status */
+  .foot{ display:flex; align-items:center; gap:8px; color:var(--muted); font-size:11.5px; padding:2px 1px 0; }
+  .foot .led{ width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 3px #3ddc9722; } .foot .led.off{ background:var(--slate2); box-shadow:none; }
+  .foot code{ color:var(--accent-bright); }
+
+  /* empty state */
+  .empty{ text-align:center; padding:26px 18px 8px; }
+  .empty .logo{ width:88px; height:88px; margin:0 auto 6px; }
+  .empty h2{ color:var(--text); font-size:19px; font-weight:600; margin-bottom:8px; }
+  .empty p{ color:var(--muted); font-size:12.5px; line-height:1.6; max-width:300px; margin:0 auto; }
+
+  /* pairing */
+  .pair{ text-align:center; padding:6px 6px 2px; }
+  .pair .ask{ color:var(--grey); font-size:13px; margin-bottom:14px; }
+  .qrwrap{ display:flex; gap:18px; align-items:center; justify-content:center; }
+  .qr{ width:156px; height:156px; background:#fff; padding:9px; border-radius:10px; display:grid; gap:0; grid-auto-rows:1fr; }
+  .qr i{ display:block; } .qr i.on{ background:#0b0c10; }
+  .codecard{ background:var(--surface); border:1px solid #ffffff14; border-radius:10px; padding:13px 15px; }
+  .codecard .t{ color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.6px; margin-bottom:7px; }
+  .codecard .c{ color:var(--accent-bright); font-family:'Roboto Mono',ui-monospace,monospace; font-size:21px; font-weight:600; letter-spacing:2px; }
+  .waiting{ display:flex; align-items:center; justify-content:space-between; margin-top:18px; color:var(--grey); font-size:12px; }
+  .waiting .l{ display:flex; align-items:center; gap:8px; } .waiting .sp{ width:13px; height:13px; border:2px solid var(--accent); border-top-color:transparent; border-radius:50%; display:inline-block; }
+  .secure{ color:var(--muted); font-size:11px; margin-top:9px; } .secure b{ color:var(--ok); }
+  .success{ text-align:center; padding:28px 18px; }
+  .success .ck{ width:62px; height:62px; border-radius:50%; background:#11362a; color:var(--ok); font-size:32px; display:flex; align-items:center; justify-content:center; margin:0 auto 14px; }
+  .success h2{ color:var(--text); font-size:17px; font-weight:600; margin-bottom:7px; } .success p{ color:var(--muted); font-size:12px; }
+
+  /* training progress */
+  .bar{ height:10px; border-radius:6px; background:var(--field); overflow:hidden; margin:12px 0 9px; border:1px solid #ffffff0a; }
+  .bar .fill{ height:100%; width:68%; background:linear-gradient(90deg,var(--accent),var(--accent-bright)); border-radius:6px; }
+  .meta{ color:var(--muted); font-size:11.5px; } .meta b{ color:var(--grey); font-weight:500; }
+  .loss{ color:var(--grey); font-size:12.5px; margin-top:6px; } .loss .down{ color:var(--ok); font-weight:600; }
+
+  /* tray menu */
+  .tray{ width:300px; background:var(--panel); border:1px solid #ffffff1a; border-radius:11px; overflow:hidden; box-shadow:0 14px 44px rgba(0,0,0,.6); padding:6px 0; }
+  .tray .mi{ padding:8px 15px; font-size:13px; color:var(--text); display:flex; align-items:center; gap:9px; }
+  .tray .mi.muted{ color:var(--muted); font-size:11.5px; } .tray .mi.head{ color:var(--grey); }
+  .tray .mi .led{ width:8px; height:8px; border-radius:50%; background:var(--ok); }
+  .tray .sep{ height:1px; background:#ffffff12; margin:6px 0; }
+  .tray .mi:hover{ background:var(--accent); color:#fff; }
+
+  /* preferences */
+  .pref{ display:flex; flex-direction:column; gap:0; }
+  .pf{ display:flex; align-items:center; gap:12px; padding:12px 0; border-top:1px solid #ffffff0d; }
+  .pf:first-child{ border-top:0; } .pf .k{ width:140px; color:var(--grey); font-size:12.5px; } .pf .v{ flex:1; display:flex; align-items:center; gap:8px; justify-content:flex-end; }
+  .field{ background:var(--field); border:1px solid #ffffff14; border-radius:8px; color:var(--text); font-size:12px; padding:8px 11px; flex:1; text-align:left; }
+  .seg{ display:flex; background:var(--field); border:1px solid #ffffff14; border-radius:8px; overflow:hidden; }
+  .seg span{ padding:7px 13px; font-size:12px; color:var(--muted); } .seg span.on{ background:var(--accent); color:#fff; }
+  .ghost{ background:var(--surface); border:1px solid #ffffff14; border-radius:8px; color:var(--grey); font-size:12px; padding:8px 12px; }
+</style></head>
+<body>
+  <h1>idiolect — the desktop app (cross-platform sync &amp; training)</h1>
+  <div class="legend">
+    A standalone <b>Linux / macOS / Windows</b> app replaces the three-terminal sync mess. It runs the pairing + ingest server in the
+    background behind a <b>tray / menu-bar</b> icon, so phone corrections sync <b>automatically</b> with zero commands. Two cards:
+    <b>Phones</b> (pair by QR, see paired devices, unpair) and <b>Learning</b> (new-correction count, one-click <b>Train personal model</b>,
+    and an <b>Auto-train</b> toggle that is <b>off by default</b>). Training runs in a crash-isolated <code>trainerctl</code> subprocess and,
+    on success, <b>atomically serves</b> the improved model to your phones — and on Linux the running daemon <b>hot-reloads</b> it so your PC
+    dictation upgrades too. Styled to match the phone app (periwinkle on slate).
+  </div>
+  <div class="grid" id="r"></div>
+
+  <script>
+    const MIC=`<svg viewBox="0 0 64 64"><g fill="none" stroke="#7c83fd" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><rect x="22" y="8" width="20" height="30" rx="10" fill="#7c83fd"/><path d="M14 34 C14 50 50 50 50 34"/><path d="M32 47 L32 54"/><path d="M23 55 L41 55"/></g></svg>`;
+    const QRICON=`<svg viewBox="0 0 24 24"><path d="M3,3h8v8H3V3zm2,2v4h4V5H5zm8,-2h8v8h-8V3zm2,2v4h4V5h-4zM3,13h8v8H3v-8zm2,2v4h4v-4H5zm10,-2h2v2h-2v-2zm4,0h2v2h-2v-2zm-4,4h2v2h-2v-2zm0,4h2v-2h2v2h2v-2h-2v-2h2v-2h-2v2h-2v2h-2v2z"/></svg>`;
+    const BRAIN=`<svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v.2A3.5 3.5 0 0 0 6 9.7a3.5 3.5 0 0 0 .3 6.1A3 3 0 0 0 9 19a3 3 0 0 0 3-1V3zm3 0a3 3 0 0 1 3 3v.2a3.5 3.5 0 0 1 3 3.5 3.5 3.5 0 0 1-.3 6.1A3 3 0 0 1 15 19a3 3 0 0 1-3-1V3z"/></svg>`;
+    const COG=`<svg viewBox="0 0 24 24"><path d="M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94 0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94l-0.36,-2.54c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41l-0.36,2.54c-0.59,0.24 -1.13,0.57 -1.62,0.94l-2.39,-0.96c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6 3.6,1.62 3.6,3.6 -1.62,3.6 -3.6,3.6z"/></svg>`;
+
+    // deterministic faux-QR (21x21 with finder patterns) — looks like a real code in the mockup
+    function qr(){
+      const N=21, cells=[];
+      const finder=(r,c)=> (r<7&&c<7)||(r<7&&c>=N-7)||(r>=N-7&&c<7);
+      const inFinder=(r,c,br,bc)=>{ const rr=r-br, cc=c-bc; if(rr<0||rr>6||cc<0||cc>6) return null;
+        const ring=(rr===0||rr===6||cc===0||cc===6); const core=(rr>=2&&rr<=4&&cc>=2&&cc<=4); return ring||core; };
+      let seed=1234567;
+      const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return (seed>>8)&1; };
+      for(let r=0;r<N;r++) for(let c=0;c<N;c++){
+        let on=false;
+        if(finder(r,c)){ const f = inFinder(r,c,0,0) ?? inFinder(r,c,0,N-7) ?? inFinder(r,c,N-7,0); on = !!f; }
+        else if((r===7&&c<9)||(c===7&&r<9)){ on=(r+c)%2===0; } // timing-ish
+        else { on = rnd()===1; }
+        cells.push(`<i class="${on?'on':''}"></i>`);
+      }
+      return `<div class="qr" style="grid-template-columns:repeat(${N},1fr)">${cells.join('')}</div>`;
+    }
+
+    const win=(body,opts={})=>`<div class="win">
+        <div class="titlebar">
+          <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+          <div class="brand"><span class="dot"></span> idiolect</div>
+          <svg class="gear" viewBox="0 0 24 24">${COG.match(/<path[^>]*>/)[0]}</path></svg>
+        </div>
+        <div class="body">${body}</div>
+      </div>`;
+
+    const dev=(emoji,name,sub)=>`<div class="dev"><div class="pic">${emoji}</div><div class="nm"><b>${name}</b><small>${sub}</small></div><span class="un">Unpair</span></div>`;
+    const pairBtn=`<div class="big">${QRICON.replace('viewBox','width="18" height="18" viewBox')} Pair a phone</div>`;
+
+    // ---- 1 · main, paired with corrections ----
+    const main = win(`
+      <div class="card"><div class="lbl">Phones</div>
+        ${dev('📱','Pixel 8 (Nick)','paired 2 days ago')}
+        ${dev('📱','iPhone','paired just now')}
+        ${pairBtn}
+      </div>
+      <div class="card"><div class="lbl">Learning</div>
+        <div class="lead">12 new corrections from your phones</div>
+        <div class="sub">last trained · yesterday 18:40</div>
+        <div class="big">${BRAIN.replace('viewBox','width="18" height="18" viewBox')} Train personal model</div>
+        <div class="auto">
+          <div class="sw"><i></i></div>
+          <div class="tx"><b>Auto-train</b> after <span class="dim">corrections build up</span></div>
+          <div class="num">25</div>
+        </div>
+      </div>
+      <div class="foot"><span class="led"></span> Sync on · reachable at <code>https://100.64.0.7:8765</code></div>
+    `);
+
+    // ---- 2 · empty ----
+    const empty = win(`
+      <div class="empty">
+        <div class="logo">${MIC}</div>
+        <h2>idiolect</h2>
+        <p>Pair your phone to start syncing dictation corrections here and training your personal model.</p>
+        ${pairBtn}
+      </div>
+      <div class="foot"><span class="led off"></span> Sync turns on automatically when you pair</div>
+    `);
+
+    // ---- 3 · pairing (QR + code + waiting) ----
+    const pairing = win(`
+      <div class="pair">
+        <div class="ask">Open <b style="color:var(--accent-bright)">idiolect</b> on your phone and scan:</div>
+        <div class="qrwrap">
+          ${qr()}
+          <div class="codecard"><div class="t">or type code</div><div class="c">KFV5-XC47</div></div>
+        </div>
+        <div class="waiting"><span class="l"><span class="sp"></span> Waiting for your phone…</span><span>expires in 9:41</span></div>
+        <div class="secure">🔒 <b>verified</b> by certificate fingerprint</div>
+        <div class="btnrow"><span class="btn sec" style="flex:0 0 auto; padding:9px 22px;">Cancel</span></div>
+      </div>
+    `);
+
+    // ---- 4 · pairing success ----
+    const paired = win(`
+      <div class="success">
+        <div class="ck">✓</div>
+        <h2>Paired with Pixel 8</h2>
+        <p>It will sync corrections automatically.</p>
+        <div class="btnrow" style="justify-content:center; margin-top:18px;"><span class="btn accent" style="flex:0 0 auto; padding:10px 30px;">Done</span></div>
+      </div>
+    `);
+
+    // ---- 5 · training in progress (Learning card close-up) ----
+    const training = `<div class="card" style="width:440px;"><div class="lbl">Learning</div>
+        <div class="lead">Training your personal model…</div>
+        <div class="bar"><div class="fill"></div></div>
+        <div class="meta">epoch <b>2/2</b> · sample <b>90/120</b></div>
+        <div class="loss">holdout loss <b style="color:var(--grey)">0.33</b> ▸ <span class="down">0.19 and falling</span></div>
+        <div class="btnrow"><span class="btn sec" style="flex:0 0 auto; padding:9px 22px;">Cancel</span></div>
+      </div>`;
+
+    // ---- 6 · training complete ----
+    const done = `<div class="card" style="width:440px;"><div class="lbl">Learning</div>
+        <div class="lead"><span style="color:var(--ok)">✓</span> Model improved</div>
+        <div class="loss" style="margin-top:9px;">holdout loss <b style="color:var(--grey)">0.33</b> → <span class="down">0.16</span> &nbsp;·&nbsp; 120 corrections used</div>
+        <div class="sub" style="margin-top:8px;">now serving to your phones</div>
+        <div class="sub" style="color:var(--ok);">✓ your PC dictation upgraded too <span style="color:var(--muted)">(Linux)</span></div>
+      </div>`;
+
+    // ---- 7 · tray / menu-bar ----
+    const tray = `<div class="tray">
+        <div class="mi head" style="font-weight:600;"><span class="dot" style="width:9px;height:9px;border-radius:50%;background:var(--accent);display:inline-block;"></span> idiolect</div>
+        <div class="sep"></div>
+        <div class="mi"><span class="led"></span> Sync on</div>
+        <div class="mi muted">2 phones · 12 new corrections</div>
+        <div class="sep"></div>
+        <div class="mi">Open idiolect…</div>
+        <div class="mi">Pair a phone…</div>
+        <div class="mi">Train now (12 new)</div>
+        <div class="sep"></div>
+        <div class="mi">Quit idiolect</div>
+      </div>`;
+
+    // ---- 8 · preferences ----
+    const prefs = win(`
+      <div class="card"><div class="lbl">Preferences</div>
+        <div class="pref">
+          <div class="pf"><div class="k">Reachable address</div><div class="v"><span class="field">https://100.64.0.7:8765</span></div></div>
+          <div class="pf"><div class="k">Encryption</div><div class="v"><div class="sw on"><i></i></div><span style="color:var(--grey);font-size:12px;">TLS · pinned on pairing</span></div></div>
+          <div class="pf"><div class="k">Data folder</div><div class="v"><span class="field" style="color:var(--muted);">~/.local/share/idiolect</span><span class="ghost">Open</span></div></div>
+          <div class="pf"><div class="k">Base model</div><div class="v"><span class="field">medium-en ▾</span><span class="ghost">Download…</span></div></div>
+          <div class="pf"><div class="k">Training device</div><div class="v"><div class="seg"><span class="on">GPU (CUDA)</span><span>CPU</span></div></div></div>
+          <div class="pf"><div class="k">Start at login</div><div class="v"><div class="sw on"><i></i></div></div></div>
+        </div>
+      </div>
+    `);
+
+    const panel=(cap,sub,art)=>`<div class="panel"><div class="cap">${cap}<small>${sub}</small></div>${art}</div>`;
+    document.getElementById('r').innerHTML =
+      panel('1 · Home — paired, corrections waiting','the everyday view: phones + learning, one click to train', main)
+    + panel('2 · Home — empty (first run)','before any phone is paired', empty)
+    + panel('3 · Pair a phone','camera-free QR the phone scans · code + cert pin · live countdown', pairing)
+    + panel('4 · Paired','flips automatically the moment the phone redeems', paired)
+    + panel('5 · Training (live)','crash-isolated trainerctl subprocess · progress + falling loss', training)
+    + panel('6 · Trained','atomically served to phones; Linux PC hot-reloads too', done)
+    + panel('7 · Tray / menu-bar','runs in the background so sync never stops', tray)
+    + panel('8 · Preferences','reachable address, TLS, data folder, model, GPU/CPU, autostart', prefs);
+  </script>
+</body></html>

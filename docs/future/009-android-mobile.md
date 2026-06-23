@@ -62,6 +62,9 @@ that is "similar but not quite the same" and whose concepts we can leverage.
 - Ship learnings to the PC, free phone storage after confirmed receipt.
 - Train on the PC; optionally pull a personalised `.bin` back to the phone.
 - Maximise Rust code reuse; keep one source of truth for the dictation pipeline.
+- **Run on GrapheneOS** (de-Googled, hardened): no Google Play Services,
+  network-optional, `hardened_malloc`-safe native libs, FOSS-only. See the
+  *GrapheneOS compatibility* section in [009-android-implementation-plan.md](009-android-implementation-plan.md#grapheneos-compatibility--a-hard-target).
 
 **Non-goals (initially)**
 - On-device training (stays on PC).
@@ -247,12 +250,15 @@ which is precisely why "limit mobile storage" means *ship then delete the Opus*.
 
 ### Wire format
 
-- `POST /v1/learnings/batch` (phone → PC, the hot path): `multipart/mixed` so
-  audio stays binary (no base64 bloat). Part 0 = JSON
-  `{protocol_version, device_id, batch_id, base_model_id, learnings:[SyncLearning]}`;
-  parts 1..N = `audio/idopus` raw IDOPUS1 bytes, one per learning, **named by its
-  `audio_digest`**. Response: `{accepted, rejected, already_have}`. **Idempotent**
-  on `(device_id, audio_digest)`.
+- `POST /v1/learnings/batch` (phone → PC, the hot path): a **length-prefixed
+  binary container** (`Content-Type: application/vnd.idiolect.sync.v1`,
+  magic `IDSYNC1`) so audio stays binary (no base64 bloat) **and** without the
+  boundary-collision risk of `multipart/mixed` over binary blobs. Layout: JSON
+  `{device_id, batch_id, learnings:[SyncLearning]}` then `audio_count` parts of
+  raw IDOPUS1 bytes, each **content-addressed by its `audio_digest`** (so a
+  digest shared by two learnings ships its bytes once). Response:
+  `{accepted, rejected, already_have}`. **Idempotent** on `(device_id, audio_digest)`.
+  Implemented in [`idiolect-sync`](../../crates/idiolect-sync/src/codec.rs).
 - `GET /v1/model/current?base=<id>&since=<version>` (PC → phone): the merged ggml
   `.bin` as `octet-stream`, `Range`-resumable, `X-Artifact-Sha256` verified; `304`
   if current.
@@ -381,9 +387,9 @@ Key facts that make A the clear minimal-waste choice:
 crates/idiolect-adapters/android/        # mirrors the existing desktop/ subtree
   capture/   idiolect-adapter-android-audio   # AudioInputPort via AudioRecord
   ime/       idiolect-adapter-android-ime     # InputMethodPort over an FFI callback
-crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, multipart codec)
-crates/idiolect-sync-client/   # phone: outbox, ACK-then-delete
-crates/idiolect-sync-server/   # PC: HTTP ingest hung off idiolectd; GET /model
+crates/idiolect-sync/          # SHARED wire types (SyncLearning, SyncBatch, binary container codec) ✅ exists
+crates/idiolect-sync-client/   # ✅ logic: build_batch (outbox→envelope) + confirm_shipped (ACK→reclaim)
+crates/idiolect-sync-server/   # ✅ ingest logic (envelope→rows+audio, idempotent); HTTP/GET-model still TODO
 crates/idiolect-mobile-runtime/  # Android twin of idiolectd's run_loop (in-process, no socket)
 crates/idiolect-ffi/           # the ONE UniFFI facade; the only cdylib/.so; kept OUT of `members`
 
@@ -408,32 +414,51 @@ boundary marked untestable-headless (with the reason stated), mirroring the
 existing IBus/eframe caveats.
 
 **Sync-protocol track (mostly desktop-side, no Android needed):**
-- **S0 — Foundation.** New `idiolect-sync` crate: `SyncLearning`/`SyncBatch` DTOs
-  + multipart codec (unit-tested round-trip). Add SHA-256 `audio_digest` compute
-  and **finally populate `utterances.audio_sha256` on capture (desktop too)** —
-  this also unblocks `BurnTrainer.validate_manifest`, which rejects empty digests.
-- **S1 — Delete-after-ship locally.** Add the `synced` status +
-  `mark_synced_and_drop_audio` (status flip + `delete_source_audio_for`) + the
-  outbox query (`status NOT IN ('synced','rejected')`). Prove on desktop that
-  audio can be dropped while row+transcript survive and training still runs.
-- **S2 — Transport + ingest on one box.** Stand up the HTTP ingest beside the
-  Unix listener; add an `idiolect-cli` subcommand that POSTs a batch from one
-  data-root to another over loopback/Tailscale and reclaims on ACK. E2E: capture
-  on box A → POST → `trainerctl revalidate`+`train` on box B yields a merged
-  `.bin`. **Validates the whole protocol before any Kotlin exists.**
+- **S0 — Foundation.** ✅ **Done.** New `idiolect-sync` crate: `SyncLearning`/`SyncBatch`
+  DTOs + length-prefixed binary container codec (unit-tested round-trip + framing
+  errors). SHA-256 `audio_digest` compute lives in `idiolect_common::digest`, and
+  capture now **populates `utterances.audio_sha256` (desktop too)** via
+  `persist_session` → `set_audio_digest` — this also unblocks manifest validation,
+  which rejects empty digests.
+- **S1 — Delete-after-ship locally.** ✅ **Done.** Added the `synced` status +
+  `mark_synced_and_drop_audio` (status flip then narrow `delete_source_audio_for`)
+  + the outbox query `training_candidates_pending_sync` (`status = 'captured'`);
+  the manifest feed now also excludes `synced`. Proven on desktop: audio dropped
+  while row+transcript survive and the remaining captured candidate still trains.
+- **S2 — Transport + ingest on one box.** ✅ **Ingest logic + one-box round-trip
+  done in-process** (`idiolect-sync-server::ingest`, content-addressed idempotent;
+  `sync_round_trip.rs`: build → wire codec → ingest into a second data-root →
+  trainable candidates with audio intact → reclaim). **Remaining:** the HTTP hop
+  (axum `POST` beside the Unix listener) + an `idiolect-cli` push subcommand, and
+  extending the e2e through `trainerctl train` on box B to a merged `.bin`.
 - **S3 — Auth + pairing.** QR/code handshake → per-device bearer token,
   idempotency (`batch_id` + `(device_id,digest)` dedup), at-rest outbox encryption.
 
 **Mobile track:**
-- **M0 — Build plumbing (the real cost).** cargo-ndk + NDK CMake; cross-compile
-  the brain + portable adapters to `aarch64-linux-android` (`cuda`/`vulkan` OFF);
-  bundle `libc++_shared`; disable LTO. **Verify the Android whisper-rs/ggml build
-  against the same fixture as the desktop `whisper_burn_parity` test** so the
-  tokenizer/decode doesn't drift (or training pairs become inconsistent).
-- **M1 — Path provider + UniFFI facade.** `PathProvider` trait (XDG desktop impl,
-  `filesDir` Android impl); `idiolect-ffi` exposing `toggle/commit/cancel/
-  report_correction` + the `RecordingStatus`/`PreeditUpdate` callback flow;
-  unit-test through the UniFFI seam against fixture adapters.
+- **M0 — Build plumbing (the real cost).** ✅ **Cross-compile proven** (NDK r28 +
+  cargo-ndk): the brain + portable adapters build for `aarch64-linux-android` and
+  `x86_64-linux-android` via `scripts/android-cross-build.sh` (whisper.cpp, opus,
+  bundled SQLite, webrtc-vad all clean; `cuda`/`vulkan` OFF). A dead
+  `usearch`/`numkong` C++ dep was removed. ✅ **Run-half proven too:** the core
+  *executes* on the x86_64 emulator (`scripts/android-emulator-test.sh`, 25 groups
+  green) including the **real whisper decode** (whisper.cpp transcribing the
+  fixture on-device; same assertion passes host + device = no tokenizer/decode
+  drift). `libc++_shared` per-ABI bundling now handled by
+  [android-ffi-build.sh](scripts/android-ffi-build.sh) (M1); LTO-off release still
+  TODO (M3 APK packaging).
+- ✅ **M1 — Path provider + UniFFI facade — done.** `PathProvider` trait
+  (`XdgPaths` desktop, `RootedPaths` Android `filesDir`) in `idiolect-common`;
+  `idiolect-ffi` (UniFFI 0.31) exposes `IdiolectCore` (toggle/push_pcm_frame/cancel/
+  report_correction/load_model + history ops) and the `IdiolectInputMethod`
+  callback (recording_status/show_preedit/update_preedit/commit_text/cancel_preedit/
+  insert_text/edit_history/dictation_error), driving the unchanged `DictationUseCase`
+  over a real `SqliteMetadataStore`. (M3 part 1 wired the live streaming take onto
+  this facade; see the build plan.) Host seam tests green; cdylib cross-builds to both ABIs
+  with Kotlin bindings. **Divergences from "Concrete layout" below:** `idiolect-ffi`
+  is kept **in** the workspace `members` (host-buildable ⇒ covered by the
+  `--workspace` gates) and carries its **own** `[lints]` (UniFFI's generated
+  scaffolding emits `unsafe`, which the workspace `forbid(unsafe_code)` cannot
+  allow-away; hand-written code stays safe).
 - **M2 — Lift streaming orchestration.** Move `LiveStreamState`/`handle_snippet`/
   `finalize_streamed_take`/`choose_final_take_text` from `idiolectd/run_loop.rs`
   **up into `idiolect-application`** (shared = no Android re-implementation =

@@ -214,6 +214,27 @@ impl ReviewApp {
         }
     }
 
+    /// The header label text. While recording it is the plain word "Recording"
+    /// — the round status cue is *painted* (see `ui`) rather than carried by a
+    /// `●` glyph the dialog font can't render (it showed as a tofu square).
+    fn header_title(&self) -> &'static str {
+        if self.listening {
+            "Recording"
+        } else {
+            "Review dictation"
+        }
+    }
+
+    /// The header label colour: recording-red while live, normal text once the
+    /// take is finalized and editable.
+    fn header_color(&self) -> egui::Color32 {
+        if self.listening {
+            LIVE
+        } else {
+            TEXT
+        }
+    }
+
     /// Place the window dead-center on the monitor (egui/winit don't do this for
     /// us). Runs on the first frame where the monitor + window sizes are known.
     fn center(&mut self, ctx: &egui::Context) {
@@ -294,14 +315,26 @@ impl ReviewApp {
             }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let (title, color) = if self.listening {
-                        ("● Listening", LIVE)
-                    } else {
-                        ("Review dictation", TEXT)
-                    };
+                    if self.listening {
+                        // A *painted* round recording dot. The header used to
+                        // prefix the title with a `●` glyph, but the dialog font
+                        // has no such glyph so it rendered as a tofu square —
+                        // paint a real red disc instead, vertically centred in
+                        // the row next to the title.
+                        let radius = 6.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(radius * 2.0, radius * 2.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(rect.center(), radius, LIVE);
+                        ui.add_space(8.0);
+                    }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(title).heading().strong().color(color),
+                            egui::RichText::new(self.header_title())
+                                .heading()
+                                .strong()
+                                .color(self.header_color()),
                         )
                         .selectable(false),
                     );
@@ -450,6 +483,32 @@ mod tests {
         let ctx = egui::Context::default();
         install_theme(&ctx);
         let _ = ctx.run(input, |ctx| app.ui(ctx));
+    }
+
+    #[test]
+    fn header_reads_recording_while_listening_with_no_tofu_glyph() {
+        // The header used to embed a `●` glyph the dialog font can't render, so
+        // it showed as a tofu square. The round "recording" cue is now painted
+        // (a GUI-only detail, unreachable headlessly); the label text must be
+        // the plain word "Recording" — verb the user asked for, no glyph.
+        let (app, _, _) = app();
+        assert!(app.listening);
+        assert_eq!(app.header_title(), "Recording");
+        assert!(
+            !app.header_title().contains('●'),
+            "no tofu glyph in the label"
+        );
+        assert_eq!(app.header_color(), LIVE);
+    }
+
+    #[test]
+    fn header_reads_review_after_final() {
+        let (mut app, _, feed) = app();
+        push(&feed, "final done");
+        run(&mut app, egui::RawInput::default());
+        assert!(!app.listening);
+        assert_eq!(app.header_title(), "Review dictation");
+        assert_eq!(app.header_color(), TEXT);
     }
 
     #[test]

@@ -30,6 +30,16 @@ const SESSION_STATE_CANCELLED: &str = "cancelled";
 const TRAINING_SOURCE_ACCEPTED: &str = "accepted_without_edit";
 const TRAINING_SOURCE_CORRECTED: &str = "accepted_with_edit";
 const TRAINING_STATUS_CAPTURED: &str = "captured";
+/// A candidate whose learning has been shipped to the PC and whose source audio
+/// has been dropped locally to reclaim storage. The row + transcript survive,
+/// but it leaves the manifest feed (no audio to train on) and the sync outbox
+/// (already shipped). Freeform `TEXT` column — no migration needed.
+const TRAINING_STATUS_SYNCED: &str = "synced";
+/// A captured candidate whose source audio was reclaimed by the storage cap before
+/// it could be shipped. Like `synced` the row + transcript survive (history is
+/// preserved) but it leaves the sync outbox — without audio it can never train, and
+/// shipping it would send a learning with no bytes. Freeform `TEXT`, no migration.
+const TRAINING_STATUS_EVICTED: &str = "evicted";
 const CAPTURE_QUALITY_LIVE: &str = "live";
 const CANCEL_PAYLOAD: &str = "cancelled";
 const DEFAULT_USER_ID: &str = "default";
@@ -1014,6 +1024,11 @@ impl SqliteMetadataStore {
                 &session_key,
             ));
         }
+        // Allocate the next event index for this session rather than a fixed `1`,
+        // so a session can be corrected more than once (repeated in-field fixes, or
+        // a history edit followed by an in-field correction) without colliding on
+        // UNIQUE(session_id, event_index) — and so the correction never clashes with
+        // a take's earlier preedit-change events either.
         backend_result(transaction.execute(
             "INSERT INTO ime_edit_events(
                 session_id,
@@ -1023,10 +1038,12 @@ impl SqliteMetadataStore {
                 event_index,
                 event_type,
                 timestamp_ms
-             ) VALUES (
-                ?1, ?1, ?2, ?3, 1, 'post_commit_correction',
-                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-             )",
+             )
+             SELECT
+                ?1, ?1, ?2, ?3,
+                COALESCE((SELECT MAX(event_index) FROM ime_edit_events WHERE session_id = ?1), 0) + 1,
+                'post_commit_correction',
+                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
             params![session_key, committed_text, corrected_text],
         ))?;
         backend_result(transaction.execute(
@@ -1197,15 +1214,44 @@ impl SqliteMetadataStore {
         Ok(candidates)
     }
 
+    /// Candidates eligible for a training manifest: everything except `rejected`
+    /// (untrustworthy text), `synced` (audio dropped after shipping), and `evicted`
+    /// (source audio reclaimed by the storage cap). The latter two no longer have
+    /// local audio to train on, so feeding them would yield missing/unusable samples.
     pub fn training_candidates_for_manifest_v2(
         &self,
         user_id: &str,
+    ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
+        self.collect_candidates(
+            user_id,
+            "tc.status NOT IN ('rejected', 'synced', 'evicted')",
+        )
+    }
+
+    /// The sync outbox: candidates captured locally but not yet shipped to the
+    /// PC. Only `captured` rows — `rejected` are untrainable and `synced` already
+    /// left. Same shape as the manifest feed so the sync client maps them
+    /// straight to `SyncLearning`s.
+    pub fn training_candidates_pending_sync(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
+        self.collect_candidates(user_id, "tc.status = 'captured'")
+    }
+
+    /// Shared projection behind the manifest feed and the sync outbox. The
+    /// `status_predicate` is a trusted in-crate literal (never user input), so
+    /// interpolating it is safe.
+    fn collect_candidates(
+        &self,
+        user_id: &str,
+        status_predicate: &str,
     ) -> Result<Vec<ManifestV2TrainingCandidate>, SqliteStorageError> {
         if self.user_data_deleted_event_count(user_id)? > 0 {
             return Ok(Vec::new());
         }
 
-        let mut statement = backend_result(self.connection.prepare(
+        let sql = format!(
             "SELECT tc.id,
                     s.user_id,
                     u.id,
@@ -1220,9 +1266,10 @@ impl SqliteMetadataStore {
              JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
              JOIN utterances AS u ON u.id = tc.utterance_id
              WHERE s.user_id = ?1
-               AND tc.status != 'rejected'
-             ORDER BY tc.id",
-        ))?;
+               AND {status_predicate}
+             ORDER BY tc.id"
+        );
+        let mut statement = backend_result(self.connection.prepare(&sql))?;
         let rows = backend_result(statement.query_map([user_id], |row| {
             let trust_score = row.get::<_, f64>(9)?;
             Ok(ManifestV2TrainingCandidate {
@@ -1302,7 +1349,110 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
-    pub fn set_audio_digest_for_test(
+    /// Delete-after-ship: mark a candidate `synced` and drop **only** its source
+    /// audio, keeping the row + transcript. Used once a learning is durably
+    /// stored on the PC, to reclaim phone storage without losing the record of
+    /// what was said. Narrow by construction — it never touches other rows or the
+    /// cascading delete in [`prune_training_data`].
+    ///
+    /// The status flip is committed *before* the file delete: a crash in between
+    /// leaves a `synced` row with a stale (harmless) audio file that the next
+    /// retention prune reclaims — far better than dropping audio under a row that
+    /// still looks shippable.
+    pub fn mark_synced_and_drop_audio(
+        &mut self,
+        candidate_id: i64,
+        audio_store: &FileAudioStore,
+    ) -> Result<(), SqliteStorageError> {
+        let (user_id, utterance_id) = {
+            let mut statement = backend_result(self.connection.prepare(
+                "SELECT s.user_id, tc.utterance_id
+                 FROM training_candidates AS tc
+                 JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+                 WHERE tc.id = ?1",
+            ))?;
+            let mut rows = backend_result(statement.query(params![candidate_id]))?;
+            match backend_result(rows.next())? {
+                Some(row) => (
+                    backend_result(row.get::<_, String>(0))?,
+                    backend_result(row.get::<_, String>(1))?,
+                ),
+                None => {
+                    return Err(SqliteStorageError::not_found(
+                        "training candidate",
+                        &candidate_id.to_string(),
+                    ));
+                }
+            }
+        };
+
+        backend_result(self.connection.execute(
+            "UPDATE training_candidates SET status = ?1 WHERE id = ?2",
+            params![TRAINING_STATUS_SYNCED, candidate_id],
+        ))?;
+
+        audio_store
+            .delete_source_audio_for(&user_id, &utterance_id)
+            .map_err(SqliteStorageError::audio_delete)?;
+        Ok(())
+    }
+
+    /// Storage cap: reclaim the **oldest** captured audio until the total on-disk
+    /// source audio for `user_id` fits within `cap_bytes`. Each reclaimed candidate
+    /// has its source audio deleted and its status flipped to `evicted` — keeping
+    /// the row + transcript (so dictation history survives) while removing it from
+    /// the sync outbox, so a later pairing never ships a learning whose audio is
+    /// gone. Returns the number of candidates evicted; `cap_bytes == 0` evicts all
+    /// captured audio.
+    ///
+    /// Oldest-first by candidate id (= capture order). Per candidate it mirrors
+    /// [`Self::mark_synced_and_drop_audio`]'s flip-status-then-delete ordering, so a
+    /// crash leaves an `evicted` row with a harmless stale file the next prune reaps.
+    /// Only captured (pending) audio is counted — `synced`/`evicted` candidates have
+    /// already dropped theirs.
+    pub fn evict_captured_audio_over_cap(
+        &mut self,
+        user_id: &str,
+        cap_bytes: u64,
+        audio_store: &FileAudioStore,
+    ) -> Result<u64, SqliteStorageError> {
+        // Oldest-first (the pending query orders by candidate id) with each
+        // candidate's current on-disk audio size.
+        let pending = self.training_candidates_pending_sync(user_id)?;
+        let mut sized = Vec::with_capacity(pending.len());
+        let mut total: u64 = 0;
+        for candidate in pending {
+            let size = audio_store
+                .source_audio_size_by_key(&candidate.audio_object_key)
+                .map_err(SqliteStorageError::audio_delete)?;
+            total = total.saturating_add(size);
+            sized.push((candidate, size));
+        }
+
+        let mut evicted = 0;
+        for (candidate, size) in sized {
+            if total <= cap_bytes {
+                break;
+            }
+            backend_result(self.connection.execute(
+                "UPDATE training_candidates SET status = ?1 WHERE id = ?2",
+                params![TRAINING_STATUS_EVICTED, candidate.training_candidate_id],
+            ))?;
+            audio_store
+                .delete_source_audio_for(&candidate.user_id, &candidate.utterance_id)
+                .map_err(SqliteStorageError::audio_delete)?;
+            total = total.saturating_sub(size);
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
+    /// Persist the content digest (lowercase-hex SHA-256 of the encoded audio
+    /// payload) for an utterance. Capture calls this so the training-manifest
+    /// builder — which rejects an empty `audio_digest` — accepts real captures.
+    /// The digest itself is computed via
+    /// [`idiolect_common::digest::audio_sha256_hex`] so every layer agrees.
+    pub fn set_audio_digest(
         &self,
         utterance_id: &str,
         audio_digest: &str,
@@ -1315,6 +1465,46 @@ impl SqliteMetadataStore {
             return Err(SqliteStorageError::not_found("utterance", utterance_id));
         }
         Ok(())
+    }
+
+    /// The utterance row id for a session, derived purely from the session id
+    /// (no query) so callers that have just created a session can address its
+    /// audio without a round-trip. Matches the id written by `create_session`.
+    pub fn utterance_id_for_session(
+        &self,
+        session_id: ImeSessionId,
+    ) -> Result<String, SqliteStorageError> {
+        let session_key = Self::session_key(session_id)?;
+        Ok(Self::utterance_key(&session_key))
+    }
+
+    /// Whether any utterance for `user_id` already carries this content digest —
+    /// the content-addressed dedup the sync-server ingest uses to make a replayed
+    /// batch idempotent.
+    pub fn has_utterance_with_digest(
+        &self,
+        user_id: &str,
+        audio_digest: &str,
+    ) -> Result<bool, SqliteStorageError> {
+        let count: i64 = backend_result(self.connection.query_row(
+            "SELECT COUNT(*) FROM utterances WHERE user_id = ?1 AND audio_sha256 = ?2",
+            params![user_id, audio_digest],
+            |row| row.get(0),
+        ))?;
+        Ok(count > 0)
+    }
+
+    /// Read back an utterance's stored audio digest. `None` means the column is
+    /// still NULL (digest never populated). Test/inspection helper.
+    pub fn audio_digest_for_test(
+        &self,
+        utterance_id: &str,
+    ) -> Result<Option<String>, SqliteStorageError> {
+        backend_result(self.connection.query_row(
+            "SELECT audio_sha256 FROM utterances WHERE id = ?1",
+            params![utterance_id],
+            |row| row.get::<_, Option<String>>(0),
+        ))
     }
 
     pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
@@ -2411,6 +2601,47 @@ mod amend_correction_tests {
             )
         );
         assert_eq!(post_commit_edits(&store, &key), 1);
+    }
+
+    #[test]
+    fn a_session_can_be_corrected_more_than_once() {
+        let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("restart traffic"))
+            .expect("create");
+        store
+            .commit_session(session, "restart traffic", "commit-1")
+            .expect("commit");
+        let key = SqliteMetadataStore::session_key(session).expect("key");
+
+        // Two successive corrections of the same take must not collide on
+        // UNIQUE(session_id, event_index) — the edit index is allocated, not fixed.
+        store
+            .amend_correction(session, "restart traffic", "restart Traefik")
+            .expect("first amend");
+        store
+            .amend_correction(session, "restart Traefik", "restart Traefik v2")
+            .expect("second amend");
+
+        // Both corrections are logged, and the candidate + history reflect the latest
+        // (raw ASR preserved across re-corrections).
+        assert_eq!(post_commit_edits(&store, &key), 2);
+        assert_eq!(
+            candidate(&store, &key),
+            (
+                "restart traffic".to_owned(),
+                "restart Traefik v2".to_owned(),
+                "accepted_with_edit".to_owned()
+            )
+        );
+        let entry = store
+            .recent_history(10)
+            .expect("recent")
+            .into_iter()
+            .next()
+            .expect("one entry");
+        assert_eq!(entry.text, "restart Traefik v2");
     }
 
     #[test]

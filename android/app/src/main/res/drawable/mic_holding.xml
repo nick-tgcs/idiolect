@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Holding mic (press-to-talk): a live-red disc in a red glow halo — "recording, release to send".
+     Shares the live-red palette with the continuous mic; the two are never shown at once and the
+     status text distinguishes them. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/idiolect_live_glow" />
+        </shape>
+    </item>
+    <item android:left="10dp" android:top="10dp" android:right="10dp" android:bottom="10dp">
+        <shape android:shape="oval">
+            <solid android:color="@color/idiolect_live" />
+        </shape>
+    </item>
+</layer-list>

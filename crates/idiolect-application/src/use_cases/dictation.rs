@@ -105,6 +105,15 @@ where
     pub fn storage(&self) -> &S {
         &self.storage
     }
+
+    /// Mutable access to the concrete store. The in-process mobile facade owns the
+    /// use case yet must reach store methods that are deliberately *not* on
+    /// [`MetadataStorePort`] (e.g. `amend_correction`, the post-commit correction
+    /// path) — the desktop daemon reaches the same concrete `SqliteMetadataStore`
+    /// directly, so this keeps the two front-ends behaviour-aligned.
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +141,7 @@ mod tests {
     use super::{DictationUseCase, DictationUseCaseError};
     use idiolect_common::ids::ImeSessionId;
     use idiolect_ports::input_method::InputMethodPort;
+    use idiolect_ports::storage::MetadataStorePort;
     use idiolect_test_support::fakes::{FakeInputMethod, FakeMetadataStore};
     use std::cell::Cell;
 
@@ -177,6 +187,21 @@ mod tests {
             ]
         );
         assert_eq!(use_case.training_candidate_count(), 1);
+    }
+
+    #[test]
+    fn storage_mut_exposes_the_concrete_store_for_post_commit_amendments() {
+        // The mobile FFI facade owns the use case but must reach the concrete
+        // store (e.g. `amend_correction`, which is not on the port) to record an
+        // in-place correction of an already-committed take.
+        let mut use_case =
+            DictationUseCase::new(FakeInputMethod::default(), FakeMetadataStore::default());
+        let session_id = use_case.storage_mut().create_session(None).unwrap();
+
+        assert_eq!(use_case.storage_events(), ["create_session:<none>"]);
+        // The returned id round-trips through the same store the use case drives.
+        use_case.transcript_ready(session_id, "hi").unwrap();
+        assert_eq!(use_case.input_events(), ["show_preedit:hi"]);
     }
 
     #[test]

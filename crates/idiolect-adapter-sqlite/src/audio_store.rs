@@ -315,6 +315,35 @@ impl FileAudioStore {
         Self::read_file(&self.source_path_from_ref(audio_ref)?)
     }
 
+    /// Read the raw stored payload for a source-audio object key. The sync
+    /// client only needs the bytes (the IDOPUS1 container is self-describing),
+    /// so it reads by key without reconstructing codec metadata.
+    pub fn read_source_payload_by_key(
+        &self,
+        object_key: &str,
+    ) -> Result<Vec<u8>, FileAudioStoreError> {
+        let path = Self::path_from_key(&self.audio_root, object_key, AUDIO_KEY_PREFIX)?;
+        Self::read_file(&path)
+    }
+
+    /// On-disk byte size of a stored source-audio object by key, or `0` if it is
+    /// absent (already reclaimed) or not a regular file (a symlink is never
+    /// followed, matching the store's safety posture). Used by the storage cap to
+    /// total captured audio without reading the bytes.
+    pub fn source_audio_size_by_key(&self, object_key: &str) -> Result<u64, FileAudioStoreError> {
+        let path = Self::path_from_key(&self.audio_root, object_key, AUDIO_KEY_PREFIX)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+            Ok(_) => Ok(0),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(err) => Err(FileAudioStoreError::Io {
+                op: "metadata",
+                path,
+                source: err,
+            }),
+        }
+    }
+
     fn remove_decoded_cache(
         &self,
         cache_ref: &DecodedAudioCacheRef,

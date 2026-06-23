@@ -30,6 +30,10 @@ pub struct WhisperOptions {
     pub language: String,
     /// CPU decode threads (still set for GPU builds; harmless there).
     pub n_threads: u32,
+    /// Beam width for decoding. `<= 1` selects greedy decoding — markedly faster and
+    /// the right default for live, on-device dictation; larger values use beam search
+    /// (a small accuracy gain) and suit the GPU-backed desktop, which can afford it.
+    pub beam_size: u32,
 }
 
 impl Default for WhisperOptions {
@@ -39,6 +43,8 @@ impl Default for WhisperOptions {
             gpu_device: 0,
             language: "en".to_owned(),
             n_threads: 1,
+            // Desktop default: beam search. The mobile facade overrides this to greedy.
+            beam_size: 5,
         }
     }
 }
@@ -106,6 +112,21 @@ mod backend {
         context: WhisperContext,
         language: String,
         n_threads: i32,
+        beam_size: u32,
+    }
+
+    /// Map a beam width to a whisper sampling strategy. `beam_size <= 1` ⇒ greedy
+    /// decoding (fastest; the on-device default); otherwise beam search with the given
+    /// width. A pure mapping so the speed/accuracy policy is unit-testable.
+    pub(crate) fn sampling_strategy(beam_size: u32) -> SamplingStrategy {
+        if beam_size <= 1 {
+            SamplingStrategy::Greedy { best_of: 1 }
+        } else {
+            SamplingStrategy::BeamSearch {
+                beam_size: i32::try_from(beam_size).unwrap_or(i32::MAX),
+                patience: -1.0,
+            }
+        }
     }
 
     impl WhisperBackend {
@@ -135,6 +156,7 @@ mod backend {
                 context,
                 language: options.language,
                 n_threads: i32::try_from(options.n_threads.max(1)).unwrap_or(i32::MAX),
+                beam_size: options.beam_size,
             })
         }
 
@@ -168,10 +190,7 @@ mod backend {
                 .create_state()
                 .map_err(|error| WhisperAsrError::backend(error.to_string()))?;
 
-            let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-                beam_size: 5,
-                patience: -1.0,
-            });
+            let mut params = FullParams::new(sampling_strategy(self.beam_size));
             params.set_n_threads(self.n_threads);
             let language = task.language.as_deref().unwrap_or(self.language.as_str());
             params.set_language(Some(language));
@@ -212,9 +231,24 @@ mod backend {
     }
 
     fn fixture_model_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/whisper")
-            .join(PRIMARY_FIXTURE_MODEL_FILE)
+        // On the host, the fixture lives in-repo relative to CARGO_MANIFEST_DIR.
+        // When these tests are cross-run on an Android device/emulator (cargo-ndk),
+        // that host path does not exist on the device, so fall back to a pushed
+        // device location. An explicit override always wins (and lets CI point at
+        // a downloaded model). Host behaviour is unchanged.
+        if let Some(path) = std::env::var_os("IDIOLECT_WHISPER_FIXTURE_MODEL") {
+            return PathBuf::from(path);
+        }
+        #[cfg(target_os = "android")]
+        {
+            PathBuf::from("/data/local/tmp/whisper").join(PRIMARY_FIXTURE_MODEL_FILE)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/whisper")
+                .join(PRIMARY_FIXTURE_MODEL_FILE)
+        }
     }
 
     fn prepare_audio(audio: &AudioSegment) -> Vec<f32> {
@@ -408,6 +442,33 @@ mod tests {
             result,
             Err(super::WhisperAsrLoadError::Backend(_))
         ));
+    }
+
+    #[test]
+    fn sampling_strategy_is_greedy_on_device_and_beam_for_desktop() {
+        use whisper_rs::SamplingStrategy;
+        // Mobile (beam_size 1) ⇒ greedy: the fast on-device path.
+        match super::backend::sampling_strategy(1) {
+            SamplingStrategy::Greedy { best_of } => assert_eq!(best_of, 1),
+            _ => panic!("beam_size 1 must select greedy decoding"),
+        }
+        // 0 also means greedy (no beam).
+        assert!(matches!(
+            super::backend::sampling_strategy(0),
+            SamplingStrategy::Greedy { .. }
+        ));
+        // Desktop default (beam_size 5) ⇒ beam search at that width.
+        match super::backend::sampling_strategy(5) {
+            SamplingStrategy::BeamSearch { beam_size, .. } => assert_eq!(beam_size, 5),
+            _ => panic!("beam_size 5 must select beam search"),
+        }
+    }
+
+    #[test]
+    fn default_options_keep_desktop_on_beam_search() {
+        // Desktop builds rely on the default beam width; only the mobile facade opts into
+        // greedy. Pin that so a default change can't silently regress desktop accuracy.
+        assert_eq!(super::WhisperOptions::default().beam_size, 5);
     }
 
     #[test]

@@ -17,6 +17,10 @@ members = [
     "crates/idiolect-adapter-vad",
     "crates/idiolect-adapter-whisper",
     "crates/idiolect-trainerctl",
+    "crates/idiolect-sync",
+    "crates/idiolect-sync-client",
+    "crates/idiolect-sync-server",
+    "crates/idiolect-ffi",
     "crates/idiolect-ml-core",
     "crates/idiolect-trainer-burn",
     "crates/idiolectd",
@@ -73,6 +77,11 @@ toml = "=0.8.23"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
 tempfile = "=3.10.1"
+# Desktop-only HTTP (the personal model/sync server). Not a dependency of the
+# Android `.so` (idiolect-ffi), so it never reaches the phone.
+axum = "=0.7.9"
+tower = "=0.5.2"
+http-body-util = "=0.1.2"
 
 # The Burn whisper parity/training tests do real model math; without optimized
 # kernels they take minutes under `cargo test` (dev profile). Only these math

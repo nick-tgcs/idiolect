@@ -558,6 +558,66 @@ pub fn check_socket_path_len(path: &Path, platform: Platform) -> Result<(), Conf
     Ok(())
 }
 
+/// Where Idiolect keeps its app-private persistent state, abstracted across
+/// platforms. The desktop resolves it from the XDG/Apple base dirs ([`XdgPaths`]);
+/// Android injects its sandbox `filesDir` directly ([`RootedPaths`]) since the
+/// sandbox has no `HOME`/`XDG_*`. A trait — rather than a hand-injected
+/// [`XdgBaseDirs`] override — so the FFI facade and the daemon share one seam.
+pub trait PathProvider {
+    /// Root directory for app-private persistent data. The SQLite metadata
+    /// database and the Opus source-audio store both live beneath it.
+    fn data_dir(&self) -> PathBuf;
+
+    /// The SQLite metadata database path under [`Self::data_dir`].
+    fn database_path(&self) -> PathBuf {
+        self.data_dir().join("idiolect.db")
+    }
+
+    /// The source-audio object store directory under [`Self::data_dir`].
+    fn audio_dir(&self) -> PathBuf {
+        self.data_dir().join("audio")
+    }
+}
+
+/// A [`PathProvider`] rooted at a single injected directory — Android's app-private
+/// `filesDir`. Everything nests directly beneath it.
+#[derive(Debug, Clone)]
+pub struct RootedPaths {
+    root: PathBuf,
+}
+
+impl RootedPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl PathProvider for RootedPaths {
+    fn data_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
+}
+
+/// A [`PathProvider`] backed by the desktop XDG/Apple base dirs, namespacing all
+/// state under an `idiolect` subdirectory of the data home.
+#[derive(Debug, Clone)]
+pub struct XdgPaths {
+    base: XdgBaseDirs,
+}
+
+impl XdgPaths {
+    #[must_use]
+    pub fn new(base: XdgBaseDirs) -> Self {
+        Self { base }
+    }
+}
+
+impl PathProvider for XdgPaths {
+    fn data_dir(&self) -> PathBuf {
+        self.base.data_home.join("idiolect")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedConfigPaths {
     pub config_file: PathBuf,
@@ -780,6 +840,51 @@ fn env_path_or_fallback(name: &str, fallback: PathBuf) -> PathBuf {
     match env::var_os(name) {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => fallback,
+    }
+}
+
+#[cfg(test)]
+mod path_provider_tests {
+    use super::{PathProvider, Platform, RootedPaths, XdgBaseDirs, XdgPaths};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rooted_paths_put_everything_under_the_injected_root() {
+        // Android has no HOME/XDG: the app injects its private `filesDir` and all
+        // persistent state lives directly beneath it.
+        let provider = RootedPaths::new("/data/data/dev.idiolect/files");
+        assert_eq!(
+            provider.data_dir(),
+            Path::new("/data/data/dev.idiolect/files")
+        );
+        assert_eq!(
+            provider.database_path(),
+            Path::new("/data/data/dev.idiolect/files/idiolect.db")
+        );
+        assert_eq!(
+            provider.audio_dir(),
+            Path::new("/data/data/dev.idiolect/files/audio")
+        );
+    }
+
+    #[test]
+    fn xdg_paths_nest_under_the_data_home() {
+        // The desktop impl reuses the XDG/Apple base dirs, namespacing under an
+        // `idiolect` subdirectory of the data home.
+        let xdg = XdgBaseDirs::platform_defaults(
+            Platform::Linux,
+            Path::new("/home/u"),
+            Path::new("/tmp"),
+        );
+        let provider = XdgPaths::new(xdg);
+        assert_eq!(
+            provider.data_dir(),
+            PathBuf::from("/home/u/.local/share/idiolect")
+        );
+        assert_eq!(
+            provider.database_path(),
+            PathBuf::from("/home/u/.local/share/idiolect/idiolect.db")
+        );
     }
 }
 

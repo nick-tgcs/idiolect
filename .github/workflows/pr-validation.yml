@@ -51,6 +51,32 @@ jobs:
           fi
 
   # =========================================================================
+  # MAIN SOURCE BRANCH GUARD
+  #
+  # GitHub rulesets can require a PR into main but cannot restrict its *source*
+  # branch, so GitFlow's "main only ever merges from develop" is enforced here:
+  # a PR whose base is main must have head == develop, else this fails. Folded
+  # into "PR Validation Summary" (a required check), so it gates merges to main
+  # without adding a new required-check context. PRs into develop are unaffected.
+  # =========================================================================
+  main-source-guard:
+    name: Main Source Branch Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce that main only accepts PRs from develop
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          echo "PR: ${HEAD_REF} -> ${BASE_REF}"
+          if [[ "$BASE_REF" == "main" && "$HEAD_REF" != "develop" ]]; then
+            echo "::error::PRs into 'main' must come from 'develop' (got '${HEAD_REF}'). Merge your work into develop first, then open a develop -> main PR."
+            exit 1
+          fi
+          echo "Source-branch policy satisfied."
+
+  # =========================================================================
   # CONVENTIONAL COMMITS CHECK
   # =========================================================================
   conventional-commits:
@@ -272,6 +298,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - pr-size
+      - main-source-guard
       - conventional-commits
       - rust-quick
       - fcitx5-quick
@@ -284,6 +311,7 @@ jobs:
         run: |
           # Check if any required job failed
           if [[ "${{ needs.pr-size.result }}" != "success" ]] || \
+             [[ "${{ needs.main-source-guard.result }}" != "success" ]] || \
              [[ "${{ needs.conventional-commits.result }}" != "success" ]] || \
              [[ "${{ needs.rust-quick.result }}" != "success" ]] || \
              [[ "${{ needs.fcitx5-quick.result }}" != "success" ]] || \

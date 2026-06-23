@@ -199,6 +199,87 @@ fn commit_session_without_created_session_fails_without_writes() {
     assert_training_candidate_count(&store, 0);
 }
 
+#[test]
+fn audio_digest_persists_and_reads_back() {
+    let mut store = migrated_store();
+    let session_id = store
+        .create_session(Some("restart traffic"))
+        .expect("session should be created");
+    let link = store
+        .session_utterance_link_for_test(session_id)
+        .expect("link should query")
+        .expect("link should exist");
+
+    // A freshly created utterance carries no audio digest yet — capture must
+    // populate it, and nothing else does.
+    assert_eq!(
+        store
+            .audio_digest_for_test(&link.utterance_id)
+            .expect("digest should query"),
+        None,
+    );
+
+    let digest = idiolect_common::digest::audio_sha256_hex(b"idopus1-payload-bytes");
+    store
+        .set_audio_digest(&link.utterance_id, &digest)
+        .expect("digest should persist");
+
+    assert_eq!(
+        store
+            .audio_digest_for_test(&link.utterance_id)
+            .expect("digest should query"),
+        Some(digest),
+    );
+}
+
+#[test]
+fn utterance_id_for_session_matches_the_link_row() {
+    let mut store = migrated_store();
+    let session = store.create_session(Some("hello")).expect("create");
+    let link = store
+        .session_utterance_link_for_test(session)
+        .expect("link query")
+        .expect("link exists");
+    assert_eq!(
+        store.utterance_id_for_session(session).expect("id"),
+        link.utterance_id,
+        "the production accessor must equal the stored utterance row id"
+    );
+}
+
+#[test]
+fn has_utterance_with_digest_reflects_set_audio_digest() {
+    let mut store = migrated_store();
+    let session = store.create_session(Some("hello")).expect("create");
+    let link = store
+        .session_utterance_link_for_test(session)
+        .expect("link query")
+        .expect("link exists");
+    let digest = idiolect_common::digest::audio_sha256_hex(b"payload");
+
+    assert!(!store
+        .has_utterance_with_digest("default", &digest)
+        .expect("query"));
+    store
+        .set_audio_digest(&link.utterance_id, &digest)
+        .expect("set digest");
+    assert!(store
+        .has_utterance_with_digest("default", &digest)
+        .expect("query"));
+    assert!(!store
+        .has_utterance_with_digest("default", "some-other-digest")
+        .expect("query"));
+}
+
+#[test]
+fn set_audio_digest_for_unknown_utterance_errors() {
+    let store = migrated_store();
+    let error = store
+        .set_audio_digest("utterance:missing", "deadbeef")
+        .expect_err("unknown utterance should fail");
+    assert_eq!(error.kind(), SqliteStorageErrorKind::Backend);
+}
+
 fn migrated_store() -> SqliteMetadataStore {
     let mut store = SqliteMetadataStore::open_in_memory().expect("store should open");
     store.migrate().expect("migration should apply");

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Error mic: the idle slate disc ringed in live-red to flag the fault. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@color/idiolect_slate" />
+    <stroke android:width="2dp" android:color="@color/idiolect_live" />
+</shape>

@@ -17,15 +17,16 @@ use idiolect_adapter_opus::{OpusCodec, OpusCodecError};
 use idiolect_adapter_sqlite::{
     FileAudioStore, FileAudioStoreError, SqliteMetadataStore, SqliteStorageError,
 };
-use idiolect_adapter_vad::{VadAdapter, FRAME_DURATION_MS, FRAME_SAMPLE_COUNT};
+use idiolect_adapter_vad::VadAdapter;
 use idiolect_application::use_cases::history::ClipboardPort;
 use idiolect_application::use_cases::maintenance::{MaintenanceUseCase, DEFAULT_PRUNE_INTERVAL};
 use idiolect_application::use_cases::menu::{
     validate_training_retention_days, MenuUseCase, RecordingState, MAX_ENTRY_CHOICES,
     RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
 };
-use idiolect_application::use_cases::segmentation::{
-    FrameBuffer, SegmenterConfig, UtteranceSegmenter,
+use idiolect_application::use_cases::streaming::{
+    merge_tail_correction, FinalizedTake, StreamObserver, StreamingConfig, StreamingTake,
+    TakeOutcome, TakeTranscriber, TranscribeFailure,
 };
 use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
 use idiolect_common::ids::ImeSessionId;
@@ -995,114 +996,142 @@ struct ActiveSession {
     tail_text: Option<String>,
 }
 
-/// Per-recording streaming state for pause-triggered translation: incremental
-/// resampling, frame re-chunking, frame-level VAD, and the utterance segmenter,
-/// plus the take-level accumulators. Created on start when translation is
-/// enabled; the pump feeds it every loop tick, each finished snippet is
-/// transcribed/translated immediately, and the WHOLE take is finalized once at
-/// stop — one merged recording, one merged string.
+/// Per-recording streaming state for pause-triggered dictation. The take's
+/// segmenter, accumulators, auto-stop clock, and error de-duplication live in the
+/// shared [`StreamingTake`] orchestration (so the Android path runs the identical
+/// rules); the daemon keeps only the two desktop-specific feeds — the lazy
+/// capture-rate [`crate::adapters::StreamingResampler`] and the [`VadAdapter`] —
+/// and pipes resampled 16 kHz audio plus each frame's speech verdict into it.
 struct LiveStreamState {
     /// Built lazily from the first non-empty poll, which reports the device's
     /// real capture rate (the config value is advisory; hardware decides).
     resampler: Option<crate::adapters::StreamingResampler>,
-    frames: FrameBuffer,
     vad: VadAdapter,
-    segmenter: UtteranceSegmenter,
-    /// Every snippet's audio, concatenated: the take's single stored recording.
-    merged_samples: Vec<f32>,
-    /// Every snippet's translation, space-joined: the take's single string.
-    merged_text: String,
-    /// The most recent snippet's text (no joining space) — the suffix a
-    /// post-take in-place correction replaces.
-    last_snippet_text: Option<String>,
-    /// Whether any speech frame has been heard this take. Auto-stop only arms
-    /// after the first speech: pre-take thinking time never ends the take.
-    spoke: bool,
-    /// Consecutive silence frames since the last speech frame (audio time).
-    silence_frames_since_speech: usize,
-    /// The take's auto-stop threshold (effective config at arm time; 0 = never).
-    auto_stop_threshold_ms: u32,
-    /// Error code already surfaced to the user this take — failures repeat per
-    /// pause, the notification must not.
-    notified_error: Option<String>,
+    take: StreamingTake,
 }
 
 impl LiveStreamState {
     fn new(vad_config: &VadConfig) -> Self {
         Self {
             resampler: None,
-            frames: FrameBuffer::new(),
             vad: VadAdapter::new(),
-            segmenter: UtteranceSegmenter::new(SegmenterConfig {
-                sample_rate_hz: 16_000,
-                frame_ms: FRAME_DURATION_MS as u32,
+            take: StreamingTake::new(&StreamingConfig {
                 min_speech_ms: vad_config.min_speech_ms,
                 pre_roll_ms: vad_config.pre_roll_ms,
                 post_roll_ms: vad_config.post_roll_ms,
                 max_utterance_ms: vad_config.max_utterance_ms,
+                auto_stop_silence_ms: vad_config.auto_stop_silence_ms,
             }),
-            merged_samples: Vec::new(),
-            merged_text: String::new(),
-            last_snippet_text: None,
-            spoke: false,
-            silence_frames_since_speech: 0,
-            auto_stop_threshold_ms: vad_config.auto_stop_silence_ms,
-            notified_error: None,
         }
     }
 
-    /// True exactly once per take for a given error code: the first failed
-    /// snippet notifies the user, the rest only log.
-    fn first_error_this_take(&mut self, code: &str) -> bool {
-        if self.notified_error.as_deref() == Some(code) {
-            return false;
-        }
-        self.notified_error = Some(code.to_owned());
-        true
-    }
-
-    /// Whether the take has gone silent long enough (in audio time, after its
-    /// first speech) to end automatically. `0` disables auto-stop.
-    fn auto_stop_due(&self, threshold_ms: u32) -> bool {
-        threshold_ms != 0
-            && self.spoke
-            && self.silence_frames_since_speech * FRAME_DURATION_MS >= threshold_ms as usize
-    }
-
-    /// Pushes one drained capture chunk through resample → frame → VAD →
-    /// segmenter; returns the snippets (16 kHz mono samples) completed by it.
+    /// Resamples one drained capture chunk to 16 kHz mono and pushes it through
+    /// the take's segmenter, labelling each frame with the VAD; returns the
+    /// snippets a pause completed.
     fn ingest(&mut self, drained: &AudioSegment) -> Vec<Vec<f32>> {
         if drained.samples_f32_mono.is_empty() {
             return Vec::new();
         }
-        let resampler = self.resampler.get_or_insert_with(|| {
-            crate::adapters::StreamingResampler::new(drained.sample_rate_hz)
-        });
-        let resampled = resampler.push(&drained.samples_f32_mono);
-
-        let mut snippets = Vec::new();
-        for frame in self.frames.push(&resampled, FRAME_SAMPLE_COUNT) {
-            // A frame the detector rejects is treated as silence: losing one
-            // 30 ms verdict must never abort the whole take.
-            let is_speech = self.vad.is_speech_frame(&frame).unwrap_or(false);
-            if is_speech {
-                self.spoke = true;
-                self.silence_frames_since_speech = 0;
-            } else {
-                self.silence_frames_since_speech += 1;
-            }
-            if let Some(snippet) = self.segmenter.push_frame(&frame, is_speech) {
-                snippets.push(snippet.samples_f32_mono);
-            }
-        }
-        snippets
+        let Self {
+            resampler,
+            vad,
+            take,
+        } = self;
+        let resampled = resampler
+            .get_or_insert_with(|| crate::adapters::StreamingResampler::new(drained.sample_rate_hz))
+            .push(&drained.samples_f32_mono);
+        take.ingest(&resampled, |frame| {
+            vad.is_speech_frame(frame).unwrap_or(false)
+        })
     }
 
     /// Recovers the un-paused tail utterance when recording stops.
     fn flush(&mut self) -> Option<Vec<f32>> {
-        self.segmenter
-            .flush()
-            .map(|snippet| snippet.samples_f32_mono)
+        self.take.flush()
+    }
+
+    /// Whether the take has gone silent past its auto-stop threshold.
+    fn auto_stop_due(&self) -> bool {
+        self.take.auto_stop_due()
+    }
+}
+
+/// Binds the daemon's transcribe+translate to the take's decode port: builds a
+/// 16 kHz segment and runs `transcribe_translated`, re-reading the effective
+/// translation config each call so a tray toggle mid-take takes effect on the
+/// next snippet.
+struct DaemonTranscriber<'a> {
+    store: &'a SqliteMetadataStore,
+    config: &'a RunLoopConfig,
+}
+
+impl TakeTranscriber for DaemonTranscriber<'_> {
+    fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+        let duration_ms = (samples_f32_mono.len() as u64 * 1_000 / 16_000) as u32;
+        let segment = AudioSegment {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            duration_ms,
+            samples_f32_mono: samples_f32_mono.to_vec(),
+        };
+        let translation = effective_translation_config(self.store, &self.config.translation_config);
+        crate::adapters::transcribe_translated(&self.config.adapter_profile, &translation, &segment)
+            .map(|draft| draft.text)
+            .map_err(|error| TranscribeFailure {
+                code: error.code().to_owned(),
+                message: error.to_string(),
+            })
+    }
+}
+
+/// Routes a live take's events to the IPC client and the desktop notifier. Each
+/// snippet is pushed as a PARTIAL preedit — typed by the engine in direct mode,
+/// or display-only when "review before insert" is on; a failed snippet surfaces
+/// once per take as a desktop notification.
+struct DaemonObserver<'a> {
+    stream: &'a mut UnixStream,
+    store: &'a SqliteMetadataStore,
+    config: &'a RunLoopConfig,
+}
+
+impl StreamObserver for DaemonObserver<'_> {
+    type Error = RunLoopError;
+
+    fn snippet_committed(&mut self, chunk: &str) -> Result<(), RunLoopError> {
+        send_ipc_message(
+            self.stream,
+            &IpcMessage::PreeditUpdate(PreeditUpdate {
+                text: chunk.to_owned(),
+                review: review_mode_enabled(self.store),
+                partial: true,
+            }),
+        )
+    }
+
+    fn snippet_dropped(&mut self, decoded: &str) -> Result<(), RunLoopError> {
+        eprintln!(
+            "snippet decode dropped ({decoded:?}); its audio is kept for the stop-time decode"
+        );
+        Ok(())
+    }
+
+    fn transcribe_failed(&mut self, code: &str, message: &str) -> Result<(), RunLoopError> {
+        eprintln!("snippet transcription failed: {message}");
+        // The journal alone is invisible: the user pauses, nothing appears, and
+        // they can't tell broken from working. Tell them — once per take.
+        let mut body = message.to_owned();
+        if code == "translation-unavailable" {
+            body.push_str(
+                "\nSet translation.command in config.toml, or switch \
+                 'Translate to' back to English in the tray.",
+            );
+        }
+        crate::adapters::notify_user(
+            &self.config.notify_command,
+            "Idiolect — dictation is failing",
+            &body,
+        );
+        Ok(())
     }
 }
 
@@ -1151,7 +1180,7 @@ fn materialize_session(
         Ok(draft) => draft,
         Err(error) => return Ok(StartSessionOutcome::Recoverable(error)),
     };
-    let session_id = persist_session(store, audio_store, config, &encoded, &draft.text)?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &draft.text)?;
 
     Ok(StartSessionOutcome::Started(ActiveSession {
         session_id,
@@ -1167,17 +1196,24 @@ fn materialize_session(
 fn persist_session(
     store: &mut SqliteMetadataStore,
     audio_store: &FileAudioStore,
-    config: &RunLoopConfig,
+    user_id: &str,
     encoded: &idiolect_ports::audio::EncodedAudio,
     text: &str,
 ) -> Result<ImeSessionId, RunLoopError> {
     let session_id = store
         .create_session(Some(text))
         .map_err(|error| RunLoopError::storage("create session", error))?;
-    let utterance_id = utterance_id_for_session(session_id)?;
+    let utterance_id = idiolect_common::ids::utterance_id_for_session(session_id);
     audio_store
-        .write_source_audio(&config.user_id, &utterance_id, encoded)
+        .write_source_audio(user_id, &utterance_id, encoded)
         .map_err(|error| RunLoopError::audio_store("write source audio", error))?;
+    // Content digest of the encoded payload. The trainer's manifest builder
+    // rejects an empty digest, so without this real captures could never be
+    // validated/trained — historically the column was only ever set in tests.
+    let audio_digest = idiolect_common::digest::audio_sha256_hex(&encoded.payload);
+    store
+        .set_audio_digest(&utterance_id, &audio_digest)
+        .map_err(|error| RunLoopError::storage("set audio digest", error))?;
     Ok(session_id)
 }
 
@@ -1394,108 +1430,41 @@ fn pump_live_stream(
         }
     };
     for snippet in state.ingest(&drained) {
-        handle_snippet(stream, store, config, state, snippet)?;
+        fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
     }
-    Ok(state.auto_stop_due(state.auto_stop_threshold_ms))
+    Ok(state.auto_stop_due())
 }
 
-/// Transcribes/translates one pause-completed snippet and folds it into the
-/// take: audio onto the merged recording, text onto the merged string. Unless
-/// "review before insert" is on (which holds everything for ONE dialog at
-/// stop), the snippet is pushed live as a PARTIAL preedit — typed by the
-/// engine, finalizing nothing. The pushed text carries its joining space so
-/// what the app accumulates equals the merged string exactly. A snippet that
-/// fails to transcribe is logged and skipped — the take continues.
-fn handle_snippet(
+/// Decodes one pause-completed snippet through the shared [`StreamingTake`],
+/// binding the daemon's transcribe+translate and the IPC/notify feeds. The
+/// orchestration folds the audio and text and emits the PARTIAL preedit (typed
+/// in direct mode, display-only under review) or the once-per-take failure.
+fn fold_snippet_into_take(
     stream: &mut UnixStream,
     store: &mut SqliteMetadataStore,
     config: &RunLoopConfig,
-    state: &mut LiveStreamState,
-    samples_f32_mono: Vec<f32>,
+    take: &mut StreamingTake,
+    snippet: Vec<f32>,
 ) -> Result<(), RunLoopError> {
-    let duration_ms = (samples_f32_mono.len() as u64 * 1_000 / 16_000) as u32;
-    let segment = AudioSegment {
-        sample_rate_hz: 16_000,
-        channels: 1,
-        duration_ms,
-        samples_f32_mono,
+    let mut transcriber = DaemonTranscriber {
+        store: &*store,
+        config,
     };
-
-    let translation = effective_translation_config(store, &config.translation_config);
-    let draft = match crate::adapters::transcribe_translated(
-        &config.adapter_profile,
-        &translation,
-        &segment,
-    ) {
-        Ok(draft) => draft,
-        Err(error) => {
-            eprintln!("snippet transcription failed: {error}");
-            // The journal alone is invisible: the user pauses, nothing appears,
-            // and they can't tell broken from working. Tell them — once per
-            // take, not once per pause.
-            if state.first_error_this_take(error.code()) {
-                let mut body = error.to_string();
-                if error.code() == "translation-unavailable" {
-                    body.push_str(
-                        "\nSet translation.command in config.toml, or switch \
-                         'Translate to' back to English in the tray.",
-                    );
-                }
-                crate::adapters::notify_user(
-                    &config.notify_command,
-                    "Idiolect — dictation is failing",
-                    &body,
-                );
-            }
-            return Ok(());
-        }
-    };
-
-    // The audio ALWAYS folds into the take's recording, even when this
-    // snippet's decode is dropped below: VAD heard speech here, and the
-    // stop-time decode of the whole recording can recover words a
-    // short-context decode missed (a real take decoded "I don't want" to
-    // nothing exactly this way).
-    state
-        .merged_samples
-        .extend_from_slice(&segment.samples_f32_mono);
-
-    // A snippet that decodes to nothing, or to noise-only markers
-    // ("[BLANK_AUDIO]", "(knocking)"), contributes no text — and says so in
-    // the journal instead of disappearing silently.
-    let Some(chunk) = snippet_chunk(&state.merged_text, &draft.text) else {
-        eprintln!(
-            "snippet decode dropped ({:?}); its audio is kept for the stop-time decode",
-            draft.text
-        );
-        return Ok(());
-    };
-    state.merged_text.push_str(&chunk);
-    state.last_snippet_text = Some(draft.text.trim().to_owned());
-
-    // Every snippet is pushed live. Direct mode (review off): the engine types
-    // it into the focused app. Review mode: review=true makes it display-only —
-    // the engine streams it into the review dialog (open in its listening
-    // state) so the user watches the take grow, but nothing touches the
-    // document until that same dialog turns editable at stop.
-    send_ipc_message(
+    let mut observer = DaemonObserver {
         stream,
-        &IpcMessage::PreeditUpdate(PreeditUpdate {
-            text: chunk,
-            review: review_mode_enabled(store),
-            partial: true,
-        }),
-    )?;
-    Ok(())
+        store: &*store,
+        config,
+    };
+    take.fold_snippet(&mut transcriber, &mut observer, snippet)
 }
 
-/// Closes out a streamed take as ONE session: the merged recording is decoded
-/// once as a whole — the authoritative text — and persisted together with it
-/// (falling back to the glued snippet previews if that decode fails). With
-/// review off the preview text already reached the app via partials, so the
-/// session is committed daemon-side (the engine has nothing left to confirm);
-/// with review on, the final text goes to the client once, as the single
-/// review dialog. An empty take (no speech) stores nothing.
+/// Closes out a streamed take as ONE session: the shared [`StreamingTake`]
+/// decodes the merged recording once as a whole (the authoritative text, falling
+/// back to the glued snippet previews if that decode fails) and reports the
+/// outcome; the daemon then persists it. With review off the preview text already
+/// reached the app via partials, so the session is committed daemon-side; with
+/// review on, the final text goes to the client once, as the single review
+/// dialog. An empty take (no speech) stores nothing.
 fn finalize_streamed_take(
     stream: &mut UnixStream,
     ctx: Ctx<'_>,
@@ -1508,48 +1477,42 @@ fn finalize_streamed_take(
         codec,
         config,
     } = ctx;
-    if state.merged_samples.is_empty() {
-        return Ok(());
+
+    let outcome = {
+        let mut transcriber = DaemonTranscriber {
+            store: &*store,
+            config,
+        };
+        state.take.finalize(&mut transcriber)
+    };
+    let FinalizedTake {
+        final_text,
+        merged_samples,
+        last_snippet_text,
+        fallback_reason,
+    } = match outcome {
+        TakeOutcome::Silent => return Ok(()),
+        TakeOutcome::Speech(finalized) => finalized,
+    };
+    if let Some(reason) = fallback_reason {
+        eprintln!(
+            "whole-take transcription failed at stop; keeping the previewed snippet text: {reason}"
+        );
     }
-    let duration_ms = (state.merged_samples.len() as u64 * 1_000 / 16_000) as u32;
+
+    let duration_ms = (merged_samples.len() as u64 * 1_000 / 16_000) as u32;
     let segment = AudioSegment {
         sample_rate_hz: 16_000,
         channels: 1,
         duration_ms,
-        samples_f32_mono: state.merged_samples,
+        samples_f32_mono: merged_samples,
     };
-
-    // The take's truth is ONE decode of the whole recording: snippet decodes
-    // are short-context previews and drop words at pause boundaries (a real
-    // take lost "I don't want" that way — the words were still in the merged
-    // audio). When the stop-time decode fails or hears nothing, keep the
-    // previewed snippet text rather than lose the take.
-    let previewed = state.merged_text;
-    let translation = effective_translation_config(store, &config.translation_config);
-    let final_text = match crate::adapters::transcribe_translated(
-        &config.adapter_profile,
-        &translation,
-        &segment,
-    ) {
-        Ok(draft) => choose_final_take_text(draft.text, previewed),
-        Err(error) => {
-            eprintln!(
-                    "whole-take transcription failed at stop; keeping the previewed snippet text: {error}"
-                );
-            previewed
-        }
-    };
-    if final_text.trim().is_empty() {
-        // Nothing decodable in the whole take (e.g. only noise): store nothing.
-        return Ok(());
-    }
-
     let encoded = codec
         .encode(&segment)
         .map_err(|error| RunLoopError::codec("encode audio", error))?;
 
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
-    let session_id = persist_session(store, audio_store, config, &encoded, &final_text)?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &final_text)?;
 
     if review_mode_enabled(store) {
         *active_session = Some(ActiveSession {
@@ -1575,7 +1538,7 @@ fn finalize_streamed_take(
             session_id,
             current_text: final_text,
             finalized: true,
-            tail_text: state.last_snippet_text,
+            tail_text: last_snippet_text,
         });
     }
     Ok(())
@@ -1618,7 +1581,7 @@ fn stop_live_and_transcribe(
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
-                    handle_snippet(stream, store, config, &mut state, snippet)?;
+                    fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
                 }
                 finalize_streamed_take(
                     stream,
@@ -1810,15 +1773,6 @@ fn cancel_uncommitted_active_session(
         .map_err(|error| RunLoopError::storage("cancel session", error))?;
     active.finalized = true;
     Ok(())
-}
-
-fn utterance_id_for_session(session_id: ImeSessionId) -> Result<String, RunLoopError> {
-    Ok(format!(
-        "utterance:{}",
-        serde_json::to_string(&session_id)
-            .map_err(RunLoopError::serialization)?
-            .trim_matches('"')
-    ))
 }
 
 fn idempotency_key(prefix: &str, session_id: ImeSessionId) -> Result<String, RunLoopError> {
@@ -2145,73 +2099,6 @@ fn handle_tray_callback(
     Ok(())
 }
 
-/// Whether a snippet transcription is only non-speech markers. Whisper labels
-/// noise with bracketed/parenthesised annotations — `[BLANK_AUDIO]`,
-/// `(knocking)`, `[silence]` — and a snippet that contains nothing else (a
-/// knock, a cough, a breath that fooled the VAD) must be dropped, not typed
-/// into the user's document.
-fn is_noise_transcript(text: &str) -> bool {
-    let mut depth = 0_u32;
-    for character in text.chars() {
-        match character {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth = depth.saturating_sub(1),
-            _ if depth > 0 => {}
-            _ if character.is_alphanumeric() => return false,
-            _ => {}
-        }
-    }
-    true
-}
-
-/// Applies an engine-reported in-place correction to a take's text. The
-/// engine's correction window only ever tracks the take's final snippet
-/// (`tail`), so when the take's text ends with that snippet, the correction
-/// replaces just that suffix. Batch takes (`tail` = None) — where the window
-/// held the whole transcript — replace the full text. A tail that no longer
-/// suffixes the text (the stored text is the stop-time whole-recording decode,
-/// which can differ from the last snippet preview) keeps the take unchanged:
-/// one snippet's correction must never overwrite the whole take.
-fn merge_tail_correction(current: &str, tail: Option<&str>, corrected: &str) -> String {
-    match tail {
-        Some(tail) if current.ends_with(tail) => {
-            format!("{}{corrected}", &current[..current.len() - tail.len()])
-        }
-        Some(_) => current.to_owned(),
-        None => corrected.to_owned(),
-    }
-}
-
-/// The text a snippet contributes to the take: trimmed (Whisper pads snippet
-/// decodes with whitespace, which would double the join space — a real take
-/// stored "…  …" this way), carrying its joining space when the take already
-/// has text. `None` when the trimmed decode is empty or noise-only markers —
-/// nothing worth typing.
-fn snippet_chunk(take_so_far: &str, decoded: &str) -> Option<String> {
-    let text = decoded.trim();
-    if text.is_empty() || is_noise_transcript(text) {
-        return None;
-    }
-    Some(if take_so_far.is_empty() {
-        text.to_owned()
-    } else {
-        format!(" {text}")
-    })
-}
-
-/// Picks the take's final text at stop: the decode of the WHOLE recording when
-/// it produced usable words (short-context snippet decodes drop words at pause
-/// boundaries — a real take lost "I don't want" that way), otherwise the glued
-/// snippet previews — never lose text the user already saw typed.
-fn choose_final_take_text(full_decode: String, previewed: String) -> String {
-    let text = full_decode.trim();
-    if text.is_empty() || is_noise_transcript(text) {
-        previewed
-    } else {
-        text.to_owned()
-    }
-}
-
 fn parse_id_suffix(action: &str, prefix: &str) -> Option<i64> {
     action
         .strip_prefix(prefix)
@@ -2349,75 +2236,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn snippet_chunks_are_trimmed_and_joined_with_one_space() {
-        use super::snippet_chunk;
-        // First snippet: no joining space.
-        assert_eq!(
-            snippet_chunk("", "restart traffic"),
-            Some("restart traffic".to_owned())
-        );
-        // Later snippets carry exactly one joining space — even when the decode
-        // arrives whitespace-padded (a real take stored a double space because
-        // a padded decode was glued verbatim).
-        assert_eq!(
-            snippet_chunk("take", " so far "),
-            Some(" so far".to_owned())
-        );
-        // Empty or whitespace-only decodes contribute nothing — no bare space.
-        assert_eq!(snippet_chunk("take", ""), None);
-        assert_eq!(snippet_chunk("take", "   "), None);
-        // Noise-only markers contribute nothing.
-        assert_eq!(snippet_chunk("take", "[BLANK_AUDIO]"), None);
-    }
+    // The pure streaming-take text logic (`snippet_chunk`, `choose_final_take_text`,
+    // `merge_tail_correction`, `is_noise_transcript`) moved to
+    // `idiolect_application::use_cases::streaming` (M2) and is unit-tested there;
+    // the daemon's streaming integration tests below still exercise it end to end.
 
-    #[test]
-    fn the_stop_time_decode_wins_unless_it_heard_nothing() {
-        use super::choose_final_take_text;
-        // Usable whole-recording decode: authoritative (and trimmed).
-        assert_eq!(
-            choose_final_take_text(" the full take ".to_owned(), "the full".to_owned()),
-            "the full take"
-        );
-        // Empty or noise-only decode: keep the previewed snippet text — never
-        // lose words the user already saw typed.
-        assert_eq!(
-            choose_final_take_text(String::new(), "previewed".to_owned()),
-            "previewed"
-        );
-        assert_eq!(
-            choose_final_take_text("[BLANK_AUDIO]".to_owned(), "previewed".to_owned()),
-            "previewed"
-        );
-    }
+    mod capture_persist {
+        use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+        use idiolect_common::digest::audio_sha256_hex;
+        use idiolect_ports::audio::EncodedAudio;
 
-    #[test]
-    fn tail_corrections_replace_only_the_final_snippet() {
-        use super::merge_tail_correction;
-        // Streamed take: the engine's correction window held only the last
-        // snippet, so the fix lands on that suffix of the merged string.
-        assert_eq!(
-            merge_tail_correction(
-                "restart traffic deploy nginx",
-                Some("deploy nginx"),
-                "deploy Nginx"
-            ),
-            "restart traffic deploy Nginx"
-        );
-        // Batch take: the window held the whole transcript.
-        assert_eq!(
-            merge_tail_correction("restart traffic", None, "restart Traefik"),
-            "restart Traefik"
-        );
-        // A tail that no longer suffixes the text: the take's text may be the
-        // stop-time whole-recording decode, which can legitimately differ from
-        // the last snippet preview the engine's window held. Replacing the
-        // whole take with one snippet's correction would destroy it — keep the
-        // take and drop the unplaceable correction instead.
-        assert_eq!(
-            merge_tail_correction("something else", Some("deploy nginx"), "deploy Nginx"),
-            "something else"
-        );
+        use crate::run_loop::persist_session;
+
+        #[test]
+        fn persisting_a_capture_records_the_audio_digest() {
+            // The production gap S0a closes: a real capture must populate
+            // `utterances.audio_sha256` (content digest of the encoded payload),
+            // because the trainer's manifest builder rejects an empty digest.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let audio_store =
+                FileAudioStore::new(tmp.path().join("audio"), tmp.path().join("decoded"));
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+
+            let payload = b"IDOPUS1 fake encoded opus payload".to_vec();
+            let encoded = EncodedAudio {
+                codec_name: "opus".to_owned(),
+                sample_rate_hz: 16_000,
+                channels: 1,
+                payload: payload.clone(),
+            };
+
+            let session_id = persist_session(
+                &mut store,
+                &audio_store,
+                "default",
+                &encoded,
+                "restart traffic",
+            )
+            .expect("persist should succeed");
+
+            let link = store
+                .session_utterance_link_for_test(session_id)
+                .expect("link should query")
+                .expect("link should exist");
+
+            // The stored audio file landed...
+            assert!(
+                audio_store
+                    .source_audio_exists_for_test(&idiolect_ports::storage::AudioObjectRef {
+                        object_key: format!("audio/1970/01/01/default/{}.ogg", link.utterance_id),
+                        codec_name: "opus".to_owned(),
+                        sample_rate_hz: 16_000,
+                        channels: 1,
+                    })
+                    .expect("exists query"),
+                "capture must write the source audio",
+            );
+            // ...and the utterance row carries the digest of exactly those bytes.
+            assert_eq!(
+                store
+                    .audio_digest_for_test(&link.utterance_id)
+                    .expect("digest should query"),
+                Some(audio_sha256_hex(&payload)),
+            );
+        }
     }
 
     mod insert_via_ime {
@@ -2664,21 +2547,6 @@ mod tests {
             assert!(state.flush().is_none(), "no tail after the final pause");
         }
 
-        // A take that keeps failing the same way notifies once; a different
-        // failure (or the next take's fresh state) notifies again.
-        #[test]
-        fn first_error_this_take_dedupes_by_code() {
-            let mut state = LiveStreamState::new(&VadConfig::default());
-            assert!(state.first_error_this_take("translation-unavailable"));
-            assert!(!state.first_error_this_take("translation-unavailable"));
-            assert!(
-                state.first_error_this_take("asr-unavailable"),
-                "new code, new notification"
-            );
-            let mut next_take = LiveStreamState::new(&VadConfig::default());
-            assert!(next_take.first_error_this_take("translation-unavailable"));
-        }
-
         // Ragged chunk delivery (like real 150 ms polls) must produce the same
         // outcome as one big drain.
         #[test]
@@ -2700,12 +2568,19 @@ mod tests {
             assert_eq!(snippets.len(), 2);
         }
 
-        // A long silence after the take's first speech must flag auto-stop —
-        // the "I paused for ages and nothing happened" fix. Silence BEFORE any
-        // speech must not (thinking time before dictating is not a stop).
+        // The daemon's real resampler + VAD glue feeding the shared auto-stop
+        // clock: real silence after the take's first speech crosses the threshold
+        // (the "I paused for ages and nothing happened" fix), while pre-speech
+        // silence (thinking time) never does. The threshold arithmetic itself is
+        // unit-tested on the orchestration; this proves the wiring. (The per-take
+        // dedup and the threshold rules live in
+        // `idiolect_application::use_cases::streaming::take_tests`.)
         #[test]
-        fn long_trailing_silence_flags_auto_stop_only_after_speech() {
-            let mut state = LiveStreamState::new(&VadConfig::default());
+        fn real_silence_after_speech_flags_auto_stop() {
+            let mut state = LiveStreamState::new(&VadConfig {
+                auto_stop_silence_ms: 2_000,
+                ..VadConfig::default()
+            });
             let silence_second = idiolect_ports::audio::AudioSegment {
                 sample_rate_hz: 16_000,
                 channels: 1,
@@ -2713,45 +2588,21 @@ mod tests {
                 samples_f32_mono: vec![0.0; 16_000],
             };
 
-            // Three seconds of pre-speech silence: no auto-stop (threshold 2 s).
+            // Three seconds of pre-speech silence: no auto-stop.
             for _ in 0..3 {
                 assert!(state.ingest(&silence_second).is_empty());
             }
             assert!(
-                !state.auto_stop_due(2_000),
+                !state.auto_stop_due(),
                 "pre-speech silence never stops the take"
             );
 
-            // Speak, then go quiet: the threshold now applies.
+            // Speak, then go quiet past the 2 s threshold.
             state.ingest(&speech_pause_speech_fixture_16khz_mono());
-            assert!(
-                !state.auto_stop_due(60_000),
-                "long threshold not yet reached"
-            );
             state.ingest(&silence_second);
             state.ingest(&silence_second);
-            assert!(
-                state.auto_stop_due(2_000),
-                "2s threshold crossed after speech"
-            );
-            assert!(!state.auto_stop_due(0), "0 disables auto-stop entirely");
+            assert!(state.auto_stop_due(), "2s threshold crossed after speech");
         }
-    }
-
-    #[test]
-    fn noise_only_transcripts_are_recognised() {
-        use super::is_noise_transcript;
-        // Whisper labels non-speech with bracketed/parenthesised markers; a
-        // snippet that is ONLY such markers (a knock, a breath) must be dropped,
-        // not typed into the user's document.
-        assert!(is_noise_transcript("[BLANK_AUDIO]"));
-        assert!(is_noise_transcript("(knocking)"));
-        assert!(is_noise_transcript(" [silence] (keyboard clacking) "));
-        assert!(is_noise_transcript(""));
-        assert!(is_noise_transcript("  ."));
-        // Real words survive, even alongside a marker.
-        assert!(!is_noise_transcript("restart traffic"));
-        assert!(!is_noise_transcript("(sighs) restart traffic"));
     }
 
     mod dictation_timing_settings {

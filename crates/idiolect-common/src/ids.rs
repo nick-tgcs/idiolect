@@ -17,6 +17,21 @@ impl Default for ImeSessionId {
     }
 }
 
+/// The audio-store key for a session's single recording: `utterance:<uuid>`.
+///
+/// The source-audio object store and the `audio_sha256` digest are both keyed by
+/// this, so every front-end — the desktop daemon and the in-process mobile facade
+/// — must derive it identically. Keeping it here (rather than copied per
+/// front-end) makes that impossible to drift.
+#[must_use]
+pub fn utterance_id_for_session(session_id: ImeSessionId) -> String {
+    // The bare hyphenated UUID. `Uuid`'s `Display` is byte-identical to the inner
+    // value of `ImeSessionId`'s JSON serialization with its quotes stripped — the
+    // form the desktop daemon historically wrote — so audio already on disk keeps
+    // resolving. The test below cross-checks that equivalence.
+    format!("utterance:{}", session_id.0)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct UserId(String);
 
@@ -36,7 +51,7 @@ impl UserId {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{ImeSessionId, UserId};
+    use super::{utterance_id_for_session, ImeSessionId, UserId};
 
     #[test]
     fn ime_session_id_round_trips_through_json() {
@@ -50,6 +65,25 @@ mod tests {
     #[test]
     fn default_user_id_is_stable() {
         assert_eq!(UserId::default_user().as_str(), "default");
+    }
+
+    #[test]
+    fn utterance_id_is_the_session_uuid_with_a_stable_prefix() {
+        let id = ImeSessionId::new();
+        let utterance_id = utterance_id_for_session(id);
+
+        // `utterance:<uuid>`, where `<uuid>` is the JSON value with its quotes
+        // stripped — never the quoted JSON form (a quote in an object key would
+        // be rejected by the audio store's identifier validation).
+        let bare_uuid = serde_json::to_string(&id)
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+        assert_eq!(utterance_id, format!("utterance:{bare_uuid}"));
+        assert!(!utterance_id.contains('"'));
+        // Deterministic: the same session always maps to the same key (so audio
+        // written, digested, and later deleted all resolve to one object).
+        assert_eq!(utterance_id, utterance_id_for_session(id));
     }
 
     #[test]

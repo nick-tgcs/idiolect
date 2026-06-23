@@ -15,7 +15,6 @@ idiolect-ports = { path = "../idiolect-ports" }
 rusqlite.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
-sqlite-vector-rs = "0.2.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

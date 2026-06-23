@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  idiolect's "instant insert" accessibility service. It needs only focus/selection events
+  (to know which field the user dictated into) and the ability to write into that node, so it
+  can drop a reviewed correction into the app while the user's own keyboard is the active IME.
+  flagRetrieveInteractiveWindows lets it see the host app's window behind the review dialog.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused|typeViewTextSelectionChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="50"
+    android:description="@string/accessibility_description"
+    android:label="@string/accessibility_label" />
