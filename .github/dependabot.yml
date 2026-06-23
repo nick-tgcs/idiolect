@@ -3,6 +3,11 @@ updates:
   # Rust dependencies
   - package-ecosystem: "cargo"
     directory: "/"
+    # GitFlow: dependency bumps integrate via develop, never straight to main
+    # (main only ever merges from develop — enforced by the main-source-guard).
+    # NOTE: dependabot reads THIS FILE only from the repo's default branch (main),
+    # so this retarget takes effect once it lands on main.
+    target-branch: "develop"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -12,7 +17,11 @@ updates:
       - "dependencies"
       - "rust"
     commit-message:
-      prefix: "chore(deps):"
+      # `include: scope` appends the scope, giving e.g. "chore(deps): bump …".
+      # The prefix must NOT itself contain "(deps):" or the scope doubles up
+      # ("chore(deps):(deps): …"), which is ugly and barely passes the
+      # conventional-commits gate.
+      prefix: "chore"
       include: "scope"
     groups:
       rust-dev-dependencies:
@@ -30,6 +39,8 @@ updates:
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
+    # GitFlow: target develop, same as cargo above.
+    target-branch: "develop"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -39,7 +50,7 @@ updates:
       - "dependencies"
       - "github-actions"
     commit-message:
-      prefix: "chore(deps):"
+      prefix: "chore"
       include: "scope"
 
   # Docker (if we add Docker support later)
