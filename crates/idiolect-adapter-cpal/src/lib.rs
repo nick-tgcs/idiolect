@@ -146,10 +146,7 @@ impl RealCaptureBackend {
             })?
             .clear();
 
-        let supported_config = self
-            .device
-            .default_input_config()
-            .map_err(map_cpal_error)?;
+        let supported_config = self.device.default_input_config().map_err(map_cpal_error)?;
         let sample_rate_hz = supported_config.sample_rate();
         let channels = supported_config.channels();
         let sample_format = supported_config.sample_format();
