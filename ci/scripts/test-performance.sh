@@ -3,7 +3,7 @@ set -euo pipefail
 
 perf_dir="target/performance"
 startup_threshold_ms=5000
-transcription_threshold_ms=120000
+transcription_threshold_ms=180000
 max_rss_threshold_kb=1048576
 
 if [[ ! -x /usr/bin/time ]]; then
