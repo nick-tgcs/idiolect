@@ -120,7 +120,7 @@ jobs:
         run: gh release delete edge --cleanup-tag --yes -R "${{ github.repository }}" || true
 
       - name: Publish/replace edge release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: edge
           name: Edge (latest main)
