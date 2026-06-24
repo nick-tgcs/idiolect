@@ -52,4 +52,4 @@ rqrr = { version = "=0.10.1", default-features = false }
 # Android X509TrustManager: trust the self-signed server iff the presented leaf's DER
 # SubjectPublicKeyInfo SHA-256 equals the pinned fingerprint. `x509-parser` pulls that
 # SPKI out of the cert the server presents, exactly as `cert.publicKey.encoded` does on Android.
-x509-parser = "=0.16.0"
+x509-parser = "=0.18.1"
