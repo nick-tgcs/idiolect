@@ -81,7 +81,7 @@ tempfile = "=3.27.0"
 # Android `.so` (idiolect-ffi), so it never reaches the phone.
 axum = "=0.8.9"
 tower = "=0.5.3"
-http-body-util = "=0.1.2"
+http-body-util = "=0.1.3"
 
 # The Burn whisper parity/training tests do real model math; without optimized
 # kernels they take minutes under `cargo test` (dev profile). Only these math
