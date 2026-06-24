@@ -16,7 +16,7 @@ cuda = ["whisper-rs/cuda"]
 
 [dependencies]
 idiolect-ports = { path = "../idiolect-ports" }
-thiserror = "=1.0.61"
+thiserror = "=2.0.18"
 whisper-rs = "=0.16.0"
 
 [dev-dependencies]
