@@ -109,6 +109,10 @@ struct Indicator {
 }
 
 impl eframe::App for Indicator {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // rendering is done via Indicator::ui(ctx) called from update()
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0] // fully transparent window
     }
@@ -154,7 +158,7 @@ impl Indicator {
                     center - egui::vec2(0.0, 1.5),
                     egui::vec2(5.0, 8.5),
                 );
-                painter.rect_filled(body, egui::Rounding::same(2.5), GLYPH);
+                painter.rect_filled(body, egui::CornerRadius::same(2), GLYPH);
                 let stroke = egui::Stroke::new(1.3, GLYPH);
                 painter.add(egui::Shape::CubicBezier(
                     egui::epaint::CubicBezierShape::from_points_stroke(

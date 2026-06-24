@@ -256,7 +256,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 144, 161);
 fn install_theme(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -279,16 +279,16 @@ fn install_theme(ctx: &egui::Context) {
     .into();
 
     let mut v = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(8.0);
+    let corner_radius = egui::CornerRadius::same(8);
     v.window_fill = BG;
     v.panel_fill = BG;
     v.extreme_bg_color = FIELD;
     v.override_text_color = Some(TEXT);
-    v.widgets.noninteractive.rounding = rounding;
-    v.widgets.inactive.rounding = rounding;
-    v.widgets.hovered.rounding = rounding;
-    v.widgets.active.rounding = rounding;
-    v.widgets.open.rounding = rounding;
+    v.widgets.noninteractive.corner_radius = corner_radius;
+    v.widgets.inactive.corner_radius = corner_radius;
+    v.widgets.hovered.corner_radius = corner_radius;
+    v.widgets.active.corner_radius = corner_radius;
+    v.widgets.open.corner_radius = corner_radius;
     v.widgets.inactive.bg_fill = SURFACE;
     v.widgets.inactive.weak_bg_fill = SURFACE;
     let surface_hover = egui::Color32::from_rgb(44, 47, 60);
@@ -299,7 +299,7 @@ fn install_theme(ctx: &egui::Context) {
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// How long the window must stay unfocused AND stationary before a focus-loss is
@@ -382,6 +382,10 @@ fn emit(action: &str) {
 }
 
 impl eframe::App for SettingsApp {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // rendering is done in update()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // "Click off" closes the window, like the menu it replaces — but a window
         // manager title-bar *move* also drops focus (while streaming the new

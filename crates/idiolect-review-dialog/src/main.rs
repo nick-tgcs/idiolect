@@ -120,7 +120,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 144, 161);
 fn install_theme(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -143,17 +143,17 @@ fn install_theme(ctx: &egui::Context) {
     .into();
 
     let mut v = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(10.0);
-    v.window_rounding = egui::Rounding::same(14.0);
+    let corner_radius = egui::CornerRadius::same(10);
+    v.window_corner_radius = egui::CornerRadius::same(14);
     v.window_fill = BG;
     v.panel_fill = BG;
     v.extreme_bg_color = FIELD;
     v.override_text_color = Some(TEXT);
-    v.widgets.noninteractive.rounding = rounding;
-    v.widgets.inactive.rounding = rounding;
-    v.widgets.hovered.rounding = rounding;
-    v.widgets.active.rounding = rounding;
-    v.widgets.open.rounding = rounding;
+    v.widgets.noninteractive.corner_radius = corner_radius;
+    v.widgets.inactive.corner_radius = corner_radius;
+    v.widgets.hovered.corner_radius = corner_radius;
+    v.widgets.active.corner_radius = corner_radius;
+    v.widgets.open.corner_radius = corner_radius;
     v.widgets.inactive.bg_fill = SURFACE;
     v.widgets.inactive.weak_bg_fill = SURFACE;
     let surface_hover = egui::Color32::from_rgb(44, 47, 60);
@@ -162,15 +162,15 @@ fn install_theme(ctx: &egui::Context) {
     v.selection.bg_fill = ACCENT.gamma_multiply(0.45);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     v.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 6.0),
-        blur: 24.0,
-        spread: 0.0,
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
         color: egui::Color32::from_black_alpha(120),
     };
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(10.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 struct ReviewApp {
@@ -262,6 +262,10 @@ impl ReviewApp {
 }
 
 impl eframe::App for ReviewApp {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // rendering is done via ReviewApp::ui(ctx) called from update()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
@@ -307,12 +311,7 @@ impl ReviewApp {
 
         // Draggable header (the window is frameless) + title and hint.
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 16.0,
-                bottom: 6.0,
-            }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 6 }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if self.listening {
@@ -363,12 +362,7 @@ impl ReviewApp {
 
         // Action buttons pinned to the bottom so they are never clipped.
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 12.0,
-                bottom: 16.0,
-            }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 12, bottom: 16 }))
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let insert = egui::Button::new(
@@ -394,12 +388,7 @@ impl ReviewApp {
         // The transcript fills the space between, scrolling if long. Read-only
         // while listening (the daemon owns the text until the take ends).
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 2.0,
-                bottom: 2.0,
-            }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 2, bottom: 2 }))
             .show(ctx, |ui| {
                 let blurb = if self.listening {
                     "Each pause adds a phrase. Nothing is typed until you finish."
