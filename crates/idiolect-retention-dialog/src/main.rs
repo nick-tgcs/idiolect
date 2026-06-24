@@ -284,8 +284,9 @@ impl RetentionApp {
                 });
             });
 
+        #[allow(deprecated)]
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22.0, 8.0)))
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22, 8)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let field = ui.add(
