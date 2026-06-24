@@ -80,7 +80,7 @@ tempfile = "=3.10.1"
 # Desktop-only HTTP (the personal model/sync server). Not a dependency of the
 # Android `.so` (idiolect-ffi), so it never reaches the phone.
 axum = "=0.7.9"
-tower = "=0.5.2"
+tower = "=0.5.3"
 http-body-util = "=0.1.2"
 
 # The Burn whisper parity/training tests do real model math; without optimized
