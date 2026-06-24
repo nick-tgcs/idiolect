@@ -223,7 +223,12 @@ impl RetentionApp {
 
         // Draggable frameless header.
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 6 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 16,
+                bottom: 6,
+            }))
             .show(ctx, |ui| {
                 ui.add(
                     egui::Label::new(
@@ -243,7 +248,12 @@ impl RetentionApp {
             });
 
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 8, bottom: 16 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 8,
+                bottom: 16,
+            }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let hint = match resolved {

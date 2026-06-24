@@ -311,7 +311,12 @@ impl ReviewApp {
 
         // Draggable header (the window is frameless) + title and hint.
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 6 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 16,
+                bottom: 6,
+            }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if self.listening {
@@ -362,7 +367,12 @@ impl ReviewApp {
 
         // Action buttons pinned to the bottom so they are never clipped.
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 12, bottom: 16 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 12,
+                bottom: 16,
+            }))
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let insert = egui::Button::new(
@@ -388,7 +398,12 @@ impl ReviewApp {
         // The transcript fills the space between, scrolling if long. Read-only
         // while listening (the daemon owns the text until the take ends).
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 22, right: 22, top: 2, bottom: 2 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 2,
+                bottom: 2,
+            }))
             .show(ctx, |ui| {
                 let blurb = if self.listening {
                     "Each pause adds a phrase. Nothing is typed until you finish."
