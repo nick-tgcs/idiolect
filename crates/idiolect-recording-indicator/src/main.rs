@@ -135,8 +135,9 @@ impl Indicator {
 
         let t = ctx.input(|i| i.time) as f32;
 
+        #[allow(deprecated)]
         egui::CentralPanel::default()
-            .frame(egui::Frame::none())
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 let center = ui.max_rect().center();
                 let painter = ui.painter();

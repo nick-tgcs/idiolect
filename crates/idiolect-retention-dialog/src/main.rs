@@ -222,8 +222,9 @@ impl RetentionApp {
         }
 
         // Draggable frameless header.
+        #[allow(deprecated)]
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
                 top: 16,
@@ -247,8 +248,9 @@ impl RetentionApp {
                 }
             });
 
+        #[allow(deprecated)]
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
                 top: 8,
@@ -283,7 +285,7 @@ impl RetentionApp {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(22.0, 8.0)))
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22.0, 8.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let field = ui.add(

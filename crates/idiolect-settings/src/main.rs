@@ -407,11 +407,12 @@ impl eframe::App for SettingsApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        #[allow(deprecated)]
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(BG)
-                    .inner_margin(egui::Margin::same(18.0)),
+                    .inner_margin(egui::Margin::same(18)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -458,7 +459,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_source(id)
+                egui::ComboBox::from_id_salt(id)
                     .selected_text(selected_label.to_owned())
                     .width(170.0)
                     .show_ui(ui, |ui| {

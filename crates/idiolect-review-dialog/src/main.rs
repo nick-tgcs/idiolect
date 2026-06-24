@@ -310,8 +310,9 @@ impl ReviewApp {
         }
 
         // Draggable header (the window is frameless) + title and hint.
+        #[allow(deprecated)]
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
                 top: 16,
@@ -366,8 +367,9 @@ impl ReviewApp {
             });
 
         // Action buttons pinned to the bottom so they are never clipped.
+        #[allow(deprecated)]
         egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
                 top: 12,
@@ -397,8 +399,9 @@ impl ReviewApp {
 
         // The transcript fills the space between, scrolling if long. Read-only
         // while listening (the daemon owns the text until the take ends).
+        #[allow(deprecated)]
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
                 top: 2,
