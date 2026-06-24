@@ -76,7 +76,7 @@ whisper-rs = "=0.16.0"
 toml = "=0.8.23"
 burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
-tempfile = "=3.10.1"
+tempfile = "=3.27.0"
 # Desktop-only HTTP (the personal model/sync server). Not a dependency of the
 # Android `.so` (idiolect-ffi), so it never reaches the phone.
 axum = "=0.8.9"
