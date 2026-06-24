@@ -88,13 +88,13 @@ impl ServerTls {
     ) -> Result<Self, TlsError> {
         // The SAN is cosmetic: the phone pins the SPKI and skips hostname verification (the
         // server is IP-addressed), so the name in the cert is never checked.
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["idiolect-sync".to_owned()])?;
         let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let key_pem = signing_key.serialize_pem();
         // Hash the key pair's SPKI; it is byte-identical to the SPKI embedded in the cert
         // the client is presented (asserted in `the_fingerprint_matches_the_certificate_spki`).
-        let fingerprint = sha256_hex(&key_pair.public_key_der());
+        let fingerprint = sha256_hex(&signing_key.public_key_raw_der());
 
         std::fs::create_dir_all(dir).map_err(|source| TlsError::Io {
             path: dir.to_path_buf(),
@@ -155,7 +155,7 @@ impl ServerTls {
 /// the same pin it minted.
 fn fingerprint_from_key_pem(key_pem: &str) -> Result<String, TlsError> {
     let key_pair = rcgen::KeyPair::from_pem(key_pem)?;
-    Ok(sha256_hex(&key_pair.public_key_der()))
+    Ok(sha256_hex(&key_pair.public_key_raw_der()))
 }
 
 fn read(path: &Path) -> Result<String, TlsError> {
