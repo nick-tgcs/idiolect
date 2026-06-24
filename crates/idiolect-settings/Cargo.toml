@@ -10,7 +10,7 @@ name = "idiolect-settings"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
 idiolect-application = { path = "../idiolect-application" }
 serde_json.workspace = true
 tiny-skia = "0.12"
