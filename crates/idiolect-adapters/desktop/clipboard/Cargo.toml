@@ -11,4 +11,4 @@ workspace = true
 [dependencies]
 arboard = "3"
 idiolect-application = { path = "../../../idiolect-application" }
-thiserror = "1.0"
+thiserror = "2.0"

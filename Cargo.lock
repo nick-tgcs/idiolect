@@ -141,7 +141,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys 0.5.0+25.2.9519653",
  "num_enum",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1358,7 +1358,7 @@ dependencies = [
  "polling",
  "rustix 0.38.44",
  "slab",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2900,7 +2900,7 @@ dependencies = [
  "egui",
  "epaint",
  "log",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "type-map",
  "web-time 0.2.4",
  "wgpu 0.20.1",
@@ -3788,7 +3788,7 @@ checksum = "6f56f6318968d03c18e1bcf4857ff88c61157e9da8e47c5f29055d60e1228884"
 dependencies = [
  "log",
  "presser",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "winapi",
  "windows 0.52.0",
 ]
@@ -3909,7 +3909,7 @@ dependencies = [
  "com",
  "libc",
  "libloading 0.8.9",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "widestring",
  "winapi",
 ]
@@ -4197,7 +4197,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "idiolect-application",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4215,7 +4215,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "tempfile",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4248,7 +4248,7 @@ version = "0.1.0"
 dependencies = [
  "idiolect-ports",
  "ksni",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "tiny-skia",
 ]
 
@@ -4283,7 +4283,7 @@ name = "idiolect-adapter-translate"
 version = "0.1.0"
 dependencies = [
  "idiolect-ports",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4301,7 +4301,7 @@ version = "0.1.0"
 dependencies = [
  "idiolect-ports",
  "idiolect-test-support",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "whisper-rs",
 ]
 
@@ -4312,7 +4312,7 @@ dependencies = [
  "idiolect-common",
  "idiolect-ports",
  "idiolect-test-support",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4336,7 +4336,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "time",
  "toml 0.8.23",
  "uuid",
@@ -4362,7 +4362,7 @@ dependencies = [
  "idiolect-sync-client",
  "idiolect-test-support",
  "tempfile",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "uniffi",
 ]
 
@@ -4419,7 +4419,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4473,7 +4473,7 @@ dependencies = [
  "idiolect-common",
  "serde",
  "serde_json",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4482,7 +4482,7 @@ version = "0.1.0"
 dependencies = [
  "idiolect-adapter-sqlite",
  "idiolect-sync",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4506,7 +4506,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "thiserror 1.0.61",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tower",
@@ -4717,7 +4717,7 @@ dependencies = [
  "combine",
  "jni-sys 0.3.1",
  "log",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "walkdir",
  "windows-sys 0.45.0",
 ]
@@ -5231,7 +5231,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "spirv 0.3.0+sdk-1.3.268.0",
  "termcolor",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "unicode-xid",
 ]
 
@@ -5319,7 +5319,7 @@ dependencies = [
  "num_enum",
  "raw-window-handle 0.5.2",
  "raw-window-handle 0.6.2",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5333,7 +5333,7 @@ dependencies = [
  "log",
  "ndk-sys 0.6.0+11769913",
  "num_enum",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7199,7 +7199,7 @@ dependencies = [
  "log",
  "memmap2",
  "rustix 0.38.44",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "wayland-backend",
  "wayland-client",
  "wayland-csd-frame",
@@ -7395,7 +7395,7 @@ dependencies = [
  "byteorder",
  "enum-as-inner",
  "libc",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "walkdir",
 ]
 
@@ -7436,7 +7436,7 @@ dependencies = [
  "ndarray 0.16.1",
  "rand 0.8.6",
  "safetensors 0.3.3",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "torch-sys",
  "zip 0.6.6",
 ]
@@ -7490,11 +7490,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.61"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c546c80d6be4bc6a00c0f01730c08df82eaa7a7a61f11d656526506112cc1709"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl 1.0.61",
+ "thiserror-impl 1.0.69",
 ]
 
 [[package]]
@@ -7508,9 +7508,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.61"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c3384250002a6d5af4d114f2845d37b57521033f30d5c3f46c4d70e1197533"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8791,7 +8791,7 @@ dependencies = [
  "raw-window-handle 0.6.2",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "web-sys",
  "wgpu-hal 0.21.1",
  "wgpu-types 0.20.0",
@@ -8891,7 +8891,7 @@ dependencies = [
  "renderdoc-sys",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror 1.0.61",
+ "thiserror 1.0.69",
  "wasm-bindgen",
  "web-sys",
  "wgpu-types 0.20.0",
