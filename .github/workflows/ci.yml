@@ -78,7 +78,7 @@ jobs:
         run: cargo llvm-cov --workspace --features idiolect-ibus/ibus-engine --all-targets --fail-under-lines 80
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: target/llvm-cov/html
@@ -338,7 +338,7 @@ jobs:
         run: bash ci/scripts/test-performance.sh
 
       - name: Upload performance report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: performance-report
           path: target/performance/
@@ -465,7 +465,7 @@ jobs:
         run: bash ci/scripts/test-package-lifecycle.sh
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian-package
           path: target/package/*.deb
