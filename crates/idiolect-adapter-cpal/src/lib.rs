@@ -291,7 +291,7 @@ where
 {
     device
         .build_input_stream(
-            config.clone(),
+            *config,
             move |data: &[T], _info| {
                 let channels = usize::from(channels);
                 if channels == 0 {
