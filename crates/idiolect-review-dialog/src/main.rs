@@ -489,6 +489,7 @@ mod tests {
     fn run(app: &mut ReviewApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
+        #[allow(deprecated)]
         let _ = ctx.run(input, |ctx| app.ui(ctx));
     }
 

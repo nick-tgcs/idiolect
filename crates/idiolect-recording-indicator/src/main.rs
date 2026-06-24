@@ -221,6 +221,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         // Running a frame must not panic and must move the window to the caret.
+        #[allow(deprecated)]
         let output = ctx.run(egui::RawInput::default(), |ctx| indicator.ui(ctx));
         let moved_to_caret = output.viewport_output.values().any(|vp| {
             vp.commands.iter().any(|cmd| {

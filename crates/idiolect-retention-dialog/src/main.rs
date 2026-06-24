@@ -342,6 +342,7 @@ mod tests {
     fn run(app: &mut RetentionApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
+        #[allow(deprecated)]
         let _ = ctx.run(input, |ctx| app.ui(ctx));
     }
 
