@@ -1,0 +1,168 @@
+name: Android Release
+
+# Builds the signed, ARM-only (arm64-v8a) idiolect Android APK and publishes it as a
+# GitHub Release asset, which Obtainium tracks (https://github.com/nick-tgcs/idiolect →
+# "Add App"). Mirrors the nick-tgcs/WhisperVault release approach + CalVer versioning,
+# adapted for idiolect's Rust core (NDK cross-compile) and Android-only tag namespace.
+#
+# Triggers:
+#   1. push to main        → auto-computes the next android-vYYYY.MM.N tag, builds & releases
+#   2. push of an android-v* tag → uses that tag (manual tag-push fallback)
+#   3. workflow_dispatch   → manual; pass a tag to (re)release an existing one, or leave
+#                            blank to auto-compute the next CalVer tag
+#
+# Why one combined job: a tag pushed with GITHUB_TOKEN cannot trigger another workflow, so
+# splitting "tag" and "build" into two workflows would never chain. Doing it all here sidesteps
+# that. The android-v* namespace keeps this clear of the desktop release.yml (which owns v*).
+#
+# Verification is out-of-band (build/CI plumbing has no unit/integration/e2e seam): the gate is
+# the Android unit suite below + a green release build; locally, ./gradlew :app:assembleRelease
+# -PandroidAbis=arm64-v8a reproduces it.
+
+on:
+  push:
+    branches: [main]
+    tags: ['android-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. android-v2026.06.1). Leave blank to auto-compute.'
+        required: false
+        default: ''
+
+env:
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: "28.0.13004108"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release (arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Serialize so concurrent auto-computes don't race to create the same tag.
+    concurrency:
+      group: android-release
+      cancel-in-progress: false
+    # Skip main pushes whose head commit says [skip android]; always run on tag/dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       !contains(github.event.head_commit.message, '[skip android]'))
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed to enumerate tags
+
+      - name: Resolve or compute version tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+            if [[ ! "$TAG" =~ ^android-v[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]; then
+              echo "::error::Invalid tag '${TAG}'. Expected android-vYYYY.MM.N (e.g. android-v2026.06.1)."
+              exit 1
+            fi
+            if ! git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "::error::Tag '${TAG}' does not exist. Push it first or leave the input blank to auto-compute."
+              exit 1
+            fi
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            # Auto-compute the next android-vYYYY.MM.N tag for push-to-main / blank dispatch.
+            YEAR=$(date -u +%Y); MONTH=$(date -u +%m)
+            PREFIX="android-v${YEAR}.${MONTH}."
+            LAST=$(git tag -l "${PREFIX}*" | sed "s|${PREFIX}||" | sort -n | tail -1)
+            if [ -z "$LAST" ]; then COUNT=1; else COUNT=$((LAST + 1)); fi
+            TAG="${PREFIX}${COUNT}"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "$TAG"
+            git push origin "$TAG"   # GITHUB_TOKEN push won't re-trigger this workflow
+          fi
+          VERSION="${TAG#android-v}"
+          # versionCode = base + number of android-vYYYY.* tags (monotonic across releases).
+          BASE_VERSION_CODE=1
+          RELEASE_COUNT=$(git tag -l "android-v[0-9][0-9][0-9][0-9].*" | wc -l)
+          echo "tag=${TAG}"                                   >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"                           >> "$GITHUB_OUTPUT"
+          echo "code=$((BASE_VERSION_CODE + RELEASE_COUNT))"  >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG} (versionName=${VERSION}, versionCode=$((BASE_VERSION_CODE + RELEASE_COUNT)))"
+
+      - name: Checkout tagged commit (explicit-tag dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        run: git checkout "${{ steps.tag.outputs.tag }}"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Rust toolchain (arm64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Cache cargo + native build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Decode release keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "${{ github.workspace }}/android/idiolect-release.jks"
+
+      - name: Android unit-test gate
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest :ffi:test
+
+      - name: Build signed arm64 release APK
+        working-directory: android
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/android/idiolect-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew :app:assembleRelease \
+            -PandroidAbis=arm64-v8a \
+            -PappVersionName="${{ steps.tag.outputs.version }}" \
+            -PappVersionCode="${{ steps.tag.outputs.code }}"
+
+      - name: Stage APK asset
+        id: apk
+        run: |
+          SRC=android/app/build/outputs/apk/release/app-release.apk
+          OUT="idiolect-arm64-${{ steps.tag.outputs.tag }}.apk"
+          cp "$SRC" "$OUT"
+          ls -l "$OUT"
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: ${{ steps.apk.outputs.path }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false

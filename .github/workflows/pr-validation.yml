@@ -2,8 +2,11 @@ name: PR Validation
 
 on:
   pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, develop]
+    # `edited` is included so retargeting a PR's base branch (e.g. develop -> main
+    # with no new commit) re-runs validation; otherwise the main-source-guard below
+    # would not be re-evaluated and a green summary could escape the source rule.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
@@ -49,6 +52,38 @@ jobs:
           if [ "$LINE_COUNT" -gt 1000 ]; then
             echo "::warning::PR modifies more than 1000 lines ($LINE_COUNT). Consider splitting into smaller PRs."
           fi
+
+  # =========================================================================
+  # MAIN SOURCE BRANCH GUARD
+  #
+  # GitHub rulesets can require a PR into main but cannot restrict its *source*
+  # branch, so GitFlow's "main only ever merges from develop" is enforced here:
+  # a PR whose base is main must come from THIS repo's `develop` branch, else it
+  # fails. Folded into "PR Validation Summary" (a required check), so it gates
+  # merges to main without adding a new required-check context. PRs into develop
+  # are unaffected. The head-repo check matters because `github.head_ref` is only
+  # a branch *name*: a fork branch also named `develop` would otherwise pass.
+  # =========================================================================
+  main-source-guard:
+    name: Main Source Branch Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce that main only accepts PRs from this repo's develop
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+        run: |
+          echo "PR: ${HEAD_REPO}:${HEAD_REF} -> ${BASE_REF}"
+          if [[ "$BASE_REF" == "main" ]]; then
+            if [[ "$HEAD_REF" != "develop" || "$HEAD_REPO" != "$THIS_REPO" ]]; then
+              echo "::error::PRs into 'main' must come from '${THIS_REPO}:develop' (got '${HEAD_REPO}:${HEAD_REF}'). Merge your work into develop first, then open a develop -> main PR."
+              exit 1
+            fi
+          fi
+          echo "Source-branch policy satisfied."
 
   # =========================================================================
   # CONVENTIONAL COMMITS CHECK
@@ -97,7 +132,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -172,7 +207,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -205,7 +240,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -239,7 +274,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -272,6 +307,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - pr-size
+      - main-source-guard
       - conventional-commits
       - rust-quick
       - fcitx5-quick
@@ -284,6 +320,7 @@ jobs:
         run: |
           # Check if any required job failed
           if [[ "${{ needs.pr-size.result }}" != "success" ]] || \
+             [[ "${{ needs.main-source-guard.result }}" != "success" ]] || \
              [[ "${{ needs.conventional-commits.result }}" != "success" ]] || \
              [[ "${{ needs.rust-quick.result }}" != "success" ]] || \
              [[ "${{ needs.fcitx5-quick.result }}" != "success" ]] || \

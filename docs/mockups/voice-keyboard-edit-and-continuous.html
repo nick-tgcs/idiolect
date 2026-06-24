@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>idiolect — continuous mode + edit dialog mockup</title><style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  :root{
+    --accent:#7c83fd; --accent-bright:#a6abff; --live:#eb5757;
+    --bg:#16171e; --panel:#1b1e27; --strip:#272b36; --surface:#1f212b;
+    --field:#101117; --slate:#333845; --slate2:#454b5c;
+    --text:#e5e7f0; --grey:#c7cad3; --muted:#8c90a1;
+  }
+  body{ background:#0d0e12; font-family:'Roboto','Segoe UI',sans-serif; padding:30px; color:var(--grey); }
+  h1{ font-size:18px; font-weight:600; color:var(--text); margin-bottom:4px; }
+  .sub{ color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .row{ display:flex; gap:22px; align-items:flex-start; }
+  .col{ width:330px; }
+  .cap{ font-size:14px; text-align:center; margin-bottom:10px; font-weight:500; color:var(--grey); }
+  .cap small{ display:block; color:var(--muted); font-weight:400; font-size:12px; margin-top:2px; }
+  .ime{ background:var(--panel); border-radius:16px 16px 0 0; padding-bottom:16px; overflow:hidden;
+        box-shadow:0 -2px 28px rgba(0,0,0,.55); border:1px solid #ffffff0a; }
+  .progress{ height:3px; background:var(--strip); } .progress>i{ display:block; height:100%; width:0; background:var(--accent); }
+  .strip{ display:flex; align-items:center; justify-content:space-around; background:var(--strip);
+          border-radius:24px; height:46px; margin:12px 14px 0; }
+  .ib{ width:42px; height:34px; display:flex; align-items:center; justify-content:center; border-radius:18px; }
+  .ib svg{ width:22px; height:22px; fill:var(--grey); }
+  .ib.on{ background:var(--accent); } .ib.on svg{ fill:#fff; }
+  .ib.on .lbl{ color:#fff; } .lbl{ font-size:12px; margin-left:5px; color:var(--grey); }
+  .divider{ width:1px; height:20px; background:#ffffff1c; }
+  .status{ height:22px; line-height:22px; text-align:center; font-size:13px; margin-top:11px; font-weight:500; }
+  .stage{ display:flex; align-items:center; justify-content:center; padding:16px 0 8px; }
+  .mic{ width:92px; height:92px; border-radius:50%; display:flex; align-items:center; justify-content:center; position:relative; }
+  .mic svg{ width:40px; height:40px; }
+  .mic .rec{ position:absolute; top:-2px; right:-2px; background:var(--live); color:#fff; font-size:10px;
+             font-weight:700; padding:2px 7px; border-radius:10px; border:2px solid var(--panel); }
+  .listenC{ background:var(--accent); box-shadow:0 0 0 8px #7c83fd2e; }
+  .contC{ background:var(--live); box-shadow:0 0 0 9px #eb57572b; }
+  .preview{ margin:2px 16px 0; color:var(--muted); font-size:12.5px; text-align:center; line-height:1.5; }
+  .preview b{ color:var(--text); font-weight:500; }
+  /* edit dialog */
+  .dlg{ margin:12px 14px 0; background:var(--bg); border-radius:12px; padding:14px 14px 12px; border:1px solid #ffffff10; }
+  .dlg .h{ display:flex; justify-content:space-between; align-items:baseline; }
+  .dlg .h b{ color:var(--text); font-size:15px; font-weight:600; }
+  .dlg .h span{ color:var(--muted); font-size:11px; }
+  .dlg .blurb{ color:var(--muted); font-size:11.5px; margin:6px 0 8px; }
+  .dlg .field{ background:var(--field); border:1px solid #ffffff14; border-radius:8px; padding:11px 12px;
+               color:var(--text); font-size:13px; line-height:1.55; min-height:96px; }
+  .dlg .field .cur{ display:inline-block; width:2px; height:15px; background:var(--accent); vertical-align:-2px;
+                    margin-left:1px; }
+  .dlg .field mark{ background:#7c83fd3d; color:var(--text); border-radius:3px; }
+  .dlg .actions{ display:flex; justify-content:flex-end; gap:8px; margin-top:11px; }
+  .btn{ border-radius:9px; padding:8px 18px; font-size:13px; font-weight:600; }
+  .btn.ins{ background:var(--accent); color:#fff; } .btn.can{ background:var(--surface); color:var(--muted); }
+  .kbhint{ margin:10px 8px 0; display:flex; flex-direction:column; gap:5px; opacity:.5; }
+  .kbrow{ display:flex; gap:5px; justify-content:center; }
+  .key{ width:26px; height:26px; background:var(--slate); border-radius:5px; }
+  .key.w{ width:120px; }
+</style></head>
+<body>
+  <h1>idiolect — continuous mode &amp; the edit dialog</h1>
+  <div class="sub">Solving: (1) keep dictating until I stop, (2) fix long text without chip clutter — an editable surface like the desktop review.</div>
+  <div class="row" id="r"></div>
+  <script>
+    const mic=(c)=>`<svg viewBox="0 0 64 64"><g fill="none" stroke="${c}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><rect x="22" y="8" width="20" height="30" rx="10" fill="${c}"/><path d="M14 34 C14 50 50 50 50 34"/><path d="M32 47 L32 54"/><path d="M23 55 L41 55"/></g></svg>`;
+    const KEY=`<svg viewBox="0 0 24 24"><path d="M20,5H4C2.9,5 2.01,5.9 2.01,7L2,17c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V7c0,-1.1 -0.9,-2 -2,-2zM11,8h2v2h-2zM11,11h2v2h-2zM8,8h2v2H8zM8,11h2v2H8zM7,13H5v-2h2zM7,10H5V8h2zM16,17H8v-2h8zM16,13h-2v-2h2zM16,10h-2V8h2zM19,13h-2v-2h2zM19,10h-2V8h2z"/></svg>`;
+    const GLOBE=`<svg viewBox="0 0 24 24"><path d="M12,2A10,10 0 1,0 22,12 10,10 0 0,0 12,2zm6.92,6h-2.95a15.65,15.65 0 0,0 -1.38,-3.56A8,8 0 0,1 18.92,8zM12,4.04A14,14 0 0,1 13.91,8h-3.82A14,14 0 0,1 12,4.04zM4.26,14a7.82,7.82 0 0,1 0,-4h3.38a16.5,16.5 0 0,0 0,4zm.82,2h2.95a15.65,15.65 0 0,0 1.38,3.56A8,8 0 0,1 5.08,16zm2.95,-8H5.08a8,8 0 0,1 4.33,-3.56A15.65,15.65 0 0,0 8.03,8zM12,19.96A14,14 0 0,1 10.09,16h3.82A14,14 0 0,1 12,19.96zM14.34,14H9.66a14.92,14.92 0 0,1 0,-4h4.68a14.92,14.92 0 0,1 0,4zm.25,5.56A15.65,15.65 0 0,0 15.97,16h2.95a8,8 0 0,1 -4.33,3.56zM16.36,14a16.5,16.5 0 0,0 0,-4h3.38a7.82,7.82 0 0,1 0,4z"/></svg>`;
+    const INF=`<svg viewBox="0 0 24 24"><path d="M18.6,6.62A4.38,4.38 0 0,0 14.22,11 4.38,4.38 0 0,0 9.84,6.62 4.38,4.38 0 1,0 9.84,17.38 4.38,4.38 0 0,0 14.22,13 4.38,4.38 0 0,0 18.6,17.38 4.38,4.38 0 1,0 18.6,6.62zM7.4,14.88A2.88,2.88 0 1,1 10.28,12 2.88,2.88 0 0,1 7.4,14.88zm9.2,0A2.88,2.88 0 1,1 19.48,12 2.88,2.88 0 0,1 16.6,14.88z"/></svg>`;
+    function stripHTML(contOn){ return `<div class="strip">
+        <div class="ib">${KEY}</div><div class="divider"></div>
+        <div class="ib ${contOn?'on':''}">${INF}<span class="lbl">∞</span></div><div class="divider"></div>
+        <div class="ib">${GLOBE}</div></div>`; }
+    const r=document.getElementById('r');
+    r.innerHTML = `
+      <div class="col">
+        <div class="cap">A · Continuous mode ON — recording<small>tap mic to start; keeps going across pauses</small></div>
+        <div class="ime">
+          <div class="progress"><i></i></div>
+          ${stripHTML(true)}
+          <div class="status" style="color:var(--live)">● Listening — tap to stop</div>
+          <div class="stage"><div class="mic contC">${mic('#fff')}<span class="rec">REC</span></div></div>
+          <div class="preview"><b>Pick up milk and eggs.</b> <b>Call the dentist tomorrow.</b> and now I'm still talking…</div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="cap">B · Manual (press &amp; hold)<small>for one quick utterance — the default</small></div>
+        <div class="ime">
+          <div class="progress"><i></i></div>
+          ${stripHTML(false)}
+          <div class="status" style="color:var(--accent-bright)">Listening…</div>
+          <div class="stage"><div class="mic listenC">${mic('#fff')}</div></div>
+          <div class="preview">hold the mic, speak, release to insert</div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="cap">C · Edit dialog (long text, no chips)<small>tap ⌨ / a take to open — editable, like desktop</small></div>
+        <div class="ime">
+          <div class="progress"><i></i></div>
+          ${stripHTML(false)}
+          <div class="dlg">
+            <div class="h"><b>Review dictation</b><span>insert · cancel</span></div>
+            <div class="blurb">Edit it however you like — your fix is recorded for training.</div>
+            <div class="field">Pick up milk and eggs. Call the dentist <mark>tomorrow</mark><span class="cur"></span> about the appointment, and remember to send the report before lunch.</div>
+            <div class="actions"><span class="btn can">Cancel</span><span class="btn ins">Insert</span></div>
+          </div>
+          <div class="kbhint">
+            <div class="kbrow"><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span></div>
+            <div class="kbrow"><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span></div>
+            <div class="kbrow"><span class="key w"></span></div>
+          </div>
+        </div>
+      </div>`;
+  </script>
+</body></html>

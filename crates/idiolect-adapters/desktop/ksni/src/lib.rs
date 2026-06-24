@@ -68,6 +68,13 @@ impl TrayPort for KsniTray {
 }
 
 impl KsniTray {
+    /// Whether the ksni service loop is running and the tray will (re-)register
+    /// with `StatusNotifierWatcher` when it appears. `false` means the daemon is
+    /// running headless (no icon, no reconnect).
+    pub fn is_live(&self) -> bool {
+        self.handle.is_some()
+    }
+
     pub fn new(sender: mpsc::Sender<TrayCallback>) -> Result<Self, KsniTrayError> {
         // Escape hatch for headless/in-process use (notably integration tests that
         // run several daemons inside one process): registering a StatusNotifierItem
@@ -84,11 +91,18 @@ impl KsniTray {
             menu_items: Vec::new(),
             sender,
         };
-        // Degrade gracefully when there is no tray host: a missing
-        // `StatusNotifierWatcher` (headless, or the desktop shell not up yet at
-        // login) must not crash the daemon — dictation works without an icon, and
-        // the daemon stays up instead of the autostart unit giving up on it.
-        let handle = match inner.spawn() {
+        // The daemon's systemd unit fires as soon as graphical-session.target is
+        // reached, but GNOME Shell (which registers org.kde.StatusNotifierWatcher)
+        // can take ~800 ms longer. assume_sni_available(true) tells ksni to treat
+        // a missing watcher as transient: it starts its reconnect loop instead of
+        // returning Err, so the icon appears once GNOME Shell catches up. Without
+        // this, the spawn failed with ServiceUnknown, the handle became None, and
+        // no icon ever appeared for the entire daemon session.
+        //
+        // If the session bus is absent entirely (headless server, CI without
+        // dbus-run-session), the session() connection builder itself fails before
+        // we reach the watcher check, and we still degrade gracefully to None.
+        let handle = match inner.assume_sni_available(true).spawn() {
             Ok(handle) => Some(handle),
             Err(error) => {
                 eprintln!("idiolect: tray unavailable, running without a tray icon: {error}");
@@ -159,12 +173,30 @@ impl InnerTray {
                 // option index.
                 let group_id = item.id.clone();
                 let sender = sender.clone();
-                MenuItem::RadioGroup(RadioGroup {
+                let group = MenuItem::RadioGroup(RadioGroup {
                     selected: *selected,
                     options: radio_items,
                     select: Box::new(move |_this: &mut InnerTray, idx: usize| {
                         let _ = sender.send(TrayCallback::Activate(format!("{group_id}:{idx}")));
                     }),
+                });
+                if item.label.is_empty() {
+                    return group;
+                }
+                // DBusMenu radio groups carry no caption, so a bare group renders
+                // as an anonymous run of options — adjacent groups blur into one
+                // unreadable list. Preserve the label as a submenu title, with
+                // the current choice appended so "what is it set to?" is
+                // answered without expanding.
+                let title = match options.get(*selected) {
+                    Some(current) => format!("{} — {}", item.label, current),
+                    None => item.label.clone(),
+                };
+                MenuItem::SubMenu(SubMenu {
+                    label: title,
+                    enabled: item.enabled,
+                    submenu: vec![group],
+                    ..Default::default()
                 })
             }
             TrayMenuItemKind::Separator => MenuItem::Separator,
@@ -223,6 +255,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_is_not_live_when_handle_is_none() {
+        // is_live() is the observable proxy for whether the ksni reconnect loop is
+        // running. handle: None means either IDIOLECT_DISABLE_TRAY was set or the
+        // session bus was absent; either way the tray is not live.
+        let tray = KsniTray { handle: None };
+        assert!(!tray.is_live());
+    }
+
+    #[test]
     fn degraded_tray_without_a_host_is_a_safe_noop() {
         // When no tray host is available the tray has no handle; every operation
         // must succeed as a no-op so the daemon runs headless instead of crashing.
@@ -232,5 +273,99 @@ mod tests {
         assert!(tray.set_tooltip("Idiolect — Recording…").is_ok());
         assert!(tray.set_menu(Vec::new()).is_ok());
         assert!(tray.set_status(TrayStatus::Active).is_ok());
+    }
+
+    fn inner_tray() -> (InnerTray, mpsc::Receiver<TrayCallback>) {
+        let (sender, receiver) = mpsc::channel();
+        (
+            InnerTray {
+                icon: TrayIcon::Idle,
+                tooltip: String::new(),
+                status: ksni::Status::Passive,
+                menu_items: Vec::new(),
+                sender,
+            },
+            receiver,
+        )
+    }
+
+    fn radio_group_item(label: &str, options: &[&str], selected: usize) -> TrayMenuItem {
+        TrayMenuItem {
+            id: "settings:pause".to_owned(),
+            label: label.to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::RadioGroup {
+                options: options.iter().map(|o| (*o).to_owned()).collect(),
+                selected,
+            },
+        }
+    }
+
+    #[test]
+    fn a_labelled_radio_group_keeps_its_label_and_shows_the_current_value() {
+        // DBusMenu radio groups have no caption: rendered bare, four groups in a
+        // row become one anonymous run of numbers ("0.4 s, 0.7 s, 0.15 s, …") —
+        // unusable. The label must survive as a submenu title, with the current
+        // choice visible at a glance without expanding.
+        let (mut tray, receiver) = inner_tray();
+        let item = radio_group_item(
+            "Send a phrase after a pause of",
+            &["0.4 s", "0.7 s (default)", "1.2 s"],
+            1,
+        );
+        let sender = tray.sender.clone();
+        let mapped = tray.map_menu_item(&item, sender);
+
+        let MenuItem::SubMenu(submenu) = mapped else {
+            panic!("labelled radio group must render as a titled submenu");
+        };
+        assert_eq!(
+            submenu.label, "Send a phrase after a pause of — 0.7 s (default)",
+            "submenu title = group label + current choice"
+        );
+        assert_eq!(submenu.submenu.len(), 1, "the choices live inside");
+        let MenuItem::RadioGroup(group) = &submenu.submenu[0] else {
+            panic!("the submenu must contain the actual radio group");
+        };
+        assert_eq!(group.selected, 1);
+        assert_eq!(group.options.len(), 3);
+
+        // Selecting still emits the same "<group-id>:<index>" action id, so the
+        // daemon's tray-action parsing is untouched.
+        let select = match &submenu.submenu[0] {
+            MenuItem::RadioGroup(group) => &group.select,
+            _ => unreachable!(),
+        };
+        select(&mut tray, 2);
+        match receiver.try_recv() {
+            Ok(TrayCallback::Activate(id)) => assert_eq!(id, "settings:pause:2"),
+            other => panic!("expected Activate(settings:pause:2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unlabelled_radio_group_stays_inline() {
+        // No label means nothing to preserve — don't force an extra menu level.
+        let (tray, _receiver) = inner_tray();
+        let item = radio_group_item("", &["a", "b"], 0);
+        let sender = tray.sender.clone();
+        let mapped = tray.map_menu_item(&item, sender);
+        assert!(
+            matches!(mapped, MenuItem::RadioGroup(_)),
+            "unlabelled groups render bare"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_selection_still_renders_with_the_plain_label() {
+        // Defensive: a bad index must not panic or invent a value.
+        let (tray, _receiver) = inner_tray();
+        let item = radio_group_item("Show last", &["1 day"], 9);
+        let sender = tray.sender.clone();
+        let mapped = tray.map_menu_item(&item, sender);
+        let MenuItem::SubMenu(submenu) = mapped else {
+            panic!("labelled radio group must render as a titled submenu");
+        };
+        assert_eq!(submenu.label, "Show last");
     }
 }

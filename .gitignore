@@ -23,3 +23,23 @@ fcitx5/idiolect-fcitx5/build/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# --- Android (Gradle / NDK) ---
+# Build outputs — fully regenerable, never committed. Mirrors android/.gitignore
+# (on feat/android-mobile) but rooted here so the artifacts stay ignored on every
+# branch — including CI branches that don't carry the Android tree yet still end
+# up with a stale android/ build dir left on disk after a branch switch.
+android/.gradle/
+android/**/build/
+android/.kotlin/
+android/**/.cxx/
+android/local.properties
+
+# Signing secrets — NEVER commit (release keystore + its passwords/alias).
+*.jks
+*.keystore
+keystore.properties
+
+# Android Studio / IntelliJ project files
+android/.idea/
+android/**/*.iml

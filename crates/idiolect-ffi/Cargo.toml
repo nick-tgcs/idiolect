@@ -1,0 +1,59 @@
+[package]
+name = "idiolect-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The single UniFFI facade the Android app loads: a `cdylib` (the `.so`) plus an
+# `rlib` so the workspace test/clippy gates exercise the seam on the host. UniFFI's
+# generated scaffolding emits `unsafe`, which the workspace's `forbid(unsafe_code)`
+# could not allow-away, so this crate sets its own lints (below) — all *hand-written*
+# code here stays safe; the unsafe lives only in UniFFI's generated component.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints.rust]
+warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[dependencies]
+uniffi = { version = "=0.31.2", features = ["cli"] }
+thiserror.workspace = true
+idiolect-common = { path = "../idiolect-common" }
+idiolect-ports = { path = "../idiolect-ports" }
+idiolect-application = { path = "../idiolect-application" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+# Learning-sync (M6): the outbox→wire codec and the transport-free phone client
+# (build_batch / confirm_shipped) exposed through the FFI so the Kotlin WorkManager
+# pump can ship learnings and reclaim after the PC's ACK.
+idiolect-sync = { path = "../idiolect-sync" }
+idiolect-sync-client = { path = "../idiolect-sync-client" }
+# At-rest encryption of the history projection (ChaCha20-Poly1305), keyed on device
+# from the Android Keystore. The cipher is reused unchanged from desktop.
+idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
+# On-device streaming: the live take folds snippets through the same VAD + Opus +
+# Whisper adapters the daemon uses (no `cuda` feature ⇒ CPU on the phone).
+idiolect-adapter-vad = { path = "../idiolect-adapter-vad" }
+idiolect-adapter-opus = { path = "../idiolect-adapter-opus" }
+idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
+
+[dev-dependencies]
+tempfile.workspace = true
+# The seam tests drive the streaming lifecycle with a scripted `TakeTranscriber`
+# (deterministic) and prove the real on-device path with the committed fixture
+# Whisper model over the real speech fixture.
+idiolect-test-support = { path = "../idiolect-test-support" }

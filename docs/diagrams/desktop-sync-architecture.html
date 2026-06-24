@@ -1,0 +1,197 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>idiolect — one product, identical UX, per-OS adapters</title><style>
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  :root{
+    --accent:#7c83fd; --accent-bright:#a6abff; --live:#eb5757; --ok:#3ddc97; --warn:#e0a44a;
+    --bg:#16171e; --panel:#1b1e27; --surface:#1f212b; --field:#101117;
+    --slate:#333845; --slate2:#454b5c; --text:#e5e7f0; --grey:#c7cad3; --muted:#8c90a1;
+  }
+  body{ background:#0d0e12; font-family:'Roboto','Segoe UI',sans-serif; color:var(--grey); padding:30px; width:1280px; }
+  h1{ font-size:19px; color:var(--text); font-weight:600; margin-bottom:4px; }
+  .sub{ color:var(--muted); font-size:12.5px; margin-bottom:20px; line-height:1.6; max-width:1120px; }
+  .sub b{ color:var(--accent-bright); }
+  .flow{ display:flex; flex-direction:column; gap:14px; align-items:center; }
+
+  .box{ background:var(--panel); border:1px solid #ffffff14; border-radius:12px; padding:13px 15px; }
+  .box .t{ color:var(--text); font-size:13.5px; font-weight:600; display:flex; align-items:center; gap:8px; }
+  .box .tag{ font-size:10px; font-weight:700; color:var(--muted); background:#ffffff0d; padding:2px 7px; border-radius:9px; letter-spacing:.4px; }
+  .box ul{ list-style:none; margin-top:9px; display:flex; flex-direction:column; gap:5px; }
+  .box li{ color:var(--grey); font-size:11.8px; line-height:1.45; padding-left:14px; position:relative; }
+  .box li::before{ content:"›"; position:absolute; left:0; color:var(--muted); }
+  .box li b{ color:var(--text); font-weight:500; }
+  code{ color:var(--accent-bright); background:#ffffff0d; padding:1px 5px; border-radius:4px; font-size:10.6px; }
+  .accentbox{ border-color:#7c83fd55; box-shadow:0 0 0 1px #7c83fd22, 0 6px 24px #7c83fd14; }
+  .accentbox>.t{ color:var(--accent-bright); }
+
+  .phone{ width:600px; text-align:left; }
+  .arrows{ display:flex; gap:34px; align-items:center; justify-content:center; color:var(--muted); font-size:11.5px; }
+  .arrows .a{ display:flex; flex-direction:column; align-items:center; gap:2px; }
+  .arrows .ln{ color:var(--accent); font-size:18px; line-height:1; }
+
+  /* CORE */
+  .core{ width:100%; background:#13141b; border:1px solid #7c83fd44; border-radius:16px; padding:16px; box-shadow:0 0 0 1px #7c83fd1a, 0 8px 30px #7c83fd10; }
+  .core>.hd{ color:var(--accent-bright); font-size:15px; font-weight:700; margin-bottom:3px; }
+  .core>.hs{ color:var(--muted); font-size:11.5px; margin-bottom:12px; }
+  .grid3{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+  .mini{ background:var(--surface); border:1px solid #ffffff10; border-radius:9px; padding:10px 12px; }
+  .mini .mt{ color:var(--text); font-size:12px; font-weight:600; margin-bottom:5px; }
+  .mini .ml{ color:var(--grey); font-size:11px; line-height:1.5; }
+  .mini .ml .x{ color:var(--muted); }
+  .pill{ font-size:9.5px; font-weight:700; padding:2px 7px; border-radius:9px; margin-left:6px; }
+  .pill.ok{ background:#11362a; color:var(--ok); } .pill.new{ background:#2a2550; color:var(--accent-bright); }
+
+  /* PORTS bar */
+  .ports{ width:100%; background:var(--panel); border:1px dashed #7c83fd55; border-radius:12px; padding:11px 14px; }
+  .ports .pt{ color:var(--muted); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.6px; margin-bottom:8px; }
+  .ports .chips{ display:flex; flex-wrap:wrap; gap:7px; }
+  .pchip{ background:var(--surface); border:1px solid #ffffff14; border-radius:8px; padding:5px 10px; font-size:11px; color:var(--grey); }
+  .pchip b{ color:var(--accent-bright); }
+  .pchip.hot{ border-color:#7c83fd66; }
+
+  .swap{ color:var(--muted); font-size:11.5px; text-align:center; }
+  .swap b{ color:var(--accent); }
+
+  /* per-OS adapter columns */
+  .cols{ display:flex; gap:16px; width:100%; }
+  .col{ flex:1; background:#13141b; border:1px solid #ffffff0d; border-radius:14px; padding:14px; }
+  .col>.hd{ color:var(--text); font-size:13.5px; font-weight:700; margin-bottom:2px; }
+  .col>.hs{ color:var(--muted); font-size:10.8px; margin-bottom:11px; }
+  .ad{ display:flex; align-items:center; gap:8px; padding:7px 0; border-top:1px solid #ffffff0d; font-size:11.4px; }
+  .ad:first-of-type{ border-top:0; } .ad .k{ color:var(--muted); width:96px; flex:0 0 auto; }
+  .ad .v{ color:var(--grey); flex:1; } .ad .v b{ color:var(--text); }
+  .badge{ font-size:9px; font-weight:700; padding:2px 6px; border-radius:8px; }
+  .badge.ok{ background:#11362a; color:var(--ok); } .badge.new{ background:#2a2550; color:var(--accent-bright); }
+
+  /* identical tray */
+  .traywrap{ width:100%; background:var(--panel); border:1px solid #7c83fd55; border-radius:12px; padding:14px 16px; }
+  .traywrap .bt{ color:var(--accent-bright); font-size:13px; font-weight:700; margin-bottom:2px; }
+  .traywrap .bs{ color:var(--muted); font-size:11.3px; margin-bottom:11px; }
+  .traywrap .bs b{ color:var(--grey); }
+  .menu{ background:#0f1014; border:1px solid #ffffff14; border-radius:10px; padding:7px 0; width:360px; margin:0 auto; }
+  .menu .mi{ padding:6px 16px; font-size:12.3px; color:var(--grey); display:flex; align-items:center; gap:8px; }
+  .menu .mi .sm{ color:var(--muted); font-size:10.4px; margin-left:auto; }
+  .menu .mi.new{ color:#fff; } .menu .mi.new .dot{ width:7px; height:7px; border-radius:50%; background:var(--accent); }
+  .menu .mi.new .tg{ color:var(--accent-bright); font-size:9.5px; margin-left:auto; }
+  .menu .sep{ height:1px; background:#ffffff14; margin:6px 0; }
+
+  .band{ width:100%; background:var(--panel); border:1px solid #ffffff14; border-radius:12px; padding:12px 15px; }
+  .band .bt{ color:var(--muted); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.6px; margin-bottom:8px; }
+  .chips{ display:flex; flex-wrap:wrap; gap:7px; }
+  .chip{ background:var(--surface); border:1px solid #ffffff12; border-radius:8px; padding:6px 10px; font-size:11px; color:var(--accent-bright); font-family:'Roboto Mono',ui-monospace,monospace; }
+  .legend{ display:flex; gap:22px; margin-top:4px; color:var(--muted); font-size:11px; flex-wrap:wrap; }
+  .legend .badge{ vertical-align:middle; }
+</style></head>
+<body>
+  <h1>idiolect — one product, identical UX everywhere, per-OS adapters underneath</h1>
+  <div class="sub">
+    The same app, the same tray, the same features on <b>Linux · macOS · Windows</b>. It already works this way: a portable
+    <b>core</b> (capture via cpal, whisper ASR, history, translation, the sync server, training, the dashboard, and the tray menu)
+    plugs into <b>ports</b>. Only the <b>adapters</b> behind two ports are OS-specific — text injection (<code>InputMethodPort</code>)
+    and tray rendering (<code>TrayPort</code>). Nothing is added or removed per OS — like for like.
+  </div>
+
+  <div class="flow">
+
+    <!-- PHONE -->
+    <div class="box phone accentbox">
+      <div class="t">📱 Phone — Android app <span class="tag">UNCHANGED</span></div>
+      <ul>
+        <li>On-device dictation; edits become correction pairs; outbox ships them, pulls the model back</li>
+        <li>Pairs by scanning the QR · <code>POST /v1/pair</code> · <code>POST /v1/sync</code> · <code>GET /v1/model</code> over pinned HTTPS</li>
+      </ul>
+    </div>
+    <div class="arrows"><div class="a"><span class="ln">▲▼</span><span>HTTPS · pinned cert — to whichever process hosts the core on that OS</span></div></div>
+
+    <!-- CORE -->
+    <div class="core">
+      <div class="hd">idiolect core — built ONCE, identical on every OS</div>
+      <div class="hs">portable Rust crates; this is where the tray menu, dictation pipeline, sync and training all live</div>
+      <div class="grid3">
+        <div class="mini"><div class="mt">Dictation pipeline</div><div class="ml">cpal capture <span class="pill ok">cross-platform</span> → VAD → <span class="x">whisper</span> ASR → text</div></div>
+        <div class="mini"><div class="mt">Tray menu &amp; UX</div><div class="ml"><code>MenuUseCase</code> builds the <b style="color:var(--text)">one</b> menu; egui dashboard; review dialog</div></div>
+        <div class="mini"><div class="mt">History &amp; translation</div><div class="ml">sqlite corpus, recent-history, translate-while-dictating</div></div>
+        <div class="mini"><div class="mt">Sync server</div><div class="ml"><code>idiolect-sync-server</code>: pairing · ingest · model-serve + TLS</div></div>
+        <div class="mini"><div class="mt">Training</div><div class="ml"><code>idiolect-trainerctl</code> subprocess · LoRA + atomic <code>--serve</code></div></div>
+        <div class="mini"><div class="mt">Learning loop</div><div class="ml">corrections → corpus → train → serve to phones → hot-reload local ASR</div></div>
+      </div>
+    </div>
+
+    <!-- PORTS -->
+    <div class="ports">
+      <div class="pt">Ports (the seams — already exist in idiolect-ports)</div>
+      <div class="chips">
+        <span class="pchip hot"><b>InputMethodPort</b> ← OS-specific</span>
+        <span class="pchip hot"><b>TrayPort</b> ← OS-specific</span>
+        <span class="pchip">AudioInputPort · cpal (portable)</span>
+        <span class="pchip">AsrPort · whisper (portable)</span>
+        <span class="pchip">TrainerPort</span>
+        <span class="pchip">MetadataStorePort · sqlite</span>
+        <span class="pchip">TranslationPort</span>
+      </div>
+    </div>
+
+    <div class="swap">▲ the same core fills these ports with <b>different adapters per OS</b> ▼ &nbsp;— the only place the OS matters</div>
+
+    <!-- PER-OS ADAPTERS -->
+    <div class="cols">
+      <div class="col">
+        <div class="hd">🐧 Linux</div>
+        <div class="hs">host: IBus-integrated daemon (<code>idiolectd</code>) + launched egui windows</div>
+        <div class="ad"><span class="k">InputMethodPort</span><span class="v"><b>IBus engine</b></span><span class="badge ok">EXISTS ✓</span></div>
+        <div class="ad"><span class="k">TrayPort</span><span class="v"><b>ksni</b> (StatusNotifier)</span><span class="badge ok">EXISTS ✓</span></div>
+        <div class="ad"><span class="k">Capture / ASR</span><span class="v">cpal · whisper</span><span class="badge ok">SHARED ✓</span></div>
+      </div>
+      <div class="col">
+        <div class="hd">🍎 macOS</div>
+        <div class="hs">host: standalone tray app (same core binary)</div>
+        <div class="ad"><span class="k">InputMethodPort</span><span class="v"><b>Accessibility / IMK</b> injector</span><span class="badge new">BUILD</span></div>
+        <div class="ad"><span class="k">TrayPort</span><span class="v"><b>tray-icon</b> (menu-bar)</span><span class="badge new">BUILD</span></div>
+        <div class="ad"><span class="k">Capture / ASR</span><span class="v">cpal · whisper</span><span class="badge ok">SHARED ✓</span></div>
+      </div>
+      <div class="col">
+        <div class="hd">🪟 Windows</div>
+        <div class="hs">host: standalone tray app (same core binary)</div>
+        <div class="ad"><span class="k">InputMethodPort</span><span class="v"><b>UI Automation / TSF</b> injector</span><span class="badge new">BUILD</span></div>
+        <div class="ad"><span class="k">TrayPort</span><span class="v"><b>tray-icon</b> (notification area)</span><span class="badge new">BUILD</span></div>
+        <div class="ad"><span class="k">Capture / ASR</span><span class="v">cpal · whisper</span><span class="badge ok">SHARED ✓</span></div>
+      </div>
+    </div>
+
+    <!-- IDENTICAL TRAY -->
+    <div class="traywrap">
+      <div class="bt">The tray menu — IDENTICAL on Linux · macOS · Windows</div>
+      <div class="bs">Built once by <code>MenuUseCase</code>. Same items, same order, same behaviour everywhere. <b>Existing items kept; sync/train appended.</b></div>
+      <div class="menu">
+        <div class="mi">Start Recording</div>
+        <div class="mi">Stop &amp; Insert</div>
+        <div class="mi">Cancel (discard)</div>
+        <div class="sep"></div>
+        <div class="mi">Recent History ▸ <span class="sm">Edit · Insert · Copy · Delete</span></div>
+        <div class="sep"></div>
+        <div class="mi">☑ Translate while dictating</div>
+        <div class="mi">Settings…</div>
+        <div class="sep"></div>
+        <div class="mi new"><span class="dot"></span> Sync on <span class="sm">2 phones · 12 new</span></div>
+        <div class="mi new">Pair a phone… <span class="tg">+ new</span></div>
+        <div class="mi new">Train now (12 new) <span class="tg">+ new</span></div>
+        <div class="mi new">Open dashboard… <span class="tg">+ new</span></div>
+      </div>
+    </div>
+
+    <!-- DATA -->
+    <div class="band">
+      <div class="bt">Data dir (per OS conventions) — db, audio, model slot, tokens, cert</div>
+      <div class="chips">
+        <span class="chip">idiolect.sqlite</span><span class="chip">audio/</span>
+        <span class="chip">models/whisper/*.bin ← train swaps atomically</span>
+        <span class="chip">device-tokens.json</span><span class="chip">sync-tls-cert.pem</span>
+      </div>
+      <div class="legend" style="margin-top:10px;">
+        <span><span class="badge ok">EXISTS ✓</span> already in the tree</span>
+        <span><span class="badge ok">SHARED ✓</span> portable, written once</span>
+        <span><span class="badge new">BUILD</span> the only per-OS work for full parity (injector + tray adapter)</span>
+      </div>
+    </div>
+
+  </div>
+</body></html>

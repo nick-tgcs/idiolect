@@ -22,7 +22,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::{self, JoinHandle};
@@ -30,7 +30,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idiolect_adapter_sqlite::SqliteMetadataStore;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
-use idiolect_ipc::messages::{InsertText, ServerHello, PROTOCOL_VERSION};
+use idiolect_ipc::messages::{
+    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, PROTOCOL_VERSION,
+};
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::Proxy;
@@ -97,6 +99,12 @@ async fn engine_dictates_and_daemon_records_the_session() {
         committed, DRAFT,
         "the transcript is committed straight into the app"
     );
+
+    // The streamed snippet's correction window opens when the daemon's
+    // recording=false push lands — one IPC message AFTER the CommitText we just
+    // observed, on a different channel than these D-Bus keys. Give the reader a
+    // beat so the keys below are tracked, as a human's first backspace would be.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Fix it in place: backspace "traffic" and retype "Traefik". These pass
     // through to the app, but the engine tracks the tail edit.
@@ -224,6 +232,260 @@ async fn engine_inserts_history_text_on_daemon_request() {
 
     drop(engine);
     drop(conn);
+}
+
+/// The direct-mode (review OFF) transcript emit, isolated to its one variable:
+/// `active_path`. Via a fake daemon (full control of the wire) the engine is armed
+/// (`RecordingStatus{true}`) and handed a final `PreeditUpdate{review:false}` — and
+/// with a prior `FocusIn` (as focusing a text field does) it types the transcript
+/// into the focused context. This is the A in an A/B with the next test: the only
+/// difference is the `FocusIn`, pinning `active_path` as what makes direct mode type
+/// (and closing the gap that the ProcessKeyEvent path masks by self-setting it).
+#[tokio::test]
+async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-direct-focused");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, mut server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Focusing a text field is the ONLY thing that sets active_path in the real
+    // direct-mode flow (Super+T never reaches the engine as a key).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    // The daemon arms the engine, then delivers a finished direct-mode take.
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: DRAFT.to_owned(),
+            review: false,
+            partial: false,
+        }),
+    );
+
+    let committed = next_commit(&mut commit_signals).await;
+    assert_eq!(
+        committed, DRAFT,
+        "a focused context receives the direct-mode transcript via CommitText"
+    );
+    // The engine also reports the commit back so the daemon records it.
+    expect_commit_preedit(&mut server_reader);
+
+    drop(engine);
+    drop(conn);
+}
+
+/// The belt-and-braces behaviour for "no focused context": the SAME direct take as
+/// above but with NO `FocusIn` (so `active_path` stays `None`, as when idiolect is
+/// not the focused IBus context). Rather than silently lose the text into nowhere
+/// AND let the daemon bank a never-landed training pair, the engine DISCARDS the
+/// take — it sends `CancelPreedit` (not `CommitPreedit`) and emits no `CommitText`.
+/// Only `FocusIn` differs from the test above, so `active_path` is proven to be the
+/// cause, and a missing target no longer poisons the corpus.
+#[tokio::test]
+async fn direct_transcript_without_focus_in_is_discarded_not_typed_or_recorded() {
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-direct-unfocused");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, mut server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Deliberately NO FocusIn / ProcessKeyEvent: active_path is never set.
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: DRAFT.to_owned(),
+            review: false,
+            partial: false,
+        }),
+    );
+
+    // No focused context: the engine discards the take (cancels it daemon-side)
+    // rather than recording a pair whose text never landed...
+    expect_cancel_preedit(&mut server_reader);
+    // ...and nothing reaches the app.
+    let typed = {
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(2), commit_signals.next()).await
+    };
+    assert!(
+        typed.is_err(),
+        "with no focused context the transcript is discarded, not typed"
+    );
+
+    drop(engine);
+    drop(conn);
+}
+
+/// Invalidate-on-destroy: a context that had focus is destroyed (the app/window
+/// went away), so `active_path` must not keep pointing at it. After `Destroy`, a
+/// direct take has no live target and is discarded — proving the dead context is
+/// no longer a stale commit destination.
+#[tokio::test]
+async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-direct-destroyed");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, mut server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Focus the context (sets active_path), then destroy it (must clear active_path).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+    engine_proxy
+        .call::<_, _, ()>("Destroy", &())
+        .await
+        .expect("Destroy");
+
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: DRAFT.to_owned(),
+            review: false,
+            partial: false,
+        }),
+    );
+
+    // The dead context is not targeted: the take is discarded, nothing is typed.
+    expect_cancel_preedit(&mut server_reader);
+    let typed = {
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(2), commit_signals.next()).await
+    };
+    assert!(
+        typed.is_err(),
+        "a destroyed context must not receive a CommitText"
+    );
+
+    drop(engine);
+    drop(conn);
+}
+
+/// Accept the engine's connection and complete the v1 handshake, returning the
+/// (writer, reader) halves the test drives the fake daemon through.
+fn accept_and_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixStream>) {
+    let (stream, _) = listener.accept().expect("engine connects");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).expect("read ClientHello");
+    assert!(
+        matches!(decode_json_line(&hello), Ok(IpcMessage::ClientHello(_))),
+        "engine should greet with ClientHello"
+    );
+    send_line(
+        &mut writer,
+        &IpcMessage::ServerHello(ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            accepted_features: vec![],
+        }),
+    );
+    (writer, reader)
+}
+
+async fn connect_private(bus: &PrivateBus) -> zbus::Connection {
+    zbus::connection::Builder::address(bus.address())
+        .expect("valid bus address")
+        .build()
+        .await
+        .expect("connect to private bus")
+}
+
+async fn create_engine(conn: &zbus::Connection) -> Proxy<'static> {
+    let factory = await_factory(conn).await;
+    let engine_path: OwnedObjectPath = factory
+        .call("CreateEngine", &("idiolect",))
+        .await
+        .expect("CreateEngine");
+    Proxy::new(conn, BUS_NAME, engine_path, ENGINE_IFACE)
+        .await
+        .expect("engine proxy")
+}
+
+/// The engine reports a direct-mode commit back to the daemon (so the take is
+/// recorded) regardless of whether it could type it — assert that CommitPreedit.
+fn expect_commit_preedit(reader: &mut BufReader<UnixStream>) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read CommitPreedit");
+    match decode_json_line(&line).expect("decode") {
+        IpcMessage::CommitPreedit(CommitPreedit { text }) => {
+            assert_eq!(text, DRAFT, "the take is committed daemon-side")
+        }
+        other => panic!("expected CommitPreedit, got {other:?}"),
+    }
+}
+
+/// The engine discards an un-typeable take by cancelling it daemon-side — assert
+/// that `CancelPreedit` (so no history row and no training pair is recorded).
+fn expect_cancel_preedit(reader: &mut BufReader<UnixStream>) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read CancelPreedit");
+    match decode_json_line(&line).expect("decode") {
+        IpcMessage::CancelPreedit => {}
+        other => panic!("expected CancelPreedit, got {other:?}"),
+    }
+}
+
+async fn next_commit<S>(stream: &mut S) -> String
+where
+    S: futures_util::Stream<Item = zbus::Message> + Unpin,
+{
+    let msg = next_signal(stream).await;
+    let body = msg.body();
+    let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
+    extract_ibus_text(&text)
 }
 
 fn send_line(writer: &mut impl Write, message: &IpcMessage) {

@@ -10,6 +10,8 @@ mod classifier;
 pub mod manifest;
 mod metrics;
 mod promotion;
+pub mod revalidate;
+pub mod train_command;
 
 pub use manifest::{
     LearningManifestBuilder, Manifest, ManifestBuildError, ManifestBuildInput, ManifestCandidate,
@@ -23,6 +25,10 @@ pub use promotion::{
 };
 
 pub use classifier::{CandidateClassifier, CandidateEvidence, CandidateLabel};
+pub use revalidate::{
+    decide, revalidate_user, RevalidationEntry, RevalidationError, RevalidationOutcome,
+    RevalidationReport,
+};
 
 #[cfg(test)]
 mod tests {

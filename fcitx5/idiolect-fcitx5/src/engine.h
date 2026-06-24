@@ -48,6 +48,10 @@ public:
     /// Called when the daemon delivers the final transcript: commit it into the
     /// focused app (via the committer) and tell the daemon to finalize.
     void on_transcript(std::string text);
+    /// Called for each streamed mid-take snippet (a PARTIAL preedit): commit it
+    /// into the focused app and keep recording — the daemon finalizes the
+    /// merged take itself at stop, so nothing is sent back.
+    void on_partial_transcript(std::string text);
     /// Abort an in-progress take.
     void cancel();
     /// The daemon reported an error mid-take; return to idle.

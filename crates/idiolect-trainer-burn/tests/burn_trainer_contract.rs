@@ -28,7 +28,7 @@ fn candidate_artifact_records_base_model_manifest_and_backend() {
 
     assert_eq!(artifact.base_model_id(), "whisper-medium-en");
     assert_eq!(artifact.manifest_digest(), "manifest-v2-digest");
-    assert_eq!(artifact.backend_id(), "burn-ndarray-0.13.2");
+    assert_eq!(artifact.backend_id(), "burn-ndarray-0.21.0");
 }
 
 #[test]

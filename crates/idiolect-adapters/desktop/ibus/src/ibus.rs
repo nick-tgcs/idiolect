@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use idiolect_ipc::messages::{EditHistory, HistoryEdited};
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{Array, Dict, OwnedObjectPath, Signature, StructureBuilder, Value};
 use zbus::{interface, Connection};
@@ -67,8 +68,10 @@ impl Surface for PendingSurface {
 struct Shared {
     session: Mutex<Session<DaemonSender, PendingSurface>>,
     active_path: Mutex<Option<OwnedObjectPath>>,
-    /// Review dialog used in "review before insert" mode. Behind a trait so the
-    /// GUI toolkit is swappable; runs out-of-process so it never blocks the IME.
+    /// Review dialog used in "review before insert" mode. Doubles as the live
+    /// mid-take surface (snippets stream into it as the user pauses). Behind a
+    /// trait so the GUI toolkit is swappable; runs out-of-process so it never
+    /// blocks the IME.
     dialog: Box<dyn crate::review::ReviewDialog>,
     /// "Voice is live" overlay shown next to the caret while recording.
     indicator: Box<dyn crate::indicator::RecordingIndicator>,
@@ -76,13 +79,35 @@ struct Shared {
     /// so the indicator can appear right where the user is dictating.
     caret: Mutex<(i32, i32)>,
     connection: Connection,
+    /// Restores X11 focus to the app the user was dictating into before a direct
+    /// (no-dialog) commit, mirroring what the review dialog already does — the WM
+    /// may not have handed focus back yet after the take (indicator, focus churn),
+    /// and a commit racing that transition lands nowhere.
+    focus: Box<dyn crate::focus::WindowFocus>,
+    /// The window that was focused when the current take started recording — the
+    /// commit target to re-assert focus on (captured on `recording=true`).
+    dictation_target: Mutex<Option<crate::focus::WindowId>>,
 }
+
+/// After re-asserting focus, give the WM + app a moment to process the focus-in
+/// and re-establish their input context before the engine commits — otherwise the
+/// commit races the focus hand-back (the same settle the review dialog uses).
+const FOCUS_SETTLE: Duration = Duration::from_millis(120);
 
 type SharedRef = Arc<Shared>;
 
 impl Shared {
     fn set_active(&self, path: &OwnedObjectPath) {
         *self.active_path.lock().expect("active_path mutex") = Some(path.clone());
+    }
+
+    /// Forget the active target if it is this (now-gone) context, so a destroyed
+    /// or disabled context can never be a stale commit target.
+    fn clear_active_if(&self, path: &OwnedObjectPath) {
+        let mut active = self.active_path.lock().expect("active_path mutex");
+        if active.as_ref() == Some(path) {
+            *active = None;
+        }
     }
 
     /// Run a session operation and return the resulting surface ops (lock held
@@ -199,6 +224,11 @@ fn ibus_text_str(value: &Value<'_>) -> String {
 
 async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
     for SurfaceOp::Commit { text } in ops {
+        dbg_edit(&format!(
+            "emit CommitText -> {} : {:?}",
+            engine_path.as_str(),
+            text
+        ));
         let result = conn
             .emit_signal(
                 None::<&str>,
@@ -269,9 +299,11 @@ impl IbusEngine {
     }
     async fn disable(&self) {
         dbg_edit("disable");
+        self.shared.clear_active_if(&self.path);
     }
     async fn destroy(&self) {
         dbg_edit("destroy");
+        self.shared.clear_active_if(&self.path);
     }
 
     async fn set_capabilities(&self, caps: u32) {
@@ -387,8 +419,13 @@ impl Trigger {
             .lock()
             .expect("active_path mutex")
             .clone();
-        if let Some(path) = target {
-            emit_surface_ops(&self.shared.connection, &path, ops).await;
+        match target {
+            Some(path) => emit_surface_ops(&self.shared.connection, &path, ops).await,
+            None if !ops.is_empty() => dbg_edit(&format!(
+                "toggle emit DROPPED: active_path None — {} op(s) NOT typed",
+                ops.len()
+            )),
+            None => {}
         }
     }
 }
@@ -396,20 +433,44 @@ impl Trigger {
 /// Daemon read loop (one per process): delivers transcripts/errors into the
 /// shared session and emits the resulting preedit/commit on the *currently
 /// focused* engine object.
-fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSender) {
+fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonSender) {
     let handle = tokio::runtime::Handle::current();
     let socket = ipc::default_socket_path();
     tokio::task::spawn_blocking(move || loop {
         let ops = match reader.read_message() {
             Ok(IpcMessage::PreeditUpdate(update)) => {
                 dbg_edit(&format!(
-                    "transcript <- daemon: {:?} (review={})",
-                    update.text, update.review
+                    "transcript <- daemon: {:?} (review={} partial={})",
+                    update.text, update.review, update.partial
                 ));
-                if update.review {
-                    // Review mode: show our own editable dialog (blocking — fine
-                    // on this dedicated reader thread), then commit the user's
-                    // final text into the app and record raw→edited, or cancel.
+                if update.partial && update.review {
+                    // A display-only snippet of a review-mode take: stream it
+                    // into the review dialog (opening it, in its listening
+                    // state, on the first snippet) so the user watches the
+                    // take grow in the same window they will edit at stop;
+                    // nothing touches the document.
+                    shared.dialog.append(&update.text);
+                    continue;
+                }
+                if update.partial {
+                    // A mid-take snippet of a streamed take: type it and keep
+                    // recording. The daemon finalizes the whole take at stop.
+                    // Re-assert focus on the dictation target first (same dance as
+                    // the final direct commit) so the snippet lands in the app and
+                    // not wherever the WM's focus churn left things — streaming
+                    // dictation hits THIS arm, not the batch one below.
+                    let target = *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex");
+                    restore_dictation_focus(shared.focus.as_ref(), target);
+                    shared.run_session(|s| s.on_partial_transcript(update.text))
+                } else if update.review {
+                    // Review mode: the take is over — the listening dialog
+                    // turns editable with the full merged text (blocking —
+                    // fine on this dedicated reader thread), then commit the
+                    // user's final text into the app and record raw→edited,
+                    // or cancel.
                     match shared.dialog.review(&update.text) {
                         Some(edited) => {
                             dbg_edit(&format!("dialog -> insert {edited:?}"));
@@ -420,8 +481,30 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                             shared.run_session(|s| s.cancel_reviewed())
                         }
                     }
-                } else {
+                } else if shared
+                    .active_path
+                    .lock()
+                    .expect("active_path mutex")
+                    .is_some()
+                {
+                    // Direct (review-off) take with a focused context to type into.
+                    // Re-assert focus on the window the user started dictating in and
+                    // let it settle BEFORE committing — after a take the WM may not
+                    // have handed focus back yet (indicator/focus churn), and a commit
+                    // racing that transition lands nowhere. This is the focus dance the
+                    // review dialog already does; the direct path was missing it.
+                    let target = *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex");
+                    restore_dictation_focus(shared.focus.as_ref(), target);
                     shared.run_session(|s| s.on_transcript(update.text))
+                } else {
+                    // Direct take but NO focused context: typing would lose the
+                    // text into nowhere AND the daemon would bank a never-landed
+                    // training pair. Discard it instead (and trace it loudly).
+                    dbg_edit("direct transcript with no active_path: discarding take (not typed, not recorded)");
+                    shared.run_session(|s| s.on_transcript_without_target())
                 }
             }
             Ok(IpcMessage::InsertText(insert)) => {
@@ -435,9 +518,40 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                 // instead of tracking our own. Drives the "voice is live" indicator
                 // (refreshed by sync_indicator below).
                 dbg_edit(&format!("recording_status <- daemon: {}", status.recording));
+                if status.recording {
+                    // Capture the window the user is dictating into NOW, before the
+                    // take can disrupt focus, so a direct commit can re-assert it.
+                    let target = shared.focus.active_window();
+                    dbg_edit(&format!("dictation target captured: {target:?}"));
+                    *shared
+                        .dictation_target
+                        .lock()
+                        .expect("dictation_target mutex") = target;
+                } else {
+                    // A take that ends WITH a final transcript already consumed
+                    // its dialog in review() above; this only tears down a
+                    // still-listening dialog (cancelled take), where it is the
+                    // engine's only signal.
+                    shared.dialog.close();
+                }
                 shared.run_session(|s| s.on_recording_status(status.recording))
             }
-            Ok(IpcMessage::Error(_)) => shared.run_session(|s| s.on_error()),
+            Ok(IpcMessage::Error(_)) => {
+                shared.dialog.close();
+                shared.run_session(|s| s.on_error())
+            }
+            Ok(IpcMessage::EditHistory(edit)) => {
+                // Retroactive history edit: run the review dialog over the stored
+                // take and report the user's correction. Only the record changes —
+                // nothing is typed into the app — so this never touches the session
+                // or emits surface ops; it always `continue`s.
+                dbg_edit(&format!(
+                    "edit_history <- daemon: id={} text={:?}",
+                    edit.id, edit.text
+                ));
+                handle_edit_history(&*shared.dialog, &mut sender, edit);
+                continue;
+            }
             Ok(_) => continue,
             Err(_) => {
                 // The daemon connection dropped — e.g. the daemon restarted. Rather
@@ -446,6 +560,7 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
                 // state push. We retry until the daemon returns, so even a long outage
                 // (an update, a slow restart) self-heals.
                 reader = reconnect_reader(&socket, &sender);
+                shared.dialog.close();
                 shared.run_session(|s| s.reset_to_idle());
                 shared.sync_indicator();
                 continue;
@@ -457,10 +572,58 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, sender: DaemonSende
             .lock()
             .expect("active_path mutex")
             .clone();
-        if let Some(path) = target {
-            handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
+        match target {
+            Some(path) => handle.block_on(emit_surface_ops(&shared.connection, &path, ops)),
+            // No focused IBus context to type into: the transcript is still
+            // recorded daemon-side but lands in no app. Trace it — this otherwise
+            // silent drop is exactly the "text in history but not in the app" bug.
+            None if !ops.is_empty() => dbg_edit(&format!(
+                "emit DROPPED: active_path None — {} commit op(s) NOT typed into any app",
+                ops.len()
+            )),
+            None => {}
         }
     });
+}
+
+/// Re-assert X11 focus on the window the user was dictating into (if one was
+/// captured at record-start) and let it settle, so a direct commit lands there
+/// instead of racing the WM's focus hand-back after a take. Returns whether a
+/// restore was performed. The same focus dance the review dialog does before it
+/// commits — the direct path was missing it, so direct commits could vanish while
+/// review-mode commits (which restore + settle) landed fine.
+fn restore_dictation_focus(
+    focus: &dyn crate::focus::WindowFocus,
+    target: Option<crate::focus::WindowId>,
+) -> bool {
+    let Some(window) = target else { return false };
+    dbg_edit(&format!(
+        "direct commit: restoring focus to window {window}"
+    ));
+    focus.restore(window);
+    std::thread::sleep(FOCUS_SETTLE);
+    true
+}
+
+/// Run the review dialog over a stored history entry's text and report the
+/// user's correction back to the daemon as `HistoryEdited`; a cancelled dialog
+/// reports nothing. Updates only the record — it types nothing into the focused
+/// app — so it runs outside the session/surface path.
+fn handle_edit_history(
+    dialog: &dyn crate::review::ReviewDialog,
+    sender: &mut DaemonSender,
+    edit: EditHistory,
+) {
+    match dialog.review(&edit.text) {
+        Some(corrected) => {
+            dbg_edit(&format!("edit_history -> confirmed id={}", edit.id));
+            let _ = sender.send(&IpcMessage::HistoryEdited(HistoryEdited {
+                id: edit.id,
+                corrected_text: corrected,
+            }));
+        }
+        None => dbg_edit(&format!("edit_history -> cancelled id={}", edit.id)),
+    }
 }
 
 /// Re-establish the daemon connection after it drops, retrying indefinitely while
@@ -573,6 +736,8 @@ pub async fn run() -> zbus::Result<()> {
         indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
         caret: Mutex::new((400, 400)),
         connection: connection.clone(),
+        focus: crate::focus::default_window_focus(),
+        dictation_target: Mutex::new(None),
     });
     spawn_reader(Arc::clone(&shared), reader, reader_sender);
 
@@ -599,4 +764,133 @@ pub async fn run() -> zbus::Result<()> {
 
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(all(test, feature = "ibus-engine"))]
+mod tests {
+    //! Tests for the retroactive history-edit arm: the engine runs the review
+    //! dialog over the daemon's stored text and reports the user's correction
+    //! back, typing nothing. Driven through `handle_edit_history` over a bare
+    //! socket pair — no runtime, no D-Bus, no live reader loop.
+
+    use std::io::{BufRead, BufReader, ErrorKind, Read};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use idiolect_ipc::framing::decode_json_line;
+    use idiolect_ipc::messages::EditHistory;
+    use idiolect_ipc::IpcMessage;
+
+    use std::sync::Mutex as StdMutex;
+
+    use crate::focus::{WindowFocus, WindowId};
+    use crate::ipc::DaemonSender;
+    use crate::review::ReviewDialog;
+
+    use super::{handle_edit_history, restore_dictation_focus};
+
+    /// Records the windows focus was re-asserted on, so we can assert the direct
+    /// commit hands focus back to where the user was dictating.
+    struct RecordingFocus {
+        restored: StdMutex<Vec<WindowId>>,
+    }
+    impl WindowFocus for RecordingFocus {
+        fn active_window(&self) -> Option<WindowId> {
+            None
+        }
+        fn restore(&self, window: WindowId) {
+            self.restored.lock().expect("restored mutex").push(window);
+        }
+    }
+
+    #[test]
+    fn direct_commit_restores_focus_to_the_captured_window() {
+        let focus = RecordingFocus {
+            restored: StdMutex::new(Vec::new()),
+        };
+        assert!(restore_dictation_focus(&focus, Some(42)));
+        assert_eq!(*focus.restored.lock().expect("restored mutex"), vec![42]);
+    }
+
+    #[test]
+    fn direct_commit_without_a_captured_window_does_not_restore() {
+        let focus = RecordingFocus {
+            restored: StdMutex::new(Vec::new()),
+        };
+        assert!(!restore_dictation_focus(&focus, None));
+        assert!(focus.restored.lock().expect("restored mutex").is_empty());
+    }
+
+    /// A dialog with a fixed verdict: `Some(text)` confirms with that text,
+    /// `None` cancels.
+    struct FakeDialog {
+        reply: Option<String>,
+    }
+    impl ReviewDialog for FakeDialog {
+        fn append(&self, _chunk: &str) {}
+        fn review(&self, _transcript: &str) -> Option<String> {
+            self.reply.clone()
+        }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn confirmed_edit_reports_history_edited_with_the_corrected_text() {
+        let (engine_side, daemon_side) = UnixStream::pair().expect("socketpair");
+        let mut sender = DaemonSender::from_stream(daemon_side);
+        let dialog = FakeDialog {
+            reply: Some("restart Traefik".to_owned()),
+        };
+
+        handle_edit_history(
+            &dialog,
+            &mut sender,
+            EditHistory {
+                id: 42,
+                text: "restart traffic".to_owned(),
+            },
+        );
+        // Close the write end so the read sees EOF after the one message.
+        drop(sender);
+
+        let mut line = String::new();
+        BufReader::new(engine_side)
+            .read_line(&mut line)
+            .expect("read");
+        match decode_json_line(&line).expect("decode") {
+            IpcMessage::HistoryEdited(edited) => {
+                assert_eq!(edited.id, 42);
+                assert_eq!(edited.corrected_text, "restart Traefik");
+            }
+            other => panic!("expected HistoryEdited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_edit_reports_nothing() {
+        let (engine_side, daemon_side) = UnixStream::pair().expect("socketpair");
+        let mut sender = DaemonSender::from_stream(daemon_side);
+        let dialog = FakeDialog { reply: None };
+
+        handle_edit_history(
+            &dialog,
+            &mut sender,
+            EditHistory {
+                id: 7,
+                text: "original".to_owned(),
+            },
+        );
+        drop(sender);
+
+        // A cancelled review must type nothing back: a short read finds no bytes.
+        engine_side
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let mut buf = [0u8; 1];
+        match (&engine_side).read(&mut buf) {
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Ok(0) => {}
+            other => panic!("expected no data for a cancelled edit, got {other:?}"),
+        }
+    }
 }

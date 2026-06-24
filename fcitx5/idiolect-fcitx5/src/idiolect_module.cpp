@@ -121,7 +121,18 @@ void IdiolectModule::onSocketReadable() {
         while (const auto message = ipc_->poll_server_message()) {
             switch (message->kind) {
             case ServerMessageKind::Preedit:
-                engine_->on_transcript(message->text);
+                // A streamed mid-take snippet types and keeps recording; a
+                // take-final transcript commits and finalizes with the daemon.
+                // Display-only snippets (partial+review) feed the IBus
+                // engine's live review dialog — this addon has no dialog, so
+                // it must skip them rather than type review-held text.
+                if (message->partial) {
+                    if (!message->review) {
+                        engine_->on_partial_transcript(message->text);
+                    }
+                } else {
+                    engine_->on_transcript(message->text);
+                }
                 break;
             case ServerMessageKind::Error:
                 FCITX_ERROR() << "idiolect: daemon error: " << message->text;

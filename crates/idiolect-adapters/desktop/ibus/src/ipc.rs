@@ -133,6 +133,15 @@ impl DaemonSender {
     pub fn replace_stream(&self, stream: Option<UnixStream>) {
         *self.stream.lock().expect("daemon stream mutex poisoned") = stream;
     }
+
+    /// Test-only: wrap an already-connected stream directly (no handshake), so
+    /// reader-loop logic can be exercised over a bare `UnixStream::pair()`.
+    #[cfg(all(test, feature = "ibus-engine"))]
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(Some(stream))),
+        }
+    }
 }
 
 impl DaemonClient for DaemonSender {

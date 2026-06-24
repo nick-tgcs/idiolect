@@ -30,3 +30,6 @@ idiolect-ports = { path = "../idiolect-ports" }
 idiolect-test-support = { path = "../idiolect-test-support" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

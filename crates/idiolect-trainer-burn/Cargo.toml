@@ -8,10 +8,18 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# GPU training backend (CubeCL/CUDA); CI never enables it.
+cuda = ["burn/cuda"]
+
 [dependencies]
 burn.workspace = true
 burn-ndarray.workspace = true
-bincode.workspace = true
 idiolect-ml-core = { path = "../idiolect-ml-core" }
 idiolect-ports = { path = "../idiolect-ports" }
 sha2.workspace = true
+
+[dev-dependencies]
+idiolect-adapter-whisper = { path = "../idiolect-adapter-whisper" }
+idiolect-test-support = { path = "../idiolect-test-support" }
+tempfile.workspace = true

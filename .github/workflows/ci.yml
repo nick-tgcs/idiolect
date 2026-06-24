@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+  # Reusable: release.yml calls this workflow as its full-CI gate for tag releases.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
@@ -39,7 +41,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -76,7 +78,7 @@ jobs:
         run: cargo llvm-cov --workspace --features idiolect-ibus/ibus-engine --all-targets --fail-under-lines 80
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: target/llvm-cov/html
@@ -131,7 +133,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -179,7 +181,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -238,7 +240,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -277,7 +279,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -319,7 +321,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -336,7 +338,7 @@ jobs:
         run: bash ci/scripts/test-performance.sh
 
       - name: Upload performance report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: performance-report
           path: target/performance/
@@ -363,7 +365,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -397,7 +399,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -431,7 +433,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -463,7 +465,7 @@ jobs:
         run: bash ci/scripts/test-package-lifecycle.sh
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian-package
           path: target/package/*.deb
@@ -490,7 +492,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -535,7 +537,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -564,6 +566,59 @@ jobs:
         # Note: This runs in Xvfb for headless GUI testing
 
   # =========================================================================
+  # MACOS FOUNDATION (portable crates) — see docs/future/009-macos-port.md
+  #
+  # The macOS port lands phase by phase; this job guards the cross-platform
+  # foundation that already builds on macOS: the hexagonal core, ports, IPC, and
+  # the platform-aware base-dir / sun_path logic in idiolect-common. The pure
+  # `Platform`-keyed code paths mean this runner exercises the *macOS* layout for
+  # real, not just a compile. As whisper-metal, the egui GUIs, and the IMK
+  # component land, add their crates here.
+  # =========================================================================
+  macos:
+    name: macOS Foundation (portable crates)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # No system packages: every crate below is dependency-pure (no ALSA, DBus,
+      # X11, fcitx5, or CUDA), so it builds against the stock macOS toolchain.
+      - name: Clippy (warnings as errors)
+        run: |
+          cargo clippy \
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            --all-targets -- -D warnings
+
+      - name: Test (incl. macOS base-dir + sun_path layout)
+        run: |
+          cargo test \
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            --all-targets
+
+  # =========================================================================
   # SUMMARY / GATE
   # =========================================================================
   gate:
@@ -583,6 +638,7 @@ jobs:
       - packaging
       - coverage-map
       - e2e-headless
+      - macos
     if: always()
     steps:
       - name: Check all required jobs succeeded

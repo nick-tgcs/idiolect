@@ -1,6 +1,7 @@
 //! Shared Idiolect types that do not depend on backend libraries.
 
 pub mod config;
+pub mod digest;
 pub mod error;
 pub mod ids;
 pub mod languages;

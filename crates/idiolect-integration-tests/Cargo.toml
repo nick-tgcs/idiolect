@@ -24,10 +24,20 @@ idiolectd = { path = "../idiolectd" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-application = { path = "../idiolect-application" }
+idiolect-sync = { path = "../idiolect-sync" }
+idiolect-sync-client = { path = "../idiolect-sync-client" }
+idiolect-sync-server = { path = "../idiolect-sync-server" }
 
 [dev-dependencies]
 idiolect-cli = { path = "../idiolect-cli" }
+# The M6 capstone parses the served model bytes back as ggml; trainer-burn is
+# already in the graph via idiolect-trainerctl, so this adds no extra build.
+idiolect-trainer-burn = { path = "../idiolect-trainer-burn" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+# The M6 sync ingest HTTP hop is driven through the axum router via tower::oneshot.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }

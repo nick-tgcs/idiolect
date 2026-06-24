@@ -17,15 +17,16 @@ use idiolect_adapter_opus::{OpusCodec, OpusCodecError};
 use idiolect_adapter_sqlite::{
     FileAudioStore, FileAudioStoreError, SqliteMetadataStore, SqliteStorageError,
 };
-use idiolect_adapter_vad::{VadAdapter, FRAME_DURATION_MS, FRAME_SAMPLE_COUNT};
+use idiolect_adapter_vad::VadAdapter;
 use idiolect_application::use_cases::history::ClipboardPort;
 use idiolect_application::use_cases::maintenance::{MaintenanceUseCase, DEFAULT_PRUNE_INTERVAL};
 use idiolect_application::use_cases::menu::{
     validate_training_retention_days, MenuUseCase, RecordingState, MAX_ENTRY_CHOICES,
     RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
 };
-use idiolect_application::use_cases::segmentation::{
-    FrameBuffer, SegmenterConfig, UtteranceSegmenter,
+use idiolect_application::use_cases::streaming::{
+    merge_tail_correction, FinalizedTake, StreamObserver, StreamingConfig, StreamingTake,
+    TakeOutcome, TakeTranscriber, TranscribeFailure,
 };
 use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
 use idiolect_common::ids::ImeSessionId;
@@ -33,8 +34,8 @@ use idiolect_common::languages::is_supported_language;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
-    CommitPreedit, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse, InsertText,
-    IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
+    CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
+    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -61,6 +62,9 @@ pub(crate) struct RunLoopConfig {
     pub(crate) translation_config: TranslationConfig,
     /// VAD timing rules; drives the pause-triggered segmenter in streaming mode.
     pub(crate) vad_config: VadConfig,
+    /// Desktop-notification command for surfacing problems the user would
+    /// otherwise never see (`<command> <summary> <body>`; empty = disabled).
+    pub(crate) notify_command: String,
 }
 
 #[derive(Debug)]
@@ -211,6 +215,9 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
 
     // A single tray owned here; its callbacks are drained inside the connection loop.
     let (tray_callback_tx, tray_callback_rx) = mpsc::channel::<TrayCallback>();
+    // The Settings window feeds its changes into the SAME channel, so a change
+    // made there is applied exactly like a tray click.
+    let settings_forward_tx = tray_callback_tx.clone();
     let mut tray =
         KsniTray::new(tray_callback_tx).map_err(|error| RunLoopError::tray("tray init", error))?;
     // Degrade gracefully when there is no display (headless server, or a CI
@@ -224,13 +231,7 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
         }
     };
 
-    refresh_tray_menu(
-        &mut tray,
-        &store,
-        &config.history_config,
-        &config.translation_config,
-        RecordingState::Idle,
-    )?;
+    refresh_tray_menu(&mut tray, &store, &config, RecordingState::Idle)?;
     tray.set_icon(TrayIcon::Idle)
         .map_err(|error| RunLoopError::tray("tray icon", error))?;
     tray.set_tooltip("Idiolect — Ready")
@@ -271,6 +272,7 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
             &mut clipboard,
             &mut store,
             &tray_callback_rx,
+            &settings_forward_tx,
         )?;
         if config.shutdown_after_client {
             return Ok(());
@@ -447,6 +449,81 @@ fn effective_translation_config(
     }
 }
 
+/// Resolves the active dictation-timing configuration, layering persisted
+/// `tray_settings` overrides on top of the `[vad]` config-file defaults (the
+/// same layering as history and translation). Unparseable overrides fall back
+/// to the defaults, and a nonzero auto-stop below the pause threshold is lifted
+/// to it so a take can never end before one snippet pause completes.
+fn effective_vad_config(store: &SqliteMetadataStore, defaults: &VadConfig) -> VadConfig {
+    let settings = store.get_all_tray_settings().unwrap_or_default();
+    let override_ms = |key: &str, fallback: u32| {
+        settings
+            .get(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(fallback)
+    };
+
+    let post_roll_ms = override_ms("vad_post_roll_ms", defaults.post_roll_ms);
+    let mut auto_stop_silence_ms =
+        override_ms("vad_auto_stop_silence_ms", defaults.auto_stop_silence_ms);
+    if auto_stop_silence_ms != 0 && auto_stop_silence_ms < post_roll_ms {
+        auto_stop_silence_ms = post_roll_ms;
+    }
+    VadConfig {
+        post_roll_ms,
+        min_speech_ms: override_ms("vad_min_speech_ms", defaults.min_speech_ms),
+        max_utterance_ms: override_ms("vad_max_utterance_ms", defaults.max_utterance_ms),
+        auto_stop_silence_ms,
+        ..defaults.clone()
+    }
+}
+
+/// Applies a `settings:pause/min_speech/max_phrase/auto_stop:N` tray activation,
+/// persisting the picked preset as a `tray_settings` override. Returns whether
+/// the action was a dictation-timing action (so the caller refreshes the menu).
+/// An out-of-range index (e.g. the appended "(custom)" marker) is consumed but
+/// changes nothing.
+fn apply_dictation_tray_action(
+    store: &mut SqliteMetadataStore,
+    action: &str,
+) -> Result<bool, RunLoopError> {
+    use idiolect_application::use_cases::menu::{
+        auto_stop_ms_for_index, max_phrase_ms_for_index, min_speech_ms_for_index,
+        pause_ms_for_index,
+    };
+    type MsForIndex = fn(usize) -> Option<u32>;
+    let knobs: [(&str, &str, MsForIndex); 4] = [
+        ("settings:pause:", "vad_post_roll_ms", pause_ms_for_index),
+        (
+            "settings:min_speech:",
+            "vad_min_speech_ms",
+            min_speech_ms_for_index,
+        ),
+        (
+            "settings:max_phrase:",
+            "vad_max_utterance_ms",
+            max_phrase_ms_for_index,
+        ),
+        (
+            "settings:auto_stop:",
+            "vad_auto_stop_silence_ms",
+            auto_stop_ms_for_index,
+        ),
+    ];
+    for (prefix, key, value_for_index) in knobs {
+        if let Some(index) = parse_index_suffix(action, prefix) {
+            match value_for_index(index) {
+                Some(ms) => store
+                    .set_tray_setting(key, &ms.to_string())
+                    .map_err(|error| RunLoopError::storage("set dictation timing", error))?,
+                None => eprintln!("tray dictation-timing index out of range: {action}"),
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether "review before insert" mode is on (persisted in `tray_settings`).
 /// In this mode the daemon flags each transcript so the client opens its own
 /// review/correction dialog before committing, instead of inserting directly.
@@ -463,16 +540,15 @@ fn review_mode_enabled(store: &SqliteMetadataStore) -> bool {
 fn refresh_tray_menu(
     tray: &mut KsniTray,
     store: &SqliteMetadataStore,
-    defaults: &HistoryConfig,
-    translation_defaults: &TranslationConfig,
+    config: &RunLoopConfig,
     recording_state: RecordingState,
 ) -> Result<(), RunLoopError> {
-    let config = effective_history_config(store, defaults);
-    let translation = effective_translation_config(store, translation_defaults);
+    let history = effective_history_config(store, &config.history_config);
+    let translation = effective_translation_config(store, &config.translation_config);
     let entries = store
-        .recent_history(config.max_entries)
+        .recent_history(history.max_entries)
         .map_err(|error| RunLoopError::storage("recent history", error))?;
-    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &config, &translation);
+    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &translation);
     menu.push(idiolect_ports::storage::TrayMenuItem {
         id: "review_mode".to_owned(),
         label: "Review before insert".to_owned(),
@@ -492,6 +568,7 @@ fn handle_connection(
     clipboard: &mut ArboardClipboard,
     store: &mut SqliteMetadataStore,
     tray_callback_rx: &mpsc::Receiver<TrayCallback>,
+    settings_forward_tx: &mpsc::Sender<TrayCallback>,
 ) -> Result<(), RunLoopError> {
     let reader_stream = stream
         .try_clone()
@@ -508,6 +585,8 @@ fn handle_connection(
     let codec = OpusCodec::new();
     // Out-of-process dialog for the "Custom…" retention entry; discovered once.
     let retention_dialog = SubprocessRetentionDialog::discover();
+    // Out-of-process Settings window ("Settings…" in the tray); discovered once.
+    let settings_window = crate::settings_launcher::SettingsLauncher::discover();
     // Per-connection state bundled into `Live`:
     //  - active_session: the in-flight dictation, if any.
     //  - live_capture: set only while a real microphone recording is in progress.
@@ -537,14 +616,18 @@ fn handle_connection(
                     config,
                 },
                 &mut live,
-                &retention_dialog,
+                &ConfigSurfaces {
+                    retention_dialog: &retention_dialog,
+                    settings_window: &settings_window,
+                    settings_forward_tx,
+                },
             )?;
         }
 
         // While a streaming take is live, every loop tick (the 150 ms read
         // timeout guarantees one even with a silent client) pumps the mic
         // through the segmenter and delivers any pause-completed snippets.
-        pump_live_stream(
+        let auto_stop = pump_live_stream(
             &mut stream,
             Ctx {
                 store: &mut *store,
@@ -554,6 +637,22 @@ fn handle_connection(
             },
             &mut live,
         )?;
+        if auto_stop {
+            // The user went silent past the auto-stop threshold: the long pause
+            // IS the stop — finalize the take exactly as a toggle would (one
+            // review dialog / one committed session), and release the mic.
+            stop_live_and_transcribe(
+                &mut stream,
+                tray,
+                Ctx {
+                    store: &mut *store,
+                    audio_store: &audio_store,
+                    codec: &codec,
+                    config,
+                },
+                &mut live,
+            )?;
+        }
 
         match reader.read_line(&mut line) {
             // A clean EOF (0) or an abrupt reset are both just the peer going away —
@@ -677,17 +776,32 @@ fn handle_connection(
                 // The user fixed the auto-committed text in place: amend the
                 // just-committed session with the corrected form, and re-render the
                 // tray so the history entry shows the corrected text immediately.
+                // For a streamed take the engine's correction window only ever
+                // held the final snippet, so the correction replaces that tail of
+                // the merged string rather than the whole take.
                 if let Some(active) = live.active_session.as_mut() {
                     if active.finalized {
-                        store
-                            .amend_correction(
-                                active.session_id,
-                                &active.current_text,
-                                &correction.corrected_text,
-                            )
-                            .map_err(|error| RunLoopError::storage("amend correction", error))?;
-                        active.current_text = correction.corrected_text.clone();
-                        live.status_tx.refresh_tray(tray, store, config)?;
+                        let corrected_full = merge_tail_correction(
+                            &active.current_text,
+                            active.tail_text.as_deref(),
+                            &correction.corrected_text,
+                        );
+                        if corrected_full != active.current_text {
+                            store
+                                .amend_correction(
+                                    active.session_id,
+                                    &active.current_text,
+                                    &corrected_full,
+                                )
+                                .map_err(|error| {
+                                    RunLoopError::storage("amend correction", error)
+                                })?;
+                            active.current_text = corrected_full;
+                            if active.tail_text.is_some() {
+                                active.tail_text = Some(correction.corrected_text.clone());
+                            }
+                            live.status_tx.refresh_tray(tray, store, config)?;
+                        }
                     }
                 }
             }
@@ -721,6 +835,36 @@ fn handle_connection(
                 )?;
                 send_ipc_message(&mut stream, &IpcMessage::HistoryCopyResponse(response))?;
             }
+            IpcMessage::HistoryEdited(edited) => {
+                // The user retroactively corrected a past history entry via the
+                // review dialog: amend the stored record and its raw→corrected
+                // training pair. Any entry (not just the current take) may be
+                // targeted by id; if the edited entry is the active session, keep
+                // live state consistent so a later correction doesn't clobber it.
+                match store.get_history_entry(edited.id) {
+                    Ok(Some(entry)) => {
+                        match apply_history_edit(store, edited.id, &edited.corrected_text) {
+                            Ok(_) => {
+                                if let Some(active) = live.active_session.as_mut() {
+                                    if active.session_id == entry.session_id {
+                                        active.current_text = edited.corrected_text.clone();
+                                    }
+                                }
+                                live.status_tx.refresh_tray(tray, store, config)?;
+                            }
+                            Err(error) => {
+                                eprintln!("history edit: amend failed: {error}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("history edit: entry {} not found", edited.id);
+                    }
+                    Err(error) => {
+                        eprintln!("history edit: lookup failed: {error}");
+                    }
+                }
+            }
             IpcMessage::HistoryReinsertResponse(_) | IpcMessage::HistoryCopyResponse(_) => {
                 send_ipc_message(
                     &mut stream,
@@ -734,6 +878,7 @@ fn handle_connection(
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
+            | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
                 send_ipc_message(
                     &mut stream,
@@ -844,66 +989,149 @@ struct ActiveSession {
     session_id: ImeSessionId,
     current_text: String,
     finalized: bool,
+    /// For a streamed take committed daemon-side: the final snippet's text.
+    /// The engine's post-commit correction window only ever tracks that last
+    /// snippet, so an incoming correction replaces this suffix of
+    /// `current_text`, not the whole take.
+    tail_text: Option<String>,
 }
 
-/// Per-recording streaming state for pause-triggered translation: incremental
-/// resampling, frame re-chunking, frame-level VAD, and the utterance segmenter.
-/// Created on start when translation is enabled; the pump feeds it every loop
-/// tick and each finished snippet is transcribed/translated immediately.
+/// Per-recording streaming state for pause-triggered dictation. The take's
+/// segmenter, accumulators, auto-stop clock, and error de-duplication live in the
+/// shared [`StreamingTake`] orchestration (so the Android path runs the identical
+/// rules); the daemon keeps only the two desktop-specific feeds — the lazy
+/// capture-rate [`crate::adapters::StreamingResampler`] and the [`VadAdapter`] —
+/// and pipes resampled 16 kHz audio plus each frame's speech verdict into it.
 struct LiveStreamState {
     /// Built lazily from the first non-empty poll, which reports the device's
     /// real capture rate (the config value is advisory; hardware decides).
     resampler: Option<crate::adapters::StreamingResampler>,
-    frames: FrameBuffer,
     vad: VadAdapter,
-    segmenter: UtteranceSegmenter,
+    take: StreamingTake,
 }
 
 impl LiveStreamState {
     fn new(vad_config: &VadConfig) -> Self {
         Self {
             resampler: None,
-            frames: FrameBuffer::new(),
             vad: VadAdapter::new(),
-            segmenter: UtteranceSegmenter::new(SegmenterConfig {
-                sample_rate_hz: 16_000,
-                frame_ms: FRAME_DURATION_MS as u32,
+            take: StreamingTake::new(&StreamingConfig {
                 min_speech_ms: vad_config.min_speech_ms,
                 pre_roll_ms: vad_config.pre_roll_ms,
                 post_roll_ms: vad_config.post_roll_ms,
                 max_utterance_ms: vad_config.max_utterance_ms,
+                auto_stop_silence_ms: vad_config.auto_stop_silence_ms,
             }),
         }
     }
 
-    /// Pushes one drained capture chunk through resample → frame → VAD →
-    /// segmenter; returns the snippets (16 kHz mono samples) completed by it.
+    /// Resamples one drained capture chunk to 16 kHz mono and pushes it through
+    /// the take's segmenter, labelling each frame with the VAD; returns the
+    /// snippets a pause completed.
     fn ingest(&mut self, drained: &AudioSegment) -> Vec<Vec<f32>> {
         if drained.samples_f32_mono.is_empty() {
             return Vec::new();
         }
-        let resampler = self.resampler.get_or_insert_with(|| {
-            crate::adapters::StreamingResampler::new(drained.sample_rate_hz)
-        });
-        let resampled = resampler.push(&drained.samples_f32_mono);
-
-        let mut snippets = Vec::new();
-        for frame in self.frames.push(&resampled, FRAME_SAMPLE_COUNT) {
-            // A frame the detector rejects is treated as silence: losing one
-            // 30 ms verdict must never abort the whole take.
-            let is_speech = self.vad.is_speech_frame(&frame).unwrap_or(false);
-            if let Some(snippet) = self.segmenter.push_frame(&frame, is_speech) {
-                snippets.push(snippet.samples_f32_mono);
-            }
-        }
-        snippets
+        let Self {
+            resampler,
+            vad,
+            take,
+        } = self;
+        let resampled = resampler
+            .get_or_insert_with(|| crate::adapters::StreamingResampler::new(drained.sample_rate_hz))
+            .push(&drained.samples_f32_mono);
+        take.ingest(&resampled, |frame| {
+            vad.is_speech_frame(frame).unwrap_or(false)
+        })
     }
 
     /// Recovers the un-paused tail utterance when recording stops.
     fn flush(&mut self) -> Option<Vec<f32>> {
-        self.segmenter
-            .flush()
-            .map(|snippet| snippet.samples_f32_mono)
+        self.take.flush()
+    }
+
+    /// Whether the take has gone silent past its auto-stop threshold.
+    fn auto_stop_due(&self) -> bool {
+        self.take.auto_stop_due()
+    }
+}
+
+/// Binds the daemon's transcribe+translate to the take's decode port: builds a
+/// 16 kHz segment and runs `transcribe_translated`, re-reading the effective
+/// translation config each call so a tray toggle mid-take takes effect on the
+/// next snippet.
+struct DaemonTranscriber<'a> {
+    store: &'a SqliteMetadataStore,
+    config: &'a RunLoopConfig,
+}
+
+impl TakeTranscriber for DaemonTranscriber<'_> {
+    fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+        let duration_ms = (samples_f32_mono.len() as u64 * 1_000 / 16_000) as u32;
+        let segment = AudioSegment {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            duration_ms,
+            samples_f32_mono: samples_f32_mono.to_vec(),
+        };
+        let translation = effective_translation_config(self.store, &self.config.translation_config);
+        crate::adapters::transcribe_translated(&self.config.adapter_profile, &translation, &segment)
+            .map(|draft| draft.text)
+            .map_err(|error| TranscribeFailure {
+                code: error.code().to_owned(),
+                message: error.to_string(),
+            })
+    }
+}
+
+/// Routes a live take's events to the IPC client and the desktop notifier. Each
+/// snippet is pushed as a PARTIAL preedit — typed by the engine in direct mode,
+/// or display-only when "review before insert" is on; a failed snippet surfaces
+/// once per take as a desktop notification.
+struct DaemonObserver<'a> {
+    stream: &'a mut UnixStream,
+    store: &'a SqliteMetadataStore,
+    config: &'a RunLoopConfig,
+}
+
+impl StreamObserver for DaemonObserver<'_> {
+    type Error = RunLoopError;
+
+    fn snippet_committed(&mut self, chunk: &str) -> Result<(), RunLoopError> {
+        send_ipc_message(
+            self.stream,
+            &IpcMessage::PreeditUpdate(PreeditUpdate {
+                text: chunk.to_owned(),
+                review: review_mode_enabled(self.store),
+                partial: true,
+            }),
+        )
+    }
+
+    fn snippet_dropped(&mut self, decoded: &str) -> Result<(), RunLoopError> {
+        eprintln!(
+            "snippet decode dropped ({decoded:?}); its audio is kept for the stop-time decode"
+        );
+        Ok(())
+    }
+
+    fn transcribe_failed(&mut self, code: &str, message: &str) -> Result<(), RunLoopError> {
+        eprintln!("snippet transcription failed: {message}");
+        // The journal alone is invisible: the user pauses, nothing appears, and
+        // they can't tell broken from working. Tell them — once per take.
+        let mut body = message.to_owned();
+        if code == "translation-unavailable" {
+            body.push_str(
+                "\nSet translation.command in config.toml, or switch \
+                 'Translate to' back to English in the tray.",
+            );
+        }
+        crate::adapters::notify_user(
+            &self.config.notify_command,
+            "Idiolect — dictation is failing",
+            &body,
+        );
+        Ok(())
     }
 }
 
@@ -952,19 +1180,41 @@ fn materialize_session(
         Ok(draft) => draft,
         Err(error) => return Ok(StartSessionOutcome::Recoverable(error)),
     };
-    let session_id = store
-        .create_session(Some(&draft.text))
-        .map_err(|error| RunLoopError::storage("create session", error))?;
-    let utterance_id = utterance_id_for_session(session_id)?;
-    audio_store
-        .write_source_audio(&config.user_id, &utterance_id, &encoded)
-        .map_err(|error| RunLoopError::audio_store("write source audio", error))?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &draft.text)?;
 
     Ok(StartSessionOutcome::Started(ActiveSession {
         session_id,
         current_text: draft.text,
         finalized: false,
+        tail_text: None,
     }))
+}
+
+/// Creates the session row and stores its source audio: the persistence half of
+/// [`materialize_session`], also used by the streaming path where the text is
+/// already known (accumulated snippet by snippet) and must not be re-derived.
+fn persist_session(
+    store: &mut SqliteMetadataStore,
+    audio_store: &FileAudioStore,
+    user_id: &str,
+    encoded: &idiolect_ports::audio::EncodedAudio,
+    text: &str,
+) -> Result<ImeSessionId, RunLoopError> {
+    let session_id = store
+        .create_session(Some(text))
+        .map_err(|error| RunLoopError::storage("create session", error))?;
+    let utterance_id = idiolect_common::ids::utterance_id_for_session(session_id);
+    audio_store
+        .write_source_audio(user_id, &utterance_id, encoded)
+        .map_err(|error| RunLoopError::audio_store("write source audio", error))?;
+    // Content digest of the encoded payload. The trainer's manifest builder
+    // rejects an empty digest, so without this real captures could never be
+    // validated/trained — historically the column was only ever set in tests.
+    let audio_digest = idiolect_common::digest::audio_sha256_hex(&encoded.payload);
+    store
+        .set_audio_digest(&utterance_id, &audio_digest)
+        .map_err(|error| RunLoopError::storage("set audio digest", error))?;
+    Ok(session_id)
 }
 
 /// Stops and discards an in-progress live recording, releasing the microphone.
@@ -1125,10 +1375,15 @@ fn start_live_capture(
     match crate::adapters::begin_capture(&config.adapter_profile) {
         Ok(capture) => {
             *live_capture = Some(capture);
-            let translation = effective_translation_config(store, &config.translation_config);
-            *live_stream = translation
-                .enabled
-                .then(|| LiveStreamState::new(&config.vad_config));
+            // Every live take streams: pause-triggered snippets (plain or
+            // translated) and silence auto-stop are the default behaviour.
+            // Timing comes from the effective config (tray overrides layered on
+            // the file), captured at arm time so a take's rules never shift
+            // under it mid-recording.
+            *live_stream = Some(LiveStreamState::new(&effective_vad_config(
+                store,
+                &config.vad_config,
+            )));
             status_tx.set(stream, tray, store, config, true)?;
         }
         Err(error) => {
@@ -1145,14 +1400,76 @@ fn start_live_capture(
 }
 
 /// One pump tick of the streaming pipeline: drains whatever audio accumulated
-/// since the last tick, advances the segmenter, and transcribes/translates and
-/// delivers every snippet a pause just completed. A no-op outside streaming
-/// takes. Poll failures are logged, never fatal — one bad tick must not end a
-/// recording the user is mid-sentence in.
+/// since the last tick, advances the segmenter, and transcribes/translates
+/// every snippet a pause just completed, folding it into the take. A no-op
+/// outside streaming takes. Poll failures are logged, never fatal — one bad
+/// tick must not end a recording the user is mid-sentence in.
+///
+/// Returns `true` when the take has gone silent past
+/// `vad.auto_stop_silence_ms`: the caller then stops the take exactly as a
+/// toggle would — the long pause IS the stop.
 fn pump_live_stream(
     stream: &mut UnixStream,
     ctx: Ctx<'_>,
     live: &mut Live,
+) -> Result<bool, RunLoopError> {
+    let Ctx { store, config, .. } = ctx;
+    let Live {
+        live_capture,
+        live_stream,
+        ..
+    } = live;
+    let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
+        return Ok(false);
+    };
+    let drained = match crate::adapters::poll_capture(capture) {
+        Ok(segment) => segment,
+        Err(error) => {
+            eprintln!("live stream poll failed: {error}");
+            return Ok(false);
+        }
+    };
+    for snippet in state.ingest(&drained) {
+        fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+    }
+    Ok(state.auto_stop_due())
+}
+
+/// Decodes one pause-completed snippet through the shared [`StreamingTake`],
+/// binding the daemon's transcribe+translate and the IPC/notify feeds. The
+/// orchestration folds the audio and text and emits the PARTIAL preedit (typed
+/// in direct mode, display-only under review) or the once-per-take failure.
+fn fold_snippet_into_take(
+    stream: &mut UnixStream,
+    store: &mut SqliteMetadataStore,
+    config: &RunLoopConfig,
+    take: &mut StreamingTake,
+    snippet: Vec<f32>,
+) -> Result<(), RunLoopError> {
+    let mut transcriber = DaemonTranscriber {
+        store: &*store,
+        config,
+    };
+    let mut observer = DaemonObserver {
+        stream,
+        store: &*store,
+        config,
+    };
+    take.fold_snippet(&mut transcriber, &mut observer, snippet)
+}
+
+/// Closes out a streamed take as ONE session: the shared [`StreamingTake`]
+/// decodes the merged recording once as a whole (the authoritative text, falling
+/// back to the glued snippet previews if that decode fails) and reports the
+/// outcome; the daemon then persists it. With review off the preview text already
+/// reached the app via partials, so the session is committed daemon-side; with
+/// review on, the final text goes to the client once, as the single review
+/// dialog. An empty take (no speech) stores nothing.
+fn finalize_streamed_take(
+    stream: &mut UnixStream,
+    ctx: Ctx<'_>,
+    active_session: &mut Option<ActiveSession>,
+    state: LiveStreamState,
 ) -> Result<(), RunLoopError> {
     let Ctx {
         store,
@@ -1160,75 +1477,69 @@ fn pump_live_stream(
         codec,
         config,
     } = ctx;
-    let Live {
-        active_session,
-        live_capture,
-        live_stream,
-        ..
-    } = live;
-    let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
-        return Ok(());
-    };
-    let drained = match crate::adapters::poll_capture(capture) {
-        Ok(segment) => segment,
-        Err(error) => {
-            eprintln!("live stream poll failed: {error}");
-            return Ok(());
-        }
-    };
-    for snippet in state.ingest(&drained) {
-        deliver_snippet(
-            stream,
-            store,
-            audio_store,
-            codec,
-            config,
-            active_session,
-            snippet,
-        )?;
-    }
-    Ok(())
-}
 
-/// Transcribes/translates one pause-completed snippet, persists it as its own
-/// session, and pushes it to the client as a `PreeditUpdate` (carrying the
-/// review flag, so "review before insert" routes each snippet through the
-/// client's dialog exactly like a stop-time transcript). A snippet that fails
-/// to transcribe is logged and skipped — the take continues.
-fn deliver_snippet(
-    stream: &mut UnixStream,
-    store: &mut SqliteMetadataStore,
-    audio_store: &FileAudioStore,
-    codec: &OpusCodec,
-    config: &RunLoopConfig,
-    active_session: &mut Option<ActiveSession>,
-    samples_f32_mono: Vec<f32>,
-) -> Result<(), RunLoopError> {
-    let duration_ms = (samples_f32_mono.len() as u64 * 1_000 / 16_000) as u32;
+    let outcome = {
+        let mut transcriber = DaemonTranscriber {
+            store: &*store,
+            config,
+        };
+        state.take.finalize(&mut transcriber)
+    };
+    let FinalizedTake {
+        final_text,
+        merged_samples,
+        last_snippet_text,
+        fallback_reason,
+    } = match outcome {
+        TakeOutcome::Silent => return Ok(()),
+        TakeOutcome::Speech(finalized) => finalized,
+    };
+    if let Some(reason) = fallback_reason {
+        eprintln!(
+            "whole-take transcription failed at stop; keeping the previewed snippet text: {reason}"
+        );
+    }
+
+    let duration_ms = (merged_samples.len() as u64 * 1_000 / 16_000) as u32;
     let segment = AudioSegment {
         sample_rate_hz: 16_000,
         channels: 1,
         duration_ms,
-        samples_f32_mono,
+        samples_f32_mono: merged_samples,
     };
+    let encoded = codec
+        .encode(&segment)
+        .map_err(|error| RunLoopError::codec("encode audio", error))?;
 
-    // The previous snippet is normally committed by the engine well before the
-    // next pause completes (the pause threshold dwarfs the loop tick); if it
-    // never was, close it out before it is displaced.
-    cancel_uncommitted_active_session(store, active_session, "daemon-snippet-advance")?;
-    match materialize_session(store, audio_store, codec, config, segment)? {
-        StartSessionOutcome::Started(session) => {
-            let text = session.current_text.clone();
-            let review = review_mode_enabled(store);
-            *active_session = Some(session);
-            send_ipc_message(
-                stream,
-                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review }),
-            )?;
-        }
-        StartSessionOutcome::Recoverable(error) => {
-            eprintln!("snippet transcription failed: {error}");
-        }
+    cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
+    let session_id = persist_session(store, audio_store, &config.user_id, &encoded, &final_text)?;
+
+    if review_mode_enabled(store) {
+        *active_session = Some(ActiveSession {
+            session_id,
+            current_text: final_text.clone(),
+            finalized: false,
+            tail_text: None,
+        });
+        send_ipc_message(
+            stream,
+            &IpcMessage::PreeditUpdate(PreeditUpdate {
+                text: final_text,
+                review: true,
+                partial: false,
+            }),
+        )?;
+    } else {
+        let key = idempotency_key("daemon-stream-final", session_id)?;
+        store
+            .commit_session(session_id, &final_text, &key)
+            .map_err(|error| RunLoopError::storage("commit streamed take", error))?;
+        *active_session = Some(ActiveSession {
+            session_id,
+            current_text: final_text,
+            finalized: true,
+            tail_text: last_snippet_text,
+        });
     }
     Ok(())
 }
@@ -1263,23 +1574,26 @@ fn stop_live_and_transcribe(
 
     if let Some(mut state) = live_stream.take() {
         // Streaming stop: drain the final capture chunk, flush the segmenter's
-        // tail, and deliver whatever utterances remain. The whole take was
-        // already consumed snippet by snippet — there is no batch transcription.
+        // tail, fold the remaining utterances into the take, then finalize the
+        // WHOLE take as one session — there is no batch transcription.
         match crate::adapters::finish_capture(capture) {
             Ok(tail) => {
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
-                    deliver_snippet(
-                        stream,
+                    fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+                }
+                finalize_streamed_take(
+                    stream,
+                    Ctx {
                         store,
                         audio_store,
                         codec,
                         config,
-                        active_session,
-                        snippet,
-                    )?;
-                }
+                    },
+                    active_session,
+                    state,
+                )?;
             }
             Err(error) => {
                 send_ipc_message(
@@ -1317,7 +1631,11 @@ fn stop_live_and_transcribe(
             *active_session = Some(session);
             send_ipc_message(
                 stream,
-                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review }),
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text,
+                    review,
+                    partial: false,
+                }),
             )?;
             // The mic is closed once the take stops, so the authoritative state is
             // "not recording" even while the preedit is pending review/commit.
@@ -1364,7 +1682,11 @@ fn start_fixture_oneshot(
             *active_session = Some(session);
             send_ipc_message(
                 stream,
-                &IpcMessage::PreeditUpdate(PreeditUpdate { text, review }),
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text,
+                    review,
+                    partial: false,
+                }),
             )?;
             // A fixture one-shot captures and transcribes instantly, so the mic is
             // never held open: the authoritative state stays "not recording".
@@ -1411,6 +1733,12 @@ fn commit_active_session(
     let Some(active) = active_session.as_mut() else {
         return Ok(());
     };
+    if active.finalized {
+        // Already closed out — e.g. a streamed take the daemon committed
+        // itself. A late engine-side CommitPreedit (or a retry) must not
+        // re-commit under a different key or clobber the merged text.
+        return Ok(());
+    }
 
     if commit.text != active.current_text {
         store
@@ -1447,15 +1775,6 @@ fn cancel_uncommitted_active_session(
     Ok(())
 }
 
-fn utterance_id_for_session(session_id: ImeSessionId) -> Result<String, RunLoopError> {
-    Ok(format!(
-        "utterance:{}",
-        serde_json::to_string(&session_id)
-            .map_err(RunLoopError::serialization)?
-            .trim_matches('"')
-    ))
-}
-
 fn idempotency_key(prefix: &str, session_id: ImeSessionId) -> Result<String, RunLoopError> {
     Ok(format!(
         "{prefix}:{}",
@@ -1476,6 +1795,15 @@ fn send_ipc_message(stream: &mut UnixStream, message: &IpcMessage) -> Result<(),
 /// Routes a tray activation. Recording controls (start/stop/cancel) need access
 /// to the live capture and the IPC stream, so they are handled here; everything
 /// else (history, settings) is delegated to [`handle_tray_callback`].
+/// The out-of-process configuration surfaces a tray action can open: the
+/// "Custom…" retention prompt and the Settings window (plus the channel the
+/// window's changes flow back through).
+struct ConfigSurfaces<'a> {
+    retention_dialog: &'a dyn RetentionDialog,
+    settings_window: &'a crate::settings_launcher::SettingsLauncher,
+    settings_forward_tx: &'a mpsc::Sender<TrayCallback>,
+}
+
 fn handle_tray_action(
     callback: TrayCallback,
     stream: &mut UnixStream,
@@ -1483,10 +1811,16 @@ fn handle_tray_action(
     clipboard: &mut ArboardClipboard,
     mut ctx: Ctx<'_>,
     live: &mut Live,
-    retention_dialog: &dyn RetentionDialog,
+    surfaces: &ConfigSurfaces<'_>,
 ) -> Result<(), RunLoopError> {
     let TrayCallback::Activate(action) = callback;
     match action.as_str() {
+        "settings:open" => {
+            surfaces.settings_window.open(
+                settings_state_json(ctx.store, ctx.config),
+                surfaces.settings_forward_tx.clone(),
+            );
+        }
         "start_recording" => {
             if crate::adapters::is_live_capture(&ctx.config.adapter_profile) {
                 if live.live_capture.is_none() {
@@ -1516,16 +1850,46 @@ fn handle_tray_action(
             let id = parse_id_suffix(action, "insert:").expect("checked by guard");
             insert_entry_via_ime(stream, ctx.store, id)?;
         }
+        // "Edit…" opens the review dialog over a past history entry so the user
+        // can fix it; the result comes back as `HistoryEdited` (engine→daemon).
+        action if parse_id_suffix(action, "edit:").is_some() => {
+            let id = parse_id_suffix(action, "edit:").expect("checked by guard");
+            edit_entry_via_ime(stream, ctx.store, id)?;
+        }
         _ => handle_tray_callback(
             TrayCallback::Activate(action),
             tray,
             clipboard,
             ctx.store,
             ctx.config,
-            retention_dialog,
+            surfaces.retention_dialog,
         )?,
     }
     Ok(())
+}
+
+/// The current effective settings, serialized for the Settings window's stdin
+/// (its one input line). Effective = config-file defaults with `tray_settings`
+/// overrides applied — exactly what the daemon will dictate with next take.
+fn settings_state_json(store: &SqliteMetadataStore, config: &RunLoopConfig) -> String {
+    let history = effective_history_config(store, &config.history_config);
+    let translation = effective_translation_config(store, &config.translation_config);
+    let vad = effective_vad_config(store, &config.vad_config);
+    serde_json::json!({
+        "pause_ms": vad.post_roll_ms,
+        "min_speech_ms": vad.min_speech_ms,
+        "max_phrase_ms": vad.max_utterance_ms,
+        "auto_stop_ms": vad.auto_stop_silence_ms,
+        "review_mode": review_mode_enabled(store),
+        "translation_enabled": translation.enabled,
+        "input_lang": translation.input_language,
+        "output_lang": translation.output_language,
+        "translator_configured": !translation.command.is_empty(),
+        "retention_days": history.retention_days,
+        "max_entries": history.max_entries,
+        "training_retention_days": history.training_retention_days,
+    })
+    .to_string()
 }
 
 /// Re-insert a history entry by asking the active IME front-end to commit it at
@@ -1547,6 +1911,50 @@ fn insert_entry_via_ime(
         stream,
         &IpcMessage::InsertText(InsertText { text: entry.text }),
     )
+}
+
+/// Open the review dialog over a stored history entry so the user can fix a past
+/// take without typing anything into the active app. `stream` is the connected
+/// engine; if the entry is missing or the send fails it is logged, never fatal.
+fn edit_entry_via_ime(
+    stream: &mut UnixStream,
+    store: &SqliteMetadataStore,
+    id: i64,
+) -> Result<(), RunLoopError> {
+    let entry = store
+        .get_history_entry(id)
+        .map_err(|error| RunLoopError::storage("get history entry", error))?;
+    let Some(entry) = entry else {
+        eprintln!("tray edit: history entry {id} not found");
+        return Ok(());
+    };
+    send_ipc_message(
+        stream,
+        &IpcMessage::EditHistory(EditHistory {
+            id,
+            text: entry.text,
+        }),
+    )
+}
+
+/// Look up history entry `id` and amend its stored record and raw→corrected
+/// training pair with `corrected_text`. Returns `Ok(true)` if the entry was
+/// found and amended, `Ok(false)` if it was not found (non-fatal).
+fn apply_history_edit(
+    store: &mut SqliteMetadataStore,
+    id: i64,
+    corrected_text: &str,
+) -> Result<bool, RunLoopError> {
+    let entry = store
+        .get_history_entry(id)
+        .map_err(|error| RunLoopError::storage("get history entry", error))?;
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    store
+        .amend_correction(entry.session_id, &entry.text, corrected_text)
+        .map_err(|error| RunLoopError::storage("amend history edit", error))?;
+    Ok(true)
 }
 
 /// Persist a training-data retention value (in days) as the runtime override.
@@ -1617,21 +2025,11 @@ fn handle_tray_callback(
         store
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
-        refresh_tray_menu(
-            tray,
-            store,
-            defaults,
-            translation_defaults,
-            RecordingState::Idle,
-        )?;
-    } else if apply_translation_tray_action(store, translation_defaults, &action)? {
-        refresh_tray_menu(
-            tray,
-            store,
-            defaults,
-            translation_defaults,
-            RecordingState::Idle,
-        )?;
+        refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
+    } else if apply_translation_tray_action(store, translation_defaults, &action)?
+        || apply_dictation_tray_action(store, &action)?
+    {
+        refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
     } else if let Some(id) = parse_id_suffix(&action, "insert:") {
         let _ = reinsert_entry(store, clipboard, id, defaults.clipboard_auto_clear_secs)?;
     } else if let Some(id) = parse_id_suffix(&action, "copy:") {
@@ -1639,13 +2037,7 @@ fn handle_tray_callback(
     } else if let Some(id) = parse_id_suffix(&action, "delete:") {
         match store.delete_history_entry(id) {
             Ok(()) => {
-                refresh_tray_menu(
-                    tray,
-                    store,
-                    defaults,
-                    translation_defaults,
-                    RecordingState::Idle,
-                )?;
+                refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
             }
             Err(error) => eprintln!("tray delete of entry {id} failed: {error}"),
         }
@@ -1654,13 +2046,7 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("retention_days", &days.to_string())
                 .map_err(|error| RunLoopError::storage("set retention_days", error))?;
-            refresh_tray_menu(
-                tray,
-                store,
-                defaults,
-                translation_defaults,
-                RecordingState::Idle,
-            )?;
+            refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
         } else {
             eprintln!("tray retention index out of range: {index}");
         }
@@ -1669,13 +2055,7 @@ fn handle_tray_callback(
             store
                 .set_tray_setting("max_entries", &max.to_string())
                 .map_err(|error| RunLoopError::storage("set max_entries", error))?;
-            refresh_tray_menu(
-                tray,
-                store,
-                defaults,
-                translation_defaults,
-                RecordingState::Idle,
-            )?;
+            refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
         } else {
             eprintln!("tray max_entries index out of range: {index}");
         }
@@ -1687,13 +2067,7 @@ fn handle_tray_callback(
             match validate_training_retention_days(days) {
                 Ok(()) => {
                     set_training_retention(store, days)?;
-                    refresh_tray_menu(
-                        tray,
-                        store,
-                        defaults,
-                        translation_defaults,
-                        RecordingState::Idle,
-                    )?;
+                    refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
                 }
                 Err(error) => eprintln!("custom training retention rejected: {error}"),
             }
@@ -1702,13 +2076,19 @@ fn handle_tray_callback(
         // A preset; the appended "(custom)" marker has no preset and is a no-op.
         if let Some((_, days)) = TRAINING_RETENTION_CHOICES.get(index) {
             set_training_retention(store, *days)?;
-            refresh_tray_menu(
-                tray,
-                store,
-                defaults,
-                translation_defaults,
-                RecordingState::Idle,
-            )?;
+            refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
+        }
+    } else if let Some(days) = parse_index_suffix(&action, "settings:training_retention_days:") {
+        // A direct day count (the Settings window's free-form field — it has a
+        // real input box, so no prompt dialog is needed). Validated like the
+        // dialog path; out-of-range values are logged and ignored.
+        let days = u32::try_from(days).unwrap_or(u32::MAX);
+        match validate_training_retention_days(days) {
+            Ok(()) => {
+                set_training_retention(store, days)?;
+                refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
+            }
+            Err(error) => eprintln!("settings training retention rejected: {error}"),
         }
     } else {
         // start_recording / stop_recording / cancel originate from the IME client
@@ -1737,13 +2117,7 @@ fn update_tray_recording_state(
     config: &RunLoopConfig,
     state: RecordingState,
 ) -> Result<(), RunLoopError> {
-    refresh_tray_menu(
-        tray,
-        store,
-        &config.history_config,
-        &config.translation_config,
-        state,
-    )?;
+    refresh_tray_menu(tray, store, config, state)?;
     let recording = matches!(state, RecordingState::Recording);
     tray.set_icon(if recording {
         TrayIcon::Recording
@@ -1851,6 +2225,7 @@ mod tests {
         assert_eq!(parse_id_suffix("delete:42", "delete:"), Some(42));
         assert_eq!(parse_id_suffix("delete:nan", "delete:"), None);
         assert_eq!(parse_id_suffix("copy:1", "delete:"), None);
+        assert_eq!(parse_id_suffix("edit:7", "edit:"), Some(7));
         assert_eq!(
             parse_index_suffix("settings:retention:2", "settings:retention:"),
             Some(2)
@@ -1859,6 +2234,73 @@ mod tests {
             parse_index_suffix("settings:retention:x", "settings:retention:"),
             None
         );
+    }
+
+    // The pure streaming-take text logic (`snippet_chunk`, `choose_final_take_text`,
+    // `merge_tail_correction`, `is_noise_transcript`) moved to
+    // `idiolect_application::use_cases::streaming` (M2) and is unit-tested there;
+    // the daemon's streaming integration tests below still exercise it end to end.
+
+    mod capture_persist {
+        use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+        use idiolect_common::digest::audio_sha256_hex;
+        use idiolect_ports::audio::EncodedAudio;
+
+        use crate::run_loop::persist_session;
+
+        #[test]
+        fn persisting_a_capture_records_the_audio_digest() {
+            // The production gap S0a closes: a real capture must populate
+            // `utterances.audio_sha256` (content digest of the encoded payload),
+            // because the trainer's manifest builder rejects an empty digest.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let audio_store =
+                FileAudioStore::new(tmp.path().join("audio"), tmp.path().join("decoded"));
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+
+            let payload = b"IDOPUS1 fake encoded opus payload".to_vec();
+            let encoded = EncodedAudio {
+                codec_name: "opus".to_owned(),
+                sample_rate_hz: 16_000,
+                channels: 1,
+                payload: payload.clone(),
+            };
+
+            let session_id = persist_session(
+                &mut store,
+                &audio_store,
+                "default",
+                &encoded,
+                "restart traffic",
+            )
+            .expect("persist should succeed");
+
+            let link = store
+                .session_utterance_link_for_test(session_id)
+                .expect("link should query")
+                .expect("link should exist");
+
+            // The stored audio file landed...
+            assert!(
+                audio_store
+                    .source_audio_exists_for_test(&idiolect_ports::storage::AudioObjectRef {
+                        object_key: format!("audio/1970/01/01/default/{}.ogg", link.utterance_id),
+                        codec_name: "opus".to_owned(),
+                        sample_rate_hz: 16_000,
+                        channels: 1,
+                    })
+                    .expect("exists query"),
+                "capture must write the source audio",
+            );
+            // ...and the utterance row carries the digest of exactly those bytes.
+            assert_eq!(
+                store
+                    .audio_digest_for_test(&link.utterance_id)
+                    .expect("digest should query"),
+                Some(audio_sha256_hex(&payload)),
+            );
+        }
     }
 
     mod insert_via_ime {
@@ -1936,6 +2378,108 @@ mod tests {
                 Ok(0) => {}
                 other => panic!("expected no data for a missing entry, got {other:?}"),
             }
+        }
+    }
+
+    mod edit_via_ime {
+        use std::io::{BufRead, BufReader, ErrorKind, Read};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_ipc::messages::IpcMessage;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::{apply_history_edit, edit_entry_via_ime};
+
+        /// Seed one committed history entry and return its store and row id.
+        fn store_with_entry(text: &str) -> (SqliteMetadataStore, i64) {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let session = store.create_session(Some(text)).expect("create");
+            store
+                .commit_session(session, text, "commit-1")
+                .expect("commit");
+            let id = store
+                .recent_history(10)
+                .expect("recent")
+                .first()
+                .expect("one entry")
+                .id;
+            (store, id)
+        }
+
+        #[test]
+        fn edit_sends_the_entry_text_as_edit_history_to_the_engine() {
+            // The daemon must forward an `EditHistory` (not `InsertText`) down the
+            // engine socket so the engine can seed the review dialog with the
+            // stored text. The id must round-trip so the engine's response carries
+            // the correct entry id back.
+            let (store, id) = store_with_entry("restart traefik");
+            let (engine_side, mut daemon_side) = UnixStream::pair().expect("socketpair");
+
+            edit_entry_via_ime(&mut daemon_side, &store, id).expect("edit");
+            drop(daemon_side);
+
+            let mut reader = BufReader::new(engine_side);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read");
+            assert!(
+                !line.is_empty(),
+                "edit must send a message, not type nothing"
+            );
+            match idiolect_ipc::framing::decode_json_line(&line).expect("decode") {
+                IpcMessage::EditHistory(edit) => {
+                    assert_eq!(edit.id, id);
+                    assert_eq!(edit.text, "restart traefik");
+                }
+                other => panic!("expected EditHistory, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn edit_of_a_missing_entry_sends_nothing() {
+            let (store, id) = store_with_entry("present");
+            let (engine_side, mut daemon_side) = UnixStream::pair().expect("socketpair");
+
+            edit_entry_via_ime(&mut daemon_side, &store, id + 999).expect("edit");
+
+            engine_side
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut buf = [0u8; 1];
+            match (&engine_side).read(&mut buf) {
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Ok(0) => {}
+                other => panic!("expected no data for a missing entry, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn apply_history_edit_amends_the_stored_entry() {
+            // A confirmed review: the stored text must be updated to the corrected
+            // form and the function returns Ok(true).
+            let (mut store, id) = store_with_entry("restart traffic");
+
+            let result = apply_history_edit(&mut store, id, "restart Traefik").expect("amend");
+            assert!(result, "should return true when entry found");
+
+            // The corrected text must be persisted so the tray lists the fix and a
+            // re-edit starts from it — not left stale on the original transcript.
+            let entry = store
+                .get_history_entry(id)
+                .expect("lookup")
+                .expect("exists");
+            assert_eq!(entry.text, "restart Traefik");
+        }
+
+        #[test]
+        fn apply_history_edit_returns_false_for_missing_id() {
+            let (mut store, id) = store_with_entry("present");
+
+            let result = apply_history_edit(&mut store, id + 999, "corrected").expect("no error");
+            assert!(!result, "should return false when entry not found");
         }
     }
 
@@ -2022,6 +2566,136 @@ mod tests {
             }
 
             assert_eq!(snippets.len(), 2);
+        }
+
+        // The daemon's real resampler + VAD glue feeding the shared auto-stop
+        // clock: real silence after the take's first speech crosses the threshold
+        // (the "I paused for ages and nothing happened" fix), while pre-speech
+        // silence (thinking time) never does. The threshold arithmetic itself is
+        // unit-tested on the orchestration; this proves the wiring. (The per-take
+        // dedup and the threshold rules live in
+        // `idiolect_application::use_cases::streaming::take_tests`.)
+        #[test]
+        fn real_silence_after_speech_flags_auto_stop() {
+            let mut state = LiveStreamState::new(&VadConfig {
+                auto_stop_silence_ms: 2_000,
+                ..VadConfig::default()
+            });
+            let silence_second = idiolect_ports::audio::AudioSegment {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                duration_ms: 1_000,
+                samples_f32_mono: vec![0.0; 16_000],
+            };
+
+            // Three seconds of pre-speech silence: no auto-stop.
+            for _ in 0..3 {
+                assert!(state.ingest(&silence_second).is_empty());
+            }
+            assert!(
+                !state.auto_stop_due(),
+                "pre-speech silence never stops the take"
+            );
+
+            // Speak, then go quiet past the 2 s threshold.
+            state.ingest(&speech_pause_speech_fixture_16khz_mono());
+            state.ingest(&silence_second);
+            state.ingest(&silence_second);
+            assert!(state.auto_stop_due(), "2s threshold crossed after speech");
+        }
+    }
+
+    mod dictation_timing_settings {
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_common::config::VadConfig;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::{apply_dictation_tray_action, effective_vad_config};
+
+        fn store() -> SqliteMetadataStore {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+        }
+
+        // The tray click is a GUI boundary; this is the logic it drives: index →
+        // milliseconds, persisted as overrides that layer over the config file.
+        #[test]
+        fn tray_picks_persist_and_layer_over_config_defaults() {
+            let mut store = store();
+            let defaults = VadConfig::default();
+
+            assert_eq!(effective_vad_config(&store, &defaults), defaults);
+
+            // "Send a phrase after a pause of" → 0.4 s; "Ignore noises" → 0.4 s;
+            // "Force-split" → 60 s; "Stop listening" → 10 s.
+            assert!(apply_dictation_tray_action(&mut store, "settings:pause:0").expect("pause"));
+            assert!(
+                apply_dictation_tray_action(&mut store, "settings:min_speech:2").expect("blip")
+            );
+            assert!(
+                apply_dictation_tray_action(&mut store, "settings:max_phrase:2").expect("phrase")
+            );
+            assert!(apply_dictation_tray_action(&mut store, "settings:auto_stop:2").expect("stop"));
+
+            let effective = effective_vad_config(&store, &defaults);
+            assert_eq!(effective.post_roll_ms, 400);
+            assert_eq!(effective.min_speech_ms, 400);
+            assert_eq!(effective.max_utterance_ms, 60_000);
+            assert_eq!(effective.auto_stop_silence_ms, 10_000);
+
+            // Back to "Never" via index 0.
+            assert!(
+                apply_dictation_tray_action(&mut store, "settings:auto_stop:0").expect("never")
+            );
+            assert_eq!(
+                effective_vad_config(&store, &defaults).auto_stop_silence_ms,
+                0
+            );
+        }
+
+        #[test]
+        fn auto_stop_below_the_pause_is_lifted_to_the_pause() {
+            // A slow pause (2 s) combined with a 5 s auto-stop is fine, but if
+            // overrides ever put auto-stop below the pause, the take could end
+            // before one snippet completes — the effective value lifts to the
+            // pause threshold instead of misbehaving.
+            let mut store = store();
+            let defaults = VadConfig::default();
+            store
+                .set_tray_setting("vad_post_roll_ms", "2000")
+                .expect("set");
+            store
+                .set_tray_setting("vad_auto_stop_silence_ms", "1000")
+                .expect("set");
+
+            let effective = effective_vad_config(&store, &defaults);
+            assert_eq!(effective.post_roll_ms, 2_000);
+            assert_eq!(effective.auto_stop_silence_ms, 2_000, "lifted to the pause");
+        }
+
+        #[test]
+        fn corrupt_overrides_and_foreign_actions_are_safe() {
+            let mut store = store();
+            let defaults = VadConfig::default();
+            store
+                .set_tray_setting("vad_post_roll_ms", "banana")
+                .expect("set");
+
+            assert_eq!(
+                effective_vad_config(&store, &defaults).post_roll_ms,
+                defaults.post_roll_ms,
+                "unparseable override falls back to the config default"
+            );
+
+            // Out-of-range index is consumed but changes nothing.
+            assert!(apply_dictation_tray_action(&mut store, "settings:pause:99").expect("oob"));
+            assert_eq!(
+                effective_vad_config(&store, &defaults).post_roll_ms,
+                defaults.post_roll_ms
+            );
+            // Non-timing actions are left for the other handlers.
+            assert!(!apply_dictation_tray_action(&mut store, "review_mode").expect("foreign"));
         }
     }
 

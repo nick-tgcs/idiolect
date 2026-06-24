@@ -80,6 +80,14 @@ impl IdiolectConfig {
             });
         }
 
+        if self.vad.auto_stop_silence_ms != 0
+            && self.vad.auto_stop_silence_ms < self.vad.post_roll_ms
+        {
+            return Err(ConfigError::ValidationError {
+                field: "vad.auto_stop_silence_ms".to_owned(),
+            });
+        }
+
         if self.asr.threads == 0 {
             return Err(ConfigError::ValidationError {
                 field: "asr.threads".to_owned(),
@@ -147,6 +155,11 @@ pub struct DaemonConfig {
     pub socket_path: Option<String>,
     #[serde(default = "default_daemon_log_level")]
     pub log_level: String,
+    /// Command used to surface daemon-side problems to the user as a desktop
+    /// notification, invoked as `<command> <summary> <body>` (best-effort —
+    /// a missing binary is ignored). Empty disables notifications.
+    #[serde(default = "default_daemon_notify_command")]
+    pub notify_command: String,
 }
 
 impl Default for DaemonConfig {
@@ -154,6 +167,7 @@ impl Default for DaemonConfig {
         Self {
             socket_path: None,
             log_level: default_daemon_log_level(),
+            notify_command: default_daemon_notify_command(),
         }
     }
 }
@@ -181,7 +195,7 @@ impl Default for AudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VadConfig {
     #[serde(default = "default_vad_engine")]
     pub engine: String,
@@ -195,6 +209,14 @@ pub struct VadConfig {
     pub post_roll_ms: u32,
     #[serde(default = "default_vad_max_utterance_ms")]
     pub max_utterance_ms: u32,
+    /// Opt-in: continuous silence (after the take's first speech) that ends the
+    /// take automatically, as if the user had pressed the toggle — popping the
+    /// single review dialog or finalizing the streamed text. `0` (the default)
+    /// disables it: listening never times out and only the toggle stops a take.
+    /// Must be at least `post_roll_ms` when nonzero, or a take could end before
+    /// one snippet pause ever completes.
+    #[serde(default = "default_vad_auto_stop_silence_ms")]
+    pub auto_stop_silence_ms: u32,
 }
 
 impl Default for VadConfig {
@@ -206,6 +228,7 @@ impl Default for VadConfig {
             pre_roll_ms: default_vad_pre_roll_ms(),
             post_roll_ms: default_vad_post_roll_ms(),
             max_utterance_ms: default_vad_max_utterance_ms(),
+            auto_stop_silence_ms: default_vad_auto_stop_silence_ms(),
         }
     }
 }
@@ -410,6 +433,32 @@ pub struct ObservabilityConfig {
     pub log_private_text: bool,
 }
 
+/// The operating-system family Idiolect resolves paths and socket limits for.
+/// Carried as a value (rather than read straight from `cfg!`) so the per-platform
+/// layout is a pure function both OSes' test suites can exercise on any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Linux,
+    MacOs,
+}
+
+impl Platform {
+    /// The platform this binary was compiled for. The single `cfg` seam: every
+    /// other platform decision flows from the returned value, so the layout/limit
+    /// logic stays testable for both targets regardless of the build host.
+    #[must_use]
+    pub fn host() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Platform::MacOs
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Platform::Linux
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct XdgBaseDirs {
     pub config_home: PathBuf,
@@ -418,21 +467,154 @@ pub struct XdgBaseDirs {
     pub runtime_dir: PathBuf,
 }
 
-impl Default for XdgBaseDirs {
-    fn default() -> Self {
+impl XdgBaseDirs {
+    /// The per-platform *default* base directories rooted at `home` (and `tmp`
+    /// for the control socket), with **no** environment lookups. Pure and
+    /// deterministic, so both layouts are unit-/contract-testable on any host;
+    /// `for_platform` wraps this with the `XDG_*`/`TMPDIR`/`HOME` env resolution.
+    ///
+    /// Linux follows the XDG base-directory spec. macOS follows Apple's File
+    /// System conventions: config and data both under `Library/Application
+    /// Support` (a TOML config has no place in plist-only `Library/Preferences`),
+    /// caches under `Library/Caches`, and the socket in the per-user temp dir
+    /// (macOS has no `XDG_RUNTIME_DIR`).
+    #[must_use]
+    pub fn platform_defaults(platform: Platform, home: &Path, tmp: &Path) -> Self {
+        match platform {
+            Platform::Linux => Self {
+                config_home: home.join(".config"),
+                data_home: home.join(".local").join("share"),
+                cache_home: home.join(".cache"),
+                runtime_dir: home.join(".local").join("run").join("idiolect"),
+            },
+            Platform::MacOs => {
+                let app_support = home.join("Library").join("Application Support");
+                Self {
+                    config_home: app_support.clone(),
+                    data_home: app_support,
+                    cache_home: home.join("Library").join("Caches"),
+                    runtime_dir: tmp.to_path_buf(),
+                }
+            }
+        }
+    }
+
+    /// Resolve the base directories for `platform`, honouring `HOME`/`TMPDIR` and
+    /// any `XDG_*` overrides on top of [`Self::platform_defaults`]. The `XDG_*`
+    /// overrides are honoured on every platform so power users and tests can
+    /// redirect paths uniformly; only the fallbacks differ by OS.
+    #[must_use]
+    pub fn for_platform(platform: Platform) -> Self {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let tmp = env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let defaults = Self::platform_defaults(platform, &home, &tmp);
 
         Self {
-            config_home: env_path_or_fallback("XDG_CONFIG_HOME", home.join(".config")),
-            data_home: env_path_or_fallback("XDG_DATA_HOME", home.join(".local").join("share")),
-            cache_home: env_path_or_fallback("XDG_CACHE_HOME", home.join(".cache")),
-            runtime_dir: env_path_or_fallback(
-                "XDG_RUNTIME_DIR",
-                home.join(".local").join("run").join("idiolect"),
-            ),
+            config_home: env_path_or_fallback("XDG_CONFIG_HOME", defaults.config_home),
+            data_home: env_path_or_fallback("XDG_DATA_HOME", defaults.data_home),
+            cache_home: env_path_or_fallback("XDG_CACHE_HOME", defaults.cache_home),
+            runtime_dir: env_path_or_fallback("XDG_RUNTIME_DIR", defaults.runtime_dir),
         }
+    }
+}
+
+impl Default for XdgBaseDirs {
+    fn default() -> Self {
+        Self::for_platform(Platform::host())
+    }
+}
+
+/// The capacity of `sun_path` in `struct sockaddr_un`, **including** the trailing
+/// NUL, for `platform`. A Unix-domain socket path that fills or exceeds this can
+/// never be `bind`-ed; the kernel rejects it with a bare `EINVAL`. macOS' budget
+/// is shorter than Linux', so a path that binds on Linux can fail on macOS.
+///
+/// The literals are the load-bearing platform fact: Linux `<sys/un.h>` declares
+/// `char sun_path[108]`; BSD/macOS `<sys/un.h>` declares `char sun_path[104]`
+/// (mirrored by `libc`'s `sockaddr_un`). Pinned at unit level in `platform_tests`.
+#[must_use]
+pub fn max_socket_path_len(platform: Platform) -> usize {
+    match platform {
+        Platform::Linux => 108,
+        Platform::MacOs => 104,
+    }
+}
+
+/// Reject a Unix-domain socket path too long to `bind` on `platform`, before the
+/// kernel turns it into an opaque `EINVAL`. The usable budget is
+/// [`max_socket_path_len`] minus one byte for the NUL terminator.
+pub fn check_socket_path_len(path: &Path, platform: Platform) -> Result<(), ConfigError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let len = path.as_os_str().as_bytes().len();
+    let max = max_socket_path_len(platform);
+    if len >= max {
+        return Err(ConfigError::SocketPathTooLong { len, max });
+    }
+    Ok(())
+}
+
+/// Where Idiolect keeps its app-private persistent state, abstracted across
+/// platforms. The desktop resolves it from the XDG/Apple base dirs ([`XdgPaths`]);
+/// Android injects its sandbox `filesDir` directly ([`RootedPaths`]) since the
+/// sandbox has no `HOME`/`XDG_*`. A trait — rather than a hand-injected
+/// [`XdgBaseDirs`] override — so the FFI facade and the daemon share one seam.
+pub trait PathProvider {
+    /// Root directory for app-private persistent data. The SQLite metadata
+    /// database and the Opus source-audio store both live beneath it.
+    fn data_dir(&self) -> PathBuf;
+
+    /// The SQLite metadata database path under [`Self::data_dir`].
+    fn database_path(&self) -> PathBuf {
+        self.data_dir().join("idiolect.db")
+    }
+
+    /// The source-audio object store directory under [`Self::data_dir`].
+    fn audio_dir(&self) -> PathBuf {
+        self.data_dir().join("audio")
+    }
+}
+
+/// A [`PathProvider`] rooted at a single injected directory — Android's app-private
+/// `filesDir`. Everything nests directly beneath it.
+#[derive(Debug, Clone)]
+pub struct RootedPaths {
+    root: PathBuf,
+}
+
+impl RootedPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl PathProvider for RootedPaths {
+    fn data_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
+}
+
+/// A [`PathProvider`] backed by the desktop XDG/Apple base dirs, namespacing all
+/// state under an `idiolect` subdirectory of the data home.
+#[derive(Debug, Clone)]
+pub struct XdgPaths {
+    base: XdgBaseDirs,
+}
+
+impl XdgPaths {
+    #[must_use]
+    pub fn new(base: XdgBaseDirs) -> Self {
+        Self { base }
+    }
+}
+
+impl PathProvider for XdgPaths {
+    fn data_dir(&self) -> PathBuf {
+        self.base.data_home.join("idiolect")
     }
 }
 
@@ -448,6 +630,15 @@ pub struct ResolvedConfigPaths {
     pub manifests_dir: PathBuf,
     pub decoded_cache_dir: PathBuf,
     pub trainer_cache_dir: PathBuf,
+}
+
+impl ResolvedConfigPaths {
+    /// Reject a resolved control-socket path the host kernel could not `bind`
+    /// because it overflows `sun_path`. Validated against [`Platform::host`] so
+    /// the daemon fails fast with a clear message instead of a bare `EINVAL`.
+    pub fn validate_socket_path(&self) -> Result<(), ConfigError> {
+        check_socket_path_len(&self.socket_path, Platform::host())
+    }
 }
 
 pub fn resolve_xdg_paths(config: &IdiolectConfig, xdg: &XdgBaseDirs) -> ResolvedConfigPaths {
@@ -499,6 +690,10 @@ pub enum ConfigError {
     ParseError,
     #[error("invalid configuration: {field}")]
     ValidationError { field: String },
+    #[error(
+        "socket path is too long: {len} bytes exceeds this platform's {max}-byte sun_path limit"
+    )]
+    SocketPathTooLong { len: usize, max: usize },
 }
 
 fn default_default_user_id() -> String {
@@ -507,6 +702,10 @@ fn default_default_user_id() -> String {
 
 fn default_daemon_log_level() -> String {
     "info".to_owned()
+}
+
+fn default_daemon_notify_command() -> String {
+    "notify-send".to_owned()
 }
 
 fn default_audio_input_device() -> String {
@@ -547,6 +746,11 @@ fn default_vad_post_roll_ms() -> u32 {
 
 fn default_vad_max_utterance_ms() -> u32 {
     30_000
+}
+
+/// Disabled by default: listening never times out; only the toggle stops a take.
+fn default_vad_auto_stop_silence_ms() -> u32 {
+    0
 }
 
 fn default_asr_engine() -> String {
@@ -636,5 +840,107 @@ fn env_path_or_fallback(name: &str, fallback: PathBuf) -> PathBuf {
     match env::var_os(name) {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => fallback,
+    }
+}
+
+#[cfg(test)]
+mod path_provider_tests {
+    use super::{PathProvider, Platform, RootedPaths, XdgBaseDirs, XdgPaths};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rooted_paths_put_everything_under_the_injected_root() {
+        // Android has no HOME/XDG: the app injects its private `filesDir` and all
+        // persistent state lives directly beneath it.
+        let provider = RootedPaths::new("/data/data/dev.idiolect/files");
+        assert_eq!(
+            provider.data_dir(),
+            Path::new("/data/data/dev.idiolect/files")
+        );
+        assert_eq!(
+            provider.database_path(),
+            Path::new("/data/data/dev.idiolect/files/idiolect.db")
+        );
+        assert_eq!(
+            provider.audio_dir(),
+            Path::new("/data/data/dev.idiolect/files/audio")
+        );
+    }
+
+    #[test]
+    fn xdg_paths_nest_under_the_data_home() {
+        // The desktop impl reuses the XDG/Apple base dirs, namespacing under an
+        // `idiolect` subdirectory of the data home.
+        let xdg = XdgBaseDirs::platform_defaults(
+            Platform::Linux,
+            Path::new("/home/u"),
+            Path::new("/tmp"),
+        );
+        let provider = XdgPaths::new(xdg);
+        assert_eq!(
+            provider.data_dir(),
+            PathBuf::from("/home/u/.local/share/idiolect")
+        );
+        assert_eq!(
+            provider.database_path(),
+            PathBuf::from("/home/u/.local/share/idiolect/idiolect.db")
+        );
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::{check_socket_path_len, max_socket_path_len, Platform, XdgBaseDirs};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn host_platform_matches_the_build_target() {
+        // The one `cfg` seam: assert it agrees with the compile target so the
+        // value-carried `Platform` can never silently disagree with the host.
+        let expected = if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::Linux
+        };
+        assert_eq!(Platform::host(), expected);
+    }
+
+    #[test]
+    fn platform_defaults_are_pure_and_diverge_by_os() {
+        let home = Path::new("/home/u");
+        let tmp = Path::new("/tmp/runtime");
+        let linux = XdgBaseDirs::platform_defaults(Platform::Linux, home, tmp);
+        let macos = XdgBaseDirs::platform_defaults(Platform::MacOs, home, tmp);
+
+        // Linux ignores `tmp`; macOS routes the socket there.
+        assert_eq!(linux.runtime_dir, Path::new("/home/u/.local/run/idiolect"));
+        assert_eq!(macos.runtime_dir, tmp);
+        // macOS collapses config+data into one Application Support root.
+        assert_eq!(macos.config_home, macos.data_home);
+        assert_ne!(linux.config_home, linux.data_home);
+    }
+
+    #[test]
+    fn sun_path_limits_match_the_sockaddr_un_definitions() {
+        // The magic numbers that distinguish the two platforms — pinned at the
+        // lowest altitude so a typo (e.g. 104 -> 140) fails here, not only in
+        // the cross-platform contract tests. See `max_socket_path_len`.
+        assert_eq!(max_socket_path_len(Platform::Linux), 108);
+        assert_eq!(max_socket_path_len(Platform::MacOs), 104);
+    }
+
+    #[test]
+    fn socket_len_guard_reserves_one_byte_for_the_nul() {
+        // The boundary is exact: a path equal to the limit has no room for the
+        // NUL and must be rejected; one byte shorter is the last accepted length.
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let max = max_socket_path_len(platform);
+            let at_limit = PathBuf::from("a".repeat(max));
+            let one_under = PathBuf::from("a".repeat(max - 1));
+            check_socket_path_len(&at_limit, platform)
+                .expect_err("a path filling sun_path leaves no room for the NUL");
+            check_socket_path_len(&one_under, platform)
+                .expect("the last byte before the limit is usable");
+        }
     }
 }

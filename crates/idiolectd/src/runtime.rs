@@ -228,6 +228,16 @@ fn run_daemon_setup(args: &[String]) -> Result<String, RuntimeError> {
     let base_dirs = XdgBaseDirs::default();
     let paths = resolve_xdg_paths(&config, &base_dirs);
     prepare_configured_paths(&paths)?;
+    // Desktop integration (the GNOME dock mic) is a side effect of a *real,
+    // persistent* daemon launch only — never config validation or the ephemeral
+    // test daemons, which must not write into the user's real ~/.local/share.
+    if crate::desktop_integration::should_install(
+        run_args.check_config,
+        run_args.shutdown_after_client,
+        std::env::var_os("IDIOLECT_DISABLE_TRAY").is_some(),
+    ) {
+        crate::desktop_integration::ensure(&base_dirs);
+    }
     if !paths.model_path.is_file() {
         return Err(RuntimeError::usage(format!(
             "ASR model path does not exist: {}",
@@ -276,6 +286,7 @@ fn run_daemon_with_tray(
         history_config: config.history.clone(),
         translation_config: config.translation.clone(),
         vad_config: config.vad.clone(),
+        notify_command: config.daemon.notify_command.clone(),
     })
 }
 
@@ -321,6 +332,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, RuntimeError> {
 }
 
 fn prepare_configured_paths(paths: &ResolvedConfigPaths) -> Result<(), RuntimeError> {
+    // Fail fast (before creating any dirs) if the control socket can't fit in the
+    // host kernel's `sun_path`; otherwise `bind` later returns an opaque EINVAL.
+    // The limit tightens from 108 (Linux) to 104 (macOS) — see docs/future/009.
+    paths
+        .validate_socket_path()
+        .map_err(|error| RuntimeError::usage(format!("socket path invalid: {error}")))?;
     create_parent_dir("socket parent", &paths.socket_path)?;
     create_parent_dir("database parent", &paths.database_path)?;
     create_dir("models whisper", &paths.models_whisper_dir)?;
@@ -488,6 +505,7 @@ fn handle_fixture_connection(
                     &IpcMessage::PreeditUpdate(PreeditUpdate {
                         text: transcript.to_owned(),
                         review: false,
+                        partial: false,
                     }),
                 )?;
             }
@@ -529,7 +547,8 @@ fn handle_fixture_connection(
             IpcMessage::HistoryReinsert(_)
             | IpcMessage::HistoryCopy(_)
             | IpcMessage::HistoryReinsertResponse(_)
-            | IpcMessage::HistoryCopyResponse(_) => {
+            | IpcMessage::HistoryCopyResponse(_)
+            | IpcMessage::HistoryEdited(_) => {
                 send_ipc_message(
                     &mut stream,
                     &IpcMessage::Error(ErrorMessage {
@@ -542,6 +561,7 @@ fn handle_fixture_connection(
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
+            | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
                 send_ipc_message(
                     &mut stream,
@@ -829,5 +849,55 @@ impl MetadataStorePort for RuntimeMetadataStore {
         &self,
     ) -> Result<std::collections::HashMap<String, String>, Self::Error> {
         self.inner.get_all_tray_settings()
+    }
+}
+
+#[cfg(test)]
+mod socket_guard_tests {
+    // This covers the *rejection* path of the socket guard in isolation (no
+    // filesystem touch). The *accept* path — a normal short socket passing
+    // validation and proceeding to dir creation — is covered end-to-end by
+    // `tests/runtime_check_config.rs` (the happy `--check-config` asserts
+    // `ready: true`), so it is not duplicated here.
+    use super::{prepare_configured_paths, ResolvedConfigPaths};
+    use std::path::PathBuf;
+
+    /// A `ResolvedConfigPaths` whose only meaningful field is the socket path.
+    /// Validation rejects an overlong socket before any other path is read or
+    /// created, so the rest are inert placeholders that are never touched.
+    fn paths_with_socket(socket: PathBuf) -> ResolvedConfigPaths {
+        let inert = PathBuf::from("/proc/idiolect-never-created");
+        ResolvedConfigPaths {
+            config_file: inert.clone(),
+            socket_path: socket,
+            database_path: inert.clone(),
+            model_path: inert.clone(),
+            models_whisper_dir: inert.clone(),
+            audio_dir: inert.clone(),
+            adapters_dir: inert.clone(),
+            manifests_dir: inert.clone(),
+            decoded_cache_dir: inert.clone(),
+            trainer_cache_dir: inert,
+        }
+    }
+
+    #[test]
+    fn overlong_socket_path_is_rejected_before_touching_the_filesystem() {
+        // A 201-byte path overflows `sun_path` on every platform (max 108). The
+        // daemon must reject it with a readable message, not let `bind` later
+        // fail with a bare EINVAL — and must not create any directories first
+        // (the inert placeholders above would error if it tried).
+        let too_long = PathBuf::from(format!("/{}", "a".repeat(200)));
+        let error = prepare_configured_paths(&paths_with_socket(too_long))
+            .expect_err("a 201-byte socket path overflows sun_path");
+        let message = format!("{error}").to_lowercase();
+        assert!(
+            message.contains("socket path"),
+            "explains the cause: {message}"
+        );
+        assert!(
+            message.contains("too long"),
+            "explains the cause: {message}"
+        );
     }
 }

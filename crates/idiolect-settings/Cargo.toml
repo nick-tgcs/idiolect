@@ -1,0 +1,19 @@
+[package]
+name = "idiolect-settings"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "idiolect-settings"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+idiolect-application = { path = "../idiolect-application" }
+serde_json.workspace = true
+tiny-skia = "0.12"
+
+[lints]
+workspace = true

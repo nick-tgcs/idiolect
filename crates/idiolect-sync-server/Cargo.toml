@@ -1,0 +1,55 @@
+[package]
+name = "idiolect-sync-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+idiolect-sync = { path = "../idiolect-sync" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-ports = { path = "../idiolect-ports" }
+idiolect-common = { path = "../idiolect-common" }
+thiserror.workspace = true
+# The personal model server (M5 `GET /model`). Desktop-only — not in the Android `.so`.
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Per-device bearer tokens (S3): random token material for the pairing handshake.
+uuid.workspace = true
+# Whitens the v4 UUID into a uniform pairing code (the raw UUID version/variant bytes
+# are not uniform), and hashes codes/tokens at rest.
+sha2.workspace = true
+# Renders the one-time pairing code as a scannable QR for `--pair`. Encoder only — no
+# image/svg/pic features (we rasterise to forced-colour terminal half-blocks ourselves).
+qrcode = { version = "=0.14.1", default-features = false }
+# Percent-encodes the base URL into the pairing URI the QR carries (Android decodes it).
+percent-encoding = "=2.3.2"
+# Self-signed TLS for the pairing/sync/model transport. The server mints a persisted
+# self-signed cert; the phone pins its SPKI fingerprint (carried in the pairing QR) on
+# first pair — TOFU, no CA. Desktop-only — these never reach the Android `.so` (idiolect-ffi).
+# We terminate TLS with tokio-rustls and serve the same `axum::Router` over it via the
+# exact hyper-util loop `axum::serve` uses internally (axum 0.7 has no pluggable listener,
+# and axum-server 0.7 won't build against this workspace's pinned hyper stack).
+rcgen = "=0.14.8"
+rustls = "=0.23.41"
+rustls-pemfile = "=2.2.0"
+tokio-rustls = "=0.26.2"
+hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "service"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util.workspace = true
+tempfile.workspace = true
+# An independent QR reader, so the pairing-QR round-trip test decodes what we encode
+# (default features off: we feed a greyscale buffer, not the `image` crate's types).
+rqrr = { version = "=0.10.1", default-features = false }
+# A pinning TLS *client* for the pairing-over-https integration test, mirroring the
+# Android X509TrustManager: trust the self-signed server iff the presented leaf's DER
+# SubjectPublicKeyInfo SHA-256 equals the pinned fingerprint. `x509-parser` pulls that
+# SPKI out of the cert the server presents, exactly as `cert.publicKey.encoded` does on Android.
+x509-parser = "=0.18.1"

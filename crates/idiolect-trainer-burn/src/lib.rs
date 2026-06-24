@@ -1,6 +1,11 @@
 //! Burn-backed trainer adapter for Idiolect.
 
+pub mod ggml;
+pub mod lora;
+pub mod mel;
+pub mod train;
 mod trainer;
+pub mod whisper;
 
 pub use trainer::{BurnTrainer, BurnTrainerError};
 

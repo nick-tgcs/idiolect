@@ -1,0 +1,144 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>idiolect — centered review</title><style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  :root{
+    --accent:#7c83fd; --accent-bright:#a6abff; --live:#eb5757;
+    --bg:#16171e; --panel:#1b1e27; --strip:#272b36; --surface:#1f212b;
+    --field:#101117; --slate:#333845; --slate2:#454b5c;
+    --text:#e5e7f0; --grey:#c7cad3; --muted:#8c90a1;
+  }
+  body{ background:#0d0e12; font-family:'Roboto','Segoe UI',sans-serif; padding:30px; color:var(--grey); }
+  h1{ font-size:18px; font-weight:600; color:var(--text); margin-bottom:6px; }
+  .legend{ color:var(--muted); font-size:12.5px; margin-bottom:22px; line-height:1.7; max-width:760px; }
+  .legend b{ color:var(--accent-bright); font-weight:600; }
+  .row{ display:flex; gap:26px; align-items:flex-start; }
+  .col{ width:300px; }
+  .cap{ font-size:14px; text-align:center; margin-bottom:10px; font-weight:500; color:var(--grey); }
+  .cap small{ display:block; color:var(--muted); font-weight:400; font-size:12px; margin-top:2px; }
+
+  /* phone frame */
+  .phone{ width:300px; height:600px; background:#000; border-radius:30px; padding:9px;
+          box-shadow:0 8px 40px rgba(0,0,0,.6); }
+  .screen{ width:100%; height:100%; border-radius:22px; overflow:hidden; position:relative;
+           display:flex; flex-direction:column; }
+
+  /* host app behind */
+  .host{ flex:1; background:#0f1014; display:flex; flex-direction:column; }
+  .hostbar{ height:46px; background:#171922; display:flex; align-items:center; gap:9px; padding:0 14px;
+            border-bottom:1px solid #ffffff0d; }
+  .hostbar .av{ width:26px; height:26px; border-radius:50%; background:var(--slate2); }
+  .hostbar .t{ font-size:13px; color:var(--grey); font-weight:600; }
+  .msgs{ flex:1; padding:14px; display:flex; flex-direction:column; gap:9px; }
+  .bub{ max-width:78%; font-size:12px; padding:8px 11px; border-radius:13px; line-height:1.45; }
+  .bub.them{ background:#1d2029; color:var(--grey); align-self:flex-start; border-bottom-left-radius:4px; }
+  .bub.me{ background:#2a2f63; color:#e9eaff; align-self:flex-end; border-bottom-right-radius:4px; }
+  .composer{ height:42px; background:#171922; border-top:1px solid #ffffff0d; display:flex; align-items:center; padding:0 12px; }
+  .composer .fld{ flex:1; height:26px; background:#0c0d12; border-radius:14px; border:1px solid #ffffff10; }
+
+  /* dim scrim when reviewing */
+  .scrim{ position:absolute; inset:0; background:#05060aee; }
+
+  /* centered review card */
+  .review{ position:absolute; left:18px; right:18px; top:120px;
+           background:var(--panel); border-radius:16px; padding:15px 15px 13px;
+           border:1px solid #ffffff14; box-shadow:0 14px 50px rgba(0,0,0,.7); }
+  .review .h{ display:flex; justify-content:space-between; align-items:baseline; }
+  .review .h b{ color:var(--text); font-size:15px; font-weight:600; }
+  .review .h span{ color:var(--muted); font-size:11px; }
+  .review .sub{ color:var(--muted); font-size:11px; margin-top:3px; line-height:1.4; }
+  .review .field{ background:var(--field); border:1px solid var(--accent); border-radius:9px; padding:11px 12px;
+                  color:var(--text); font-size:12.5px; line-height:1.55; min-height:96px; margin-top:10px; }
+  .review .field mark{ background:#7c83fd3d; color:var(--text); border-radius:3px; }
+  .review .field .cur{ display:inline-block; width:2px; height:14px; background:var(--accent); vertical-align:-2px; animation:none; }
+  .review .actions{ display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
+  .btn{ border-radius:9px; padding:8px 18px; font-size:12.5px; font-weight:600; }
+  .btn.ins{ background:var(--accent); color:#fff; } .btn.can{ background:var(--surface); color:var(--muted); }
+
+  /* the user's OWN standard keyboard (generic, dark gboard-ish) */
+  .stdkb{ background:#181a1f; padding:7px 5px 9px; }
+  .stdkb .lbl{ text-align:center; color:var(--muted); font-size:10px; margin-bottom:6px; letter-spacing:.3px; }
+  .kbrow{ display:flex; gap:4px; justify-content:center; margin-bottom:5px; }
+  .k{ flex:1; max-width:26px; height:30px; background:#2b2e37; border-radius:5px; display:flex; align-items:center;
+      justify-content:center; font-size:11px; color:#d6d9e2; }
+  .k.w{ max-width:none; flex:3; } .k.fn{ background:#20222a; color:var(--muted); }
+
+  /* idiolect voice bar (for the "before" comparison) */
+  .ime{ background:var(--panel); }
+  .strip{ display:flex; align-items:center; justify-content:space-around; background:var(--strip);
+          border-radius:24px; height:42px; margin:10px 12px 0; }
+  .ib{ width:40px; height:30px; display:flex; align-items:center; justify-content:center; border-radius:16px; font-size:16px; }
+  .ib.on{ background:var(--accent); }
+  .smallcard{ margin:10px 12px; background:var(--bg); border-radius:10px; padding:10px; border:1px solid #ffffff10; }
+  .smallcard .field{ background:var(--field); border-radius:7px; padding:8px; font-size:11px; color:var(--text);
+                     min-height:52px; line-height:1.5; border:1px solid #ffffff12; }
+  .smallcard .actions{ display:flex; justify-content:flex-end; gap:6px; margin-top:8px; }
+</style></head>
+<body>
+  <h1>idiolect — review in the centre of the screen, edited with your own keyboard</h1>
+  <div class="legend">
+    New direction: when <b>👁 review</b> is on, stopping a take opens a <b>centred “Review dictation” card</b> over the app — and your
+    <b>normal keyboard</b> (whatever you use) comes up to edit it, exactly like editing any other field. idiolect does <b>not</b> render its own
+    cramped QWERTY for this. On <b>Insert</b>, the approved text drops into the field and the raw→edited pair is still recorded for training.<br>
+    (Right: the old idea — a small dialog squeezed above idiolect’s keys — for contrast.)
+  </div>
+  <div class="row" id="r"></div>
+  <script>
+    const review = `
+      <div class="scrim"></div>
+      <div class="review">
+        <div class="h"><b>Review dictation</b><span>edit · then insert</span></div>
+        <div class="sub">Edit it however you like — your fix is recorded for training.</div>
+        <div class="field">Pick up milk and eggs. Call the dentist <mark>tomorrow</mark><span class="cur"></span> about the appointment, and send the report before lunch.</div>
+        <div class="actions"><span class="btn can">Cancel</span><span class="btn ins">Insert</span></div>
+      </div>`;
+    const stdkb = `
+      <div class="stdkb">
+        <div class="lbl">▾ your usual keyboard (Gboard, etc.)</div>
+        <div class="kbrow">${'qwertyuiop'.split('').map(c=>`<div class="k">${c}</div>`).join('')}</div>
+        <div class="kbrow">${'asdfghjkl'.split('').map(c=>`<div class="k">${c}</div>`).join('')}</div>
+        <div class="kbrow"><div class="k fn">⇧</div>${'zxcvbnm'.split('').map(c=>`<div class="k">${c}</div>`).join('')}<div class="k fn">⌫</div></div>
+        <div class="kbrow"><div class="k fn">?123</div><div class="k">,</div><div class="k w">space</div><div class="k">.</div><div class="k fn">⏎</div></div>
+      </div>`;
+    document.getElementById('r').innerHTML = `
+      <div class="col">
+        <div class="cap">Centred review (this design)<small>card in the middle · your own keyboard below</small></div>
+        <div class="phone"><div class="screen">
+          <div class="host">
+            <div class="hostbar"><div class="av"></div><div class="t">Messages · Sam</div></div>
+            <div class="msgs">
+              <div class="bub them">can you grab a few things on the way?</div>
+              <div class="bub me">yep — what do we need?</div>
+              <div class="bub them">a list, hang on…</div>
+            </div>
+          </div>
+          ${review}
+          ${stdkb}
+        </div></div>
+      </div>
+      <div class="col">
+        <div class="cap" style="opacity:.7">Old idea (for contrast)<small>tiny dialog crammed over idiolect’s keys</small></div>
+        <div class="phone"><div class="screen">
+          <div class="host">
+            <div class="hostbar"><div class="av"></div><div class="t">Messages · Sam</div></div>
+            <div class="msgs">
+              <div class="bub them">can you grab a few things on the way?</div>
+              <div class="bub me">yep — what do we need?</div>
+            </div>
+            <div class="composer"><div class="fld"></div></div>
+          </div>
+          <div class="ime">
+            <div class="strip"><div class="ib">⌨</div><div class="ib on">👁</div><div class="ib">🌐</div></div>
+            <div class="smallcard">
+              <div class="field">Pick up milk and eggs. Call the dentist tomorrow about the appointment, and send the report…</div>
+              <div class="actions"><span class="btn can">Cancel</span><span class="btn ins">Insert</span></div>
+            </div>
+            <div class="stdkb" style="opacity:.5;background:var(--strip)">
+              <div class="kbrow">${'qwertyuiop'.split('').map(c=>`<div class="k" style="background:var(--slate)"></div>`).join('')}</div>
+              <div class="kbrow">${'asdfghjk'.split('').map(c=>`<div class="k" style="background:var(--slate)"></div>`).join('')}</div>
+              <div class="kbrow"><div class="k w" style="background:var(--slate)"></div></div>
+            </div>
+          </div>
+        </div></div>
+      </div>`;
+  </script>
+</body></html>

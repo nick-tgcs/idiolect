@@ -1,0 +1,4 @@
+# UniFFI binding generation for the Android facade. Only affects `uniffi-bindgen`
+# (the Gradle `generateUniffiBindings` task) — it has no effect on the cargo build.
+[bindings.kotlin]
+package_name = "org.idiolect.ffi"

@@ -1,7 +1,14 @@
-//! Pause-triggered live translation, end to end through the real daemon:
-//! one recording containing speech–pause–speech must yield one translated
-//! `PreeditUpdate` per pause-delimited snippet *while recording continues*,
-//! not a single transcript on stop.
+//! Pause-triggered live translation, end to end through the real daemon.
+//!
+//! The take is ONE conversation: each pause-delimited snippet is translated and
+//! pushed immediately as a PARTIAL preedit (the engine types it and keeps
+//! going), and the whole take is finalized exactly once at stop — one merged
+//! audio recording and one final string per take for training. The final
+//! string is ONE decode of the whole merged recording, not the glued snippet
+//! previews: short-context snippet decodes drop words at pause boundaries
+//! (a real take lost "I don't want" exactly this way), and the words are
+//! provably still in the merged audio. In "review before insert" mode nothing
+//! is pushed mid-take; the single review dialog gets the full text at stop.
 //!
 //! Driven via the reserved `fixture-stream` device (a canned
 //! speech–pause–speech clip served through the live polling path), the fixture
@@ -19,9 +26,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{ClientHello, CommitPreedit, IpcMessage, RecordingStatus};
+use idiolect_ports::storage::{HistoryState, MetadataStorePort};
+
+const SNIPPET: &str = "[sv>ja] RESTART TRAFFIC";
 
 #[test]
-fn each_pause_snippet_is_translated_and_pushed_mid_recording() {
+fn snippets_stream_as_partials_and_finalize_as_one_session() {
     let fixture = DaemonFixture::new("snippets");
     let daemon = fixture.spawn_daemon();
     let mut client = DaemonClient::connect(&fixture.socket_path());
@@ -32,27 +42,37 @@ fn each_pause_snippet_is_translated_and_pushed_mid_recording() {
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
 
-    // Two pause-delimited snippets arrive while the mic is still recording —
-    // each independently transcribed ("restart traffic") and translated by the
-    // stub ([sv>ja] + uppercase).
-    client.expect_preedit("[sv>ja] RESTART TRAFFIC");
-    client.expect_preedit("[sv>ja] RESTART TRAFFIC");
+    // Two pause-delimited snippets arrive while the mic is still recording,
+    // each translated and marked PARTIAL. The second carries its joining space
+    // so the app-typed stream reads as one sentence flow.
+    client.expect_partial_preedit(SNIPPET);
+    client.expect_partial_preedit(&format!(" {SNIPPET}"));
 
-    // The engine auto-commits a snippet mid-recording. The mic is still open,
-    // so this must NOT publish a recording=false transition (the engine would
-    // go idle and drop every later snippet).
+    // A stray CommitPreedit mid-take (nothing is finalizable yet) must neither
+    // finalize anything nor flip the published recording state.
     client.send(IpcMessage::CommitPreedit(CommitPreedit {
-        text: "[sv>ja] RESTART TRAFFIC".to_owned(),
+        text: SNIPPET.to_owned(),
     }));
 
-    // Stop: the stream is fully drained (no tail snippet), so the very next
-    // push is the stop's recording=false — anything earlier is the
-    // commit-while-recording bug.
+    // Stop: the take finalizes daemon-side (the text was already typed), so the
+    // very next push is the stop's recording=false.
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(false);
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
+
+    // Training/storage truth: ONE committed session whose text is the
+    // stop-time decode of the WHOLE recording (the fixture ASR decodes any
+    // audio — including the merged take — to one "restart traffic"), and ONE
+    // stored recording for the whole take. Glued snippet previews are never
+    // the stored truth.
+    fixture.assert_single_committed_take(SNIPPET);
+    assert_eq!(
+        fixture.stored_audio_count(),
+        1,
+        "one merged recording per take"
+    );
 }
 
 #[test]
@@ -69,21 +89,69 @@ fn streaming_translation_to_english_needs_no_command() {
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
-    client.expect_preedit("restart traffic");
-    client.expect_preedit("restart traffic");
+    client.expect_partial_preedit("restart traffic");
+    client.expect_partial_preedit(" restart traffic");
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(false);
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take("restart traffic");
 }
 
 #[test]
-fn review_mode_routes_every_snippet_through_the_review_flag() {
-    // Requirement: output honours the "Review before insert" option — when it is
-    // on, each translated snippet tells the client to open its review dialog
-    // (review=true) instead of committing directly.
+fn unworkable_translation_target_notifies_the_user_once_per_take() {
+    // Target "fr" with no translator command: every snippet fails. The failure
+    // must reach the USER — as a desktop notification through the configured
+    // notify command — not just the journal, and once per take, not once per
+    // pause. The wire stays clean (no partials, nothing typed) and nothing is
+    // stored.
+    let fixture = DaemonFixture::new("notify")
+        .with_translation_overrides("auto", "fr", Some(""))
+        .with_auto_stop_ms(2_000)
+        .with_notify_recorder();
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+
+    // Both snippets fail, so no partials can arrive; the take auto-stops on
+    // the trailing silence and the next push is the stop itself.
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+
+    let log = fs::read_to_string(fixture.notifications_log())
+        .expect("the notify command must have been invoked");
+    // One recorder line per invocation starts with the summary (the body may
+    // span lines).
+    assert_eq!(
+        log.matches("Idiolect — dictation is failing|").count(),
+        1,
+        "one notification per take, not per pause: {log:?}"
+    );
+    assert!(
+        log.contains("translation.command"),
+        "the notification must say what to fix: {log:?}"
+    );
+
+    // A take where nothing transcribed stores nothing.
+    fixture.assert_no_takes();
+    assert_eq!(fixture.stored_audio_count(), 0, "nothing worth keeping");
+}
+
+#[test]
+fn review_mode_holds_the_whole_take_for_one_dialog() {
+    // Requirement: with "Review before insert" on, the take is ONE conversation
+    // in ONE dialog — nothing is pushed per pause; the full merged text arrives
+    // once at stop with the review flag, and the user's edited text becomes the
+    // single committed string.
     let fixture = DaemonFixture::new("review");
     fixture.seed_tray_setting("review_mode", "true");
     let daemon = fixture.spawn_daemon();
@@ -94,14 +162,143 @@ fn review_mode_routes_every_snippet_through_the_review_flag() {
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
-    client.expect_preedit_with_review("[sv>ja] RESTART TRAFFIC", true);
-    client.expect_preedit_with_review("[sv>ja] RESTART TRAFFIC", true);
+
+    // Mid-take the user still SEES progress: each pause pushes a display-only
+    // partial (review=true ⇒ the engine streams it into the listening review
+    // dialog, types nothing, finalizes nothing).
+    client.expect_display_only_partial(SNIPPET);
+    client.expect_display_only_partial(&format!(" {SNIPPET}"));
+
+    // Stop: the one dialog payload — the stop-time decode of the whole
+    // recording, not the glued previews — then the stop.
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_final_review_preedit(SNIPPET);
+    client.expect_recording_status(false);
+
+    // The user edits in the (single) dialog and confirms.
+    let edited = "edited by the user in one dialog";
+    client.send(IpcMessage::CommitPreedit(CommitPreedit {
+        text: edited.to_owned(),
+    }));
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(edited);
+    assert_eq!(
+        fixture.stored_audio_count(),
+        1,
+        "one merged recording per take"
+    );
+}
+
+#[test]
+fn plain_dictation_streams_without_translation() {
+    // The default behaviour: pause-triggered streaming applies to EVERY live
+    // take, translating or not. With translation off the snippets are plain
+    // transcriptions, still one merged session per take.
+    let fixture = DaemonFixture::new("plain").with_translation_enabled(false);
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_partial_preedit("restart traffic");
+    client.expect_partial_preedit(" restart traffic");
 
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(false);
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take("restart traffic");
+}
+
+#[test]
+fn a_stop_time_decode_failure_keeps_the_previewed_snippet_text() {
+    // The stop-time whole-recording decode is the take's truth — but when it
+    // fails (here: the translator command dies on its third invocation, i.e.
+    // exactly the stop-time call), the take must fall back to the glued
+    // snippet previews rather than lose what the user already saw typed.
+    let fixture = DaemonFixture::new("stopfail").with_translator_failing_from_call(3);
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_partial_preedit(SNIPPET);
+    client.expect_partial_preedit(&format!(" {SNIPPET}"));
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(&format!("{SNIPPET} {SNIPPET}"));
+}
+
+#[test]
+fn a_long_pause_auto_stops_and_finalizes_the_take() {
+    // The user's complaint: "I pause for a really long time and nothing
+    // happens." A pause past vad.auto_stop_silence_ms must end the take by
+    // itself — no toggle — finalizing the streamed text as one session and
+    // announcing recording=false.
+    let fixture = DaemonFixture::new("autostop").with_auto_stop_ms(1_000);
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_partial_preedit(SNIPPET);
+    client.expect_partial_preedit(&format!(" {SNIPPET}"));
+
+    // No stop is ever sent: the silence after the clip crosses the threshold
+    // and the daemon ends the take itself.
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(SNIPPET);
+}
+
+#[test]
+fn a_long_pause_pops_the_single_review_dialog() {
+    // With "Review before insert" on, the long pause is what pops THE dialog:
+    // the full merged conversation arrives as one review payload, unprompted.
+    let fixture = DaemonFixture::new("autostop-review").with_auto_stop_ms(1_000);
+    fixture.seed_tray_setting("review_mode", "true");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+
+    // Live display-only progress mid-take, then — with no further client
+    // input — the dialog payload (one whole-recording decode) and the stop
+    // announcement.
+    client.expect_display_only_partial(SNIPPET);
+    client.expect_display_only_partial(&format!(" {SNIPPET}"));
+    client.expect_final_review_preedit(SNIPPET);
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::CommitPreedit(CommitPreedit {
+        text: "confirmed in the one dialog".to_owned(),
+    }));
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take("confirmed in the one dialog");
 }
 
 struct DaemonFixture {
@@ -110,6 +307,15 @@ struct DaemonFixture {
     output_language: String,
     /// `None` writes an uppercase translator stub; `Some("")` means no command.
     command_override: Option<String>,
+    /// Most tests drive the stop themselves; auto-stop tests opt in.
+    auto_stop_silence_ms: u32,
+    translation_enabled: bool,
+    /// When set, the translator stub exits non-zero from its Nth invocation
+    /// onward (1-based) — used to fail exactly the stop-time decode.
+    translator_fails_from_call: Option<u32>,
+    /// When true, `[daemon] notify_command` points at a recorder script that
+    /// appends "<summary>|<body>" lines to `notifications_log()`.
+    record_notifications: bool,
 }
 
 impl DaemonFixture {
@@ -128,9 +334,51 @@ impl DaemonFixture {
             input_language: "sv".to_owned(),
             output_language: "ja".to_owned(),
             command_override: None,
+            auto_stop_silence_ms: 0,
+            translation_enabled: true,
+            translator_fails_from_call: None,
+            record_notifications: false,
         };
         fixture.write_files();
         fixture
+    }
+
+    fn with_notify_recorder(mut self) -> Self {
+        self.record_notifications = true;
+        self.write_files();
+        self
+    }
+
+    fn notifications_log(&self) -> PathBuf {
+        self.root.join("notifications.log")
+    }
+
+    /// A take where nothing transcribed must leave no trace in history.
+    fn assert_no_takes(&self) {
+        let mut store =
+            idiolect_adapter_sqlite::SqliteMetadataStore::open_path(self.database_path())
+                .expect("assert store should open");
+        store.migrate().expect("assert store should migrate");
+        let entries = store.recent_history(50).expect("history should read");
+        assert!(entries.is_empty(), "expected no sessions, got {entries:?}");
+    }
+
+    fn with_auto_stop_ms(mut self, auto_stop_silence_ms: u32) -> Self {
+        self.auto_stop_silence_ms = auto_stop_silence_ms;
+        self.write_files();
+        self
+    }
+
+    fn with_translation_enabled(mut self, enabled: bool) -> Self {
+        self.translation_enabled = enabled;
+        self.write_files();
+        self
+    }
+
+    fn with_translator_failing_from_call(mut self, first_failing_call: u32) -> Self {
+        self.translator_fails_from_call = Some(first_failing_call);
+        self.write_files();
+        self
     }
 
     fn with_translation_overrides(
@@ -149,7 +397,6 @@ impl DaemonFixture {
     /// Persists a tray-settings override in the daemon's database before it
     /// starts, standing in for the corresponding tray click.
     fn seed_tray_setting(&self, key: &str, value: &str) {
-        use idiolect_ports::storage::MetadataStorePort;
         fs::create_dir_all(self.database_path().parent().expect("db parent"))
             .expect("db parent should be created");
         let mut store =
@@ -161,10 +408,39 @@ impl DaemonFixture {
             .expect("setting should persist");
     }
 
+    /// One take ⇒ exactly one history entry, committed, with `expected` text.
+    fn assert_single_committed_take(&self, expected: &str) {
+        let mut store =
+            idiolect_adapter_sqlite::SqliteMetadataStore::open_path(self.database_path())
+                .expect("assert store should open");
+        store.migrate().expect("assert store should migrate");
+        let entries = store.recent_history(50).expect("history should read");
+        assert_eq!(entries.len(), 1, "one session per take, got {entries:?}");
+        assert_eq!(entries[0].state, HistoryState::Committed);
+        assert_eq!(entries[0].text, expected, "the take's single merged string");
+    }
+
+    /// Counts stored source recordings under the daemon's audio root.
+    fn stored_audio_count(&self) -> usize {
+        fn walk(dir: &Path, count: &mut usize) {
+            let Ok(reader) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in reader.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else {
+                    *count += 1;
+                }
+            }
+        }
+        let mut count = 0;
+        walk(&self.data_dir().join("audio"), &mut count);
+        count
+    }
+
     fn spawn_daemon(&self) -> JoinHandle<Result<(), String>> {
-        // Headless CI runs several daemons inside one process; skip the ksni tray
-        // so their pid-keyed D-Bus registrations don't collide and reset clients.
-        std::env::set_var("IDIOLECT_DISABLE_TRAY", "1");
         let args = vec![
             "run".to_owned(),
             "--config".to_owned(),
@@ -183,11 +459,25 @@ impl DaemonFixture {
             Some(command) => command.clone(),
             None => {
                 let path = self.root.join("uppercase-translator.sh");
-                fs::write(
-                    &path,
-                    "#!/bin/sh\nprintf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n",
-                )
-                .expect("translator stub should be written");
+                let body = match self.translator_fails_from_call {
+                    // The daemon runs the translator sequentially (single run
+                    // loop), so a plain counter file is race-free.
+                    Some(first_failing_call) => format!(
+                        "#!/bin/sh\n\
+                         count_file=\"{}\"\n\
+                         n=$(cat \"$count_file\" 2>/dev/null || echo 0)\n\
+                         n=$((n + 1))\n\
+                         printf '%s' \"$n\" > \"$count_file\"\n\
+                         [ \"$n\" -ge {first_failing_call} ] && exit 1\n\
+                         printf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n",
+                        self.root.join("translator-calls").display(),
+                    ),
+                    None => {
+                        "#!/bin/sh\nprintf '[%s>%s] ' \"$1\" \"$2\"; tr '[:lower:]' '[:upper:]'\n"
+                            .to_owned()
+                    }
+                };
+                fs::write(&path, body).expect("translator stub should be written");
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
                     .expect("translator stub should be executable");
                 path.to_string_lossy().into_owned()
@@ -195,11 +485,35 @@ impl DaemonFixture {
         }
     }
 
+    /// Writes the notification recorder stub honouring the notify contract
+    /// (`<command> <summary> <body>`), returning its path.
+    fn notify_recorder_command(&self) -> String {
+        let path = self.root.join("notify-recorder.sh");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                self.notifications_log().display()
+            ),
+        )
+        .expect("notify recorder should be written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("notify recorder should be executable");
+        path.to_string_lossy().into_owned()
+    }
+
     fn write_files(&self) {
         fs::create_dir_all(self.model_path().parent().expect("model parent"))
             .expect("model parent should be created");
         fs::write(self.model_path(), b"dummy model").expect("dummy model should be written");
         let command = self.translator_command();
+        // An empty notify command disables notifications — the right default for
+        // tests, which must never pop real desktop toasts.
+        let notify_command = if self.record_notifications {
+            self.notify_recorder_command()
+        } else {
+            String::new()
+        };
         fs::write(
             self.config_path(),
             format!(
@@ -209,6 +523,7 @@ default_user_id = "default"
 [daemon]
 socket_path = "{socket_path}"
 log_level = "info"
+notify_command = "{notify_command}"
 
 [audio]
 input_device = "fixture-stream"
@@ -223,6 +538,7 @@ min_speech_ms = 250
 pre_roll_ms = 300
 post_roll_ms = 700
 max_utterance_ms = 30000
+auto_stop_silence_ms = {auto_stop_silence_ms}
 
 [asr]
 engine = "fixture"
@@ -248,7 +564,7 @@ auto_train = false
 retain_audio = true
 
 [translation]
-enabled = true
+enabled = {translation_enabled}
 input_language = "{input_language}"
 output_language = "{output_language}"
 command = "{command}"
@@ -261,6 +577,8 @@ log_private_text = false
                 database_path = self.database_path().display(),
                 input_language = self.input_language,
                 output_language = self.output_language,
+                auto_stop_silence_ms = self.auto_stop_silence_ms,
+                translation_enabled = self.translation_enabled,
             ),
         )
         .expect("config should be written");
@@ -356,20 +674,43 @@ impl DaemonClient {
         }
     }
 
-    fn expect_preedit(&mut self, expected: &str) {
-        match self.read() {
-            IpcMessage::PreeditUpdate(update) => assert_eq!(update.text, expected),
-            other => panic!("expected PreeditUpdate({expected:?}), got {other:?}"),
-        }
-    }
-
-    fn expect_preedit_with_review(&mut self, expected: &str, review: bool) {
+    /// A live mid-take snippet: typed by the engine, finalizing nothing.
+    fn expect_partial_preedit(&mut self, expected: &str) {
         match self.read() {
             IpcMessage::PreeditUpdate(update) => {
                 assert_eq!(update.text, expected);
-                assert_eq!(update.review, review, "review flag mismatch");
+                assert!(update.partial, "mid-take snippets must be partial");
+                assert!(
+                    !update.review,
+                    "direct-mode partials are typed, not review-held"
+                );
             }
-            other => panic!("expected PreeditUpdate({expected:?}), got {other:?}"),
+            other => panic!("expected partial PreeditUpdate({expected:?}), got {other:?}"),
+        }
+    }
+
+    /// A review-mode mid-take snippet: streamed into the listening review
+    /// dialog, typed nowhere, finalizing nothing.
+    fn expect_display_only_partial(&mut self, expected: &str) {
+        match self.read() {
+            IpcMessage::PreeditUpdate(update) => {
+                assert_eq!(update.text, expected);
+                assert!(update.partial, "mid-take snippets must be partial");
+                assert!(update.review, "review-mode partials are display-only");
+            }
+            other => panic!("expected display-only partial({expected:?}), got {other:?}"),
+        }
+    }
+
+    /// The take-final review payload: the whole conversation, one dialog.
+    fn expect_final_review_preedit(&mut self, expected: &str) {
+        match self.read() {
+            IpcMessage::PreeditUpdate(update) => {
+                assert_eq!(update.text, expected, "full merged text in one dialog");
+                assert!(update.review, "review mode routes through the dialog");
+                assert!(!update.partial, "the take-final payload is not partial");
+            }
+            other => panic!("expected final review PreeditUpdate, got {other:?}"),
         }
     }
 }

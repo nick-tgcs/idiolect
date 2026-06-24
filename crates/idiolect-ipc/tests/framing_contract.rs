@@ -1,5 +1,39 @@
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
-use idiolect_ipc::messages::{ClientHello, InsertText, IpcMessage, RecordingStatus};
+use idiolect_ipc::messages::{
+    ClientHello, EditHistory, HistoryEdited, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+};
+
+#[test]
+fn partial_preedit_round_trips_over_the_wire() {
+    // Streaming translation delivers one PARTIAL preedit per pause: the engine
+    // types it into the app but does not finalize anything — the whole take
+    // stays one conversation, finalized once at stop.
+    let message = IpcMessage::PreeditUpdate(PreeditUpdate {
+        text: " and the second snippet".to_owned(),
+        review: false,
+        partial: true,
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn preedit_without_partial_field_defaults_to_final() {
+    // Backward compatibility: a daemon that predates streaming never writes the
+    // field, and such a preedit is a take-final transcript.
+    let line =
+        "{\"type\":\"PreeditUpdate\",\"payload\":{\"text\":\"restart traffic\",\"review\":true}}\n";
+    match decode_json_line(line).expect("decode") {
+        IpcMessage::PreeditUpdate(update) => {
+            assert_eq!(update.text, "restart traffic");
+            assert!(update.review);
+            assert!(!update.partial, "missing field must mean final");
+        }
+        other => panic!("expected PreeditUpdate, got {other:?}"),
+    }
+}
 
 #[test]
 fn json_lines_round_trip_message_category() {
@@ -22,6 +56,34 @@ fn insert_text_round_trips_over_the_wire() {
     // the cursor; the message must survive the newline-JSON framing intact.
     let message = IpcMessage::InsertText(InsertText {
         text: "Deploy traefik and nginx".to_owned(),
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn edit_history_round_trips_over_the_wire() {
+    // The daemon asks the engine to reopen the review dialog over a stored entry
+    // so the user can retroactively fix it; id + text must survive framing intact.
+    let message = IpcMessage::EditHistory(EditHistory {
+        id: 42,
+        text: "deploy traffic and engine ex".to_owned(),
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn history_edited_round_trips_over_the_wire() {
+    // The engine returns the user's corrected text for a reviewed entry; the
+    // daemon amends the record and its training pair off this message.
+    let message = IpcMessage::HistoryEdited(HistoryEdited {
+        id: 42,
+        corrected_text: "deploy traefik and nginx".to_owned(),
     });
 
     let line = encode_json_line(&message).expect("message should encode");

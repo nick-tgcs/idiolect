@@ -1,0 +1,9 @@
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+# Release signing secrets — never commit these (personal sideload keystore).
+*.jks
+*.keystore
+keystore.properties
