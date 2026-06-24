@@ -149,7 +149,7 @@ impl RealCaptureBackend {
         let supported_config = self
             .device
             .default_input_config()
-            .map_err(map_default_stream_config_error)?;
+            .map_err(map_cpal_error)?;
         let sample_rate_hz = supported_config.sample_rate();
         let channels = supported_config.channels();
         let sample_format = supported_config.sample_format();
@@ -206,7 +206,7 @@ impl RealCaptureBackend {
             }
         };
 
-        stream.play().map_err(map_play_stream_error)?;
+        stream.play().map_err(map_cpal_error)?;
         self.sample_rate_hz = Some(sample_rate_hz);
         self.stream = Some(stream);
         Ok(())
@@ -294,7 +294,7 @@ where
 {
     device
         .build_input_stream(
-            config,
+            config.clone(),
             move |data: &[T], _info| {
                 let channels = usize::from(channels);
                 if channels == 0 {
@@ -316,10 +316,10 @@ where
                     }
                 }
             },
-            |_err| {},
+            |_err: cpal::Error| {},
             None,
         )
-        .map_err(map_build_stream_error)
+        .map_err(map_cpal_error)
 }
 
 fn sample_duration_ms(sample_rate_hz: u32, sample_count: usize) -> u32 {
@@ -331,24 +331,10 @@ fn sample_duration_ms(sample_rate_hz: u32, sample_count: usize) -> u32 {
     millis.min(u128::from(u32::MAX)) as u32
 }
 
-fn map_default_stream_config_error(err: cpal::DefaultStreamConfigError) -> CpalAudioInputError {
-    match err {
-        cpal::DefaultStreamConfigError::DeviceNotAvailable => CpalAudioInputError::DeviceNotFound,
-        other => CpalAudioInputError::BackendUnavailable(other.to_string()),
-    }
-}
-
-fn map_build_stream_error(err: cpal::BuildStreamError) -> CpalAudioInputError {
-    match err {
-        cpal::BuildStreamError::DeviceNotAvailable => CpalAudioInputError::DeviceNotFound,
-        other => CpalAudioInputError::BackendUnavailable(other.to_string()),
-    }
-}
-
-fn map_play_stream_error(err: cpal::PlayStreamError) -> CpalAudioInputError {
-    match err {
-        cpal::PlayStreamError::DeviceNotAvailable => CpalAudioInputError::DeviceNotFound,
-        other => CpalAudioInputError::BackendUnavailable(other.to_string()),
+fn map_cpal_error(err: cpal::Error) -> CpalAudioInputError {
+    match err.kind() {
+        cpal::ErrorKind::DeviceNotAvailable => CpalAudioInputError::DeviceNotFound,
+        _ => CpalAudioInputError::BackendUnavailable(err.to_string()),
     }
 }
 
