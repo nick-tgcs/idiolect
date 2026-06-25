@@ -145,7 +145,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev \
+            libx11-dev libxkbcommon-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -299,6 +300,52 @@ jobs:
         run: bash ci/scripts/test-coverage-map.sh
 
   # =========================================================================
+  # DESKTOP APP CROSS-PLATFORM CHECK (idiolect-app on macOS)
+  #
+  # Verifies the idiolect-app dashboard compiles and its tests pass on macOS.
+  # Windows build is covered by the full CI matrix; PR validation uses macOS
+  # as the representative non-Linux check (faster; no system dep installs).
+  # =========================================================================
+  desktop-app-cross-platform:
+    name: Desktop App Cross-Platform (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pr-
+
+      - name: Clippy idiolect-app (warnings as errors)
+        run: |
+          cargo clippy \
+            -p idiolect-app -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            --all-targets -- -D warnings
+
+      - name: Test idiolect-app
+        run: |
+          cargo test \
+            -p idiolect-app -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            --all-targets
+
+  # =========================================================================
   # PR VALIDATION SUMMARY
   # =========================================================================
   pr-validation-summary:
@@ -314,6 +361,7 @@ jobs:
       - interface-leakage
       - real-adapter-deps
       - coverage-map
+      - desktop-app-cross-platform
     if: always()
     steps:
       - name: Check all required jobs succeeded
@@ -326,7 +374,8 @@ jobs:
              [[ "${{ needs.fcitx5-quick.result }}" != "success" ]] || \
              [[ "${{ needs.interface-leakage.result }}" != "success" ]] || \
              [[ "${{ needs.real-adapter-deps.result }}" != "success" ]] || \
-             [[ "${{ needs.coverage-map.result }}" != "success" ]]; then
+             [[ "${{ needs.coverage-map.result }}" != "success" ]] || \
+             [[ "${{ needs.desktop-app-cross-platform.result }}" != "success" ]]; then
             echo "::error::One or more PR validation checks failed"
             exit 1
           fi

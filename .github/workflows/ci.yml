@@ -57,7 +57,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev \
+            libx11-dev libxkbcommon-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -569,16 +570,15 @@ jobs:
   # MACOS FOUNDATION (portable crates) — see docs/future/009-macos-port.md
   #
   # The macOS port lands phase by phase; this job guards the cross-platform
-  # foundation that already builds on macOS: the hexagonal core, ports, IPC, and
-  # the platform-aware base-dir / sun_path logic in idiolect-common. The pure
-  # `Platform`-keyed code paths mean this runner exercises the *macOS* layout for
-  # real, not just a compile. As whisper-metal, the egui GUIs, and the IMK
-  # component land, add their crates here.
+  # foundation that already builds on macOS: the hexagonal core, ports, IPC,
+  # the platform-aware base-dir / sun_path logic in idiolect-common, and the
+  # idiolect-app dashboard (Phase 2–4). No system packages needed: every crate
+  # here is dependency-pure (no ALSA, DBus, X11, fcitx5, or CUDA).
   # =========================================================================
   macos:
-    name: macOS Foundation (portable crates)
+    name: macOS Foundation (portable crates + idiolect-app)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -609,6 +609,8 @@ jobs:
           cargo clippy \
             -p idiolect-common -p idiolect-core -p idiolect-ml-core \
             -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            -p idiolect-app \
             --all-targets -- -D warnings
 
       - name: Test (incl. macOS base-dir + sun_path layout)
@@ -616,7 +618,80 @@ jobs:
           cargo test \
             -p idiolect-common -p idiolect-core -p idiolect-ml-core \
             -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            -p idiolect-app \
             --all-targets
+
+      - name: Build idiolect-app release binary
+        run: cargo build --release -p idiolect-app
+
+      - name: Upload macOS idiolect-app binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: idiolect-app-macos
+          path: target/release/idiolect-app
+          retention-days: 7
+
+  # =========================================================================
+  # WINDOWS (portable crates + idiolect-app)
+  #
+  # Tests the idiolect-app dashboard and portable core on Windows. No ALSA,
+  # DBus, X11, fcitx5, or CUDA — only the cross-platform subset.
+  # =========================================================================
+  windows:
+    name: Windows (portable crates + idiolect-app)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Clippy (warnings as errors)
+        run: |
+          cargo clippy `
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core `
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc `
+            -p idiolect-sync-server -p idiolect-adapter-sqlite `
+            -p idiolect-app `
+            --all-targets -- -D warnings
+
+      - name: Test
+        run: |
+          cargo test `
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core `
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc `
+            -p idiolect-sync-server -p idiolect-adapter-sqlite `
+            -p idiolect-app `
+            --all-targets
+
+      - name: Build idiolect-app release binary
+        run: cargo build --release -p idiolect-app
+
+      - name: Upload Windows idiolect-app binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: idiolect-app-windows
+          path: target/release/idiolect-app.exe
+          retention-days: 7
 
   # =========================================================================
   # SUMMARY / GATE
@@ -639,6 +714,7 @@ jobs:
       - coverage-map
       - e2e-headless
       - macos
+      - windows
     if: always()
     steps:
       - name: Check all required jobs succeeded
