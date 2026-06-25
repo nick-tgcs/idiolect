@@ -2,9 +2,12 @@
 //! in-process. No daemon subprocess required. The backend polls the SyncHost
 //! for state changes and dispatches actions directly.
 
+use idiolect_application::use_cases::sync_decision::should_auto_train;
+
 use crate::backend::Backend;
 use crate::model::{PairingSnapshot, Snapshot};
 use crate::sync_host::SyncHost;
+use crate::trainer_launcher::{TrainerConfig, TrainerLauncher};
 
 /// The standalone backend: owns the embedded sync server and drives the
 /// dashboard directly. Used on macOS and Windows (and optionally Linux when
@@ -16,25 +19,48 @@ pub(crate) struct LocalBackend {
     /// How many poll ticks between forced refreshes (each tick is ~16ms / 60fps).
     tick: u32,
     active_pairing: Option<idiolect_sync_server::pairing::PairingOffer>,
+    /// Config for spawning `idiolect-trainerctl`. `None` disables training.
+    trainer_cfg: Option<TrainerConfig>,
+    /// A live trainer subprocess, if training is in progress.
+    trainer: Option<TrainerLauncher>,
 }
 
 impl LocalBackend {
-    pub(crate) fn new(host: SyncHost) -> Self {
+    pub(crate) fn new(host: SyncHost, trainer_cfg: Option<TrainerConfig>) -> Self {
         let last = host.snapshot();
         Self {
             host,
             last,
             tick: 0,
             active_pairing: None,
+            trainer_cfg,
+            trainer: None,
         }
     }
 
     fn refresh(&mut self) {
         self.last = self.host.snapshot();
+
+        // Poll active trainer for progress / completion.
+        if let Some(t) = &self.trainer {
+            let poll = t.poll();
+            if let Some(p) = poll.progress {
+                self.last.training.progress = Some(p);
+            }
+            if let Some(result) = poll.done {
+                if let Err(e) = result {
+                    eprintln!("idiolect-app: training failed: {e}");
+                }
+                self.trainer = None;
+                self.last.training.running = false;
+                self.last.training.progress = None;
+            }
+        }
+
+        // Propagate pairing offer state (countdown / expiry).
         if let Some(offer) = &self.active_pairing {
             let now = idiolect_sync_server::pairing::system_now();
             if now >= offer.expires_at_secs {
-                // Expired; clear it.
                 self.active_pairing = None;
                 self.last.pairing = PairingSnapshot::default();
             } else {
@@ -47,6 +73,32 @@ impl LocalBackend {
                     expires_in_secs: offer.expires_at_secs.saturating_sub(now),
                 };
             }
+        }
+
+        // Check auto-train: trigger if enabled, threshold met, and no run active.
+        if self.trainer.is_none()
+            && should_auto_train(
+                self.last.training.auto_enabled,
+                self.last.training.auto_threshold,
+                self.last.learning.new_corrections,
+            )
+        {
+            self.start_training();
+        }
+    }
+
+    /// Spawn `idiolect-trainerctl` if a `TrainerConfig` is available.
+    fn start_training(&mut self) {
+        let Some(cfg) = &self.trainer_cfg else {
+            return;
+        };
+        match TrainerLauncher::start(cfg) {
+            Ok(t) => {
+                self.trainer = Some(t);
+                self.last.training.running = true;
+                self.last.training.progress = None;
+            }
+            Err(e) => eprintln!("idiolect-app: cannot start trainer: {e}"),
         }
     }
 }
@@ -91,7 +143,7 @@ impl Backend for LocalBackend {
                 self.active_pairing = None;
                 self.last.pairing = PairingSnapshot::default();
             }
-            "train:now" => { /* Phase 3 */ }
+            "train:now" => self.start_training(),
             "train:auto:on" => {
                 self.last.training.auto_enabled = true;
             }

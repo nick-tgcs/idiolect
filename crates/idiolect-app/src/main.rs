@@ -16,6 +16,7 @@ mod backend_local;
 mod model;
 mod sync_host;
 mod theme;
+mod trainer_launcher;
 mod view;
 
 use backend::Backend;
@@ -74,8 +75,16 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
             audio_root: data.join("audio"),
             tokens_path: data.join("device_tokens.json"),
         };
+        let trainer_cfg = trainer_launcher::TrainerConfig {
+            db_path: data.join("idiolect.db"),
+            audio_root: data.join("audio"),
+            base_model: data.join("ggml-base.en.bin"),
+            output: data.join("personal.bin"),
+            serve: Some(data.join("model.bin")),
+            gpu: false,
+        };
         match sync_host::SyncHost::start(cfg, rt) {
-            Ok(host) => Box::new(backend_local::LocalBackend::new(host)),
+            Ok(host) => Box::new(backend_local::LocalBackend::new(host, Some(trainer_cfg))),
             Err(e) => {
                 eprintln!("idiolect-app: cannot start sync server: {e}");
                 std::process::exit(1);
