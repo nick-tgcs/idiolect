@@ -589,9 +589,13 @@ pub fn max_socket_path_len(platform: Platform) -> usize {
 /// kernel turns it into an opaque `EINVAL`. The usable budget is
 /// [`max_socket_path_len`] minus one byte for the NUL terminator.
 pub fn check_socket_path_len(path: &Path, platform: Platform) -> Result<(), ConfigError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let len = path.as_os_str().as_bytes().len();
+    #[cfg(unix)]
+    let len = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    };
+    #[cfg(not(unix))]
+    let len = path.to_string_lossy().len();
     let max = max_socket_path_len(platform);
     if len >= max {
         return Err(ConfigError::SocketPathTooLong { len, max });
