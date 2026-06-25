@@ -123,6 +123,14 @@ impl DeviceTokenStore {
         self.persist()
     }
 
+    /// Revoke all tokens for `device_id` and persist the change. Returns `Ok(())` even if the
+    /// device was not present (idempotent).
+    pub fn revoke(&mut self, device_id: &str) -> std::io::Result<()> {
+        self.by_hash
+            .retain(|_, identity| identity.device_id != device_id);
+        self.persist()
+    }
+
     /// Resolve a presented bearer token to its device identity, or `None` if unknown.
     #[must_use]
     pub fn verify(&self, presented: &str) -> Option<DeviceIdentity> {
@@ -408,5 +416,34 @@ mod tests {
         // Must have at least the date portion (YYYY-MM-DD).
         let parts: Vec<_> = issued_at.split('T').collect();
         assert_eq!(parts[0].len(), 10, "date portion: {}", parts[0]);
+    }
+
+    // ---- revoke() ----
+
+    #[test]
+    fn revoke_removes_device_and_its_token() {
+        let (_dir, mut store) = store();
+        let token = store.issue("pixel", "default").expect("issue");
+        store.revoke("pixel").expect("revoke");
+        assert_eq!(store.verify(&token), None, "token must be invalidated");
+        assert!(store.devices().is_empty(), "device must be removed");
+    }
+
+    #[test]
+    fn revoking_nonexistent_device_is_a_noop() {
+        let (_dir, mut store) = store();
+        store.revoke("phantom").expect("revoke noop");
+        assert!(store.devices().is_empty());
+    }
+
+    #[test]
+    fn revoke_only_removes_targeted_device() {
+        let (_dir, mut store) = store();
+        store.issue("pixel", "default").expect("pixel");
+        let tablet_token = store.issue("tablet", "default").expect("tablet");
+        store.revoke("pixel").expect("revoke pixel");
+        assert!(store.verify(&tablet_token).is_some(), "tablet token intact");
+        let ids: Vec<_> = store.devices().into_iter().map(|d| d.device_id).collect();
+        assert_eq!(ids, ["tablet"]);
     }
 }

@@ -44,6 +44,15 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Discovers the machine's LAN-facing IP address by connecting a UDP socket
+/// to an external address (no data is sent). Returns `None` if no route is
+/// available (e.g. no network interface).
+fn local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
+
 /// Returns the data directory for standalone mode.
 fn data_dir() -> PathBuf {
     std::env::var_os("IDIOLECT_DATA_DIR")
@@ -74,9 +83,12 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
                 std::process::exit(1);
             }
         }
+        let pair_url = local_ip()
+            .map(|ip| format!("http://{ip}:8765"))
+            .unwrap_or_default();
         let cfg = sync_host::SyncHostConfig {
             bind: "0.0.0.0:8765".parse().expect("valid addr"),
-            pair_url: String::new(),
+            pair_url,
             tls: false,
             db_path: data.join("idiolect.db"),
             audio_root: data.join("audio"),
@@ -168,5 +180,21 @@ impl eframe::App for DashboardApp {
 
         // Re-render at a modest rate for the pairing countdown.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_ip;
+
+    #[test]
+    fn local_ip_returns_a_non_loopback_address_when_a_network_is_available() {
+        // This test is best-effort: it passes if a LAN interface is reachable,
+        // and is skipped-by-passing if not (e.g. in isolated CI without network).
+        if let Some(ip) = local_ip() {
+            assert!(!ip.is_loopback(), "pair URL should use a routable address");
+            assert!(ip.is_ipv4() || ip.is_ipv6(), "must be a valid IP");
+        }
+        // None is also acceptable (offline environment); the caller falls back to "".
     }
 }

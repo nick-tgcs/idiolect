@@ -120,9 +120,23 @@ impl SyncHost {
         self.tokens.lock().expect("tokens").devices()
     }
 
-    /// Revoke a paired device's token.
-    pub fn unpair(&self, _device_id: &str) {
-        // DeviceTokenStore revoke API is not yet implemented.
+    /// Revoke a paired device's token. Silent on I/O errors (logs to stderr).
+    pub fn unpair(&self, device_id: &str) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            if let Err(e) = tokens.revoke(device_id) {
+                eprintln!("idiolect-sync: unpair({device_id}): persist failed: {e}");
+            }
+        }
+    }
+
+    /// Test-only helper: register `device_id` directly in the token store, bypassing
+    /// the full pairing handshake. Returns the plaintext bearer token.
+    #[cfg(test)]
+    pub(crate) fn issue_test_token(&self, device_id: &str) -> std::io::Result<String> {
+        self.tokens
+            .lock()
+            .expect("tokens")
+            .issue(device_id, "test-user")
     }
 
     /// Number of corrections waiting to be trained on.
@@ -149,8 +163,66 @@ impl SyncHost {
         &self.pair_url
     }
 
+    /// Update the phone-facing URL (e.g. when the user sets it in Preferences).
+    pub fn set_pair_url(&mut self, url: String) {
+        self.pair_url = url;
+    }
+
     /// Whether the server was started with TLS.
     pub fn tls(&self) -> bool {
         self.tls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_host(dir: &std::path::Path) -> SyncHost {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let cfg = SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.join("test.db"),
+            audio_root: dir.join("audio"),
+            tokens_path: dir.join("tokens.json"),
+        };
+        SyncHost::start(cfg, rt.handle()).expect("start")
+        // rt is dropped here; the spawned task will be cancelled, but token
+        // store and DB state remain and are what we're testing.
+    }
+
+    #[test]
+    fn unpair_removes_device_and_revokes_its_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = test_host(dir.path());
+
+        host.issue_test_token("pixel").expect("issue");
+        assert_eq!(host.paired_devices().len(), 1, "device should be paired");
+
+        host.unpair("pixel");
+
+        assert!(
+            host.paired_devices().is_empty(),
+            "device should be removed after unpair"
+        );
+    }
+
+    #[test]
+    fn unpair_only_removes_targeted_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = test_host(dir.path());
+
+        host.issue_test_token("pixel").expect("pixel");
+        host.issue_test_token("tablet").expect("tablet");
+        host.unpair("pixel");
+
+        let ids: Vec<_> = host
+            .paired_devices()
+            .into_iter()
+            .map(|d| d.device_id)
+            .collect();
+        assert_eq!(ids, ["tablet"], "only pixel should be removed");
     }
 }

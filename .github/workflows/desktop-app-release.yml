@@ -73,8 +73,10 @@ jobs:
         if: matrix.os == 'linux'
         run: ${{ matrix.extra_deps }}
 
-      - name: Build release binary
-        run: cargo build --release -p idiolect-app
+      - name: Build release binaries
+        run: |
+          cargo build --release -p idiolect-app
+          cargo build --release -p idiolect-trainerctl
 
       - name: Package (Linux / macOS)
         if: matrix.os != 'windows'

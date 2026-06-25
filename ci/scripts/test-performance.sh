@@ -12,7 +12,11 @@ if [[ ! -x /usr/bin/time ]]; then
 fi
 
 mkdir -p "${perf_dir}"
+
+# Build all artefacts before timing begins so that cache-miss compilation does
+# not inflate the latency measurements.
 cargo build -p idiolectd -p idiolect-cli
+cargo test -p idiolect-integration-tests --all-features --test real_asr_contracts --no-run
 
 start_ns="$(date +%s%N)"
 /usr/bin/time -v target/debug/idiolectd --version --json >"${perf_dir}/idiolectd-version.json" 2>"${perf_dir}/idiolectd-time.txt"
