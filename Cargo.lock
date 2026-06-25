@@ -4298,6 +4298,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "idiolect-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "eframe",
+ "idiolect-adapter-sqlite",
+ "idiolect-application",
+ "idiolect-common",
+ "idiolect-sync-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "idiolect-application"
 version = "0.1.0"
 dependencies = [

@@ -30,6 +30,7 @@ members = [
     "crates/idiolect-recording-indicator",
     "crates/idiolect-retention-dialog",
     "crates/idiolect-test-support",
+    "crates/idiolect-app",
     "crates/idiolect-integration-tests",
     "crates/idiolect-adapters/desktop/ksni",
     "crates/idiolect-adapters/desktop/clipboard",

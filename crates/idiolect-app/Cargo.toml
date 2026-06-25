@@ -1,0 +1,29 @@
+[package]
+name = "idiolect-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "idiolect-app"
+path = "src/main.rs"
+
+[dependencies]
+idiolect-application = { path = "../idiolect-application" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-sync-server = { path = "../idiolect-sync-server" }
+idiolect-common = { path = "../idiolect-common" }
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts", "x11"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
