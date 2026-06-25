@@ -1,0 +1,156 @@
+//! [`SyncHost`] — the embedded sync server that both the standalone
+//! `idiolect-app` binary (macOS/Windows) and the Linux `idiolectd` daemon use
+//! to manage phone pairing and ingest.
+//!
+//! Extracting this from the binary crate allows both deployments to share the
+//! implementation without duplication.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use crate::device_tokens::{DeviceTokenStore, PairedDevice};
+use crate::pairing::{PairingOffer, PairingServerState};
+use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+
+/// Configuration for a [`SyncHost`].
+pub struct SyncHostConfig {
+    /// The address the server binds to (e.g. `0.0.0.0:8765`).
+    pub bind: SocketAddr,
+    /// The URL the phone QR/pairing link will carry (phone-facing).
+    pub pair_url: String,
+    /// Whether to serve over TLS (self-signed; phone pins via SPKI).
+    pub tls: bool,
+    /// Path to the SQLite database.
+    pub db_path: PathBuf,
+    /// Root directory for audio files.
+    pub audio_root: PathBuf,
+    /// Path to the device token store JSON file.
+    pub tokens_path: PathBuf,
+}
+
+/// An error starting or communicating with the embedded sync server.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncHostError {
+    #[error("failed to open token store: {0}")]
+    TokenStore(#[source] std::io::Error),
+    #[error("failed to open database: {0}")]
+    Database(#[source] idiolect_adapter_sqlite::SqliteStorageError),
+    #[error("failed to bind listener: {0}")]
+    Bind(#[source] std::io::Error),
+    #[error("failed to mint pairing offer: {0}")]
+    Pairing(String),
+}
+
+/// The live embedded sync server. Obtain via [`SyncHost::start`].
+pub struct SyncHost {
+    tokens: Arc<Mutex<DeviceTokenStore>>,
+    pairing: Arc<PairingServerState>,
+    store: Arc<Mutex<SqliteMetadataStore>>,
+    pair_url: String,
+    tls: bool,
+}
+
+impl SyncHost {
+    /// Start the embedded sync server, binding to `cfg.bind`. The server runs
+    /// for the lifetime of the tokio runtime (drop-to-shutdown is not yet
+    /// wired — the tokio runtime is process-scoped).
+    pub fn start(cfg: SyncHostConfig, rt: &tokio::runtime::Handle) -> Result<Self, SyncHostError> {
+        let tokens = DeviceTokenStore::open(&cfg.tokens_path).map_err(SyncHostError::TokenStore)?;
+        let tokens = Arc::new(Mutex::new(tokens));
+        let pairing = Arc::new(PairingServerState::new(tokens.clone()));
+
+        let mut store =
+            SqliteMetadataStore::open_path(&cfg.db_path).map_err(SyncHostError::Database)?;
+        store.migrate().map_err(SyncHostError::Database)?;
+        let store = Arc::new(Mutex::new(store));
+        let audio_store = FileAudioStore::new(cfg.audio_root.clone(), cfg.audio_root.clone());
+
+        let model_cfg = Arc::new(crate::model_server::ModelServerConfig {
+            model_path: cfg
+                .audio_root
+                .parent()
+                .unwrap_or(&cfg.audio_root)
+                .to_path_buf(),
+            model_id: "base.en".to_owned(),
+            tokens: tokens.clone(),
+        });
+
+        let ingest_store =
+            SqliteMetadataStore::open_path(&cfg.db_path).map_err(SyncHostError::Database)?;
+        let ingest_state = Arc::new(crate::ingest_server::IngestServerState::new(
+            ingest_store,
+            audio_store,
+            tokens.clone(),
+        ));
+
+        let app = crate::build_app(model_cfg, pairing.clone(), Some(ingest_state));
+
+        let bind_addr: SocketAddr = cfg.bind;
+        let listener = std::net::TcpListener::bind(bind_addr).map_err(SyncHostError::Bind)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(SyncHostError::Bind)?;
+
+        rt.spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("convert listener");
+            axum::serve(listener, app).await.ok();
+        });
+
+        Ok(Self {
+            tokens,
+            pairing,
+            store,
+            pair_url: cfg.pair_url,
+            tls: cfg.tls,
+        })
+    }
+
+    /// Mint a fresh pairing invitation (code + QR + expiry). The outstanding
+    /// code supersedes any previous one.
+    pub fn mint_pairing(&self, fingerprint: Option<&str>) -> Result<PairingOffer, SyncHostError> {
+        let now = crate::pairing::system_now();
+        self.pairing
+            .mint_offer(&self.pair_url, fingerprint, now)
+            .map_err(SyncHostError::Pairing)
+    }
+
+    /// List all devices that currently hold a valid token.
+    pub fn paired_devices(&self) -> Vec<PairedDevice> {
+        self.tokens.lock().expect("tokens").devices()
+    }
+
+    /// Revoke a paired device's token.
+    pub fn unpair(&self, _device_id: &str) {
+        // DeviceTokenStore revoke API is not yet implemented.
+    }
+
+    /// Number of corrections waiting to be trained on.
+    pub fn trainable_count(&self) -> u64 {
+        self.store
+            .lock()
+            .expect("store")
+            .trainable_count("default")
+            .unwrap_or(0)
+    }
+
+    /// Timestamp of the last successful training run, if any.
+    pub fn last_trained_at(&self) -> Option<String> {
+        self.store
+            .lock()
+            .expect("store")
+            .last_trained_at("default")
+            .ok()
+            .flatten()
+    }
+
+    /// Returns the phone-facing URL used in pairing QR codes.
+    pub fn pair_url(&self) -> &str {
+        &self.pair_url
+    }
+
+    /// Whether the server was started with TLS.
+    pub fn tls(&self) -> bool {
+        self.tls
+    }
+}

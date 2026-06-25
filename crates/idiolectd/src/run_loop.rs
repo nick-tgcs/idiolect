@@ -21,8 +21,8 @@ use idiolect_adapter_vad::VadAdapter;
 use idiolect_application::use_cases::history::ClipboardPort;
 use idiolect_application::use_cases::maintenance::{MaintenanceUseCase, DEFAULT_PRUNE_INTERVAL};
 use idiolect_application::use_cases::menu::{
-    validate_training_retention_days, MenuUseCase, RecordingState, MAX_ENTRY_CHOICES,
-    RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
+    validate_training_retention_days, MenuUseCase, RecordingState, SyncMenuState,
+    MAX_ENTRY_CHOICES, RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
 };
 use idiolect_application::use_cases::streaming::{
     merge_tail_correction, FinalizedTake, StreamObserver, StreamingConfig, StreamingTake,
@@ -548,7 +548,12 @@ fn refresh_tray_menu(
     let entries = store
         .recent_history(history.max_entries)
         .map_err(|error| RunLoopError::storage("recent history", error))?;
-    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &translation);
+    let mut menu = MenuUseCase::new().get_menu(
+        recording_state,
+        &entries,
+        &translation,
+        &SyncMenuState::default(),
+    );
     menu.push(idiolect_ports::storage::TrayMenuItem {
         id: "review_mode".to_owned(),
         label: "Review before insert".to_owned(),
@@ -587,6 +592,8 @@ fn handle_connection(
     let retention_dialog = SubprocessRetentionDialog::discover();
     // Out-of-process Settings window ("Settings…" in the tray); discovered once.
     let settings_window = crate::settings_launcher::SettingsLauncher::discover();
+    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray).
+    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover();
     // Per-connection state bundled into `Live`:
     //  - active_session: the in-flight dictation, if any.
     //  - live_capture: set only while a real microphone recording is in progress.
@@ -619,6 +626,7 @@ fn handle_connection(
                 &ConfigSurfaces {
                     retention_dialog: &retention_dialog,
                     settings_window: &settings_window,
+                    sync_panel: &sync_panel,
                     settings_forward_tx,
                 },
             )?;
@@ -1801,6 +1809,7 @@ fn send_ipc_message(stream: &mut UnixStream, message: &IpcMessage) -> Result<(),
 struct ConfigSurfaces<'a> {
     retention_dialog: &'a dyn RetentionDialog,
     settings_window: &'a crate::settings_launcher::SettingsLauncher,
+    sync_panel: &'a crate::sync_panel_launcher::SyncPanelLauncher,
     settings_forward_tx: &'a mpsc::Sender<TrayCallback>,
 }
 
@@ -1820,6 +1829,11 @@ fn handle_tray_action(
                 settings_state_json(ctx.store, ctx.config),
                 surfaces.settings_forward_tx.clone(),
             );
+        }
+        "open:dashboard" => {
+            surfaces
+                .sync_panel
+                .open(surfaces.settings_forward_tx.clone());
         }
         "start_recording" => {
             if crate::adapters::is_live_capture(&ctx.config.adapter_profile) {

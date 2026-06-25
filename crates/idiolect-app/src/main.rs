@@ -24,6 +24,11 @@ use model::DashboardModel;
 
 fn main() -> eframe::Result<()> {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // `--standalone` forces standalone (SyncHost) mode even when stdin is a pipe.
+    // The Linux daemon uses this to open the dashboard without state piping.
+    if std::env::args().any(|a| a == "--standalone") {
+        std::env::set_var("IDIOLECT_STANDALONE", "1");
+    }
     let backend = make_backend(rt.handle());
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -56,7 +61,9 @@ fn data_dir() -> PathBuf {
 /// If stdin is a pipe the daemon spawned us (attached mode); we read snapshots
 /// from that pipe via [`backend::PipeBackend`].
 fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
-    if std::io::stdin().is_terminal() {
+    let standalone =
+        std::io::stdin().is_terminal() || std::env::var_os("IDIOLECT_STANDALONE").is_some();
+    if standalone {
         let data = data_dir();
         for dir in [&data, &data.join("audio")] {
             if let Err(e) = std::fs::create_dir_all(dir) {

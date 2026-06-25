@@ -6,7 +6,7 @@ use idiolect_application::use_cases::sync_decision::should_auto_train;
 
 use crate::backend::Backend;
 use crate::model::{PairingSnapshot, Snapshot};
-use crate::sync_host::SyncHost;
+use crate::sync_host::{self, SyncHost};
 use crate::trainer_launcher::{TrainerConfig, TrainerLauncher};
 
 /// The standalone backend: owns the embedded sync server and drives the
@@ -27,7 +27,7 @@ pub(crate) struct LocalBackend {
 
 impl LocalBackend {
     pub(crate) fn new(host: SyncHost, trainer_cfg: Option<TrainerConfig>) -> Self {
-        let last = host.snapshot();
+        let last = sync_host::snapshot(&host);
         Self {
             host,
             last,
@@ -39,7 +39,7 @@ impl LocalBackend {
     }
 
     fn refresh(&mut self) {
-        self.last = self.host.snapshot();
+        self.last = sync_host::snapshot(&self.host);
 
         // Poll active trainer for progress / completion.
         if let Some(t) = &self.trainer {
