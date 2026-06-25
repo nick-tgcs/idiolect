@@ -22,6 +22,8 @@ pub struct IdiolectConfig {
     #[serde(default)]
     pub training: TrainingConfig,
     #[serde(default)]
+    pub sync: SyncConfig,
+    #[serde(default)]
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub history: HistoryConfig,
@@ -296,6 +298,10 @@ pub struct TrainingConfig {
     pub trainer: String,
     #[serde(default)]
     pub auto_train: bool,
+    /// How many new corrections must accumulate before an auto-train run fires.
+    /// Ignored when `auto_train = false`. Defaults to 25.
+    #[serde(default = "default_auto_train_threshold")]
+    pub auto_train_threshold: u32,
 }
 
 impl Default for TrainingConfig {
@@ -304,6 +310,7 @@ impl Default for TrainingConfig {
             min_approved_examples: default_training_min_approved_examples(),
             trainer: default_training_trainer(),
             auto_train: false,
+            auto_train_threshold: default_auto_train_threshold(),
         }
     }
 }
@@ -431,6 +438,40 @@ pub struct ObservabilityConfig {
     pub log_surrounding_app_text: bool,
     #[serde(default)]
     pub log_private_text: bool,
+}
+
+/// Configuration for the embedded sync server (phone↔PC correction transfer).
+///
+/// Disabled by default; flipped to `enabled = true` on first successful pairing.
+/// The `pair_url` must be the address the phone can reach — typically the PC's
+/// Tailscale/LAN IP, not `localhost`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SyncConfig {
+    /// Whether the embedded sync server starts at daemon launch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port` the sync server binds to. Defaults to `0.0.0.0:8765`.
+    #[serde(default = "default_sync_bind")]
+    pub bind: String,
+    /// The base URL the phone uses to reach this server (its QR/pairing URI).
+    /// Empty means "auto-detect" (the daemon uses the first non-loopback address).
+    #[serde(default)]
+    pub pair_url: String,
+    /// Serve over TLS with a self-signed cert (phone pins via SPKI fingerprint).
+    /// Defaults to `true`.
+    #[serde(default = "default_sync_tls")]
+    pub tls: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_sync_bind(),
+            pair_url: String::new(),
+            tls: default_sync_tls(),
+        }
+    }
 }
 
 /// The operating-system family Idiolect resolves paths and socket limits for.
@@ -826,6 +867,18 @@ fn default_history_clipboard_auto_clear_secs() -> u64 {
     30
 }
 
+fn default_sync_bind() -> String {
+    "0.0.0.0:8765".to_owned()
+}
+
+fn default_sync_tls() -> bool {
+    true
+}
+
+fn default_auto_train_threshold() -> u32 {
+    25
+}
+
 fn validate_non_empty_string(field: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         Err(ConfigError::ValidationError {
@@ -840,6 +893,67 @@ fn env_path_or_fallback(name: &str, fallback: PathBuf) -> PathBuf {
     match env::var_os(name) {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => fallback,
+    }
+}
+
+#[cfg(test)]
+mod sync_training_config_tests {
+    use super::*;
+
+    #[test]
+    fn sync_config_defaults_to_disabled_tls_on_standard_port() {
+        let cfg = SyncConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.bind, "0.0.0.0:8765");
+        assert!(cfg.tls);
+        assert!(cfg.pair_url.is_empty());
+    }
+
+    #[test]
+    fn sync_config_parses_from_toml() {
+        let toml = r#"
+[user]
+default_user_id = "default"
+
+[sync]
+enabled = true
+bind = "0.0.0.0:9000"
+pair_url = "https://10.0.0.1:9000"
+tls = false
+"#;
+        let cfg = IdiolectConfig::from_toml_str(toml).expect("parse");
+        assert!(cfg.sync.enabled);
+        assert_eq!(cfg.sync.bind, "0.0.0.0:9000");
+        assert_eq!(cfg.sync.pair_url, "https://10.0.0.1:9000");
+        assert!(!cfg.sync.tls);
+    }
+
+    #[test]
+    fn sync_config_absent_section_uses_all_defaults() {
+        let toml = "[user]\ndefault_user_id = \"default\"";
+        let cfg = IdiolectConfig::from_toml_str(toml).expect("parse");
+        assert_eq!(cfg.sync, SyncConfig::default());
+    }
+
+    #[test]
+    fn auto_train_threshold_defaults_to_25() {
+        let cfg = TrainingConfig::default();
+        assert_eq!(cfg.auto_train_threshold, 25);
+    }
+
+    #[test]
+    fn auto_train_threshold_parses_from_toml() {
+        let toml = r#"
+[user]
+default_user_id = "default"
+
+[training]
+auto_train = true
+auto_train_threshold = 10
+"#;
+        let cfg = IdiolectConfig::from_toml_str(toml).expect("parse");
+        assert!(cfg.training.auto_train);
+        assert_eq!(cfg.training.auto_train_threshold, 10);
     }
 }
 

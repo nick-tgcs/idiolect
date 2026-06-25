@@ -24,6 +24,18 @@ use uuid::Uuid;
 pub struct DeviceIdentity {
     pub device_id: String,
     pub user_id: String,
+    pub issued_at: Option<String>,
+}
+
+/// A device that has been paired with this server: its id, the user it belongs
+/// to, and the ISO 8601 timestamp when its token was issued (if recorded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    pub device_id: String,
+    pub user_id: String,
+    /// Present when the token was issued after this field was added; absent for
+    /// tokens migrated from an older store that lacked it.
+    pub issued_at: Option<String>,
 }
 
 /// One persisted token binding. The token itself is never stored — only its hash.
@@ -32,6 +44,8 @@ struct TokenRecord {
     token_hash: String,
     device_id: String,
     user_id: String,
+    #[serde(default)]
+    issued_at: Option<String>,
 }
 
 /// A persistent map from a per-device bearer token (by hash) to the device it was issued
@@ -58,6 +72,7 @@ impl DeviceTokenStore {
                         DeviceIdentity {
                             device_id: record.device_id,
                             user_id: record.user_id,
+                            issued_at: record.issued_at,
                         },
                     )
                 })
@@ -66,6 +81,19 @@ impl DeviceTokenStore {
             Err(error) => return Err(error),
         };
         Ok(Self { path, by_hash })
+    }
+
+    /// All currently paired devices (one entry per unique device id). Order is
+    /// unspecified (the backing map does not track insertion order).
+    pub fn devices(&self) -> Vec<PairedDevice> {
+        self.by_hash
+            .values()
+            .map(|identity| PairedDevice {
+                device_id: identity.device_id.clone(),
+                user_id: identity.user_id.clone(),
+                issued_at: identity.issued_at.clone(),
+            })
+            .collect()
     }
 
     /// Mint a fresh bearer token for `device_id`/`user_id`, persist its binding, and
@@ -89,6 +117,7 @@ impl DeviceTokenStore {
             DeviceIdentity {
                 device_id: device_id.to_owned(),
                 user_id: user_id.to_owned(),
+                issued_at: Some(iso8601_now()),
             },
         );
         self.persist()
@@ -116,6 +145,7 @@ impl DeviceTokenStore {
                 token_hash: hash.clone(),
                 device_id: identity.device_id.clone(),
                 user_id: identity.user_id.clone(),
+                issued_at: identity.issued_at.clone(),
             })
             .collect();
         let json = serde_json::to_vec_pretty(&records)
@@ -135,6 +165,53 @@ impl DeviceTokenStore {
 /// A new random bearer token: 244 bits from two v4 UUIDs, hex, no separators.
 fn mint_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Current time as an ISO 8601 UTC timestamp for recording `issued_at`.
+fn iso8601_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let millis = d.subsec_millis();
+    // Format as YYYY-MM-DDTHH:MM:SS.mmmZ from unix seconds.
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400; // days since 1970-01-01
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+fn is_leap_year(y: u64) -> bool {
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut y = 1970u64;
+    loop {
+        let dy = if is_leap_year(y) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        y += 1;
+    }
+    let leap = is_leap_year(y);
+    let months = if leap {
+        [31u64, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31u64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut mo = 1u64;
+    for dim in months {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        mo += 1;
+    }
+    (y, mo, days + 1)
 }
 
 /// Resolve an `Authorization: Bearer <token>` header against `tokens`, or `None` if the
@@ -165,13 +242,9 @@ mod tests {
         let (_dir, mut store) = store();
         let token = store.issue("pixel", "default").expect("issue");
 
-        assert_eq!(
-            store.verify(&token),
-            Some(DeviceIdentity {
-                device_id: "pixel".to_owned(),
-                user_id: "default".to_owned(),
-            }),
-        );
+        let identity = store.verify(&token).expect("must verify");
+        assert_eq!(identity.device_id, "pixel");
+        assert_eq!(identity.user_id, "default");
         assert_eq!(store.device_count(), 1);
     }
 
@@ -275,5 +348,65 @@ mod tests {
         assert_eq!(store.verify(&old), None, "the old token is revoked");
         assert_eq!(store.verify(&new).unwrap().device_id, "pixel");
         assert_eq!(store.device_count(), 1, "still one device");
+    }
+
+    // ---- devices() listing ----
+
+    #[test]
+    fn devices_is_empty_before_any_pairing() {
+        let (_dir, store) = store();
+        assert!(store.devices().is_empty());
+    }
+
+    #[test]
+    fn devices_lists_each_paired_device_once() {
+        let (_dir, mut store) = store();
+        store.issue("pixel", "default").expect("pixel");
+        store.issue("tablet", "default").expect("tablet");
+
+        let mut ids: Vec<_> = store.devices().into_iter().map(|d| d.device_id).collect();
+        ids.sort();
+        assert_eq!(ids, ["pixel", "tablet"]);
+    }
+
+    #[test]
+    fn devices_reflects_user_id_and_records_issued_at() {
+        let (_dir, mut store) = store();
+        store.issue("pixel", "default").expect("issue");
+        let devices = store.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].user_id, "default");
+        assert!(
+            devices[0].issued_at.is_some(),
+            "issued_at must be recorded after binding"
+        );
+    }
+
+    #[test]
+    fn devices_listing_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        DeviceTokenStore::open(&path)
+            .expect("open")
+            .issue("pixel", "default")
+            .expect("issue");
+
+        let reopened = DeviceTokenStore::open(&path).expect("reopen");
+        let devices = reopened.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "pixel");
+    }
+
+    #[test]
+    fn issued_at_is_an_iso8601_utc_timestamp() {
+        let (_dir, mut store) = store();
+        store.issue("pixel", "default").expect("issue");
+        let issued_at = store.devices()[0].issued_at.clone().expect("issued_at");
+        // Must end in 'Z' and contain 'T'.
+        assert!(issued_at.ends_with('Z'), "must be UTC: {issued_at}");
+        assert!(issued_at.contains('T'), "must be ISO 8601: {issued_at}");
+        // Must have at least the date portion (YYYY-MM-DD).
+        let parts: Vec<_> = issued_at.split('T').collect();
+        assert_eq!(parts[0].len(), 10, "date portion: {}", parts[0]);
     }
 }
