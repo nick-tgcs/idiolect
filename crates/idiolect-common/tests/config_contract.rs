@@ -270,11 +270,12 @@ fn config_resolves_xdg_paths_without_private_text() {
     let paths = resolve_xdg_paths(&config, &xdg);
     let paths_text = format!("{paths:?}");
 
-    assert!(paths_text.contains("models/whisper"));
+    let sep = std::path::MAIN_SEPARATOR;
+    assert!(paths_text.contains(&format!("models{sep}whisper")));
     assert!(paths_text.contains("audio"));
     assert!(paths_text.contains("adapters"));
     assert!(paths_text.contains("manifests"));
-    assert!(paths_text.contains("db/idiolect.sqlite"));
+    assert!(paths_text.contains(&format!("db{sep}idiolect.sqlite")));
     assert!(paths_text.contains("decoded"));
     assert!(paths_text.contains("trainer"));
 
