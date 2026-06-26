@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Metadata for IdiolectRecognitionService (the <meta-data android:name="android.speech"> on the
+  service). Marks idiolect as a system speech-recognition engine; settingsActivity points the
+  system speech settings at idiolect's onboarding/settings entry.
+-->
+<recognition-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="org.idiolect.android.setup.SetupActivity" />

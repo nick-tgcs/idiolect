@@ -76,6 +76,8 @@
     <string name="settings_review_sub">Open each take to edit before it lands</string>
     <string name="settings_continuous_label">Continuous on double-tap</string>
     <string name="settings_continuous_sub">Double-tap the mic to dictate hands-free</string>
+    <string name="settings_quicklaunch_label">Quick-launch mic</string>
+    <string name="settings_quicklaunch_sub">Tap Android\'s floating accessibility button to dictate into any app</string>
     <string name="settings_section_learning">Learning</string>
     <string name="settings_ship_label">Ship corrections to your PC</string>
     <string name="settings_ship_sub">Your edits train your own model at home</string>
@@ -100,4 +102,20 @@
     <!-- Shown in the review card when instant insert isn't enabled yet. -->
     <string name="review_enable_insert">Turn on instant insert so your fix lands in the app automatically.</string>
     <string name="review_enable_cta">Enable</string>
+
+    <!-- The ACTION_RECOGNIZE_SPEECH surface (idiolect as another app's mic / voice-input option). -->
+    <string name="recognize_preparing">Preparing…</string>
+    <string name="recognize_listening">Listening… tap when you\'re done</string>
+    <string name="recognize_transcribing">Transcribing…</string>
+    <string name="recognize_no_speech">Didn\'t catch that — try again</string>
+    <string name="recognize_no_model">Open idiolect and download a speech model first</string>
+    <string name="recognize_mic_needed">idiolect needs microphone access to transcribe</string>
+    <string name="recognize_failed">Transcription failed — please try again</string>
+
+    <!-- Quick-launch mic: Android's floating accessibility button → dictate into any app. -->
+    <string name="quicklaunch_disabled">Quick-launch mic is off — turn it on in idiolect ▸ Settings</string>
+    <string name="quicklaunch_listening">Listening… tap the button again to stop</string>
+    <string name="quicklaunch_transcribing">Transcribing…</string>
+    <string name="quicklaunch_no_field">Focus a text field, then try quick-launch again</string>
+    <string name="quicklaunch_mic_needed">Grant idiolect microphone access to use quick-launch</string>
 </resources>
