@@ -135,13 +135,15 @@ impl DashboardApp {
 }
 
 impl eframe::App for DashboardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // Poll for a new snapshot (non-blocking).
         if let Some(snap) = self.backend.poll_state() {
             self.model = DashboardModel::from_snapshot(&snap);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             // Top bar with prefs toggle.
             ui.horizontal(|ui| {
                 ui.label(

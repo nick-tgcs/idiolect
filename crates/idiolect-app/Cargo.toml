@@ -14,7 +14,7 @@ idiolect-application = { path = "../idiolect-application" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
 idiolect-sync-server = { path = "../idiolect-sync-server" }
 idiolect-common = { path = "../idiolect-common" }
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,7 +24,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 # X11 window-type support (needed on Linux so the tray-launched window gets
 # the correct type and does not steal focus). Not required on macOS or Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.28", features = ["x11"] }
+eframe = { version = "0.34", features = ["x11"] }
 
 [dev-dependencies]
 tempfile.workspace = true
