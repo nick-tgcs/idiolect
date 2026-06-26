@@ -113,15 +113,16 @@ impl eframe::App for Indicator {
         [0.0, 0.0, 0.0, 0.0] // fully transparent window
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
 impl Indicator {
-    /// The per-frame draw, split out of `eframe::App::update` so it can be
-    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
-    fn ui(&mut self, ctx: &egui::Context) {
+    /// The per-frame draw, split out of `eframe::App::ui` so it can be driven
+    /// headlessly in tests via `egui::Context::run_ui` (no `eframe::Frame`).
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         ctx.request_repaint(); // keep animating + tracking the caret
 
         let (cx, cy) = *self.caret.lock().expect("caret mutex");
@@ -132,8 +133,8 @@ impl Indicator {
         let t = ctx.input(|i| i.time) as f32;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
                 let center = ui.max_rect().center();
                 let painter = ui.painter();
 
@@ -154,7 +155,7 @@ impl Indicator {
                     center - egui::vec2(0.0, 1.5),
                     egui::vec2(5.0, 8.5),
                 );
-                painter.rect_filled(body, egui::Rounding::same(2.5), GLYPH);
+                painter.rect_filled(body, egui::CornerRadius::same(2), GLYPH);
                 let stroke = egui::Stroke::new(1.3, GLYPH);
                 painter.add(egui::Shape::CubicBezier(
                     egui::epaint::CubicBezierShape::from_points_stroke(
@@ -216,7 +217,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         // Running a frame must not panic and must move the window to the caret.
-        let output = ctx.run(egui::RawInput::default(), |ctx| indicator.ui(ctx));
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| indicator.draw(ui));
         let moved_to_caret = output.viewport_output.values().any(|vp| {
             vp.commands.iter().any(|cmd| {
                 matches!(cmd, egui::ViewportCommand::OuterPosition(p)

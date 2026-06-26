@@ -88,7 +88,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 144, 161);
 fn install_theme(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -107,8 +107,8 @@ fn install_theme(ctx: &egui::Context) {
     .into();
 
     let mut v = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(10.0);
-    v.window_rounding = egui::Rounding::same(14.0);
+    let corner_radius = egui::CornerRadius::same(10);
+    v.window_corner_radius = egui::CornerRadius::same(14);
     v.window_fill = BG;
     v.panel_fill = BG;
     v.extreme_bg_color = FIELD;
@@ -120,7 +120,7 @@ fn install_theme(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = rounding;
+        w.corner_radius = corner_radius;
     }
     v.widgets.inactive.bg_fill = SURFACE;
     v.widgets.inactive.weak_bg_fill = SURFACE;
@@ -132,7 +132,7 @@ fn install_theme(ctx: &egui::Context) {
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(10.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 struct RetentionApp {
@@ -196,36 +196,37 @@ impl eframe::App for RetentionApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
 impl RetentionApp {
-    /// The per-frame draw, split out of `eframe::App::update` so it can be
-    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
-    fn ui(&mut self, ctx: &egui::Context) {
-        self.center(ctx);
+    /// The per-frame draw, split out of `eframe::App::ui` so it can be driven
+    /// headlessly in tests via `egui::Context::run_ui` (no `eframe::Frame`).
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.center(&ctx);
         let resolved = self.resolved_days();
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.finish(ctx, None);
+            self.finish(&ctx, None);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(days) = resolved {
-                self.finish(ctx, Some(days));
+                self.finish(&ctx, Some(days));
             }
         }
 
         // Draggable frameless header.
-        egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 16.0,
-                bottom: 6.0,
+        egui::Panel::top("header")
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 16,
+                bottom: 6,
             }))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new("Keep training data for")
@@ -243,14 +244,14 @@ impl RetentionApp {
                 }
             });
 
-        egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 8.0,
-                bottom: 16.0,
+        egui::Panel::bottom("actions")
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 8,
+                bottom: 16,
             }))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     let hint = match resolved {
                         Some(days) => format!("≈ {days} days"),
@@ -269,18 +270,18 @@ impl RetentionApp {
                             )
                             .clicked()
                         {
-                            self.finish(ctx, resolved);
+                            self.finish(&ctx, resolved);
                         }
                         if ui.button("Cancel").clicked() {
-                            self.finish(ctx, None);
+                            self.finish(&ctx, None);
                         }
                     });
                 });
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(22.0, 8.0)))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22, 8)))
+            .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.amount)
@@ -335,7 +336,7 @@ mod tests {
     fn run(app: &mut RetentionApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
-        let _ = ctx.run(input, |ctx| app.ui(ctx));
+        let _ = ctx.run_ui(input, |ui| app.draw(ui));
     }
 
     #[test]
