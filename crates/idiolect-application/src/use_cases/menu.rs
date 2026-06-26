@@ -319,6 +319,17 @@ pub fn truncate_for_menu(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Sync / training state needed to build the tray menu's sync group.
+#[derive(Clone, Default)]
+pub struct SyncMenuState {
+    /// Whether the sync server is running.
+    pub enabled: bool,
+    /// Number of corrections available for training.
+    pub new_corrections: u64,
+    /// Whether a training run is currently in progress.
+    pub training_running: bool,
+}
+
 pub struct MenuUseCase;
 
 impl MenuUseCase {
@@ -332,6 +343,7 @@ impl MenuUseCase {
         recording_state: RecordingState,
         history: &[HistoryEntry],
         translation: &TranslationConfig,
+        sync: &SyncMenuState,
     ) -> Vec<TrayMenuItem> {
         let mut items = Vec::new();
 
@@ -493,6 +505,29 @@ impl MenuUseCase {
             kind: TrayMenuItemKind::Standard { submenu: None },
         });
 
+        // Sync / training group — always present so the user can reach the
+        // dashboard regardless of whether sync is currently enabled.
+        items.push(TrayMenuItem {
+            id: "sep_sync".to_owned(),
+            label: String::new(),
+            enabled: false,
+            kind: TrayMenuItemKind::Separator,
+        });
+        items.push(TrayMenuItem {
+            id: "open:dashboard".to_owned(),
+            label: "Corrections Dashboard…".to_owned(),
+            enabled: true,
+            kind: TrayMenuItemKind::Standard { submenu: None },
+        });
+        if sync.enabled && !sync.training_running && sync.new_corrections > 0 {
+            items.push(TrayMenuItem {
+                id: "train:now".to_owned(),
+                label: format!("Train now ({} corrections)", sync.new_corrections),
+                enabled: true,
+                kind: TrayMenuItemKind::Standard { submenu: None },
+            });
+        }
+
         items
     }
 }
@@ -590,7 +625,12 @@ mod tests {
         // Per-item tray tooltips are not supported by the DBusMenu protocol, so the
         // labels themselves must convey what Stop vs Cancel do: Stop transcribes and
         // inserts the text; Cancel throws the audio away.
-        let menu = MenuUseCase::new().get_menu(RecordingState::Recording, &[], &Default::default());
+        let menu = MenuUseCase::new().get_menu(
+            RecordingState::Recording,
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(child(&menu, "start_recording").label, "Start Recording");
         assert_eq!(child(&menu, "stop_recording").label, "Stop & Insert");
@@ -604,7 +644,12 @@ mod tests {
         // actions, single-click toggles, and ONE "Settings…" entry that opens
         // the window where all multi-choice configuration lives.
         let history = vec![entry(1, "hello world", HistoryState::Committed)];
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
+        let menu = MenuUseCase::new().get_menu(
+            RecordingState::Idle,
+            &history,
+            &Default::default(),
+            &Default::default(),
+        );
 
         let settings = child(&menu, "settings:open");
         assert_eq!(settings.label, "Settings…");
@@ -730,7 +775,7 @@ mod tests {
         fn menu_with(
             translation: &TranslationConfig,
         ) -> Vec<idiolect_ports::storage::TrayMenuItem> {
-            MenuUseCase::new().get_menu(RecordingState::Idle, &[], translation)
+            MenuUseCase::new().get_menu(RecordingState::Idle, &[], translation, &Default::default())
         }
 
         #[test]
@@ -894,7 +939,12 @@ mod tests {
     #[test]
     fn cancelled_entries_render_as_cancelled_label() {
         let history = vec![entry(1, "", HistoryState::Cancelled)];
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, &history, &Default::default());
+        let menu = MenuUseCase::new().get_menu(
+            RecordingState::Idle,
+            &history,
+            &Default::default(),
+            &Default::default(),
+        );
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")
@@ -906,7 +956,12 @@ mod tests {
     }
 
     fn entry_submenu(history: &[HistoryEntry], entry_id: i64) -> Vec<TrayMenuItem> {
-        let menu = MenuUseCase::new().get_menu(RecordingState::Idle, history, &Default::default());
+        let menu = MenuUseCase::new().get_menu(
+            RecordingState::Idle,
+            history,
+            &Default::default(),
+            &Default::default(),
+        );
         let history_item = menu
             .iter()
             .find(|item| item.id == "history")

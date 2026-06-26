@@ -170,4 +170,9 @@ fn tray_menu_cli_dumps_menu_structure() {
     // (multi-choice settings live in the window, not in the menu).
     assert!(menu.iter().any(|item| item["id"] == "settings:open"));
     assert!(menu.iter().any(|item| item["id"] == "history"));
+    // Dashboard opener must always be present regardless of sync state.
+    assert!(
+        menu.iter().any(|item| item["id"] == "open:dashboard"),
+        "tray menu must always include open:dashboard"
+    );
 }

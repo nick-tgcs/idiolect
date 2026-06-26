@@ -16,6 +16,7 @@ use idiolect_ports::storage::{AudioStorePort, MetadataStorePort};
 use idiolect_sync::SyncBatchEnvelope;
 
 pub mod device_tokens;
+pub mod host;
 pub mod ingest_server;
 pub mod model_server;
 pub mod pairing;

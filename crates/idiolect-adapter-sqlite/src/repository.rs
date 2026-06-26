@@ -1494,6 +1494,35 @@ impl SqliteMetadataStore {
         Ok(count > 0)
     }
 
+    /// Count training candidates that are trainable for `user_id`: all rows whose
+    /// status is not `rejected`, `synced`, or `evicted`. This is the "new corrections"
+    /// count shown in the dashboard and used to gate auto-train.
+    pub fn trainable_count(&self, user_id: &str) -> Result<u64, SqliteStorageError> {
+        let count: i64 = backend_result(self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM training_candidates AS tc
+             JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             WHERE s.user_id = ?1
+               AND tc.status NOT IN ('rejected', 'synced', 'evicted')",
+            params![user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count.unsigned_abs())
+    }
+
+    /// Timestamp of the most recent successfully finished training run for
+    /// `user_id`, in ISO 8601 form. `None` means no training run has ever
+    /// completed.
+    pub fn last_trained_at(&self, user_id: &str) -> Result<Option<String>, SqliteStorageError> {
+        backend_result(self.connection.query_row(
+            "SELECT MAX(finished_at)
+             FROM training_runs
+             WHERE user_id = ?1 AND status = 'completed'",
+            params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        ))
+    }
+
     /// Read back an utterance's stored audio digest. `None` means the column is
     /// still NULL (digest never populated). Test/inspection helper.
     pub fn audio_digest_for_test(
@@ -2707,5 +2736,172 @@ mod amend_correction_tests {
 
         assert_eq!(post_commit_edits(&store, &key), 0);
         assert_eq!(candidate(&store, &key).2, "accepted_without_edit");
+    }
+}
+
+#[cfg(test)]
+mod dashboard_count_tests {
+    use super::*;
+
+    fn store() -> SqliteMetadataStore {
+        let mut s = SqliteMetadataStore::open_in_memory().expect("store");
+        s.migrate().expect("migrate");
+        s
+    }
+
+    fn add_candidate(store: &mut SqliteMetadataStore, text: &str, key_suffix: u32) -> i64 {
+        let session = store.create_session(Some(text)).expect("create");
+        let audio_key = format!("audio-key-{key_suffix}");
+        store
+            .commit_session(session, text, &audio_key)
+            .expect("commit");
+        store
+            .connection
+            .query_row(
+                "SELECT id FROM training_candidates ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("candidate id")
+    }
+
+    // ---- trainable_count ----
+
+    #[test]
+    fn trainable_count_is_zero_for_empty_store() {
+        let store = store();
+        assert_eq!(store.trainable_count("default").expect("count"), 0);
+    }
+
+    #[test]
+    fn trainable_count_includes_captured_candidates() {
+        let mut store = store();
+        add_candidate(&mut store, "hello", 1);
+        add_candidate(&mut store, "world", 2);
+        assert_eq!(store.trainable_count("default").expect("count"), 2);
+    }
+
+    #[test]
+    fn trainable_count_excludes_rejected_synced_evicted_but_includes_captured() {
+        let mut store = store();
+        let trainable = add_candidate(&mut store, "trainable", 1);
+        let to_reject = add_candidate(&mut store, "to reject", 2);
+        let to_synced = add_candidate(&mut store, "to synced", 3);
+        let to_evicted = add_candidate(&mut store, "to evicted", 4);
+
+        store
+            .reject_training_candidate(to_reject, "bad-audio")
+            .expect("reject");
+        store
+            .connection
+            .execute(
+                "UPDATE training_candidates SET status = 'synced' WHERE id = ?1",
+                params![to_synced],
+            )
+            .expect("synced");
+        store
+            .connection
+            .execute(
+                "UPDATE training_candidates SET status = 'evicted' WHERE id = ?1",
+                params![to_evicted],
+            )
+            .expect("evicted");
+
+        let _ = trainable;
+        assert_eq!(store.trainable_count("default").expect("count"), 1);
+    }
+
+    #[test]
+    fn trainable_count_is_per_user() {
+        let mut store = store();
+        // Create a second user in the users table so we can assign sessions to them.
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO users(id, display_name) VALUES ('alice', 'alice')",
+                [],
+            )
+            .expect("insert alice");
+        // Create a session for default, then re-assign to alice.
+        let session = store.create_session(Some("alice text")).expect("create");
+        store
+            .commit_session(session, "alice text", "audio-alice-1")
+            .expect("commit");
+        let session_id: String = store
+            .connection
+            .query_row(
+                "SELECT text_session_id FROM training_candidates ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("session id");
+        store
+            .connection
+            .execute(
+                "UPDATE ime_text_sessions SET user_id = 'alice' WHERE id = ?1",
+                params![session_id],
+            )
+            .expect("reassign");
+
+        assert_eq!(store.trainable_count("default").expect("default"), 0);
+        assert_eq!(store.trainable_count("alice").expect("alice"), 1);
+    }
+
+    // ---- last_trained_at ----
+
+    #[test]
+    fn last_trained_at_is_none_for_no_runs() {
+        let store = store();
+        assert_eq!(store.last_trained_at("default").expect("query"), None,);
+    }
+
+    #[test]
+    fn last_trained_at_returns_the_max_finished_at_among_completed_runs() {
+        let store = store();
+        for (id, ts, status) in [
+            ("run-1", "2026-01-01T00:00:00.000Z", "completed"),
+            ("run-2", "2026-06-01T00:00:00.000Z", "completed"),
+            ("run-3", "2026-07-01T00:00:00.000Z", "failed"),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO training_runs(id, user_id, manifest_digest, status, finished_at)
+                     VALUES (?1, 'default', 'md', ?3, ?2)",
+                    params![id, ts, status],
+                )
+                .expect("insert run");
+        }
+        assert_eq!(
+            store.last_trained_at("default").expect("query"),
+            Some("2026-06-01T00:00:00.000Z".to_owned()),
+        );
+    }
+
+    #[test]
+    fn last_trained_at_ignores_other_users_runs() {
+        let store = store();
+        // Insert a second user and a completed run belonging to them.
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO users(id, display_name) VALUES ('alice', 'alice')",
+                [],
+            )
+            .expect("insert alice");
+        store
+            .connection
+            .execute(
+                "INSERT INTO training_runs(id, user_id, manifest_digest, status, finished_at)
+                 VALUES ('run-x', 'alice', 'md', 'completed', '2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("insert run");
+
+        assert_eq!(store.last_trained_at("default").expect("query"), None);
+        assert_eq!(
+            store.last_trained_at("alice").expect("query"),
+            Some("2026-01-01T00:00:00.000Z".to_owned()),
+        );
     }
 }

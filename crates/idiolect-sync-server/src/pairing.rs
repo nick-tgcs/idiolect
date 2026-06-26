@@ -184,6 +184,49 @@ impl PairingServerState {
             .expect("pairing mutex poisoned")
             .generate(now_secs)
     }
+
+    /// Mint a fresh code and build the full [`PairingOffer`] in one call: the code,
+    /// its display form, the deep-link URI, the QR bool matrix, and the expiry
+    /// timestamp. The caller supplies `base_url` (phone-facing URL) and optionally a
+    /// `fingerprint` (SPKI sha256 hex, absent for `--no-tls`). QR encoding errors are
+    /// surfaced as `Err` so the caller can degrade to the text-only fallback.
+    pub fn mint_offer(
+        &self,
+        base_url: &str,
+        fingerprint: Option<&str>,
+        now_secs: u64,
+    ) -> Result<PairingOffer, String> {
+        let code = self.generate_code(now_secs);
+        let display_code = group(&code);
+        let uri = crate::pairing_qr::pairing_uri(base_url, &code, fingerprint);
+        let (qr_matrix, qr_width) = crate::pairing_qr::qr_matrix(&uri)?;
+        Ok(PairingOffer {
+            display_code,
+            uri,
+            qr_matrix,
+            qr_width,
+            expires_at_secs: now_secs.saturating_add(PAIRING_CODE_TTL_SECS),
+            code,
+        })
+    }
+}
+
+/// The full description of an outstanding pairing invitation: everything the dashboard
+/// needs to render the QR, show the typed fallback, and display the countdown.
+#[derive(Debug, Clone)]
+pub struct PairingOffer {
+    /// The raw 8-character code from the pairing alphabet (for typed entry).
+    pub code: String,
+    /// The operator-friendly display form: `XXXX-XXXX`.
+    pub display_code: String,
+    /// The deep-link URI encoded in the QR: `idiolect://pair?u=…&c=…[&f=…]`.
+    pub uri: String,
+    /// The QR module matrix (row-major, `true` = dark), without quiet zone.
+    pub qr_matrix: Vec<bool>,
+    /// Side length of the square [`qr_matrix`].
+    pub qr_width: usize,
+    /// Unix timestamp (seconds) when this code expires.
+    pub expires_at_secs: u64,
 }
 
 /// The phone's pairing request: the short code and the device id it proposes for itself.
@@ -842,5 +885,90 @@ mod tests {
         assert_eq!(created, 1, "exactly one redeem wins");
         assert_eq!(unauthorized, 7, "every other racer is rejected");
         assert_eq!(device_count(&state), 1, "single-use under real concurrency");
+    }
+}
+
+#[cfg(test)]
+mod pairing_offer_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, Arc<PairingServerState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = crate::device_tokens::DeviceTokenStore::open(dir.path().join("tokens.json"))
+            .expect("tokens");
+        let state = Arc::new(PairingServerState::new(Arc::new(Mutex::new(tokens))));
+        (dir, state)
+    }
+
+    #[test]
+    fn mint_offer_returns_an_eight_char_code_with_grouped_display() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, system_now())
+            .expect("offer");
+        assert_eq!(offer.code.len(), 8);
+        assert_eq!(
+            offer.display_code,
+            format!("{}-{}", &offer.code[..4], &offer.code[4..])
+        );
+    }
+
+    #[test]
+    fn mint_offer_uri_encodes_the_base_url_and_code() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("offer");
+        assert!(
+            offer.uri.contains(&offer.code),
+            "uri must contain the raw code"
+        );
+        assert!(offer.uri.starts_with("idiolect://pair?"));
+    }
+
+    #[test]
+    fn mint_offer_uri_carries_fingerprint_when_supplied() {
+        let (_dir, state) = state();
+        let fp = "0123456789abcdef".repeat(4);
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", Some(&fp), 0)
+            .expect("offer");
+        assert!(offer.uri.contains(&fp), "uri must carry the fingerprint");
+    }
+
+    #[test]
+    fn mint_offer_qr_matrix_is_a_square_of_the_stated_width() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("offer");
+        assert_eq!(
+            offer.qr_matrix.len(),
+            offer.qr_width * offer.qr_width,
+            "qr_matrix must be a square"
+        );
+        assert!(offer.qr_width >= 21, "QR widths are at least 21 modules");
+    }
+
+    #[test]
+    fn mint_offer_expires_at_is_ten_minutes_after_now() {
+        let (_dir, state) = state();
+        let now = 1_000_000u64;
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, now)
+            .expect("offer");
+        assert_eq!(offer.expires_at_secs, now + PAIRING_CODE_TTL_SECS);
+    }
+
+    #[test]
+    fn consecutive_mint_offers_produce_distinct_codes() {
+        let (_dir, state) = state();
+        let a = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("a");
+        let b = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("b");
+        assert_ne!(a.code, b.code, "each mint must generate fresh entropy");
     }
 }

@@ -270,11 +270,17 @@ fn config_resolves_xdg_paths_without_private_text() {
     let paths = resolve_xdg_paths(&config, &xdg);
     let paths_text = format!("{paths:?}");
 
-    assert!(paths_text.contains("models/whisper"));
+    // Use PathBuf::ends_with for multi-component checks: Debug-format escapes
+    // backslashes on Windows, making string-contains unreliable across platforms.
+    assert!(paths
+        .models_whisper_dir
+        .ends_with(Path::new("models").join("whisper")));
+    assert!(paths
+        .database_path
+        .ends_with(Path::new("db").join("idiolect.sqlite")));
     assert!(paths_text.contains("audio"));
     assert!(paths_text.contains("adapters"));
     assert!(paths_text.contains("manifests"));
-    assert!(paths_text.contains("db/idiolect.sqlite"));
     assert!(paths_text.contains("decoded"));
     assert!(paths_text.contains("trainer"));
 

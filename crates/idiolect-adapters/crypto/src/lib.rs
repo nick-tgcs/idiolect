@@ -9,8 +9,11 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+// Unix-only: POSIX file-permission extensions (mode bits, O_CREAT with mode).
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -163,9 +166,12 @@ fn write_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), CryptoError> {
         fs::create_dir_all(parent)?;
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     let mut file = options.open(path)?;
     io::Write::write_all(&mut file, key)?;
+    #[cfg(unix)]
     // Ensure permissions are 0600 even if the file already existed.
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -295,11 +301,28 @@ mod tests {
         let second = provider.load_or_create_key().unwrap();
         assert_eq!(first, second, "key must persist across loads");
 
-        let permissions = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777,
+                0o600,
+                "key file must be owner-read-write only"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn file_key_is_created_and_readable_on_non_unix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.key");
+        let provider = FileKey::new(&path);
+        let first = provider.load_or_create_key().unwrap();
+        assert!(path.exists(), "key file must be created");
+        // Re-open to verify persistence (no permission check on Windows).
+        let second = FileKey::new(&path).load_or_create_key().unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
