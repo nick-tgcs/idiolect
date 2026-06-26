@@ -149,10 +149,11 @@ class PublicModelTransportTest {
     }
 
     @Test
-    fun the_recommended_source_is_pinned_and_served_over_https() {
-        assertTrue("default source must be https", PublicModelTransport.DEFAULT_URL.startsWith("https://"))
+    fun the_recommended_source_is_the_pinned_catalog_default_over_https() {
+        // recommended() delegates to the single-source-of-truth catalog (the fast tiny.en default).
         val manifest = PublicModelTransport.recommended().fetchManifest()
-        assertEquals("ggml-base.en", manifest.id)
+        assertEquals(PublicModelCatalog.default.id, manifest.id)
+        assertTrue("default source must be https", PublicModelCatalog.default.url.startsWith("https://"))
         assertEquals("a full SHA-256 hex digest is pinned", 64, manifest.sha256.length)
         assertTrue("a positive byte size is pinned", manifest.size > 0)
     }

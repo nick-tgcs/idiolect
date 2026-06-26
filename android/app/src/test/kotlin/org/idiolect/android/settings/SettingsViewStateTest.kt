@@ -68,6 +68,15 @@ class SettingsViewStateTest {
     }
 
     @Test
+    fun a_known_catalog_model_shows_a_friendly_name_and_size() {
+        // A model from the public catalog reads as its picker label + size, not the raw ggml id.
+        assertEquals(
+            "Tiny (English) · on-device · 31 MB",
+            state(model = InstalledModel("ggml-tiny.en-q5_1", "sha", "/p/ggml-tiny.en-q5_1.bin")).modelLabel,
+        )
+    }
+
+    @Test
     fun no_model_is_stated_plainly() {
         assertEquals("No model yet", state(model = null).modelLabel)
     }

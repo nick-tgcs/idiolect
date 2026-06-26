@@ -72,23 +72,11 @@ class PublicModelTransport(
 
     companion object {
         /**
-         * The pinned default base model for a phone with no PC: whisper.cpp `ggml-base.en`
-         * (English, the quality/speed sweet spot for on-device dictation). To change the
-         * default model, swap these four values together — [DEFAULT_SHA256] and
-         * [DEFAULT_SIZE] are the SHA-256 and byte length of the file at [DEFAULT_URL].
-         *
-         * Served from `ggerganov/whisper.cpp` (the `ggml-org/whisper.cpp` mirror is gated,
-         * HTTP 401). The digest, not the URL, is the trust anchor, so any https mirror
-         * serving identical bytes would verify the same.
+         * The recommended zero-config model source for a phone that never sees a PC — the
+         * [PublicModelCatalog] default (currently the fast tiny.en q5_1). The catalog is the
+         * single source of truth for which models exist and which is the default; this is a
+         * convenience for callers that just want "the default download".
          */
-        const val DEFAULT_URL =
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
-        const val DEFAULT_ID = "ggml-base.en"
-        const val DEFAULT_SHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
-        const val DEFAULT_SIZE = 147964211L
-
-        /** The recommended zero-config model source for a phone that never sees a PC. */
-        fun recommended(): PublicModelTransport =
-            PublicModelTransport(DEFAULT_URL, ModelManifest(DEFAULT_ID, DEFAULT_SHA256, DEFAULT_SIZE))
+        fun recommended(): PublicModelTransport = PublicModelCatalog.default.transport()
     }
 }
