@@ -62,9 +62,19 @@ class CoreRecognitionTake(context: Context) {
         val callbacks = object : NoopInputMethod() {
             override fun commitText(text: String) = live.onCommitted(text)
             override fun dictationError(message: String) = live.onFailed(RecognitionError.FAILED)
+
+            // The core fires recordingStatus(false) LAST on every finalize and is the ONLY signal
+            // for a silent take (no commitText/dictationError) — so a silent stop ends as NO_SPEECH
+            // instead of hanging the caller. A speech take has already committed by now, so this
+            // is a no-op there (the session is spent).
+            override fun recordingStatus(recording: Boolean) {
+                if (!recording) live.onFinalized()
+            }
         }
         sink = callbacks
-        host.router.bind(callbacks)
+        // Take delivery ABOVE the IME's base binding for the life of the take, so an IME that is
+        // (re)created and binds itself mid-take can't steal this take's finalize callback.
+        host.router.acquireOverride(callbacks)
         runCatching {
             executor.execute {
                 // If the take was cancelled before the load finished, live.start() is a no-op
@@ -85,12 +95,18 @@ class CoreRecognitionTake(context: Context) {
         if (!released.get()) session?.cancel()
     }
 
-    /** Unbind and close the core — ordered behind any queued load/capture task on the executor, so
-     *  the close never races a native call. Idempotent: the core reference is dropped exactly once. */
+    /** Drop the override and close the core, BOTH ordered behind any queued load/capture/finalize
+     *  task on the executor — so the close never races a native call, and a still-decoding cancelled
+     *  take's commit lands on this (spent) session rather than leaking to the IME's base sink.
+     *  Idempotent: the core reference is dropped exactly once. */
     fun release() {
         if (!released.compareAndSet(false, true)) return
-        sink?.let { host.router.unbind(it) }
-        runCatching { executor.execute { IdiolectCoreHost.release() } }
+        runCatching {
+            executor.execute {
+                sink?.let { host.router.releaseOverride(it) }
+                IdiolectCoreHost.release()
+            }
+        }
         executor.shutdown()
     }
 

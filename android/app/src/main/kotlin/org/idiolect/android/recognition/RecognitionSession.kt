@@ -93,6 +93,19 @@ class RecognitionSession(
         state = State.DONE
         output.onError(error)
     }
+
+    /**
+     * The take finalized — `recordingStatus(false)`, which the core fires LAST and for EVERY
+     * outcome (even a silent take, for which it sends no `commitText`/`dictationError`). If a result
+     * or error already arrived this is a no-op; otherwise the take was silent (or captured nothing),
+     * reported as [RecognitionError.NO_SPEECH] so the caller is never left hanging on "Transcribing…".
+     */
+    @Synchronized
+    fun onFinalized() {
+        if (state != State.LISTENING) return
+        state = State.DONE
+        output.onError(RecognitionError.NO_SPEECH)
+    }
 }
 
 /** What blocks a recognition take before it can even start; `null` ⇒ good to go. Kept pure so the

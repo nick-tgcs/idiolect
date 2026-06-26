@@ -3,61 +3,83 @@ package org.idiolect.android.core
 import org.idiolect.ffi.IdiolectInputMethod
 
 /**
- * The single [IdiolectInputMethod] callback handed to the core at construction. The core
- * lives in a process-wide [IdiolectCoreHost] (so it outlives any one IME instance), but its
- * pushes — preedit, commit, errors — must reach whichever IME is *currently* active. The
- * active IME [bind]s itself; pushes that arrive with no sink (between fields, or while the
- * user edits in their own keyboard during review) are dropped, never crash.
+ * The single [IdiolectInputMethod] callback handed to the core at construction. The core lives in
+ * a process-wide [IdiolectCoreHost] (so it outlives any one IME instance), but its pushes — preedit,
+ * commit, errors — must reach whichever consumer is *currently* active.
  *
- * `@Volatile` because the core pushes on its callback thread while bind/unbind happen on the
- * main thread.
+ * Two layers, so the IME and a headless take don't clobber each other's callbacks:
+ *  - **base** ([bind]/[unbind]) — the active IME binds itself; pushes between fields (no base, no
+ *    override) are dropped, never crash.
+ *  - **override** ([acquireOverride]/[releaseOverride]) — a headless take (the quick-launch button or
+ *    the RECOGNIZE_SPEECH / RecognitionService voice provider) takes delivery *above* the base while
+ *    it runs. This is load-bearing: the IME can be (re)created and `bind` itself mid-take, and an
+ *    override keeps that from stealing the take's finalize callback (the "stuck on Transcribing…"
+ *    hang). On [releaseOverride] the base resumes — whatever IME is bound by then.
+ *
+ * `@Volatile` because the core pushes on its callback thread while bind/override happen on other
+ * threads.
  */
 class CoreCallbackRouter : IdiolectInputMethod {
     @Volatile
-    private var sink: IdiolectInputMethod? = null
+    private var base: IdiolectInputMethod? = null
 
-    /** The now-active IME takes over delivery (replacing any previous sink). */
+    @Volatile
+    private var override: IdiolectInputMethod? = null
+
+    /** The now-active IME takes over base delivery (replacing any previous base). */
     fun bind(sink: IdiolectInputMethod) {
-        this.sink = sink
+        this.base = sink
     }
 
     /**
-     * Stop delivering to [sink]. A no-op if a newer sink has already taken over (a late
-     * unbind from a torn-down IME must not silence the current one).
+     * Stop base delivery to [sink]. A no-op if a newer base has already taken over (a late unbind
+     * from a torn-down IME must not silence the current one).
      */
     fun unbind(sink: IdiolectInputMethod) {
-        if (this.sink === sink) this.sink = null
+        if (this.base === sink) this.base = null
     }
 
+    /** A headless take takes delivery above the base while it runs (see the class note). */
+    fun acquireOverride(sink: IdiolectInputMethod) {
+        this.override = sink
+    }
+
+    /** Drop the take's override; the base (the live IME, if any) resumes. No-op if superseded. */
+    fun releaseOverride(sink: IdiolectInputMethod) {
+        if (this.override === sink) this.override = null
+    }
+
+    private fun active(): IdiolectInputMethod? = override ?: base
+
     override fun recordingStatus(recording: Boolean) {
-        sink?.recordingStatus(recording)
+        active()?.recordingStatus(recording)
     }
 
     override fun showPreedit(text: String) {
-        sink?.showPreedit(text)
+        active()?.showPreedit(text)
     }
 
     override fun updatePreedit(text: String) {
-        sink?.updatePreedit(text)
+        active()?.updatePreedit(text)
     }
 
     override fun commitText(text: String) {
-        sink?.commitText(text)
+        active()?.commitText(text)
     }
 
     override fun cancelPreedit() {
-        sink?.cancelPreedit()
+        active()?.cancelPreedit()
     }
 
     override fun insertText(text: String) {
-        sink?.insertText(text)
+        active()?.insertText(text)
     }
 
     override fun editHistory(id: Long, text: String) {
-        sink?.editHistory(id, text)
+        active()?.editHistory(id, text)
     }
 
     override fun dictationError(message: String) {
-        sink?.dictationError(message)
+        active()?.dictationError(message)
     }
 }

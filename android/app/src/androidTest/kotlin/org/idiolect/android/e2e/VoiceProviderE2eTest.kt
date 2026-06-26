@@ -71,8 +71,33 @@ class VoiceProviderE2eTest {
         )
     }
 
+    @Test
+    fun a_silent_take_finalizes_and_dismisses_instead_of_hanging() {
+        // The core sends no commitText/dictationError for a silent take — only recordingStatus(false).
+        // With the emulator mic silent, tapping "done" must still finalize (=> no-speech) and close,
+        // not leave the surface stuck on "Transcribing…". Needs the installed model to start a take.
+        ctx.startActivity(
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .setClassName(PKG, "$PKG.recognition.RecognizeSpeechActivity")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+        assertTrue(
+            "the take never reached Listening (no model installed?)",
+            device.wait(Until.hasObject(By.textContains("Listening")), MODEL_TIMEOUT),
+        )
+        // Say nothing, tap the surface to finish.
+        device.click(device.displayWidth / 2, device.displayHeight / 2)
+        assertTrue(
+            "a silent recognize take must finalize and dismiss, not hang on Transcribing…",
+            device.wait(Until.gone(By.desc(RecognizeSpeechActivity.MIC_DESC)), TIMEOUT),
+        )
+    }
+
     companion object {
         private const val PKG = "org.idiolect.android"
         private const val TIMEOUT = 10_000L
+
+        /** Generous wait covering the on-device model load before the take reaches "Listening". */
+        private const val MODEL_TIMEOUT = 25_000L
     }
 }

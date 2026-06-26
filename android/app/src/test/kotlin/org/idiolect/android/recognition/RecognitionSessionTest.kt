@@ -97,4 +97,37 @@ class RecognitionSessionTest {
         RecognitionSession(FakeTake(), out).onCommitted("nope")
         assertTrue(out.events.isEmpty())
     }
+
+    @Test
+    fun a_silent_finalize_with_no_result_is_reported_as_no_speech() {
+        // The core does NOT send commitText/dictationError for a silent take — only
+        // recordingStatus(false). Without this, a silent stop would hang the caller forever.
+        val out = Out()
+        val session = RecognitionSession(FakeTake(), out)
+        session.start()
+        session.onFinalized()
+        assertEquals(listOf("ready", "error:NO_SPEECH"), out.events)
+    }
+
+    @Test
+    fun a_finalize_after_a_result_is_ignored() {
+        // For a take WITH speech the core fires commitText before recordingStatus(false), so the
+        // session is already spent — the trailing finalize must not turn a good result into an error.
+        val out = Out()
+        val session = RecognitionSession(FakeTake(), out)
+        session.start()
+        session.onCommitted("hello")
+        session.onFinalized()
+        assertEquals(listOf("ready", "result:hello"), out.events)
+    }
+
+    @Test
+    fun a_finalize_after_cancel_is_ignored() {
+        val out = Out()
+        val session = RecognitionSession(FakeTake(), out)
+        session.start()
+        session.cancel()
+        session.onFinalized()
+        assertEquals(listOf("ready"), out.events)
+    }
 }
