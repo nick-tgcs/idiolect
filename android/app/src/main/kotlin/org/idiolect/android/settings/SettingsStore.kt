@@ -26,6 +26,14 @@ class SettingsStore(private val file: File) {
     fun shipCorrections(): Boolean = read(SHIP, default = true)
     fun setShipCorrections(on: Boolean) = write(SHIP, on)
 
+    /**
+     * Whether the floating accessibility ("quick-launch") button dictates into the focused field.
+     * Defaults on so the button — which previously did nothing — now does something useful; turn
+     * it off here to make idiolect ignore the button (see [IdiolectAccessibilityService]).
+     */
+    fun quickLaunchEnabled(): Boolean = read(QUICK_LAUNCH, default = true)
+    fun setQuickLaunchEnabled(on: Boolean) = write(QUICK_LAUNCH, on)
+
     /** Parse the whole file into a map; an absent/garbled file yields an empty map (→ defaults). */
     private fun all(): MutableMap<String, String> {
         val map = LinkedHashMap<String, String>()
@@ -57,6 +65,7 @@ class SettingsStore(private val file: File) {
         const val REVIEW = "review_by_default"
         const val CONTINUOUS = "continuous_on_double_tap"
         const val SHIP = "ship_corrections"
+        const val QUICK_LAUNCH = "quick_launch_mic"
 
         /** The on-device store, under the app's private files directory. */
         fun under(filesDir: File) = SettingsStore(File(filesDir, FILE_NAME))

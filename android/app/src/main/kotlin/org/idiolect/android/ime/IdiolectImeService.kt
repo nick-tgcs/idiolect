@@ -609,15 +609,4 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         LinearLayout.LayoutParams.WRAP_CONTENT,
         LinearLayout.LayoutParams.WRAP_CONTENT,
     ).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = 12 }
-
-    /** Adapts [IdiolectCore] to the [RecordingToggle] the mic key drives. */
-    private class CoreRecordingToggle(private val core: IdiolectCore) : RecordingToggle {
-        override fun isRecording(): Boolean = core.isRecording()
-        override fun toggle() {
-            core.toggle()
-        }
-        override fun startContinuous() {
-            core.startContinuous()
-        }
-    }
 }

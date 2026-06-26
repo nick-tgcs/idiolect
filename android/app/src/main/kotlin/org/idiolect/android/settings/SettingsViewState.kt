@@ -12,6 +12,7 @@ data class PrefsSnapshot(
     val reviewByDefault: Boolean,
     val continuousOnDoubleTap: Boolean,
     val shipCorrections: Boolean,
+    val quickLaunchMic: Boolean,
 )
 
 /** Whether the keyboard is usable, read from the framework by the activity glue. */
@@ -48,6 +49,7 @@ data class SettingsViewState(
     val reviewOn: Boolean,
     val continuousOn: Boolean,
     val shipOn: Boolean,
+    val quickLaunchOn: Boolean,
     val audioLabel: String,
     val system: SystemStatus,
 )
@@ -74,6 +76,7 @@ object SettingsView {
         reviewOn = prefs.reviewByDefault,
         continuousOn = prefs.continuousOnDoubleTap,
         shipOn = prefs.shipCorrections,
+        quickLaunchOn = prefs.quickLaunchMic,
         audioLabel = AudioUsage.format(audioUsedBytes, audioCapBytes),
         system = system,
     )

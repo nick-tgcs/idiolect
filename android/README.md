@@ -85,7 +85,8 @@ Reached via **⚙** on the mic strip:
 
 - **Connect to PC** — pair to sync corrections / pull a custom model (see below).
 - **Speech model** — the active model, with one-tap switch/download of the other.
-- **Dictation** — *Review before insert*, *Continuous on double-tap*.
+- **Dictation** — *Review before insert*, *Continuous on double-tap*, *Quick-launch mic* (the
+  floating-button dictation in §6).
 - **Learning** — *Ship corrections to your PC* (only does anything once paired).
 - **Audio on device** — captured-audio footprint against the cap (oldest evicted).
 - **System** — keyboard enabled/selected and microphone status, each tappable to fix.
@@ -110,6 +111,49 @@ Accessibility settings. Dictation works without it; it only improves the review 
 
 ---
 
+## 6. Use idiolect's voice in other apps
+
+idiolect also registers as a **system voice-input provider**, so you can dictate with it even when
+it isn't your active keyboard.
+
+### From an app's own mic button
+
+Many apps (browsers, search boxes, messengers) show a small **microphone** in the text field.
+Tapping it opens the system voice picker — **idiolect** now appears there alongside Google. Pick
+idiolect and it transcribes **on-device**, then hands the text to the app.
+
+<p align="center">
+  <img src="../docs/images/android-app/recognize-speech-listening.png" width="30%" alt="idiolect handling an app's voice-input request — Listening…" />
+</p>
+
+To make idiolect the device-wide default speech engine: **Android Settings → System → Languages &
+input → On-device speech recognition** (wording varies by phone) → choose **idiolect**.
+
+### Quick-launch mic — dictate into any app from a floating button
+
+This is what the floating mic button is *for*. idiolect can sit behind Android's **floating
+accessibility button** so one tap dictates straight into whatever field you're in — no keyboard
+switch:
+
+1. Enable **idiolect instant insert** once: *Android Settings → Accessibility → idiolect*.
+2. Turn on its shortcut: *Accessibility → idiolect → Shortcut* → **Floating button** (some phones
+   call it the "Accessibility button"). A draggable mic pill appears on the screen edge.
+3. Focus a text field, **tap the pill** → idiolect listens; **tap again** to stop. The transcript
+   lands in the field.
+
+Toggle the feature in **idiolect → Settings → Dictation → Quick-launch mic** (on by default).
+
+> **Turning the floating button off.** It's an *Android* control, so idiolect can't remove it for
+> you — turn its **Shortcut** off in *Accessibility → idiolect*. (Earlier the pill did nothing when
+> tapped; now it dictates when Quick-launch is on, or — if you've switched the toggle off — points
+> you back to this setting instead of recording.)
+
+<p align="center">
+  <img src="../docs/images/android-app/voice-settings-quicklaunch.png" width="30%" alt="Settings — the Quick-launch mic toggle in Dictation" />
+</p>
+
+---
+
 ## Troubleshooting
 
 - **Transcription feels slow** → use **Tiny** (Settings → Speech model). It's the default; if you
@@ -120,6 +164,10 @@ Accessibility settings. Dictation works without it; it only improves the review 
   Settings → System that the keyboard is selected and the mic is granted.
 - **Mic strip never appears** → make sure idiolect is the *active* keyboard (Settings → System →
   Keyboard, or the system keyboard switcher).
+- **idiolect isn't in an app's mic picker** → it registers on install as a *voice-input* option
+  (not a keyboard); if the app cached the engine list, reopen the app or reboot once (§6).
+- **The floating mic does nothing** → turn on **Settings → Dictation → Quick-launch mic**, and set
+  Android's accessibility *Shortcut* for idiolect to the **Floating button** (§6).
 - **Notifications** → a small "idiolect is listening" notification appears while recording; that's
   the foreground microphone service Android requires.
 

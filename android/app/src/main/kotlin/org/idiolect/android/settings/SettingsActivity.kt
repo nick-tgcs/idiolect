@@ -121,6 +121,7 @@ class SettingsActivity : ComponentActivity() {
                 reviewByDefault = store.reviewByDefault(),
                 continuousOnDoubleTap = store.continuousOnDoubleTap(),
                 shipCorrections = store.shipCorrections(),
+                quickLaunchMic = store.quickLaunchEnabled(),
             )
             val system = SystemStatus(isEnabled(), isSelected(), hasMicPermission())
             val audioUsed = AudioUsage.bytesOnDisk(File(filesDir, "audio"))
@@ -275,6 +276,11 @@ class SettingsActivity : ComponentActivity() {
         card.addView(
             toggleRow(R.string.settings_continuous_label, R.string.settings_continuous_sub, state.continuousOn) { on ->
                 settingsStore().setContinuousOnDoubleTap(on)
+            },
+        )
+        card.addView(
+            toggleRow(R.string.settings_quicklaunch_label, R.string.settings_quicklaunch_sub, state.quickLaunchOn) { on ->
+                settingsStore().setQuickLaunchEnabled(on)
             },
         )
         return card

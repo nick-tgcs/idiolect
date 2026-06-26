@@ -4,11 +4,14 @@
   (to know which field the user dictated into) and the ability to write into that node, so it
   can drop a reviewed correction into the app while the user's own keyboard is the active IME.
   flagRetrieveInteractiveWindows lets it see the host app's window behind the review dialog.
+  flagRequestAccessibilityButton makes idiolect an eligible target for Android's floating
+  accessibility button, so a tap on it can start dictation (the "quick-launch mic") rather than
+  doing nothing — see IdiolectAccessibilityService.onQuickLaunchButton.
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeViewFocused|typeViewTextSelectionChanged|typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagRequestAccessibilityButton"
     android:canRetrieveWindowContent="true"
     android:notificationTimeout="50"
     android:description="@string/accessibility_description"
