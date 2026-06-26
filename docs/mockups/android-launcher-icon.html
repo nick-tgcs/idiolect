@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>idiolect — Android launcher icon options</title>
+<style>
+  :root { --accent:#7c83fd; --accent-bright:#a6abff; --bg:#16171e; --slate:#333845; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0c0d12; color:#e5e7f0;
+         font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; padding:40px; }
+  h1 { font-weight:700; font-size:22px; margin:0 0 4px; }
+  p.sub { color:#8c90a1; margin:0 0 32px; font-size:14px; }
+  .grid { display:flex; gap:48px; flex-wrap:wrap; }
+  .opt { display:flex; flex-direction:column; align-items:center; gap:14px; }
+  .opt h2 { font-size:15px; font-weight:600; margin:0; }
+  .opt .desc { color:#8c90a1; font-size:12px; max-width:200px; text-align:center; line-height:1.4; }
+  .masks { display:flex; gap:18px; align-items:center; }
+  /* 108dp adaptive icon, previewed at 132px with the standard masks. */
+  .icon { width:132px; height:132px; position:relative; overflow:hidden; display:grid; place-items:center; }
+  .circle { border-radius:50%; }
+  .squircle { border-radius:30px; }
+  .legend { color:#6a6e7d; font-size:10px; text-transform:uppercase; letter-spacing:.08em; margin-top:4px; }
+  /* foreground glyph occupies the inner ~66% safe zone */
+  .glyph { width:58%; height:58%; }
+  .glyph svg { width:100%; height:100%; display:block; }
+  /* backgrounds */
+  .bg-solid { background:var(--accent); }
+  .bg-dark  { background:radial-gradient(circle at 50% 38%, #20222e 0%, var(--bg) 78%); }
+  .bg-grad  { background:radial-gradient(circle at 50% 34%, var(--accent-bright) 0%, var(--accent) 46%, #5a61e0 100%); }
+  .halo::before { content:""; position:absolute; width:74%; height:74%; border-radius:50%;
+                  background:radial-gradient(circle, rgba(124,131,253,.55) 0%, rgba(124,131,253,0) 70%); }
+  .row { display:flex; gap:8px; flex-direction:column; align-items:center; }
+</style>
+</head>
+<body>
+  <h1>idiolect — Android launcher icon</h1>
+  <p class="sub">Adaptive icon (108dp), shown under the two standard launcher masks. Derived from the in-app mic-on-periwinkle logo. Brand accent #7c83fd on slate #16171e.</p>
+  <div class="grid">
+
+    <div class="opt">
+      <h2>A · White mic on periwinkle</h2>
+      <div class="masks">
+        <div class="row"><div class="icon circle bg-solid"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#ffffff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#ffffff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">circle</span></div>
+        <div class="row"><div class="icon squircle bg-solid"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#ffffff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#ffffff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">squircle</span></div>
+      </div>
+      <div class="desc">Exactly matches the in-app logo. Bold, high-contrast, reads at small sizes.</div>
+    </div>
+
+    <div class="opt">
+      <h2>B · Periwinkle mic on dark</h2>
+      <div class="masks">
+        <div class="row"><div class="icon circle bg-dark halo"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#a6abff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#a6abff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">circle</span></div>
+        <div class="row"><div class="icon squircle bg-dark halo"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#a6abff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#a6abff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">squircle</span></div>
+      </div>
+      <div class="desc">Stealthy, matches the app's dark background; subtle accent glow halo behind the glyph.</div>
+    </div>
+
+    <div class="opt">
+      <h2>C · White mic on gradient + glow</h2>
+      <div class="masks">
+        <div class="row"><div class="icon circle bg-grad"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#ffffff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#ffffff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">circle</span></div>
+        <div class="row"><div class="icon squircle bg-grad"><div class="glyph"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#ffffff" d="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3z"/><path fill="#ffffff" d="M17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5.3c0,3.41 2.72,6.23 6,6.72V21h1.4v-3.28c3.28,-0.48 6,-3.3 6,-6.72H17z"/></svg></div></div><span class="legend">squircle</span></div>
+      </div>
+      <div class="desc">Echoes the "listening" glow aesthetic — a lit periwinkle gradient. Most distinctive.</div>
+    </div>
+
+  </div>
+</body>
+</html>

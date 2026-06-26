@@ -1,6 +1,7 @@
 package org.idiolect.android.settings
 
 import org.idiolect.android.model.InstalledModel
+import org.idiolect.android.model.PublicModelCatalog
 import org.idiolect.android.sync.SyncSettings
 
 /**
@@ -42,6 +43,8 @@ sealed interface PinView {
 data class SettingsViewState(
     val connection: ConnectionView,
     val modelLabel: String,
+    /** The active model's id, or null if none is installed — lets the picker mark the current one. */
+    val modelId: String?,
     val reviewOn: Boolean,
     val continuousOn: Boolean,
     val shipOn: Boolean,
@@ -60,7 +63,14 @@ object SettingsView {
         audioCapBytes: Long,
     ): SettingsViewState = SettingsViewState(
         connection = connectionOf(paired),
-        modelLabel = model?.let { "${it.id} · on-device" } ?: "No model yet",
+        modelLabel = model?.let { installed ->
+            // A public-catalog model reads as its friendly picker label + size; a PC-served or
+            // unknown id falls back to the raw ggml id so it is never blank.
+            PublicModelCatalog.byId(installed.id)
+                ?.let { "${it.label} · on-device · ${it.sizeLabel}" }
+                ?: "${installed.id} · on-device"
+        } ?: "No model yet",
+        modelId = model?.id,
         reviewOn = prefs.reviewByDefault,
         continuousOn = prefs.continuousOnDoubleTap,
         shipOn = prefs.shipCorrections,

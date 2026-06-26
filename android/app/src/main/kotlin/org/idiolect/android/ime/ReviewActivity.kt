@@ -21,6 +21,7 @@ import org.idiolect.android.accessibility.AccessibilityServices
 import org.idiolect.android.accessibility.IdiolectAccessibilityService
 import org.idiolect.android.accessibility.InjectQueue
 import org.idiolect.android.core.IdiolectCoreHost
+import org.idiolect.android.ui.EdgeToEdge
 import java.io.File
 
 /**
@@ -65,7 +66,11 @@ class ReviewActivity : Activity() {
             textSize = 15f
         }
 
-        setContentView(buildScrim(buildCard(field, historyId, raw)))
+        val card = buildCard(field, historyId, raw)
+        setContentView(buildScrim(card))
+        // Under edge-to-edge (targetSdk 35) the translucent window spans the bars; inset the
+        // card so its title clears the status bar and the Insert/Cancel row clears the nav bar.
+        EdgeToEdge.padSystemBars(card)
 
         field.requestFocus()
         // STATE_VISIBLE alone *replaces* the manifest's adjustResize, so the window stops
