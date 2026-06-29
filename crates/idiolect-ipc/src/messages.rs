@@ -38,6 +38,14 @@ pub struct PreeditUpdate {
     /// transcript) so daemons/clients that predate streaming interoperate.
     #[serde(default)]
     pub partial: bool,
+    /// When true, this take-final transcript should REPLACE the preview the client
+    /// already typed live (direct streaming mode): the client deletes its
+    /// live-typed run (synthesised backspaces) and commits this verified text
+    /// instead, without asking the daemon to commit again (the daemon already owns
+    /// the streamed session). Distinguishes a stop-time reconcile from a fresh
+    /// batch transcript. Defaults false so older peers interoperate.
+    #[serde(default)]
+    pub reconcile: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

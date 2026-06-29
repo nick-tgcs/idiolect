@@ -68,6 +68,7 @@ struct Model {
     max_phrase: Choice,
     auto_stop: Choice,
     review_mode: bool,
+    preview_typing: bool,
     translation_enabled: bool,
     input_lang: Choice,
     output_lang: Choice,
@@ -120,6 +121,8 @@ impl Model {
             max_phrase: Choice::new(timing_radio(&MAX_PHRASE_CHOICES_MS, max_phrase_ms, 30_000)),
             auto_stop: Choice::new(timing_radio(&AUTO_STOP_CHOICES_MS, auto_stop_ms, 0)),
             review_mode: bool_field(&state, "review_mode", false),
+            // Default ON: absent ⇒ live preview typing, matching the daemon.
+            preview_typing: bool_field(&state, "preview_typing", true),
             translation_enabled: bool_field(&state, "translation_enabled", false),
             input_lang: Choice::new(translation_input_radio(input_lang)),
             output_lang: Choice::new(translation_output_radio(output_lang)),
@@ -156,6 +159,11 @@ impl Model {
     fn toggle_review(&mut self) -> String {
         self.review_mode = !self.review_mode;
         "review_mode".to_owned()
+    }
+
+    fn toggle_preview_typing(&mut self) -> String {
+        self.preview_typing = !self.preview_typing;
+        "preview_typing".to_owned()
     }
 
     fn toggle_translation(&mut self) -> String {
@@ -498,6 +506,23 @@ impl SettingsApp {
             .color(MUTED),
         );
 
+        let mut preview = self.model.preview_typing;
+        if ui
+            .checkbox(&mut preview, egui::RichText::new("Preview typing").strong())
+            .changed()
+        {
+            emit(&self.model.toggle_preview_typing());
+        }
+        ui.label(
+            egui::RichText::new(
+                "On: words appear as you speak, then the whole phrase is replaced with the \
+                 verified text when you stop. Off: nothing is typed until you stop, then the \
+                 verified text is inserted once. (Ignored in review mode.)",
+            )
+            .small()
+            .color(MUTED),
+        );
+
         let model = &mut self.model;
         let options = model.pause.options.clone();
         let current = model.pause.current_label().to_owned();
@@ -664,7 +689,7 @@ mod tests {
     use super::*;
 
     const STATE: &str = r#"{"pause_ms":700,"min_speech_ms":250,"max_phrase_ms":30000,
-        "auto_stop_ms":0,"review_mode":true,"translation_enabled":true,
+        "auto_stop_ms":0,"review_mode":true,"preview_typing":false,"translation_enabled":true,
         "input_lang":"auto","output_lang":"zh","translator_configured":false,
         "retention_days":30,"max_entries":25,"training_retention_days":365}"#;
 
@@ -674,6 +699,10 @@ mod tests {
         assert_eq!(model.pause.current_label(), "0.7 s (default)");
         assert_eq!(model.auto_stop.current_label(), "Never (default)");
         assert!(model.review_mode);
+        assert!(
+            !model.preview_typing,
+            "the state line says preview typing off"
+        );
         assert!(model.translation_enabled);
         assert_eq!(model.input_lang.current_label(), "Auto detect");
         assert_eq!(model.output_lang.current_label(), "Chinese");
@@ -687,6 +716,10 @@ mod tests {
         let model = Model::from_json_line("not json at all");
         assert_eq!(model.pause.current_label(), "0.7 s (default)");
         assert!(!model.review_mode);
+        assert!(
+            model.preview_typing,
+            "preview typing defaults ON when the daemon omits it"
+        );
         assert_eq!(model.output_lang.current_label(), "English");
     }
 
@@ -705,6 +738,7 @@ mod tests {
             Some("settings:auto_stop:1")
         );
         assert_eq!(model.toggle_review(), "review_mode");
+        assert_eq!(model.toggle_preview_typing(), "preview_typing");
         assert_eq!(model.toggle_translation(), "translation:enabled");
         assert_eq!(
             model.pick_input_language(1).as_deref(),

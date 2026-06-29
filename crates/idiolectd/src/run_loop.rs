@@ -536,6 +536,33 @@ fn review_mode_enabled(store: &SqliteMetadataStore) -> bool {
         == Some("true")
 }
 
+/// Whether dictation types the live "preview" as you speak (persisted in
+/// `tray_settings`, **default ON**). When on, streamed snippets are typed live and
+/// the verified whole-take text replaces them at stop; when off, no snippets are
+/// streamed and only the verified text is typed once, at stop. Absent ⇒ on, so the
+/// feature is live for everyone without a migration.
+fn preview_typing_enabled(store: &SqliteMetadataStore) -> bool {
+    store
+        .get_tray_setting("preview_typing")
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
+}
+
+/// Flip the persisted "preview typing" setting (off ⇄ on). Mirrors the
+/// review-mode toggle; the tray click / settings checkbox is the GUI boundary.
+fn toggle_preview_typing(store: &mut SqliteMetadataStore) -> Result<(), RunLoopError> {
+    let next = if preview_typing_enabled(store) {
+        "false"
+    } else {
+        "true"
+    };
+    store
+        .set_tray_setting("preview_typing", next)
+        .map_err(|error| RunLoopError::storage("set preview_typing", error))
+}
+
 /// Rebuilds and installs the tray menu from current storage state.
 fn refresh_tray_menu(
     tray: &mut KsniTray,
@@ -560,6 +587,14 @@ fn refresh_tray_menu(
         enabled: true,
         kind: idiolect_ports::storage::TrayMenuItemKind::Checkable {
             checked: review_mode_enabled(store),
+        },
+    });
+    menu.push(idiolect_ports::storage::TrayMenuItem {
+        id: "preview_typing".to_owned(),
+        label: "Preview typing".to_owned(),
+        enabled: true,
+        kind: idiolect_ports::storage::TrayMenuItemKind::Checkable {
+            checked: preview_typing_enabled(store),
         },
     });
     tray.set_menu(menu)
@@ -1106,12 +1141,20 @@ impl StreamObserver for DaemonObserver<'_> {
     type Error = RunLoopError;
 
     fn snippet_committed(&mut self, chunk: &str) -> Result<(), RunLoopError> {
+        // "Preview typing" off (and not in review mode): type nothing live — the
+        // verified whole-take text is sent once, at stop. Review mode always
+        // streams display-only snippets into its dialog regardless of this toggle.
+        let review = review_mode_enabled(self.store);
+        if !review && !preview_typing_enabled(self.store) {
+            return Ok(());
+        }
         send_ipc_message(
             self.stream,
             &IpcMessage::PreeditUpdate(PreeditUpdate {
                 text: chunk.to_owned(),
-                review: review_mode_enabled(self.store),
+                review,
                 partial: true,
+                reconcile: false,
             }),
         )
     }
@@ -1496,7 +1539,9 @@ fn finalize_streamed_take(
     let FinalizedTake {
         final_text,
         merged_samples,
-        last_snippet_text,
+        // The streamed take's correction window now covers the FULL reconciled
+        // text (not just the last snippet), so the per-snippet tail is unused.
+        last_snippet_text: _,
         fallback_reason,
     } = match outcome {
         TakeOutcome::Silent => return Ok(()),
@@ -1535,6 +1580,7 @@ fn finalize_streamed_take(
                 text: final_text,
                 review: true,
                 partial: false,
+                reconcile: false,
             }),
         )?;
     } else {
@@ -1542,11 +1588,26 @@ fn finalize_streamed_take(
         store
             .commit_session(session_id, &final_text, &key)
             .map_err(|error| RunLoopError::storage("commit streamed take", error))?;
+        // Direct mode: the daemon owns and has just committed the streamed session.
+        // Send the verified whole-take text to the engine so it REPLACES the
+        // preview it typed live (backspace + re-commit) — or, with preview typing
+        // off, types it fresh. The in-place correction window now covers the FULL
+        // text, so `tail_text` is None: a later fix amends the whole take, not just
+        // a snippet suffix (see the ReportCorrection handler's None branch).
+        send_ipc_message(
+            stream,
+            &IpcMessage::PreeditUpdate(PreeditUpdate {
+                text: final_text.clone(),
+                review: false,
+                partial: false,
+                reconcile: true,
+            }),
+        )?;
         *active_session = Some(ActiveSession {
             session_id,
             current_text: final_text,
             finalized: true,
-            tail_text: last_snippet_text,
+            tail_text: None,
         });
     }
     Ok(())
@@ -1643,6 +1704,7 @@ fn stop_live_and_transcribe(
                     text,
                     review,
                     partial: false,
+                    reconcile: false,
                 }),
             )?;
             // The mic is closed once the take stops, so the authoritative state is
@@ -1694,6 +1756,7 @@ fn start_fixture_oneshot(
                     text,
                     review,
                     partial: false,
+                    reconcile: false,
                 }),
             )?;
             // A fixture one-shot captures and transcribes instantly, so the mic is
@@ -1895,6 +1958,7 @@ fn settings_state_json(store: &SqliteMetadataStore, config: &RunLoopConfig) -> S
         "max_phrase_ms": vad.max_utterance_ms,
         "auto_stop_ms": vad.auto_stop_silence_ms,
         "review_mode": review_mode_enabled(store),
+        "preview_typing": preview_typing_enabled(store),
         "translation_enabled": translation.enabled,
         "input_lang": translation.input_language,
         "output_lang": translation.output_language,
@@ -2039,6 +2103,9 @@ fn handle_tray_callback(
         store
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
+        refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
+    } else if action == "preview_typing" {
+        toggle_preview_typing(store)?;
         refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
     } else if apply_translation_tray_action(store, translation_defaults, &action)?
         || apply_dictation_tray_action(store, &action)?
@@ -2616,6 +2683,45 @@ mod tests {
             state.ingest(&silence_second);
             state.ingest(&silence_second);
             assert!(state.auto_stop_due(), "2s threshold crossed after speech");
+        }
+    }
+
+    mod preview_typing_setting {
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::{preview_typing_enabled, toggle_preview_typing};
+
+        fn store() -> SqliteMetadataStore {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+        }
+
+        #[test]
+        fn defaults_on_and_reads_the_stored_value() {
+            let mut store = store();
+            // Absent ⇒ ON, so the live-preview behaviour is on for everyone with no
+            // migration needed.
+            assert!(preview_typing_enabled(&store));
+            store
+                .set_tray_setting("preview_typing", "false")
+                .expect("set");
+            assert!(!preview_typing_enabled(&store));
+            store
+                .set_tray_setting("preview_typing", "true")
+                .expect("set");
+            assert!(preview_typing_enabled(&store));
+        }
+
+        #[test]
+        fn toggle_flips_and_persists() {
+            let mut store = store();
+            // ON by default → first toggle turns it OFF, second back ON.
+            toggle_preview_typing(&mut store).expect("toggle");
+            assert!(!preview_typing_enabled(&store));
+            toggle_preview_typing(&mut store).expect("toggle");
+            assert!(preview_typing_enabled(&store));
         }
     }
 

@@ -33,9 +33,14 @@ pub trait DaemonClient {
 }
 
 /// The text destination — in production an IBus input context. `commit_text`
-/// types the final text into the focused application.
+/// types the final text into the focused application; `delete` removes the last
+/// `count` characters the engine itself just typed, by synthesising that many
+/// backspace key events (we are a keyboard, so this works in any app — no IBus
+/// surrounding-text capability required). Used at stop to replace a live-typed
+/// preview with the verified full-take text.
 pub trait Surface {
     fn commit_text(&mut self, text: &str);
+    fn delete(&mut self, count: usize);
 }
 
 /// A key, already classified from the raw IBus keyval/state by the engine layer,
@@ -110,9 +115,11 @@ pub struct Session<D, S> {
     /// The daemon's authoritative mic state, mirrored independently of `state`
     /// (which may be `Reviewing` while the mic is still open in streaming mode).
     recording: bool,
-    /// The most recent streamed (partial) snippet typed this take: at stop it
-    /// seeds the in-place correction window over the take's final snippet.
-    pending_tail: Option<String>,
+    /// The cumulative text the engine has typed live this take (the concatenation
+    /// of every streamed partial). At stop the daemon sends the verified full-take
+    /// text and [`Session::on_reconcile`] backspaces the divergent suffix of this
+    /// run and re-commits, so the app ends up with the verified text.
+    typed_run: String,
 }
 
 impl<D, S> Session<D, S>
@@ -127,7 +134,7 @@ where
             state: State::Idle,
             review: None,
             recording: false,
-            pending_tail: None,
+            typed_run: String::new(),
         }
     }
 
@@ -165,8 +172,8 @@ where
                     self.daemon.cancel();
                     // Snappy local feedback; the daemon's `recording = false` push
                     // reconciles to the same state. A discarded take leaves no
-                    // tail to correct.
-                    self.pending_tail = None;
+                    // typed run to reconcile.
+                    self.typed_run.clear();
                     self.state = State::Idle;
                     true
                 }
@@ -262,9 +269,9 @@ where
             State::Reviewing if self.recording => self.end_review(),
             _ => return, // no take in progress; ignore an unsolicited/late transcript
         }
-        // A take-final transcript supersedes any streamed tail: the correction
+        // A take-final transcript supersedes any streamed run: the correction
         // window below covers the full text.
-        self.pending_tail = None;
+        self.typed_run.clear();
         if text.is_empty() {
             self.state = State::Idle;
             return;
@@ -278,15 +285,53 @@ where
     /// The daemon delivered a mid-take snippet of a streamed take (a PARTIAL
     /// preedit): type it into the app and keep recording. Nothing is finalized
     /// — the daemon owns the take's single session and commits it at stop —
-    /// and no correction window opens mid-take. The snippet is remembered so
-    /// the stop can open the usual in-place correction window over the take's
-    /// final snippet.
+    /// and no correction window opens mid-take. The snippet is appended to the
+    /// take's typed run so the stop-time [`on_reconcile`](Self::on_reconcile) can
+    /// replace the whole live-typed preview with the verified text.
     pub fn on_partial_transcript(&mut self, text: String) {
         if self.state != State::Recording || text.is_empty() {
             return; // no live take; ignore a stray/late partial
         }
         self.surface.commit_text(&text);
-        self.pending_tail = Some(text);
+        self.typed_run.push_str(&text);
+    }
+
+    /// The daemon delivered the verified full-take text at the stop of a direct
+    /// (review-off) streaming take. Replace the live-typed preview with it: keep
+    /// the longest common prefix, backspace the divergent suffix of the typed run,
+    /// and commit the corrected suffix. This is display-only — the daemon already
+    /// owns and committed the streamed session, so we do NOT send our own commit.
+    /// The full verified text then becomes the in-place correction window so a
+    /// later fix still reports a raw→corrected training pair.
+    ///
+    /// Self-adjusting w.r.t. the "preview typing" toggle: with preview off the
+    /// engine typed nothing this take, so the run is empty, zero backspaces are
+    /// synthesised, and the whole verified text is committed fresh.
+    pub fn on_reconcile(&mut self, final_text: String) {
+        match self.state {
+            State::Recording => {}
+            // A reconcile landing on an open window while the mic is still open is
+            // the next streamed take's stop: close the prior window (reporting any
+            // fix) and reconcile the new one.
+            State::Reviewing if self.recording => self.end_review(),
+            _ => return, // no live take; ignore an unsolicited/late reconcile
+        }
+        let typed = std::mem::take(&mut self.typed_run);
+        let shared = common_prefix_chars(&typed, &final_text);
+        let backspaces = typed.chars().count() - shared;
+        self.surface.delete(backspaces);
+        if final_text.is_empty() {
+            // The whole-take decode came back empty: the preview is gone and there
+            // is nothing to commit or correct.
+            self.state = State::Idle;
+            return;
+        }
+        let suffix: String = final_text.chars().skip(shared).collect();
+        if !suffix.is_empty() {
+            self.surface.commit_text(&suffix);
+        }
+        self.review = Some(Review::new(final_text));
+        self.state = State::Reviewing;
     }
 
     /// The daemon's authoritative recording state changed. This is the single
@@ -294,9 +339,11 @@ where
     /// A `Reviewing` correction window is a local overlay: a stop's `false` is
     /// expected and leaves it open, while a fresh `true` (a new take) closes it.
     ///
-    /// When a streamed take stops (partials were typed, daemon committed the
-    /// merged session), the stop opens the correction window over the take's
-    /// final snippet, so the in-place-fix flow works exactly as for batch takes.
+    /// For a streamed take the correction window is opened by the stop-time
+    /// [`on_reconcile`](Self::on_reconcile) (which the daemon sends *before* this
+    /// status), so a `recording = false` arriving on the already-open `Reviewing`
+    /// state simply leaves it open. A plain `Recording → false` with no transcript
+    /// (a silent take) just returns to idle.
     pub fn on_recording_status(&mut self, recording: bool) {
         self.recording = recording;
         match self.state {
@@ -307,13 +354,8 @@ where
                 }
             }
             State::Recording if !recording => {
-                self.state = match self.pending_tail.take() {
-                    Some(tail) => {
-                        self.review = Some(Review::new(tail));
-                        State::Reviewing
-                    }
-                    None => State::Idle,
-                };
+                self.typed_run.clear();
+                self.state = State::Idle;
             }
             _ => {
                 self.state = if recording {
@@ -330,7 +372,7 @@ where
     /// resyncs from a clean slate rather than a stale guess.
     pub fn reset_to_idle(&mut self) {
         self.review = None;
-        self.pending_tail = None;
+        self.typed_run.clear();
         self.state = State::Idle;
         self.recording = false;
     }
@@ -370,7 +412,7 @@ where
             _ => return,
         }
         self.daemon.cancel();
-        self.pending_tail = None;
+        self.typed_run.clear();
         self.review = None;
         self.state = State::Idle;
     }
@@ -385,7 +427,7 @@ where
     /// The daemon reported an error mid-take: return to idle.
     pub fn on_error(&mut self) {
         self.review = None;
-        self.pending_tail = None;
+        self.typed_run.clear();
         self.state = State::Idle;
     }
 
@@ -400,6 +442,12 @@ where
             }
         }
     }
+}
+
+/// Number of leading `char`s `a` and `b` share. Counts by Unicode scalar value so
+/// the backspace count matches what was committed character-for-character.
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
@@ -428,10 +476,16 @@ mod tests {
     #[derive(Default)]
     struct FakeSurface {
         committed: Vec<String>,
+        /// Each `delete(count)` call's count, in order — lets a test assert the
+        /// engine synthesised the right number of backspaces before re-committing.
+        deleted: Vec<usize>,
     }
     impl Surface for FakeSurface {
         fn commit_text(&mut self, text: &str) {
             self.committed.push(text.to_owned());
+        }
+        fn delete(&mut self, count: usize) {
+            self.deleted.push(count);
         }
     }
 
@@ -689,17 +743,110 @@ mod tests {
         assert_eq!(s.state(), State::Recording, "still mid-take");
     }
 
+    /// Stream `parts` as live partials within an open take (start + recording).
+    fn stream_partials(s: &mut Session<FakeDaemon, FakeSurface>, parts: &[&str]) {
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        for p in parts {
+            s.on_partial_transcript((*p).to_owned());
+        }
+    }
+
     #[test]
-    fn stop_after_partials_keeps_the_tail_editable() {
-        // After the daemon closes the streamed take, the engine's only local
-        // job is the usual in-place correction window — over the FINAL snippet
-        // (the daemon splices the fix into the merged string).
+    fn reconcile_replaces_preview_with_corrected_final() {
+        // Direct streaming stop: the engine typed a lossy preview live; the daemon
+        // sends the verified full-take text. The engine keeps the common prefix,
+        // backspaces the divergent suffix, and commits the corrected suffix.
+        let mut s = session();
+        stream_partials(&mut s, &["helo world"]);
+
+        s.on_reconcile("hello world".to_owned());
+
+        // "hel" is shared; 7 chars ("o world") are backspaced and "lo world" typed.
+        assert_eq!(s.surface.deleted, [7]);
+        assert_eq!(s.surface.committed, ["helo world", "lo world"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_run_accumulates_across_multiple_partials() {
+        // The engine tracks the WHOLE typed run, not just the last snippet, so the
+        // backspace count spans every snippet that diverges from the final.
+        let mut s = session();
+        stream_partials(&mut s, &["hello ", "wrld"]);
+
+        s.on_reconcile("hello world".to_owned());
+
+        // typed run "hello wrld" (10 chars); shared prefix "hello w" (7); 3 deleted.
+        assert_eq!(s.surface.deleted, [3]);
+        assert_eq!(s.surface.committed, ["hello ", "wrld", "orld"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_with_no_preview_commits_full_final() {
+        // Preview typing OFF: no partials were typed, so the engine deletes nothing
+        // and commits the whole verified final — the same code path, 0 backspaces.
         let mut s = session();
         s.on_key(Key::Trigger);
         s.on_recording_status(true);
-        s.on_partial_transcript("hello world".to_owned());
-        s.on_partial_transcript(" deploy nginx".to_owned());
 
+        s.on_reconcile("the verified text".to_owned());
+
+        assert_eq!(s.surface.deleted, [0]);
+        assert_eq!(s.surface.committed, ["the verified text"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_with_empty_final_deletes_preview_and_idles() {
+        // The whole-take decode came back empty (silence/noise after previews):
+        // remove the preview entirely and return to idle, committing nothing.
+        let mut s = session();
+        stream_partials(&mut s, &["ghost text"]);
+
+        s.on_reconcile(String::new());
+
+        assert_eq!(s.surface.deleted, [10], "the whole 10-char run is removed");
+        assert_eq!(s.surface.committed, ["ghost text"], "nothing new committed");
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn reconcile_never_commits_daemon_side() {
+        // The daemon already owns (and committed) the streamed session; the engine
+        // reconcile is display-only and must NOT send its own commit.
+        let mut s = session();
+        stream_partials(&mut s, &["helo world"]);
+        s.on_reconcile("hello world".to_owned());
+
+        let commits = s
+            .daemon
+            .events
+            .iter()
+            .filter(|e| e.starts_with("commit:"))
+            .count();
+        assert_eq!(commits, 0, "reconcile finalizes daemon-side only");
+    }
+
+    #[test]
+    fn recording_false_after_reconcile_keeps_review_open() {
+        // Stop send-order is reconcile THEN RecordingStatus(false); the trailing
+        // status must leave the freshly-opened full-text correction window open.
+        let mut s = session();
+        stream_partials(&mut s, &["helo world"]);
+        s.on_reconcile("hello world".to_owned());
+        s.on_recording_status(false);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn editing_after_reconcile_reports_the_full_corrected_text() {
+        // The correction window now covers the FULL final (not just the tail), so a
+        // fix anywhere reports the whole corrected take to the daemon.
+        let mut s = session();
+        stream_partials(&mut s, &["hello world", " deploy nginx"]);
+        s.on_reconcile("hello world deploy nginx".to_owned());
         s.on_recording_status(false);
         assert_eq!(s.state(), State::Reviewing);
 
@@ -709,16 +856,10 @@ mod tests {
         type_str(&mut s, "Nginx");
         s.on_focus_out();
 
-        // The correction carries the snippet exactly as it was typed (joining
-        // space included), so the daemon's suffix splice lines up.
-        assert_eq!(last_correction(&s), Some(" deploy Nginx".to_owned()));
-        let commits = s
-            .daemon
-            .events
-            .iter()
-            .filter(|e| e.starts_with("commit:"))
-            .count();
-        assert_eq!(commits, 0, "streamed takes are finalized daemon-side only");
+        assert_eq!(
+            last_correction(&s),
+            Some("hello world deploy Nginx".to_owned())
+        );
     }
 
     #[test]
@@ -735,13 +876,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_take_reports_the_previous_tail_correction_first() {
-        // Tail window open from a streamed take; the next take's recording=true
-        // must close it (reporting the fix) before the new take begins.
+    fn a_new_take_reports_the_previous_correction_first() {
+        // Correction window open from a reconciled streamed take; the next take's
+        // recording=true must close it (reporting the fix) before the new take.
         let mut s = session();
-        s.on_key(Key::Trigger);
-        s.on_recording_status(true);
-        s.on_partial_transcript("deploy nginx".to_owned());
+        stream_partials(&mut s, &["deploy nginx"]);
+        s.on_reconcile("deploy nginx".to_owned());
         s.on_recording_status(false);
         for _ in 0.."nginx".len() {
             s.on_key(Key::Backspace);

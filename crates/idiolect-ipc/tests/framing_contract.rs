@@ -12,11 +12,44 @@ fn partial_preedit_round_trips_over_the_wire() {
         text: " and the second snippet".to_owned(),
         review: false,
         partial: true,
+        reconcile: false,
     });
 
     let line = encode_json_line(&message).expect("message should encode");
     assert!(line.ends_with('\n'));
     assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn reconcile_preedit_round_trips_over_the_wire() {
+    // At stop in direct streaming mode the daemon sends the full-take verified
+    // text with `reconcile: true`: the engine deletes its live-typed preview and
+    // commits this instead, rather than treating it as a fresh batch transcript.
+    let message = IpcMessage::PreeditUpdate(PreeditUpdate {
+        text: "hello world".to_owned(),
+        review: false,
+        partial: false,
+        reconcile: true,
+    });
+
+    let line = encode_json_line(&message).expect("message should encode");
+    assert!(line.ends_with('\n'));
+    assert_eq!(decode_json_line(&line).expect("decode"), message);
+}
+
+#[test]
+fn preedit_without_reconcile_field_defaults_to_non_reconcile() {
+    // Backward compatibility: a daemon that predates the reconcile feature never
+    // writes the field, and such a preedit is an ordinary (non-reconcile) final.
+    let line =
+        "{\"type\":\"PreeditUpdate\",\"payload\":{\"text\":\"restart traffic\",\"review\":true}}\n";
+    match decode_json_line(line).expect("decode") {
+        IpcMessage::PreeditUpdate(update) => {
+            assert_eq!(update.text, "restart traffic");
+            assert!(!update.reconcile, "missing field must mean non-reconcile");
+        }
+        other => panic!("expected PreeditUpdate, got {other:?}"),
+    }
 }
 
 #[test]

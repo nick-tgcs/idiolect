@@ -276,6 +276,7 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -286,6 +287,94 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
     );
     // The engine also reports the commit back so the daemon records it.
     expect_commit_preedit(&mut server_reader);
+
+    drop(engine);
+    drop(conn);
+}
+
+/// Direct STREAMING stop: the engine typed a lossy preview live, then the daemon
+/// sends the verified whole-take text with `reconcile: true`. The engine must
+/// DELETE the divergent suffix of what it typed — synthesised Backspace
+/// `ForwardKeyEvent`s, because we are a keyboard, so this works in any app — and
+/// re-commit only the corrected suffix, leaving the verified text in the field.
+/// Proven over real D-Bus by observing the backspaces and the re-commit.
+#[tokio::test]
+async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
+    const PREVIEW: &str = "helo world";
+    const VERIFIED: &str = "hello world";
+    // "hel" is shared; the 7-char suffix ("o world") is backspaced, "lo world" typed.
+    const SHARED_PREFIX: usize = 3;
+    const BACKSPACES: usize = PREVIEW.len() - SHARED_PREFIX;
+
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-reconcile");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, _server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+    let mut key_signals = engine_proxy
+        .receive_signal("ForwardKeyEvent")
+        .await
+        .expect("subscribe ForwardKeyEvent");
+
+    // Focusing a text field is what sets active_path (the direct-mode target).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    // Arm the take, then type a live preview snippet (a streamed PARTIAL).
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: PREVIEW.to_owned(),
+            review: false,
+            partial: true,
+            reconcile: false,
+        }),
+    );
+    assert_eq!(
+        next_commit(&mut commit_signals).await,
+        PREVIEW,
+        "the preview snippet is typed live via CommitText"
+    );
+
+    // Stop: the daemon sends the verified text to RECONCILE the preview.
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: VERIFIED.to_owned(),
+            review: false,
+            partial: false,
+            reconcile: true,
+        }),
+    );
+
+    // The corrected suffix is re-committed only AFTER the backspaces, so once we
+    // observe it every Backspace has already been forwarded.
+    assert_eq!(
+        next_commit(&mut commit_signals).await,
+        "lo world",
+        "only the divergent suffix is re-committed (common prefix is kept)"
+    );
+
+    let presses = drain_backspace_presses(&mut key_signals).await;
+    assert_eq!(
+        presses, BACKSPACES,
+        "the divergent suffix of the live preview is backspaced before re-commit"
+    );
 
     drop(engine);
     drop(conn);
@@ -326,6 +415,7 @@ async fn direct_transcript_without_focus_in_is_discarded_not_typed_or_recorded()
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -387,6 +477,7 @@ async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -486,6 +577,29 @@ where
     let body = msg.body();
     let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
     extract_ibus_text(&text)
+}
+
+/// Count Backspace key PRESSES the engine forwarded, draining the `ForwardKeyEvent`
+/// stream until it goes quiet. The body is `(keyval, keycode, state)`; each
+/// backspace is a press (state 0) + release pair, so the press count equals the
+/// number of characters deleted.
+async fn drain_backspace_presses<S>(stream: &mut S) -> usize
+where
+    S: futures_util::Stream<Item = zbus::Message> + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut presses = 0;
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+    {
+        let body = msg.body();
+        let (keyval, _keycode, state): (u32, u32, u32) =
+            body.deserialize().expect("forward-key body");
+        assert_eq!(keyval, KEY_BACKSPACE, "only Backspace is synthesised");
+        if state == 0 {
+            presses += 1;
+        }
+    }
+    presses
 }
 
 fn send_line(writer: &mut impl Write, message: &IpcMessage) {
