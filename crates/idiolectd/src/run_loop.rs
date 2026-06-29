@@ -35,7 +35,8 @@ use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
     CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
-    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
+    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECONCILE,
+    FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -640,6 +641,7 @@ fn handle_connection(
         live_capture: None,
         live_stream: None,
         status_tx: RecordingStatusTx::new(false),
+        wants_reconcile: false,
     };
     let mut line = String::new();
 
@@ -743,6 +745,10 @@ fn handle_connection(
                     .accepted_features
                     .iter()
                     .any(|feature| feature == FEATURE_RECORDING_STATUS);
+                live.wants_reconcile = response
+                    .accepted_features
+                    .iter()
+                    .any(|feature| feature == FEATURE_RECONCILE);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
                 live.status_tx = RecordingStatusTx::new(wants_status);
                 live.status_tx.sync_initial(&mut stream)?;
@@ -1135,17 +1141,23 @@ struct DaemonObserver<'a> {
     stream: &'a mut UnixStream,
     store: &'a SqliteMetadataStore,
     config: &'a RunLoopConfig,
+    /// Whether the client negotiated [`FEATURE_RECONCILE`]. Preview typing can only
+    /// be suppressed for such a client (it gets the verified text at stop); a
+    /// client without reconcile must always receive live snippets or nothing would
+    /// ever be typed.
+    wants_reconcile: bool,
 }
 
 impl StreamObserver for DaemonObserver<'_> {
     type Error = RunLoopError;
 
     fn snippet_committed(&mut self, chunk: &str) -> Result<(), RunLoopError> {
-        // "Preview typing" off (and not in review mode): type nothing live — the
-        // verified whole-take text is sent once, at stop. Review mode always
-        // streams display-only snippets into its dialog regardless of this toggle.
+        // "Preview typing" off: type nothing live — the verified whole-take text is
+        // sent once, at stop, as the reconcile final. Only do this for a client that
+        // negotiated reconcile (else it would receive nothing); review mode always
+        // streams display-only snippets into its dialog regardless of the toggle.
         let review = review_mode_enabled(self.store);
-        if !review && !preview_typing_enabled(self.store) {
+        if !review && self.wants_reconcile && !preview_typing_enabled(self.store) {
             return Ok(());
         }
         send_ipc_message(
@@ -1385,6 +1397,12 @@ struct Live {
     live_capture: Option<crate::adapters::RuntimeCapture>,
     live_stream: Option<LiveStreamState>,
     status_tx: RecordingStatusTx,
+    /// Whether the connected client negotiated [`FEATURE_RECONCILE`]. Only such a
+    /// client receives the stop-time reconcile final (and may have its live
+    /// snippets suppressed when preview typing is off); clients that did not
+    /// advertise it keep the pre-reconcile behaviour, so they can never mistake
+    /// the reconcile final for an appended batch transcript.
+    wants_reconcile: bool,
 }
 
 /// The long-lived store, codecs, and config a connection's handlers share.
@@ -1421,6 +1439,7 @@ fn start_live_capture(
         live_capture,
         live_stream,
         status_tx,
+        wants_reconcile: _,
     } = live;
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match crate::adapters::begin_capture(&config.adapter_profile) {
@@ -1468,8 +1487,10 @@ fn pump_live_stream(
     let Live {
         live_capture,
         live_stream,
+        wants_reconcile,
         ..
     } = live;
+    let wants_reconcile = *wants_reconcile;
     let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
         return Ok(false);
     };
@@ -1481,7 +1502,14 @@ fn pump_live_stream(
         }
     };
     for snippet in state.ingest(&drained) {
-        fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+        fold_snippet_into_take(
+            stream,
+            store,
+            config,
+            &mut state.take,
+            snippet,
+            wants_reconcile,
+        )?;
     }
     Ok(state.auto_stop_due())
 }
@@ -1496,6 +1524,7 @@ fn fold_snippet_into_take(
     config: &RunLoopConfig,
     take: &mut StreamingTake,
     snippet: Vec<f32>,
+    wants_reconcile: bool,
 ) -> Result<(), RunLoopError> {
     let mut transcriber = DaemonTranscriber {
         store: &*store,
@@ -1505,6 +1534,7 @@ fn fold_snippet_into_take(
         stream,
         store: &*store,
         config,
+        wants_reconcile,
     };
     take.fold_snippet(&mut transcriber, &mut observer, snippet)
 }
@@ -1521,6 +1551,7 @@ fn finalize_streamed_take(
     ctx: Ctx<'_>,
     active_session: &mut Option<ActiveSession>,
     state: LiveStreamState,
+    wants_reconcile: bool,
 ) -> Result<(), RunLoopError> {
     let Ctx {
         store,
@@ -1539,9 +1570,9 @@ fn finalize_streamed_take(
     let FinalizedTake {
         final_text,
         merged_samples,
-        // The streamed take's correction window now covers the FULL reconciled
-        // text (not just the last snippet), so the per-snippet tail is unused.
-        last_snippet_text: _,
+        // Only used in the non-reconcile fallback, where the engine's correction
+        // window opens over the take's final snippet (the pre-reconcile contract).
+        last_snippet_text,
         fallback_reason,
     } = match outcome {
         TakeOutcome::Silent => return Ok(()),
@@ -1589,25 +1620,34 @@ fn finalize_streamed_take(
             .commit_session(session_id, &final_text, &key)
             .map_err(|error| RunLoopError::storage("commit streamed take", error))?;
         // Direct mode: the daemon owns and has just committed the streamed session.
-        // Send the verified whole-take text to the engine so it REPLACES the
-        // preview it typed live (backspace + re-commit) — or, with preview typing
-        // off, types it fresh. The in-place correction window now covers the FULL
-        // text, so `tail_text` is None: a later fix amends the whole take, not just
-        // a snippet suffix (see the ReportCorrection handler's None branch).
-        send_ipc_message(
-            stream,
-            &IpcMessage::PreeditUpdate(PreeditUpdate {
-                text: final_text.clone(),
-                review: false,
-                partial: false,
-                reconcile: true,
-            }),
-        )?;
+        let tail_text = if wants_reconcile {
+            // Send the verified whole-take text so the engine REPLACES the preview
+            // it typed live (backspace + re-commit) — or, with preview typing off,
+            // types it fresh. The in-place correction window then covers the FULL
+            // text, so `tail_text` is None (a later fix amends the whole take; see
+            // the ReportCorrection handler's None branch).
+            send_ipc_message(
+                stream,
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text: final_text.clone(),
+                    review: false,
+                    partial: false,
+                    reconcile: true,
+                }),
+            )?;
+            None
+        } else {
+            // The client did not negotiate reconcile: keep the pre-reconcile
+            // behaviour — send NO stop-time final (an older engine would append it
+            // after the preview it already typed) and let its correction window
+            // open over the take's final snippet. The preview it typed stands.
+            last_snippet_text
+        };
         *active_session = Some(ActiveSession {
             session_id,
             current_text: final_text,
             finalized: true,
-            tail_text: None,
+            tail_text,
         });
     }
     Ok(())
@@ -1636,7 +1676,9 @@ fn stop_live_and_transcribe(
         live_capture,
         live_stream,
         status_tx,
+        wants_reconcile,
     } = live;
+    let wants_reconcile = *wants_reconcile;
     let Some(capture) = live_capture.take() else {
         return Ok(());
     };
@@ -1650,7 +1692,14 @@ fn stop_live_and_transcribe(
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
-                    fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+                    fold_snippet_into_take(
+                        stream,
+                        store,
+                        config,
+                        &mut state.take,
+                        snippet,
+                        wants_reconcile,
+                    )?;
                 }
                 finalize_streamed_take(
                     stream,
@@ -1662,6 +1711,7 @@ fn stop_live_and_transcribe(
                     },
                     active_session,
                     state,
+                    wants_reconcile,
                 )?;
             }
             Err(error) => {

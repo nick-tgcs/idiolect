@@ -8,8 +8,21 @@ pub const FEATURE_COMMIT: &str = "commit";
 /// right after the handshake). Older clients that do not request it see the exact
 /// same byte stream as before.
 pub const FEATURE_RECORDING_STATUS: &str = "recording_status";
+/// Opt-in: a client that advertises this receives a take-final
+/// [`PreeditUpdate`] with `reconcile: true` at the stop of a direct (review-off)
+/// streaming take, and is expected to REPLACE the live-typed preview with it
+/// (delete what it typed, commit the verified text). Clients that do not
+/// advertise it keep the pre-reconcile behaviour — they never get this message,
+/// so an older client cannot mistake it for a batch transcript and append it
+/// after the preview.
+pub const FEATURE_RECONCILE: &str = "reconcile";
 
-const SUPPORTED_FEATURES: [&str; 3] = [FEATURE_PREEDIT, FEATURE_COMMIT, FEATURE_RECORDING_STATUS];
+const SUPPORTED_FEATURES: [&str; 4] = [
+    FEATURE_PREEDIT,
+    FEATURE_COMMIT,
+    FEATURE_RECORDING_STATUS,
+    FEATURE_RECONCILE,
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {

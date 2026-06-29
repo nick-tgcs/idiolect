@@ -221,6 +221,34 @@ fn plain_dictation_streams_without_translation() {
 }
 
 #[test]
+fn a_client_without_reconcile_gets_the_pre_reconcile_behaviour() {
+    // Backward compatibility: a client (e.g. an older engine) that did NOT
+    // negotiate the reconcile capability must keep the pre-reconcile contract —
+    // live partials are typed, and at stop NO take-final PreeditUpdate is sent
+    // (an older engine would treat it as a batch transcript and APPEND it after
+    // the preview). The take still finalizes as one committed session daemon-side.
+    let fixture = DaemonFixture::new("noreconcile");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_without_reconcile();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_partial_preedit(SNIPPET);
+    client.expect_partial_preedit(&format!(" {SNIPPET}"));
+
+    // Stop: the very next push is recording=false — NO reconcile final in between.
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(SNIPPET);
+}
+
+#[test]
 fn preview_typing_off_suppresses_live_partials_and_only_reconciles_at_stop() {
     // With "Preview typing" OFF nothing is typed while the user speaks: no PARTIAL
     // ever reaches the client. The verified whole-recording text arrives only at
@@ -669,14 +697,20 @@ impl DaemonClient {
     }
 
     fn send_hello_with_status(&mut self) {
+        self.send_hello(&["preedit", "commit", "recording_status", "reconcile"]);
+    }
+
+    /// A client that predates the reconcile capability: it advertises everything
+    /// EXCEPT `reconcile`, so the daemon must keep the pre-reconcile behaviour.
+    fn send_hello_without_reconcile(&mut self) {
+        self.send_hello(&["preedit", "commit", "recording_status"]);
+    }
+
+    fn send_hello(&mut self, features: &[&str]) {
         self.send(IpcMessage::ClientHello(ClientHello {
             client_name: "idiolect-translation-streaming-test".to_owned(),
             protocol_version: 1,
-            features: vec![
-                "preedit".to_owned(),
-                "commit".to_owned(),
-                "recording_status".to_owned(),
-            ],
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
         }));
         match self.read() {
             IpcMessage::ServerHello(server) => assert_eq!(server.protocol_version, 1),

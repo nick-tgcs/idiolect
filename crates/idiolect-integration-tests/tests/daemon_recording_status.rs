@@ -311,6 +311,8 @@ impl DaemonClient {
             "preedit".to_owned(),
             "commit".to_owned(),
             "recording_status".to_owned(),
+            // Opt into the stop-time reconcile final (this client expects it).
+            "reconcile".to_owned(),
         ]);
     }
 

@@ -69,6 +69,17 @@ fn preedit_without_partial_field_defaults_to_final() {
 }
 
 #[test]
+fn reconcile_is_an_advertised_capability() {
+    // The stop-time reconcile must be NEGOTIATED: a client that does not advertise
+    // it keeps the pre-reconcile behaviour (the daemon never sends a reconcile
+    // final it would mis-handle as an appended batch transcript).
+    assert!(
+        idiolect_ipc::messages::supported_features().contains(&"reconcile"),
+        "reconcile must be a supported feature so clients can negotiate it"
+    );
+}
+
+#[test]
 fn json_lines_round_trip_message_category() {
     let message = IpcMessage::ClientHello(ClientHello {
         client_name: "idiolect-fcitx5".to_owned(),
