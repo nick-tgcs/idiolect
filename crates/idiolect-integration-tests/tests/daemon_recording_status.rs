@@ -61,7 +61,8 @@ fn live_toggle_pushes_recording_true_then_false_around_the_take() {
     // Same intent again: the daemon decides this is a stop → transcribe, then
     // announces the mic is closed.
     client.send(IpcMessage::ToggleRecording);
-    client.expect_preedit("restart traffic");
+    client.expect_preedit("restart traffic"); // the live preview snippet
+    client.expect_preedit("restart traffic"); // the stop-time reconcile (verified text)
     client.expect_recording_status(false);
 
     // Committing the transcript is a text event, not a recording transition: no
@@ -110,7 +111,8 @@ fn commit_and_correction_push_no_duplicate_status() {
     client.send(IpcMessage::ToggleRecording);
     client.expect_recording_status(true);
     client.send(IpcMessage::ToggleRecording);
-    client.expect_preedit("restart traffic");
+    client.expect_preedit("restart traffic"); // the live preview snippet
+    client.expect_preedit("restart traffic"); // the stop-time reconcile (verified text)
     client.expect_recording_status(false);
 
     client.send(IpcMessage::CommitPreedit(CommitPreedit {
@@ -309,6 +311,8 @@ impl DaemonClient {
             "preedit".to_owned(),
             "commit".to_owned(),
             "recording_status".to_owned(),
+            // Opt into the stop-time reconcile final (this client expects it).
+            "reconcile".to_owned(),
         ]);
     }
 

@@ -52,7 +52,15 @@ impl PendingSurface {
 }
 
 enum SurfaceOp {
-    Commit { text: String },
+    Commit {
+        text: String,
+    },
+    /// Delete the last `count` characters by synthesising that many backspace key
+    /// events (emitted as IBus `ForwardKeyEvent`s) — used to remove a live-typed
+    /// preview before re-committing the verified text.
+    Delete {
+        count: usize,
+    },
 }
 
 impl Surface for PendingSurface {
@@ -60,6 +68,10 @@ impl Surface for PendingSurface {
         self.ops.push(SurfaceOp::Commit {
             text: text.to_owned(),
         });
+    }
+
+    fn delete(&mut self, count: usize) {
+        self.ops.push(SurfaceOp::Delete { count });
     }
 }
 
@@ -223,23 +235,57 @@ fn ibus_text_str(value: &Value<'_>) -> String {
 }
 
 async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
-    for SurfaceOp::Commit { text } in ops {
-        dbg_edit(&format!(
-            "emit CommitText -> {} : {:?}",
-            engine_path.as_str(),
-            text
-        ));
+    for op in ops {
+        match op {
+            SurfaceOp::Commit { text } => {
+                dbg_edit(&format!(
+                    "emit CommitText -> {} : {:?}",
+                    engine_path.as_str(),
+                    text
+                ));
+                let result = conn
+                    .emit_signal(
+                        None::<&str>,
+                        engine_path,
+                        ENGINE_IFACE,
+                        "CommitText",
+                        &(ibus_text(&text),),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+                }
+            }
+            SurfaceOp::Delete { count } => {
+                dbg_edit(&format!(
+                    "emit {count}x ForwardKeyEvent(BackSpace) -> {}",
+                    engine_path.as_str()
+                ));
+                for _ in 0..count {
+                    emit_backspace(conn, engine_path).await;
+                }
+            }
+        }
+    }
+}
+
+/// Synthesise one Backspace into the focused app via the IBus `ForwardKeyEvent`
+/// signal (signature `(keyval, keycode, state)`): a press followed by a release.
+/// We are a keyboard, so a forwarded Backspace deletes the previous character in
+/// any application — no surrounding-text capability negotiation required.
+async fn emit_backspace(conn: &Connection, engine_path: &OwnedObjectPath) {
+    for state in [0u32, RELEASE_MASK] {
         let result = conn
             .emit_signal(
                 None::<&str>,
                 engine_path,
                 ENGINE_IFACE,
-                "CommitText",
-                &(ibus_text(&text),),
+                "ForwardKeyEvent",
+                &(KEY_BACKSPACE, 0u32, state),
             )
             .await;
         if let Err(error) = result {
-            eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+            eprintln!("idiolect-ibus: failed to emit ForwardKeyEvent: {error}");
         }
     }
 }
@@ -440,8 +486,8 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
         let ops = match reader.read_message() {
             Ok(IpcMessage::PreeditUpdate(update)) => {
                 dbg_edit(&format!(
-                    "transcript <- daemon: {:?} (review={} partial={})",
-                    update.text, update.review, update.partial
+                    "transcript <- daemon: {:?} (review={} partial={} reconcile={})",
+                    update.text, update.review, update.partial, update.reconcile
                 ));
                 if update.partial && update.review {
                     // A display-only snippet of a review-mode take: stream it
@@ -498,7 +544,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                         .lock()
                         .expect("dictation_target mutex");
                     restore_dictation_focus(shared.focus.as_ref(), target);
-                    shared.run_session(|s| s.on_transcript(update.text))
+                    if update.reconcile {
+                        // Stop of a direct STREAMING take: replace the live-typed
+                        // preview with the verified full-take text (backspace the
+                        // divergent suffix, re-commit). The daemon already owns and
+                        // committed the streamed session, so the engine does not
+                        // commit again — this is a display reconcile only.
+                        shared.run_session(|s| s.on_reconcile(update.text))
+                    } else {
+                        shared.run_session(|s| s.on_transcript(update.text))
+                    }
                 } else {
                     // Direct take but NO focused context: typing would lose the
                     // text into nowhere AND the daemon would bank a never-landed
@@ -787,7 +842,22 @@ mod tests {
     use crate::ipc::DaemonSender;
     use crate::review::ReviewDialog;
 
-    use super::{handle_edit_history, restore_dictation_focus};
+    use super::{handle_edit_history, restore_dictation_focus, PendingSurface, Surface, SurfaceOp};
+
+    #[test]
+    fn pending_surface_records_delete_then_commit_in_order() {
+        // The reconcile path drives the surface as delete(N) then commit(suffix);
+        // the buffered ops must preserve that order so the async layer emits the
+        // backspaces before re-committing the verified text.
+        let mut surface = PendingSurface::default();
+        surface.delete(7);
+        surface.commit_text("lo world");
+        let ops = surface.take_ops();
+        assert!(
+            matches!(ops.as_slice(), [SurfaceOp::Delete { count: 7 }, SurfaceOp::Commit { text }] if text == "lo world"),
+            "expected Delete{{7}} then Commit, got a different op sequence"
+        );
+    }
 
     /// Records the windows focus was re-asserted on, so we can assert the direct
     /// commit hands focus back to where the user was dictating.

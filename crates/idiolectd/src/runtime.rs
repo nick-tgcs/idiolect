@@ -506,6 +506,7 @@ fn handle_fixture_connection(
                         text: transcript.to_owned(),
                         review: false,
                         partial: false,
+                        reconcile: false,
                     }),
                 )?;
             }

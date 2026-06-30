@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    FEATURE_COMMIT, FEATURE_PREEDIT, FEATURE_RECORDING_STATUS, PROTOCOL_VERSION,
+    FEATURE_COMMIT, FEATURE_PREEDIT, FEATURE_RECONCILE, FEATURE_RECORDING_STATUS, PROTOCOL_VERSION,
 };
 use idiolect_ipc::{ClientHello, CommitPreedit, IpcMessage, ReportCorrection};
 
@@ -67,6 +67,9 @@ fn client_hello() -> IpcMessage {
             FEATURE_COMMIT.to_owned(),
             // The daemon is authoritative for recording state; ask for its pushes.
             FEATURE_RECORDING_STATUS.to_owned(),
+            // This engine replaces its live preview with the verified text at stop,
+            // so opt into the daemon's stop-time reconcile final.
+            FEATURE_RECONCILE.to_owned(),
         ],
     })
 }
