@@ -36,6 +36,10 @@ class InputConnectionFieldEditor(
         post { connection.deleteSurroundingText(1, 0) }
     }
 
+    override fun performEditorAction(actionId: Int) {
+        post { connection.performEditorAction(actionId) }
+    }
+
     // Tap-driven (already on the main thread) and synchronous: applied directly, not
     // posted — `setSelection` must take effect before the mode swap, and `fieldText`
     // must return a value.

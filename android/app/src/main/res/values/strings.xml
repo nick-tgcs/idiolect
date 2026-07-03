@@ -43,6 +43,10 @@
     <string name="voice_strip_keyboard">Switch to your keyboard</string>
     <string name="voice_strip_review">Review before insert</string>
     <string name="voice_strip_settings">Settings</string>
+    <!-- ⌫ deletes the character before the cursor; ⏎ performs the field's action
+         (Send/Search/Go/Done) or inserts a newline — the common keys after a take. -->
+    <string name="voice_strip_backspace">Backspace</string>
+    <string name="voice_strip_enter">Enter</string>
 
     <!-- Settings screen (reached via the ⚙ on the mic strip). -->
     <string name="settings_title">Settings</string>

@@ -82,6 +82,8 @@ class VoiceKeyboardE2eTest {
         assertNotNull("mic missing", device.findObject(By.descContains(MIC_DESC)))
         assertNotNull("switch-to-keyboard button missing", device.findObject(By.desc(SWITCH_DESC)))
         assertNotNull("review button missing", device.findObject(By.desc("Review before insert")))
+        assertNotNull("backspace key missing", device.findObject(By.desc(BACKSPACE_DESC)))
+        assertNotNull("enter key missing", device.findObject(By.desc(ENTER_DESC)))
         assertNotNull("idle hint missing", device.findObject(By.textContains("Hold to talk")))
     }
 
@@ -131,6 +133,8 @@ class VoiceKeyboardE2eTest {
         private const val IME_ID = "$PKG/.ime.IdiolectImeService"
         private const val MIC_DESC = "Dictation microphone"
         private const val SWITCH_DESC = "Switch to your keyboard"
+        private const val BACKSPACE_DESC = "Backspace"
+        private const val ENTER_DESC = "Enter"
         private const val TIMEOUT = 12_000L
     }
 }

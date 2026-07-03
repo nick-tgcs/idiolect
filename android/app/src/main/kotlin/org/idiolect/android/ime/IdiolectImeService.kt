@@ -58,6 +58,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     private lateinit var mic: MicToggle
     private lateinit var controller: DictationController
     private lateinit var correction: CorrectionCapture
+    // The always-available editing keys (⌫ backspace, ⏎ enter) on the control strip.
+    private val keyActions = KeyActions(::fieldEditor)
     private val presenter = VoiceModePresenter()
     private val main = Handler(Looper.getMainLooper())
     // Mic taps run here, off the UI thread: the finalize toggle re-transcribes the whole
@@ -291,13 +293,19 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         }
     }
 
-    /** The rounded control-strip pill: ⌨ switch-to-your-keyboard · 👁 review-before-insert · ⚙ settings. */
+    /** The rounded control-strip pill: ⌫ backspace · ⌨ switch-to-your-keyboard · 👁 review-before-insert · ⚙ settings · ⏎ enter. */
     private fun buildControlStrip(): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundResource(R.drawable.strip_pill)
         }
+        // ⌫ and ⏎ bookend the strip: the common edits reached for right after a take —
+        // fix the tail, or send/newline — always available whether or not a take is live.
+        row.addView(
+            stripButton(R.drawable.ic_backspace, R.string.voice_strip_backspace, lit = false) { onBackspaceKey() },
+            stripLp(),
+        )
         row.addView(
             stripButton(R.drawable.ic_keyboard, R.string.voice_strip_keyboard, lit = false) { switchToYourKeyboard() },
             stripLp(),
@@ -311,6 +319,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         row.addView(review, stripLp())
         row.addView(
             stripButton(R.drawable.ic_settings, R.string.voice_strip_settings, lit = false) { openSettings() },
+            stripLp(),
+        )
+        row.addView(
+            stripButton(R.drawable.ic_enter, R.string.voice_strip_enter, lit = false) { onEnterKey() },
             stripLp(),
         )
         return row
@@ -353,6 +365,13 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     /** Open the settings screen (⚙ on the strip): pairing, dictation modes, model, storage. */
     private fun openSettings() = SettingsActivity.launch(this)
+
+    /** ⌫ key: delete the character before the cursor in the focused field. */
+    private fun onBackspaceKey() = keyActions.backspace()
+
+    /** ⏎ key: perform the field's editor action (Send/Search/Go/Done) or, when it declares
+     * none, insert a newline — the same behaviour as the system Enter key for that field. */
+    private fun onEnterKey() = keyActions.enter(currentInputEditorInfo?.imeOptions ?: 0)
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 

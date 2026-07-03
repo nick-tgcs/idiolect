@@ -19,6 +19,13 @@ interface FieldEditor {
     /** Delete the character before the cursor (`InputConnection.deleteSurroundingText`). */
     fun deleteBackward()
 
+    /**
+     * Run the field's editor action — Send/Search/Go/Done, etc.
+     * (`InputConnection.performEditorAction`). The Enter key uses this when the field
+     * declares an action; a plain newline goes through [commitText] instead.
+     */
+    fun performEditorAction(actionId: Int)
+
     /** Select a char range in the field (`InputConnection.setSelection`) — for tap-to-fix. */
     fun setSelection(start: Int, end: Int)
 
