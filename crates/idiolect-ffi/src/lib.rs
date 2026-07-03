@@ -210,6 +210,27 @@ impl StreamObserver for CallbackObserver<'_> {
         self.callback.dictation_error(message.to_owned());
         Ok(())
     }
+
+    fn finalize_progress(&mut self, full_text: &str) -> Result<(), Infallible> {
+        // The stop-time re-decode advanced by one ≤30 s chunk: replace the whole
+        // composing region with the take as it now stands (decoded chunks +
+        // still-preview tail), so a long take firms up in place instead of one big
+        // swap. `setComposingText` replaces the region, so pushing the full text is
+        // exactly right. Track it as the take's preedit so the eventual commit lines up.
+        if *self.started && self.preedit == full_text {
+            // A chunk that re-decoded to exactly its preview: nothing to redraw.
+            return Ok(());
+        }
+        self.preedit.clear();
+        self.preedit.push_str(full_text);
+        if *self.started {
+            self.callback.update_preedit(full_text.to_owned());
+        } else {
+            self.callback.show_preedit(full_text.to_owned());
+            *self.started = true;
+        }
+        Ok(())
+    }
 }
 
 /// One row of dictation history, as the Kotlin history screen renders it.
@@ -726,12 +747,25 @@ impl Inner {
             if self.continuous {
                 let outcome = {
                     let Inner {
-                        take, transcriber, ..
+                        take,
+                        transcriber,
+                        callback,
+                        preedit,
+                        preedit_started,
+                        ..
                     } = self;
                     let Some(take) = take.as_mut() else {
                         return Err(FfiError::NoActiveTake);
                     };
-                    take.finalize_phrase(transcriber)
+                    let mut observer = CallbackObserver {
+                        callback: callback.as_ref(),
+                        preedit,
+                        started: preedit_started,
+                    };
+                    match take.finalize_phrase(transcriber, &mut observer) {
+                        Ok(outcome) => outcome,
+                        Err(infallible) => match infallible {},
+                    }
                 };
                 self.commit_phrase(outcome)?;
             }
@@ -802,7 +836,27 @@ impl Inner {
                 Err(infallible) => match infallible {},
             }
         }
-        let outcome = take.finalize(&mut self.transcriber);
+        // Re-decode the take chunk by chunk (the authoritative pass), firming up the
+        // preedit in place as each ≤30 s chunk lands; a long take no longer collapses
+        // to a truncated whole-recording decode.
+        let outcome = {
+            let Inner {
+                transcriber,
+                callback,
+                preedit,
+                preedit_started,
+                ..
+            } = self;
+            let mut observer = CallbackObserver {
+                callback: callback.as_ref(),
+                preedit,
+                started: preedit_started,
+            };
+            match take.finalize(transcriber, &mut observer) {
+                Ok(outcome) => outcome,
+                Err(infallible) => match infallible {},
+            }
+        };
         let result = self.finalize_outcome(outcome);
         self.recording = false;
         self.continuous = false;

@@ -1483,7 +1483,12 @@ fn finalize_streamed_take(
             store: &*store,
             config,
         };
-        state.take.finalize(&mut transcriber)
+        let mut observer = DaemonObserver {
+            stream,
+            store: &*store,
+            config,
+        };
+        state.take.finalize(&mut transcriber, &mut observer)?
     };
     let FinalizedTake {
         final_text,

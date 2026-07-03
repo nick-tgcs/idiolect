@@ -101,6 +101,14 @@ const STREAM_FRAME_MS: u32 = 30;
 const STREAM_FRAME_SAMPLES: usize =
     (STREAM_SAMPLE_RATE_HZ as usize * STREAM_FRAME_MS as usize) / 1_000;
 
+/// The window the authoritative stop-time decode is chunked into. Whisper's
+/// acoustic context is a fixed 30 s window; handing it one long, silence-stripped
+/// block collapses the decode (a 50 s take decoded to 4 words in testing), so the
+/// finalize re-decode runs one ≤30 s chunk at a time and the chunks are stitched
+/// back together. Aligned to snippet (pause) boundaries where possible so a chunk
+/// edge never falls mid-word.
+const FINAL_CHUNK_SAMPLES: usize = STREAM_SAMPLE_RATE_HZ as usize * 30;
+
 /// The tunable timing rules for a streaming take (the `[vad]` config knobs). The
 /// frame geometry is fixed (see the module consts); only these vary by user
 /// preference and tray override.
@@ -162,6 +170,27 @@ pub trait StreamObserver {
 
     /// A snippet failed to decode — surfaced at most once per take per `code`.
     fn transcribe_failed(&mut self, code: &str, message: &str) -> Result<(), Self::Error>;
+
+    /// The authoritative stop-time decode advanced by one ≤30 s chunk. `full_text`
+    /// is the WHOLE take as it now stands: the chunks decoded so far replaced by
+    /// their authoritative text, followed by the still-preview text of the chunks
+    /// not yet re-decoded. The edge replaces the live preedit with this each time
+    /// so a long take firms up in place, chunk by chunk, instead of one big swap
+    /// (or a truncated one). Default no-op: an edge that only needs the single
+    /// final text can ignore the intermediate steps.
+    fn finalize_progress(&mut self, full_text: &str) -> Result<(), Self::Error> {
+        let _ = full_text;
+        Ok(())
+    }
+}
+
+/// One folded snippet held for the stop-time decode: its 16 kHz mono audio and
+/// the trimmed preview text it contributed (empty when the snippet decoded to
+/// nothing or noise — its audio is still kept so a chunk re-decode can recover
+/// words the short-context preview missed).
+struct TakeSnippet {
+    samples: Vec<f32>,
+    preview: String,
 }
 
 /// One live dictation take: the pause-triggered pipeline's accumulating state.
@@ -174,8 +203,12 @@ pub trait StreamObserver {
 pub struct StreamingTake {
     frames: FrameBuffer,
     segmenter: UtteranceSegmenter,
-    /// Every snippet's audio, concatenated: the take's single stored recording.
-    merged_samples: Vec<f32>,
+    /// Every folded snippet, in order: its audio plus the preview text it
+    /// contributed (empty for a noise/dropped snippet whose audio is still kept).
+    /// The take's stored recording is these snippets' audio concatenated; the
+    /// stop-time decode groups them into ≤30 s chunks so each authoritative
+    /// re-decode stays inside Whisper's window (the *cut-off-on-long-takes* fix).
+    snippets: Vec<TakeSnippet>,
     /// Every snippet's decoded text, space-joined: the take's previewed string.
     merged_text: String,
     /// The most recent snippet's text (no joining space) — the suffix a post-take
@@ -206,7 +239,7 @@ impl StreamingTake {
                 post_roll_ms: config.post_roll_ms,
                 max_utterance_ms: config.max_utterance_ms,
             }),
-            merged_samples: Vec::new(),
+            snippets: Vec::new(),
             merged_text: String::new(),
             last_snippet_text: None,
             spoke: false,
@@ -287,37 +320,66 @@ impl StreamingTake {
                 return Ok(());
             }
         };
-        // The audio folds in even when the decode is dropped below.
-        self.merged_samples.extend_from_slice(&snippet);
+        // The snippet's audio is recorded even when its decode is dropped below, so
+        // the stop-time chunk re-decode can still recover words the short-context
+        // preview missed. `merged_text` stays the glued preview string; the snippet's
+        // own trimmed word content rides along for the per-chunk preview fallback.
         let Some(chunk) = snippet_chunk(&self.merged_text, &text) else {
+            self.snippets.push(TakeSnippet {
+                samples: snippet,
+                preview: String::new(),
+            });
             return observer.snippet_dropped(&text);
         };
         self.merged_text.push_str(&chunk);
-        self.last_snippet_text = Some(text.trim().to_owned());
+        let trimmed = text.trim().to_owned();
+        self.last_snippet_text = Some(trimmed.clone());
+        self.snippets.push(TakeSnippet {
+            samples: snippet,
+            preview: trimmed,
+        });
         observer.snippet_committed(&chunk)
     }
 
-    /// Closes the take: decodes the WHOLE merged recording once — the
-    /// authoritative text — falling back to the glued snippet previews when that
-    /// decode fails or hears nothing. An empty take (no audio), or one that
-    /// decodes to nothing, is [`TakeOutcome::Silent`].
-    #[must_use]
-    pub fn finalize<T: TakeTranscriber>(mut self, transcriber: &mut T) -> TakeOutcome {
+    /// Closes the take: re-decodes the recording with the proper model — the
+    /// authoritative text — one ≤30 s chunk at a time, replacing each chunk's
+    /// preview and pushing the whole-take-so-far via
+    /// [`StreamObserver::finalize_progress`] as it goes. A chunk whose decode fails
+    /// or hears only noise keeps that chunk's preview text (never lose words the
+    /// user already saw typed). An empty take, or one that decodes to nothing, is
+    /// [`TakeOutcome::Silent`].
+    pub fn finalize<T, O>(
+        mut self,
+        transcriber: &mut T,
+        observer: &mut O,
+    ) -> Result<TakeOutcome, O::Error>
+    where
+        T: TakeTranscriber,
+        O: StreamObserver,
+    {
         // Ending the take is finalizing its one (and only) phrase.
-        self.finalize_phrase(transcriber)
+        self.finalize_phrase(transcriber, observer)
     }
 
     /// Closes the CURRENT phrase and re-opens the take for the next one: the same
-    /// authoritative whole-phrase decode as [`Self::finalize`] (whole-recording decode,
-    /// fallback to glued previews, [`TakeOutcome::Silent`] when empty/noise), but the
-    /// accumulators and per-phrase error de-dupe reset IN PLACE so dictation continues.
-    /// Continuous mode calls this at each pause; one-shot dictation calls [`Self::finalize`]
-    /// once at stop. The segmenter and frame buffer are left intact (a pause has already
-    /// returned the segmenter to idle), so the next phrase picks up cleanly.
-    #[must_use]
-    pub fn finalize_phrase<T: TakeTranscriber>(&mut self, transcriber: &mut T) -> TakeOutcome {
-        let merged_samples = core::mem::take(&mut self.merged_samples);
-        let previewed = core::mem::take(&mut self.merged_text);
+    /// authoritative chunked re-decode as [`Self::finalize`] (per ≤30 s chunk,
+    /// fallback to that chunk's preview, progressive [`StreamObserver::finalize_progress`],
+    /// [`TakeOutcome::Silent`] when empty/noise), but the accumulators and per-phrase
+    /// error de-dupe reset IN PLACE so dictation continues. Continuous mode calls this
+    /// at each pause; one-shot dictation calls [`Self::finalize`] once at stop. The
+    /// segmenter and frame buffer are left intact (a pause has already returned the
+    /// segmenter to idle), so the next phrase picks up cleanly.
+    pub fn finalize_phrase<T, O>(
+        &mut self,
+        transcriber: &mut T,
+        observer: &mut O,
+    ) -> Result<TakeOutcome, O::Error>
+    where
+        T: TakeTranscriber,
+        O: StreamObserver,
+    {
+        let snippets = core::mem::take(&mut self.snippets);
+        let _ = core::mem::take(&mut self.merged_text);
         let last_snippet_text = self.last_snippet_text.take();
         // Re-arm per-phrase state: each phrase is independent (own error budget, own
         // auto-stop clock) so one phrase's glitch can't mute or auto-stop the next.
@@ -325,22 +387,47 @@ impl StreamingTake {
         self.spoke = false;
         self.silence_frames_since_speech = 0;
 
-        if merged_samples.is_empty() {
-            return TakeOutcome::Silent;
+        if snippets.is_empty() {
+            return Ok(TakeOutcome::Silent);
         }
-        let (final_text, fallback_reason) = match transcriber.transcribe(&merged_samples) {
-            Ok(text) => (choose_final_take_text(text, previewed), None),
-            Err(failure) => (previewed, Some(failure.message)),
-        };
+
+        // The stored recording is every snippet's audio, concatenated in order.
+        let merged_samples: Vec<f32> = snippets
+            .iter()
+            .flat_map(|snippet| snippet.samples.iter().copied())
+            .collect();
+
+        // Group consecutive snippets into ≤30 s chunks and re-decode each, so a long
+        // take never hands Whisper one over-window block (which collapses the decode).
+        let chunks = chunk_snippets(&snippets);
+        let mut final_parts: Vec<String> = Vec::with_capacity(chunks.len());
+        let mut fallback_reason: Option<String> = None;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_text = match transcriber.transcribe(&chunk.samples) {
+                Ok(text) => choose_final_take_text(text, chunk.preview.clone()),
+                Err(failure) => {
+                    fallback_reason.get_or_insert(failure.message);
+                    chunk.preview.clone()
+                }
+            };
+            final_parts.push(chunk_text);
+            // The whole take as it now stands: chunks decoded so far, then the
+            // still-preview text of the chunks not yet re-decoded.
+            let mut whole = final_parts.clone();
+            whole.extend(chunks[index + 1..].iter().map(|tail| tail.preview.clone()));
+            observer.finalize_progress(&normalize_take_text(&whole.join(" ")))?;
+        }
+
+        let final_text = normalize_take_text(&final_parts.join(" "));
         if final_text.trim().is_empty() {
-            return TakeOutcome::Silent;
+            return Ok(TakeOutcome::Silent);
         }
-        TakeOutcome::Speech(FinalizedTake {
+        Ok(TakeOutcome::Speech(FinalizedTake {
             final_text,
             merged_samples,
             last_snippet_text,
             fallback_reason,
-        })
+        }))
     }
 
     /// True exactly once per take for a given error code: the first failed
@@ -352,6 +439,74 @@ impl StreamingTake {
         self.notified_error = Some(code.to_owned());
         true
     }
+}
+
+/// One ≤30 s re-decode unit: consecutive snippets' audio plus their glued preview
+/// text, used as the per-chunk fallback when the chunk's decode fails or is noise.
+struct FinalChunk {
+    samples: Vec<f32>,
+    preview: String,
+}
+
+/// Groups snippets into chunks of at most [`FINAL_CHUNK_SAMPLES`] (30 s), on
+/// snippet (pause) boundaries so a chunk edge never lands mid-word. A lone snippet
+/// longer than the window (only possible when `max_utterance_ms` is configured
+/// above 30 s) is hard-split into ≤30 s pieces, its preview riding the first piece.
+fn chunk_snippets(snippets: &[TakeSnippet]) -> Vec<FinalChunk> {
+    let mut chunks: Vec<FinalChunk> = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
+    let mut previews: Vec<String> = Vec::new();
+
+    let seal = |samples: &mut Vec<f32>, previews: &mut Vec<String>, chunks: &mut Vec<FinalChunk>| {
+        if !samples.is_empty() {
+            chunks.push(FinalChunk {
+                samples: core::mem::take(samples),
+                preview: glue_previews(&core::mem::take(previews)),
+            });
+        }
+    };
+
+    for snippet in snippets {
+        if snippet.samples.len() > FINAL_CHUNK_SAMPLES {
+            // Over-window snippet: seal what's pending, then hard-split it.
+            seal(&mut samples, &mut previews, &mut chunks);
+            for (piece_index, piece) in snippet.samples.chunks(FINAL_CHUNK_SAMPLES).enumerate() {
+                chunks.push(FinalChunk {
+                    samples: piece.to_vec(),
+                    preview: if piece_index == 0 {
+                        snippet.preview.clone()
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+            continue;
+        }
+        if !samples.is_empty() && samples.len() + snippet.samples.len() > FINAL_CHUNK_SAMPLES {
+            seal(&mut samples, &mut previews, &mut chunks);
+        }
+        samples.extend_from_slice(&snippet.samples);
+        previews.push(snippet.preview.clone());
+    }
+    seal(&mut samples, &mut previews, &mut chunks);
+    chunks
+}
+
+/// Joins the non-empty snippet previews of one chunk with single spaces (dropped
+/// snippets contribute no words but their audio is still in the chunk).
+fn glue_previews(previews: &[String]) -> String {
+    previews
+        .iter()
+        .filter(|preview| !preview.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collapses runs of whitespace to single spaces and trims — the same
+/// normalisation the whole-recording decode used, applied to the stitched chunks.
+fn normalize_take_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The result of [`StreamingTake::finalize`].
@@ -477,8 +632,42 @@ mod take_tests {
 
     use super::{
         StreamObserver, StreamingConfig, StreamingTake, TakeOutcome, TakeTranscriber,
-        TranscribeFailure, STREAM_FRAME_SAMPLES,
+        TranscribeFailure, FINAL_CHUNK_SAMPLES, STREAM_FRAME_SAMPLES,
     };
+
+    /// A decode port that mimics Whisper's long-audio collapse: any buffer longer
+    /// than one 30 s window returns a single truncated word (the real bug — a 50 s
+    /// take decoded to 4 words), while a within-window buffer returns the next
+    /// scripted result. Proves the finalize re-decode never hands the engine an
+    /// over-window block, so the collapse can't reach the committed text.
+    struct WindowAwareTranscriber {
+        within_window: VecDeque<Result<String, TranscribeFailure>>,
+    }
+
+    impl WindowAwareTranscriber {
+        fn new(within_window: impl IntoIterator<Item = Result<String, TranscribeFailure>>) -> Self {
+            Self {
+                within_window: within_window.into_iter().collect(),
+            }
+        }
+    }
+
+    impl TakeTranscriber for WindowAwareTranscriber {
+        fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+            if samples_f32_mono.len() > FINAL_CHUNK_SAMPLES {
+                return Ok("collapsed".to_owned());
+            }
+            self.within_window
+                .pop_front()
+                .expect("transcriber called more times than scripted")
+        }
+    }
+
+    /// One snippet's worth of speech audio, `secs` long (non-zero so it is never
+    /// mistaken for silence). Fed straight to `fold_snippet`, bypassing the segmenter.
+    fn speech_snippet(secs: usize) -> Vec<f32> {
+        vec![0.4; super::STREAM_SAMPLE_RATE_HZ as usize * secs]
+    }
 
     /// A decode port that returns scripted results in call order.
     struct ScriptedTranscriber {
@@ -507,6 +696,8 @@ mod take_tests {
         committed: Vec<String>,
         dropped: Vec<String>,
         failures: Vec<(String, String)>,
+        /// The whole-take text pushed after each finalize chunk, in order.
+        progress: Vec<String>,
     }
 
     impl StreamObserver for RecordingObserver {
@@ -522,6 +713,10 @@ mod take_tests {
         }
         fn transcribe_failed(&mut self, code: &str, message: &str) -> Result<(), Infallible> {
             self.failures.push((code.to_owned(), message.to_owned()));
+            Ok(())
+        }
+        fn finalize_progress(&mut self, full_text: &str) -> Result<(), Infallible> {
+            self.progress.push(full_text.to_owned());
             Ok(())
         }
     }
@@ -604,7 +799,12 @@ mod take_tests {
         assert_eq!(observer.dropped, ["[BLANK_AUDIO]"]);
         // Both snippets' audio is in the merged recording (the dropped one too):
         // a stop-time decode of the whole take can still recover its words.
-        let outcome = take.finalize(&mut ScriptedTranscriber::new([ok("restart traffic")]));
+        let outcome = take
+            .finalize(
+                &mut ScriptedTranscriber::new([ok("restart traffic")]),
+                &mut observer,
+            )
+            .expect("finalize");
         match outcome {
             TakeOutcome::Speech(finalized) => {
                 assert_eq!(finalized.merged_samples.len(), 2 * STREAM_FRAME_SAMPLES);
@@ -646,7 +846,8 @@ mod take_tests {
         assert!(observer.committed.is_empty());
         // No snippet decoded, so nothing was folded: the take is silent.
         assert_eq!(
-            take.finalize(&mut ScriptedTranscriber::new([])),
+            take.finalize(&mut ScriptedTranscriber::new([]), &mut observer)
+                .expect("finalize"),
             TakeOutcome::Silent
         );
     }
@@ -695,7 +896,12 @@ mod take_tests {
         )
         .expect("fold");
 
-        let outcome = take.finalize(&mut ScriptedTranscriber::new([ok("I don't want to leave")]));
+        let outcome = take
+            .finalize(
+                &mut ScriptedTranscriber::new([ok("I don't want to leave")]),
+                &mut observer,
+            )
+            .expect("finalize");
         match outcome {
             TakeOutcome::Speech(finalized) => {
                 assert_eq!(finalized.final_text, "I don't want to leave");
@@ -723,7 +929,12 @@ mod take_tests {
         )
         .expect("fold");
 
-        let outcome = take.finalize(&mut ScriptedTranscriber::new([Err(failure("stop-decode"))]));
+        let outcome = take
+            .finalize(
+                &mut ScriptedTranscriber::new([Err(failure("stop-decode"))]),
+                &mut observer,
+            )
+            .expect("finalize");
         match outcome {
             TakeOutcome::Speech(finalized) => {
                 // The glued previews — never lose what the user already saw typed.
@@ -752,7 +963,7 @@ mod take_tests {
 
         let mut finalize: Box<dyn TakeTranscriber + Send> =
             Box::new(ScriptedTranscriber::new([ok("restart traffic")]));
-        match take.finalize(&mut finalize) {
+        match take.finalize(&mut finalize, &mut observer).expect("finalize") {
             TakeOutcome::Speech(finalized) => assert_eq!(finalized.final_text, "restart traffic"),
             TakeOutcome::Silent => panic!("expected a take"),
         }
@@ -761,8 +972,10 @@ mod take_tests {
     #[test]
     fn finalize_of_an_empty_take_is_silent() {
         let take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
         assert_eq!(
-            take.finalize(&mut ScriptedTranscriber::new([])),
+            take.finalize(&mut ScriptedTranscriber::new([]), &mut observer)
+                .expect("finalize"),
             TakeOutcome::Silent
         );
     }
@@ -785,7 +998,10 @@ mod take_tests {
         // Phrase 1: a pause-completed snippet, then the phrase boundary.
         take.fold_snippet(&mut transcriber, &mut observer, snippet())
             .expect("fold");
-        match take.finalize_phrase(&mut transcriber) {
+        match take
+            .finalize_phrase(&mut transcriber, &mut observer)
+            .expect("finalize")
+        {
             TakeOutcome::Speech(f) => assert_eq!(f.final_text, "restart traffic"),
             TakeOutcome::Silent => panic!("expected phrase 1 speech"),
         }
@@ -794,7 +1010,10 @@ mod take_tests {
         // (the accumulators reset at the boundary).
         take.fold_snippet(&mut transcriber, &mut observer, snippet())
             .expect("fold");
-        match take.finalize_phrase(&mut transcriber) {
+        match take
+            .finalize_phrase(&mut transcriber, &mut observer)
+            .expect("finalize")
+        {
             TakeOutcome::Speech(f) => assert_eq!(f.final_text, "deploy nginx"),
             TakeOutcome::Silent => panic!("expected phrase 2 speech"),
         }
@@ -806,7 +1025,12 @@ mod take_tests {
         // An empty scripted transcriber: if finalize_phrase tried to decode an empty
         // phrase it would panic ("called more times than scripted").
         let mut transcriber = ScriptedTranscriber::new([]);
-        assert_eq!(take.finalize_phrase(&mut transcriber), TakeOutcome::Silent);
+        let mut observer = RecordingObserver::default();
+        assert_eq!(
+            take.finalize_phrase(&mut transcriber, &mut observer)
+                .expect("finalize"),
+            TakeOutcome::Silent
+        );
     }
 
     #[test]
@@ -820,7 +1044,10 @@ mod take_tests {
 
         take.fold_snippet(&mut transcriber, &mut observer, snippet())
             .expect("fold");
-        let _ = take.finalize_phrase(&mut transcriber); // Silent (failed fold kept no audio)
+        // Silent (failed fold kept no audio).
+        let _ = take
+            .finalize_phrase(&mut transcriber, &mut observer)
+            .expect("finalize");
         take.fold_snippet(&mut transcriber, &mut observer, snippet())
             .expect("fold");
 
@@ -880,5 +1107,134 @@ mod take_tests {
         take.ingest(&vec![0.5; STREAM_FRAME_SAMPLES], |_| true);
         take.ingest(&vec![0.0; STREAM_FRAME_SAMPLES * 1_000], |_| false);
         assert!(!take.auto_stop_due(), "0 disables auto-stop entirely");
+    }
+
+    // --- The cut-off-on-long-takes fix: the finalize re-decode is chunked into
+    // ≤30 s windows so a long take never hands Whisper one over-window block (which
+    // collapses the decode), and the chunks firm up the preedit progressively. ---
+
+    #[test]
+    fn a_long_take_re_decodes_per_chunk_instead_of_collapsing_the_whole_recording() {
+        // Two 20 s snippets ⇒ 40 s total ⇒ two ≤30 s chunks. A whole-recording decode
+        // (>30 s) would collapse to "collapsed"; the chunked decode must keep both.
+        let mut take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
+        let mut transcriber = WindowAwareTranscriber::new([
+            ok("preview one"),  // fold snippet A (20 s ≤ window)
+            ok("preview two"),  // fold snippet B (20 s ≤ window)
+            ok("final one"),    // finalize chunk 1 (snippet A, 20 s)
+            ok("final two"),    // finalize chunk 2 (snippet B, 20 s)
+        ]);
+
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold A");
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold B");
+
+        let outcome = take
+            .finalize(&mut transcriber, &mut observer)
+            .expect("finalize");
+        match outcome {
+            TakeOutcome::Speech(finalized) => {
+                assert_eq!(
+                    finalized.final_text, "final one final two",
+                    "both chunks survive; the over-window collapse never reaches the take"
+                );
+                assert!(finalized.fallback_reason.is_none());
+                // The whole 40 s of audio is still stored for training.
+                assert_eq!(
+                    finalized.merged_samples.len(),
+                    super::STREAM_SAMPLE_RATE_HZ as usize * 40
+                );
+            }
+            TakeOutcome::Silent => panic!("expected a take"),
+        }
+    }
+
+    #[test]
+    fn finalize_replaces_the_preview_chunk_by_chunk_as_it_goes() {
+        // The preedit firms up in place: after chunk 1 the first 20 s is authoritative
+        // while the second is still its preview; after chunk 2 the whole take is final.
+        let mut take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
+        let mut transcriber = WindowAwareTranscriber::new([
+            ok("preview one"),
+            ok("preview two"),
+            ok("final one"),
+            ok("final two"),
+        ]);
+
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold A");
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold B");
+        take.finalize(&mut transcriber, &mut observer)
+            .expect("finalize");
+
+        assert_eq!(
+            observer.progress,
+            [
+                "final one preview two", // chunk 1 final + chunk 2 still preview
+                "final one final two",   // both chunks final
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chunk_whose_re_decode_is_noise_keeps_that_chunks_preview() {
+        // Per-chunk fallback: only the first-pass preview of a chunk that fails to
+        // re-decode is kept; the other chunk's authoritative text still lands.
+        let mut take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
+        let mut transcriber = WindowAwareTranscriber::new([
+            ok("preview one"),
+            ok("preview two"),
+            ok("final one"),      // chunk 1 re-decodes cleanly
+            ok("[BLANK_AUDIO]"),  // chunk 2 re-decodes to noise → keep its preview
+        ]);
+
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold A");
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(20))
+            .expect("fold B");
+
+        match take
+            .finalize(&mut transcriber, &mut observer)
+            .expect("finalize")
+        {
+            TakeOutcome::Speech(finalized) => {
+                assert_eq!(finalized.final_text, "final one preview two");
+            }
+            TakeOutcome::Silent => panic!("expected a take"),
+        }
+    }
+
+    #[test]
+    fn a_short_take_still_re_decodes_the_whole_recording_once() {
+        // A ≤30 s take is a single chunk: exactly one re-decode, and the whole-take
+        // decode still wins over the previews (the streaming-drops-words guarantee).
+        let mut take = StreamingTake::new(&config());
+        let mut observer = RecordingObserver::default();
+        let mut transcriber = WindowAwareTranscriber::new([
+            ok("I want"),              // fold snippet A
+            ok("to leave"),           // fold snippet B
+            ok("I don't want to leave"), // single finalize chunk
+        ]);
+
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(5))
+            .expect("fold A");
+        take.fold_snippet(&mut transcriber, &mut observer, speech_snippet(5))
+            .expect("fold B");
+
+        match take
+            .finalize(&mut transcriber, &mut observer)
+            .expect("finalize")
+        {
+            TakeOutcome::Speech(finalized) => {
+                assert_eq!(finalized.final_text, "I don't want to leave");
+                assert_eq!(observer.progress, ["I don't want to leave"]);
+            }
+            TakeOutcome::Silent => panic!("expected a take"),
+        }
     }
 }

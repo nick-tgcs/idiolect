@@ -21,8 +21,13 @@ use idiolect_ffi::{FfiError, IdiolectCore, IdiolectInputMethod};
 use idiolect_ports::audio::AudioSegment;
 use idiolect_sync::decode_batch;
 use idiolect_test_support::fixtures::{
-    speech_and_silence_fixture_16khz_mono, speech_pause_speech_fixture_16khz_mono,
+    restart_traffic_fixture_16khz_mono, speech_and_silence_fixture_16khz_mono,
+    speech_pause_speech_fixture_16khz_mono,
 };
+
+/// One 30 s Whisper window in 16 kHz mono samples — the cap the finalize re-decode
+/// must never exceed in a single call (a longer block collapses the decode).
+const WINDOW_SAMPLES: usize = 16_000 * 30;
 
 /// A test double for the Kotlin-side callback: records every push in order so the
 /// tests can assert the exact Rust→front-end event stream.
@@ -95,6 +100,37 @@ impl TakeTranscriber for ScriptedTranscriber {
         self.0
             .pop_front()
             .expect("scripted transcriber called more times than scripted")
+    }
+}
+
+/// Records the longest audio buffer it is ever asked to decode. The finalize
+/// re-decode must chunk a long take into ≤30 s windows, so no single decode may
+/// exceed one window — the deterministic seam-level proof of the cut-off fix.
+struct MaxLenTranscriber {
+    max_len: Arc<Mutex<usize>>,
+}
+
+impl TakeTranscriber for MaxLenTranscriber {
+    fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+        let mut max = self.max_len.lock().unwrap();
+        *max = (*max).max(samples_f32_mono.len());
+        Ok("word".to_owned())
+    }
+}
+
+/// Concatenate `clip` back to back until the result holds at least `secs` seconds
+/// of 16 kHz mono audio — a monologue long enough to span several Whisper windows.
+fn repeat_to_secs(clip: &AudioSegment, secs: usize) -> AudioSegment {
+    let target = 16_000 * secs;
+    let mut samples = Vec::new();
+    while samples.len() < target {
+        samples.extend_from_slice(&clip.samples_f32_mono);
+    }
+    AudioSegment {
+        sample_rate_hz: 16_000,
+        channels: 1,
+        duration_ms: (samples.len() as u64 * 1_000 / 16_000) as u32,
+        samples_f32_mono: samples,
     }
 }
 
@@ -513,6 +549,38 @@ fn a_multi_snippet_take_accumulates_the_full_preedit_then_commits_it() {
         "the second snippet updates the full composing text: {events:?}"
     );
     assert!(events.contains(&"commit_text:restart traffic deploy nginx".to_owned()));
+}
+
+#[test]
+fn a_long_take_never_re_decodes_more_than_one_window_in_a_single_pass() {
+    // The cut-off bug: at stop the WHOLE recording was decoded in one pass, which
+    // collapses past ~30 s. A >45 s monologue must instead be re-decoded chunk by
+    // chunk, so no single decode ever exceeds one 30 s window — and it still commits.
+    let (core, cb) = new_core();
+    let max_len = Arc::new(Mutex::new(0usize));
+    core.install_transcriber(Box::new(MaxLenTranscriber {
+        max_len: Arc::clone(&max_len),
+    }));
+
+    core.toggle().unwrap();
+    push_audio(
+        &core,
+        &repeat_to_secs(&restart_traffic_fixture_16khz_mono(), 45),
+    );
+    core.toggle().unwrap();
+
+    let longest = *max_len.lock().unwrap();
+    assert!(
+        longest <= WINDOW_SAMPLES,
+        "the finalize re-decode must chunk a long take: longest single decode was \
+         {longest} samples ({:.1} s), over the {WINDOW_SAMPLES}-sample window",
+        longest as f32 / 16_000.0
+    );
+    assert!(
+        cb.events().iter().any(|e| e.starts_with("commit_text:")),
+        "a long take must still commit: {:?}",
+        cb.events()
+    );
 }
 
 #[test]
