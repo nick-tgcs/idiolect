@@ -33,9 +33,21 @@ pub trait DaemonClient {
 }
 
 /// The text destination — in production an IBus input context. `commit_text`
-/// types the final text into the focused application.
+/// types the final text into the focused application; `delete_before` removes the
+/// last `chars` characters typed (for the stop-time re-decode replacing the tail).
 pub trait Surface {
     fn commit_text(&mut self, text: &str);
+
+    /// Delete the `chars` characters immediately before the cursor
+    /// (`InputConnection.delete_surrounding_text`). Used to re-type the changed tail
+    /// of a take when the authoritative decode replaces the live preview.
+    fn delete_before(&mut self, chars: usize);
+}
+
+/// The number of leading characters `a` and `b` share — the unchanged prefix the
+/// re-decode keeps, so only the divergent tail is deleted and re-typed.
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 /// A key, already classified from the raw IBus keyval/state by the engine layer,
@@ -113,6 +125,10 @@ pub struct Session<D, S> {
     /// The most recent streamed (partial) snippet typed this take: at stop it
     /// seeds the in-place correction window over the take's final snippet.
     pending_tail: Option<String>,
+    /// The take text currently typed into the app (the concatenated live previews,
+    /// or the last authoritative re-decode). Diffed against each incoming
+    /// [`ReplaceTake`](Self::on_replace_take) so only the changed tail is re-typed.
+    typed_take: String,
 }
 
 impl<D, S> Session<D, S>
@@ -128,6 +144,7 @@ where
             review: None,
             recording: false,
             pending_tail: None,
+            typed_take: String::new(),
         }
     }
 
@@ -286,7 +303,38 @@ where
             return; // no live take; ignore a stray/late partial
         }
         self.surface.commit_text(&text);
+        // Track everything typed this take so a later authoritative re-decode
+        // ([`Self::on_replace_take`]) can diff against it and re-type only the tail.
+        self.typed_take.push_str(&text);
         self.pending_tail = Some(text);
+    }
+
+    /// The daemon's stop-time re-decode produced the authoritative take text for a
+    /// streamed direct-mode take (`ReplaceTake`, sent once per ≤30 s chunk). Replace
+    /// what is currently typed with `full_text`, re-typing only the changed tail:
+    /// delete the characters past the shared prefix, then commit the new suffix. The
+    /// whole re-typed text becomes the correction window's baseline at stop.
+    ///
+    /// Only acts on a live take (`Recording`); a stray/late replace is ignored. The
+    /// cursor is assumed to sit at the end of the typed take, as it does immediately
+    /// after the engine's own commits — the same assumption the correction window makes.
+    pub fn on_replace_take(&mut self, full_text: String) {
+        if self.state != State::Recording {
+            return;
+        }
+        let shared = common_prefix_chars(&self.typed_take, &full_text);
+        let stale = self.typed_take.chars().count() - shared;
+        if stale > 0 {
+            self.surface.delete_before(stale);
+        }
+        let suffix: String = full_text.chars().skip(shared).collect();
+        if !suffix.is_empty() {
+            self.surface.commit_text(&suffix);
+        }
+        self.typed_take = full_text.clone();
+        // At stop the correction window now covers the whole re-typed take, not just
+        // the last live snippet.
+        self.pending_tail = Some(full_text);
     }
 
     /// The daemon's authoritative recording state changed. This is the single
@@ -299,6 +347,10 @@ where
     /// final snippet, so the in-place-fix flow works exactly as for batch takes.
     pub fn on_recording_status(&mut self, recording: bool) {
         self.recording = recording;
+        if recording {
+            // A fresh take: nothing typed yet, so the re-decode diff starts clean.
+            self.typed_take.clear();
+        }
         match self.state {
             State::Reviewing => {
                 if recording {
@@ -428,10 +480,16 @@ mod tests {
     #[derive(Default)]
     struct FakeSurface {
         committed: Vec<String>,
+        /// Every commit/delete in order, so the re-type diff can be asserted precisely.
+        ops: Vec<String>,
     }
     impl Surface for FakeSurface {
         fn commit_text(&mut self, text: &str) {
             self.committed.push(text.to_owned());
+            self.ops.push(format!("commit:{text}"));
+        }
+        fn delete_before(&mut self, chars: usize) {
+            self.ops.push(format!("delete:{chars}"));
         }
     }
 
@@ -778,5 +836,94 @@ mod tests {
         // A late status push after reset is mirrored normally.
         s.on_recording_status(true);
         assert_eq!(s.state(), State::Recording);
+    }
+
+    // --- Stop-time re-decode replacing the live previews in the app (ReplaceTake). ---
+
+    /// Start a take and type `previews` as live snippet partials, leaving the mic open.
+    fn recording_with_previews(s: &mut Session<FakeDaemon, FakeSurface>, previews: &[&str]) {
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        for preview in previews {
+            s.on_partial_transcript((*preview).to_owned());
+        }
+    }
+
+    #[test]
+    fn a_re_decode_that_extends_the_preview_only_appends() {
+        // The authoritative chunk decode agrees with the preview and adds more: no
+        // deletion, just the new tail typed on.
+        let mut s = session();
+        recording_with_previews(&mut s, &["restart traffic"]);
+        s.on_replace_take("restart traffic deploy nginx".to_owned());
+        assert_eq!(
+            s.surface.ops,
+            ["commit:restart traffic", "commit: deploy nginx"],
+            "an extending re-decode appends without deleting",
+        );
+    }
+
+    #[test]
+    fn a_re_decode_that_changes_the_tail_deletes_then_re_types_only_the_tail() {
+        // The chunk decode corrects the tail: delete just the diverging characters
+        // (not the whole take) and type the corrected tail.
+        let mut s = session();
+        recording_with_previews(&mut s, &["restart traffic deploy nginx"]);
+        s.on_replace_take("restart traffic deploy Nginx".to_owned());
+        assert_eq!(
+            s.surface.ops,
+            [
+                "commit:restart traffic deploy nginx",
+                "delete:5", // "nginx"
+                "commit:Nginx",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_re_typed_take_seeds_the_correction_window_with_the_whole_text() {
+        // After re-typing, the stop-time correction window covers the WHOLE take, so
+        // an in-place fix anywhere reports the whole corrected text (not just a tail).
+        let mut s = session();
+        recording_with_previews(&mut s, &["I want"]);
+        s.on_replace_take("I don't want".to_owned());
+        s.on_key(Key::Trigger); // stop intent
+        s.on_recording_status(false); // mic closed → correction window opens
+        assert_eq!(s.state(), State::Reviewing);
+        // Delete the last char and pass through: the reported correction is the whole
+        // re-typed text minus that char — proof the window held the full take.
+        s.on_key(Key::Backspace);
+        s.on_key(Key::Passthrough);
+        assert_eq!(last_correction(&s).as_deref(), Some("I don't wan"));
+    }
+
+    #[test]
+    fn a_replace_take_outside_a_live_take_is_ignored() {
+        // A stray/late ReplaceTake with no take in progress types nothing.
+        let mut s = session();
+        s.on_replace_take("ghost".to_owned());
+        assert!(s.surface.ops.is_empty());
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn a_fresh_take_re_types_from_a_clean_slate() {
+        // The typed-take tracker resets each take: a second take's re-decode diffs
+        // against only its own previews, never the previous take's text.
+        let mut s = session();
+        recording_with_previews(&mut s, &["first take"]);
+        s.on_replace_take("first take".to_owned());
+        s.on_key(Key::Trigger); // stop
+        s.on_recording_status(false); // → Reviewing over "first take"
+
+        // A second take: on_key(Trigger) closes the review, then recording starts fresh.
+        recording_with_previews(&mut s, &["second"]);
+        s.surface.ops.clear();
+        s.on_replace_take("second take".to_owned());
+        assert_eq!(
+            s.surface.ops,
+            ["commit: take"],
+            "the second take appends against its own preview, not the first take's",
+        );
     }
 }

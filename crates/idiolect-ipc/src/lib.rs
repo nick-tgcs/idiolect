@@ -6,7 +6,7 @@ pub mod messages;
 
 pub use messages::{
     ClientHello, CommitPreedit, ErrorMessage, HistoryCopy, HistoryCopyResponse, HistoryReinsert,
-    HistoryReinsertResponse, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    HistoryReinsertResponse, InsertText, IpcMessage, PreeditUpdate, RecordingStatus, ReplaceTake,
     ReportCorrection, ServerHello,
 };
 

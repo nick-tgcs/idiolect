@@ -35,7 +35,8 @@ use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
     CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
-    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
+    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, ReplaceTake,
+    FEATURE_RECORDING_STATUS, FEATURE_REPLACE_TAKE,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -598,6 +599,7 @@ fn handle_connection(
         live_capture: None,
         live_stream: None,
         status_tx: RecordingStatusTx::new(false),
+        replace_take: false,
     };
     let mut line = String::new();
 
@@ -700,6 +702,10 @@ fn handle_connection(
                     .accepted_features
                     .iter()
                     .any(|feature| feature == FEATURE_RECORDING_STATUS);
+                live.replace_take = response
+                    .accepted_features
+                    .iter()
+                    .any(|feature| feature == FEATURE_REPLACE_TAKE);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
                 live.status_tx = RecordingStatusTx::new(wants_status);
                 live.status_tx.sync_initial(&mut stream)?;
@@ -877,6 +883,7 @@ fn handle_connection(
             IpcMessage::ServerHello(_)
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
+            | IpcMessage::ReplaceTake(_)
             | IpcMessage::InsertText(_)
             | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
@@ -1092,6 +1099,10 @@ struct DaemonObserver<'a> {
     stream: &'a mut UnixStream,
     store: &'a SqliteMetadataStore,
     config: &'a RunLoopConfig,
+    /// Whether the client negotiated `replace_take`: if so, the stop-time chunked
+    /// re-decode is pushed progressively so the client re-types the take to the
+    /// authoritative text as it firms up. Only the finalize path sets this true.
+    replace_take: bool,
 }
 
 impl StreamObserver for DaemonObserver<'_> {
@@ -1131,6 +1142,22 @@ impl StreamObserver for DaemonObserver<'_> {
             "Idiolect — dictation is failing",
             &body,
         );
+        Ok(())
+    }
+
+    fn finalize_progress(&mut self, full_text: &str) -> Result<(), RunLoopError> {
+        // Direct mode only: the client typed the live previews into the app, so a
+        // chunk's authoritative re-decode replaces that typed text as it lands. In
+        // review mode the snippets went to the dialog (never the app), so there is
+        // nothing typed to replace — the single final text drives the dialog instead.
+        if self.replace_take && !review_mode_enabled(self.store) {
+            send_ipc_message(
+                self.stream,
+                &IpcMessage::ReplaceTake(ReplaceTake {
+                    text: full_text.to_owned(),
+                }),
+            )?;
+        }
         Ok(())
     }
 }
@@ -1334,6 +1361,9 @@ struct Live {
     live_capture: Option<crate::adapters::RuntimeCapture>,
     live_stream: Option<LiveStreamState>,
     status_tx: RecordingStatusTx,
+    /// Whether the connected client negotiated `replace_take` (re-type a streamed
+    /// take to the authoritative chunked decode as it finalizes). Set at handshake.
+    replace_take: bool,
 }
 
 /// The long-lived store, codecs, and config a connection's handlers share.
@@ -1370,6 +1400,7 @@ fn start_live_capture(
         live_capture,
         live_stream,
         status_tx,
+        ..
     } = live;
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match crate::adapters::begin_capture(&config.adapter_profile) {
@@ -1454,6 +1485,8 @@ fn fold_snippet_into_take(
         stream,
         store: &*store,
         config,
+        // Snippet folding never drives finalize_progress, so this is inert here.
+        replace_take: false,
     };
     take.fold_snippet(&mut transcriber, &mut observer, snippet)
 }
@@ -1470,6 +1503,7 @@ fn finalize_streamed_take(
     ctx: Ctx<'_>,
     active_session: &mut Option<ActiveSession>,
     state: LiveStreamState,
+    replace_take: bool,
 ) -> Result<(), RunLoopError> {
     let Ctx {
         store,
@@ -1487,6 +1521,7 @@ fn finalize_streamed_take(
             stream,
             store: &*store,
             config,
+            replace_take,
         };
         state.take.finalize(&mut transcriber, &mut observer)?
     };
@@ -1539,11 +1574,16 @@ fn finalize_streamed_take(
         store
             .commit_session(session_id, &final_text, &key)
             .map_err(|error| RunLoopError::storage("commit streamed take", error))?;
+        // When the client re-typed the whole take to the authoritative decode
+        // (`replace_take`), its correction window covers the WHOLE text, so a fix
+        // replaces all of it (`tail_text = None`). Without it the client still shows
+        // the glued snippet previews, whose last snippet is the correctable tail.
+        let tail_text = if replace_take { None } else { last_snippet_text };
         *active_session = Some(ActiveSession {
             session_id,
             current_text: final_text,
             finalized: true,
-            tail_text: last_snippet_text,
+            tail_text,
         });
     }
     Ok(())
@@ -1572,6 +1612,7 @@ fn stop_live_and_transcribe(
         live_capture,
         live_stream,
         status_tx,
+        replace_take,
     } = live;
     let Some(capture) = live_capture.take() else {
         return Ok(());
@@ -1598,6 +1639,7 @@ fn stop_live_and_transcribe(
                     },
                     active_session,
                     state,
+                    *replace_take,
                 )?;
             }
             Err(error) => {

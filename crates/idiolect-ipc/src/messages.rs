@@ -8,8 +8,18 @@ pub const FEATURE_COMMIT: &str = "commit";
 /// right after the handshake). Older clients that do not request it see the exact
 /// same byte stream as before.
 pub const FEATURE_RECORDING_STATUS: &str = "recording_status";
+/// Opt-in: a client that advertises this feature receives [`IpcMessage::ReplaceTake`]
+/// pushes during a streamed direct-mode take's stop-time decode, so its typed text
+/// firms up to the authoritative per-chunk decode as it goes. Older clients keep the
+/// live snippet previews they already typed.
+pub const FEATURE_REPLACE_TAKE: &str = "replace_take";
 
-const SUPPORTED_FEATURES: [&str; 3] = [FEATURE_PREEDIT, FEATURE_COMMIT, FEATURE_RECORDING_STATUS];
+const SUPPORTED_FEATURES: [&str; 4] = [
+    FEATURE_PREEDIT,
+    FEATURE_COMMIT,
+    FEATURE_RECORDING_STATUS,
+    FEATURE_REPLACE_TAKE,
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
@@ -42,6 +52,18 @@ pub struct PreeditUpdate {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommitPreedit {
+    pub text: String,
+}
+
+/// Server→client: replace the take text currently typed into the app with `text`
+/// (the whole take as it now stands). Sent progressively — once per finalize
+/// chunk — during a streamed direct-mode take's stop-time re-decode, so the typed
+/// text firms up to the authoritative decode chunk by chunk instead of keeping the
+/// first-pass snippet previews. The client diffs `text` against what it last typed
+/// for this take and re-types only the changed tail. Gated on [`FEATURE_REPLACE_TAKE`]
+/// so a client that predates it is byte-for-byte unaffected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplaceTake {
     pub text: String,
 }
 
@@ -137,6 +159,8 @@ pub enum IpcMessage {
     RecordingStatus(RecordingStatus),
     PreeditUpdate(PreeditUpdate),
     CommitPreedit(CommitPreedit),
+    /// Server→client: re-type the take to `text` (see [`ReplaceTake`]).
+    ReplaceTake(ReplaceTake),
     CancelPreedit,
     ReportCorrection(ReportCorrection),
     /// Client→server: the user's corrected text from an [`EditHistory`] review.

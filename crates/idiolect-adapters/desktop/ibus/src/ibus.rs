@@ -53,6 +53,7 @@ impl PendingSurface {
 
 enum SurfaceOp {
     Commit { text: String },
+    DeleteBefore { chars: usize },
 }
 
 impl Surface for PendingSurface {
@@ -60,6 +61,10 @@ impl Surface for PendingSurface {
         self.ops.push(SurfaceOp::Commit {
             text: text.to_owned(),
         });
+    }
+
+    fn delete_before(&mut self, chars: usize) {
+        self.ops.push(SurfaceOp::DeleteBefore { chars });
     }
 }
 
@@ -223,23 +228,45 @@ fn ibus_text_str(value: &Value<'_>) -> String {
 }
 
 async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
-    for SurfaceOp::Commit { text } in ops {
-        dbg_edit(&format!(
-            "emit CommitText -> {} : {:?}",
-            engine_path.as_str(),
-            text
-        ));
-        let result = conn
-            .emit_signal(
-                None::<&str>,
-                engine_path,
-                ENGINE_IFACE,
-                "CommitText",
-                &(ibus_text(&text),),
-            )
-            .await;
+    for op in ops {
+        let result = match op {
+            SurfaceOp::Commit { text } => {
+                dbg_edit(&format!(
+                    "emit CommitText -> {} : {:?}",
+                    engine_path.as_str(),
+                    text
+                ));
+                conn.emit_signal(
+                    None::<&str>,
+                    engine_path,
+                    ENGINE_IFACE,
+                    "CommitText",
+                    &(ibus_text(&text),),
+                )
+                .await
+            }
+            SurfaceOp::DeleteBefore { chars } => {
+                // IBus DeleteSurroundingText(offset, n_chars): a negative offset counts
+                // from the cursor, so deleting the `chars` characters just typed is
+                // offset = -chars, n_chars = chars.
+                let count = u32::try_from(chars).unwrap_or(u32::MAX);
+                dbg_edit(&format!(
+                    "emit DeleteSurroundingText -> {} : {}",
+                    engine_path.as_str(),
+                    count
+                ));
+                conn.emit_signal(
+                    None::<&str>,
+                    engine_path,
+                    ENGINE_IFACE,
+                    "DeleteSurroundingText",
+                    &(-(count as i32), count),
+                )
+                .await
+            }
+        };
         if let Err(error) = result {
-            eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+            eprintln!("idiolect-ibus: failed to emit surface op: {error}");
         }
     }
 }
@@ -551,6 +578,19 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 ));
                 handle_edit_history(&*shared.dialog, &mut sender, edit);
                 continue;
+            }
+            Ok(IpcMessage::ReplaceTake(replace)) => {
+                // The stop-time re-decode replaced the live preview for a streamed
+                // direct-mode take: re-type only the changed tail into the app. Same
+                // focus dance as a live snippet so the deletes/commits land in the
+                // dictation target and not wherever the WM's focus churn left things.
+                dbg_edit(&format!("replace_take <- daemon: {:?}", replace.text));
+                let target = *shared
+                    .dictation_target
+                    .lock()
+                    .expect("dictation_target mutex");
+                restore_dictation_focus(shared.focus.as_ref(), target);
+                shared.run_session(|s| s.on_replace_take(replace.text))
             }
             Ok(_) => continue,
             Err(_) => {

@@ -560,6 +560,7 @@ fn handle_fixture_connection(
             IpcMessage::ServerHello(_)
             | IpcMessage::RecordingStatus(_)
             | IpcMessage::PreeditUpdate(_)
+            | IpcMessage::ReplaceTake(_)
             | IpcMessage::InsertText(_)
             | IpcMessage::EditHistory(_)
             | IpcMessage::Error(_) => {
