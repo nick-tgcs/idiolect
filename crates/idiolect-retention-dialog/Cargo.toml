@@ -12,5 +12,13 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
 
+# X11 windowing backend. eframe with default-features off pulls in NO platform
+# backend, so winit fails to build (and the binary cannot open a window) unless
+# a target enables one. A full workspace build hides this via feature
+# unification from sibling GUI crates; an isolated build of this dialog does
+# not — so declare it here. Not needed on macOS or Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.34", features = ["x11"] }
+
 [lints]
 workspace = true
