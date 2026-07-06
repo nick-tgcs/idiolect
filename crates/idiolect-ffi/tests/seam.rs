@@ -98,6 +98,26 @@ impl TakeTranscriber for ScriptedTranscriber {
     }
 }
 
+/// One 30 s Whisper window in 16 kHz mono samples — the cap the stop-time re-decode
+/// chunks a long take into.
+const WINDOW_SAMPLES: usize = 16_000 * 30;
+
+/// Records the sample length of every buffer it is asked to decode, in call order:
+/// the per-snippet preview (fold) decodes first as audio streams, then the stop-time
+/// re-decode chunks. Lets the seam prove a long take is re-decoded in ≤30 s chunks
+/// and that the model is never handed one over-window block (which collapses the
+/// decode and truncated long takes).
+struct DecodeLenRecorder {
+    lengths: Arc<Mutex<Vec<usize>>>,
+}
+
+impl TakeTranscriber for DecodeLenRecorder {
+    fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure> {
+        self.lengths.lock().unwrap().push(samples_f32_mono.len());
+        Ok("word".to_owned())
+    }
+}
+
 /// Build a core over a throwaway data dir, returning the core plus a handle to the
 /// callback's recorded event log. The dir is leaked so it outlives the core; the
 /// test process is short-lived and the OS reclaims it.
@@ -513,6 +533,62 @@ fn a_multi_snippet_take_accumulates_the_full_preedit_then_commits_it() {
         "the second snippet updates the full composing text: {events:?}"
     );
     assert!(events.contains(&"commit_text:restart traffic deploy nginx".to_owned()));
+}
+
+#[test]
+fn a_take_past_one_window_re_decodes_in_chunks_without_an_over_window_block() {
+    // The mobile half of the cut-off fix: a take longer than one 30 s Whisper window
+    // must be re-decoded one ≤30 s chunk at a time at stop, never handed to the model
+    // as a single over-window block (which collapsed the decode — a 50 s take came
+    // back as 4 words). Drive a ~45 s take as a run of pause-separated utterances so
+    // the VAD segments it into many ≤30 s snippets whose merged recording spans more
+    // than one window.
+    let (core, cb) = new_core();
+    let lengths = Arc::new(Mutex::new(Vec::new()));
+    core.install_transcriber(Box::new(DecodeLenRecorder {
+        lengths: Arc::clone(&lengths),
+    }));
+
+    core.toggle().unwrap(); // mic on
+    let utterance = speech_and_silence_fixture_16khz_mono();
+    let gap = vec![0.0_f32; 12_000]; // +750 ms: the known-safe pause that segments but never auto-stops
+    let mut long = Vec::new();
+    for _ in 0..24 {
+        long.extend_from_slice(&utterance.samples_f32_mono);
+        long.extend_from_slice(&gap);
+    }
+    push_audio(
+        &core,
+        &AudioSegment {
+            sample_rate_hz: 16_000,
+            channels: 1,
+            duration_ms: (long.len() as u64 * 1_000 / 16_000) as u32,
+            samples_f32_mono: long,
+        },
+    );
+
+    // Everything decoded up to here is a live per-snippet preview (fold); everything
+    // after the stop toggle is the stop-time re-decode.
+    let fold_decodes = lengths.lock().unwrap().len();
+    core.toggle().unwrap(); // stop → the whole take is re-decoded and committed
+
+    let all = lengths.lock().unwrap().clone();
+    let finalize_decodes = all.len() - fold_decodes;
+
+    assert!(
+        cb.events().iter().any(|e| e.starts_with("commit_text:")),
+        "a long take should commit: {:?}",
+        cb.events()
+    );
+    assert!(
+        finalize_decodes >= 2,
+        "a take past one window must re-decode in ≥2 chunks (got {finalize_decodes} \
+         finalize decodes over {fold_decodes} snippets — was the take long enough?)"
+    );
+    assert!(
+        all.iter().all(|&len| len <= WINDOW_SAMPLES),
+        "no decode — preview or stop-time chunk — may exceed one 30 s window: {all:?}"
+    );
 }
 
 #[test]

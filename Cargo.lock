@@ -4326,6 +4326,7 @@ dependencies = [
 name = "idiolect-adapter-whisper"
 version = "0.1.0"
 dependencies = [
+ "idiolect-application",
  "idiolect-ports",
  "idiolect-test-support",
  "thiserror 2.0.18",

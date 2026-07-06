@@ -21,3 +21,4 @@ whisper-rs = "=0.16.0"
 
 [dev-dependencies]
 idiolect-test-support = { path = "../idiolect-test-support" }
+idiolect-application = { path = "../idiolect-application" }
