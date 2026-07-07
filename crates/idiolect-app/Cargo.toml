@@ -14,7 +14,7 @@ idiolect-application = { path = "../idiolect-application" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
 idiolect-sync-server = { path = "../idiolect-sync-server" }
 idiolect-common = { path = "../idiolect-common" }
-eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
