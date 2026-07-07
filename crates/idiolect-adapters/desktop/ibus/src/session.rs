@@ -1,13 +1,17 @@
 //! Pure dictation state machine for the IBus engine.
 //!
 //! Knows nothing about IBus, DBus, sockets, or audio. Toggle model: a trigger
-//! starts recording; the next trigger stops it; when the daemon returns the
-//! transcript it is committed straight into the focused app (no preedit, no
-//! Enter step). Immediately after commit the engine opens a *correction window*
-//! and models the user's keyboard edits (cursor movement, insert, delete)
-//! against a shadow buffer, so a fix made anywhere in the just-dictated text is
-//! reported to the daemon as a raw→corrected training signal. Unit-testable
-//! with fakes.
+//! starts recording; the next trigger stops it. A batch take is committed
+//! straight into the focused app at stop (no Enter step). A streamed take shows
+//! its live preview in the IME-owned **preedit** as it grows (never committed, so
+//! no app can auto-transform it), and at stop the engine clears the preedit and
+//! commits the single verified full-take text — see
+//! [`on_partial_transcript`](Session::on_partial_transcript) and
+//! [`on_reconcile`](Session::on_reconcile). Immediately after that commit the
+//! engine opens a *correction window* and models the user's keyboard edits
+//! (cursor movement, insert, delete) against a shadow buffer, so a fix made
+//! anywhere in the just-dictated text is reported to the daemon as a
+//! raw→corrected training signal. Unit-testable with fakes.
 //!
 //! Limitation: edits are reconstructed from keystrokes, so mouse-click cursor
 //! repositioning (which sends no key event) is not modeled. The window only
@@ -33,14 +37,20 @@ pub trait DaemonClient {
 }
 
 /// The text destination — in production an IBus input context. `commit_text`
-/// types the final text into the focused application; `delete` removes the last
-/// `count` characters the engine itself just typed, by synthesising that many
-/// backspace key events (we are a keyboard, so this works in any app — no IBus
-/// surrounding-text capability required). Used at stop to replace a live-typed
-/// preview with the verified full-take text.
+/// types the verified text into the focused application. `set_preedit` shows the
+/// live streaming preview as IME-owned **preedit** (the underlined pre-commit
+/// region); the whole region is replaced each call and an empty string clears it.
+///
+/// The preview lives in preedit, not committed text, on purpose: preedit belongs
+/// to the input method, so applications never auto-transform it the way they
+/// mangle committed text (bracket auto-close, autocompletion, smart quotes). At
+/// stop the engine clears the preedit and commits the verified full-take text
+/// exactly once — so there is no live-typed preview in the document to reconcile
+/// with backspaces, and nothing an auto-closing editor can corrupt. idiolect owns
+/// the input; the preview is ours until we commit.
 pub trait Surface {
     fn commit_text(&mut self, text: &str);
-    fn delete(&mut self, count: usize);
+    fn set_preedit(&mut self, text: &str);
 }
 
 /// A key, already classified from the raw IBus keyval/state by the engine layer,
@@ -115,11 +125,12 @@ pub struct Session<D, S> {
     /// The daemon's authoritative mic state, mirrored independently of `state`
     /// (which may be `Reviewing` while the mic is still open in streaming mode).
     recording: bool,
-    /// The cumulative text the engine has typed live this take (the concatenation
-    /// of every streamed partial). At stop the daemon sends the verified full-take
-    /// text and [`Session::on_reconcile`] backspaces the divergent suffix of this
-    /// run and re-commits, so the app ends up with the verified text.
-    typed_run: String,
+    /// The cumulative live preview this take: the concatenation of every streamed
+    /// partial, held in the IME-owned **preedit** (never committed to the app). At
+    /// stop [`Session::on_reconcile`] clears the preedit and commits the verified
+    /// full-take text once; abandoning the take (cancel/error/silent-stop/reset)
+    /// clears it via [`Session::clear_preview`]. Empty means no preview is showing.
+    preview: String,
 }
 
 impl<D, S> Session<D, S>
@@ -134,7 +145,7 @@ where
             state: State::Idle,
             review: None,
             recording: false,
-            typed_run: String::new(),
+            preview: String::new(),
         }
     }
 
@@ -171,9 +182,9 @@ where
                 Key::Cancel => {
                     self.daemon.cancel();
                     // Snappy local feedback; the daemon's `recording = false` push
-                    // reconciles to the same state. A discarded take leaves no
-                    // typed run to reconcile.
-                    self.typed_run.clear();
+                    // reconciles to the same state. A discarded take must drop its
+                    // live preedit preview (it was never committed).
+                    self.clear_preview();
                     self.state = State::Idle;
                     true
                 }
@@ -269,9 +280,10 @@ where
             State::Reviewing if self.recording => self.end_review(),
             _ => return, // no take in progress; ignore an unsolicited/late transcript
         }
-        // A take-final transcript supersedes any streamed run: the correction
-        // window below covers the full text.
-        self.typed_run.clear();
+        // A take-final transcript supersedes any streamed preview: drop the
+        // preedit before committing so the correction window below covers only the
+        // full committed text.
+        self.clear_preview();
         if text.is_empty() {
             self.state = State::Idle;
             return;
@@ -282,31 +294,34 @@ where
         self.state = State::Reviewing;
     }
 
-    /// The daemon delivered a mid-take snippet of a streamed take (a PARTIAL
-    /// preedit): type it into the app and keep recording. Nothing is finalized
-    /// — the daemon owns the take's single session and commits it at stop —
-    /// and no correction window opens mid-take. The snippet is appended to the
-    /// take's typed run so the stop-time [`on_reconcile`](Self::on_reconcile) can
-    /// replace the whole live-typed preview with the verified text.
+    /// The daemon delivered a mid-take snippet of a streamed take (a PARTIAL): show
+    /// it in the IME-owned **preedit** and keep recording. Nothing is finalized —
+    /// the daemon owns the take's single session and commits it at stop — and no
+    /// correction window opens mid-take. The snippet is appended to the running
+    /// preview and the whole preview is set as the preedit region (preedit
+    /// replaces, so we resend the full text), so the stop-time
+    /// [`on_reconcile`](Self::on_reconcile) can clear it and commit the verified
+    /// text without any live-typed preview in the document to reconcile.
     pub fn on_partial_transcript(&mut self, text: String) {
         if self.state != State::Recording || text.is_empty() {
             return; // no live take; ignore a stray/late partial
         }
-        self.surface.commit_text(&text);
-        self.typed_run.push_str(&text);
+        self.preview.push_str(&text);
+        self.surface.set_preedit(&self.preview);
     }
 
     /// The daemon delivered the verified full-take text at the stop of a direct
-    /// (review-off) streaming take. Replace the live-typed preview with it: keep
-    /// the longest common prefix, backspace the divergent suffix of the typed run,
-    /// and commit the corrected suffix. This is display-only — the daemon already
-    /// owns and committed the streamed session, so we do NOT send our own commit.
-    /// The full verified text then becomes the in-place correction window so a
-    /// later fix still reports a raw→corrected training pair.
+    /// (review-off) streaming take. The live preview was IME-owned preedit, never
+    /// committed, so we simply clear the preedit and commit the verified text once
+    /// — no divergence math, no synthesised backspaces that an auto-closing editor
+    /// could corrupt. This commit is display-only: the daemon already owns and
+    /// committed the streamed session, so we do NOT send our own commit. The full
+    /// verified text then becomes the in-place correction window so a later fix
+    /// still reports a raw→corrected training pair.
     ///
-    /// Self-adjusting w.r.t. the "preview typing" toggle: with preview off the
-    /// engine typed nothing this take, so the run is empty, zero backspaces are
-    /// synthesised, and the whole verified text is committed fresh.
+    /// Self-adjusting w.r.t. the "preview typing" toggle: with preview off no
+    /// preedit was ever shown, so [`clear_preview`](Self::clear_preview) is a
+    /// no-op and the whole verified text is committed fresh.
     pub fn on_reconcile(&mut self, final_text: String) {
         match self.state {
             State::Recording => {}
@@ -316,20 +331,16 @@ where
             State::Reviewing if self.recording => self.end_review(),
             _ => return, // no live take; ignore an unsolicited/late reconcile
         }
-        let typed = std::mem::take(&mut self.typed_run);
-        let shared = common_prefix_chars(&typed, &final_text);
-        let backspaces = typed.chars().count() - shared;
-        self.surface.delete(backspaces);
+        // Drop the ephemeral preedit preview before committing (clear-then-commit),
+        // so the app replaces the underlined preview with the verified text.
+        self.clear_preview();
         if final_text.is_empty() {
             // The whole-take decode came back empty: the preview is gone and there
             // is nothing to commit or correct.
             self.state = State::Idle;
             return;
         }
-        let suffix: String = final_text.chars().skip(shared).collect();
-        if !suffix.is_empty() {
-            self.surface.commit_text(&suffix);
-        }
+        self.surface.commit_text(&final_text);
         self.review = Some(Review::new(final_text));
         self.state = State::Reviewing;
     }
@@ -354,7 +365,9 @@ where
                 }
             }
             State::Recording if !recording => {
-                self.typed_run.clear();
+                // Mic closed while still Recording means no reconcile arrived (a
+                // silent/aborted streamed take): clear any preedit preview.
+                self.clear_preview();
                 self.state = State::Idle;
             }
             _ => {
@@ -372,7 +385,7 @@ where
     /// resyncs from a clean slate rather than a stale guess.
     pub fn reset_to_idle(&mut self) {
         self.review = None;
-        self.typed_run.clear();
+        self.clear_preview();
         self.state = State::Idle;
         self.recording = false;
     }
@@ -412,7 +425,7 @@ where
             _ => return,
         }
         self.daemon.cancel();
-        self.typed_run.clear();
+        self.clear_preview();
         self.review = None;
         self.state = State::Idle;
     }
@@ -427,8 +440,19 @@ where
     /// The daemon reported an error mid-take: return to idle.
     pub fn on_error(&mut self) {
         self.review = None;
-        self.typed_run.clear();
+        self.clear_preview();
         self.state = State::Idle;
+    }
+
+    /// Drop the live preedit preview, if any. Preedit is IME-owned and ephemeral,
+    /// so abandoning a take (cancel, error, silent stop, supersede, reconnect) must
+    /// visibly clear it. No-op when no preview is showing, so callers stay clean
+    /// and no spurious `set_preedit("")` op is emitted.
+    fn clear_preview(&mut self) {
+        if !self.preview.is_empty() {
+            self.preview.clear();
+            self.surface.set_preedit("");
+        }
     }
 
     /// Close the correction window: if the user actually edited the dictated
@@ -442,12 +466,6 @@ where
             }
         }
     }
-}
-
-/// Number of leading `char`s `a` and `b` share. Counts by Unicode scalar value so
-/// the backspace count matches what was committed character-for-character.
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
@@ -476,16 +494,17 @@ mod tests {
     #[derive(Default)]
     struct FakeSurface {
         committed: Vec<String>,
-        /// Each `delete(count)` call's count, in order — lets a test assert the
-        /// engine synthesised the right number of backspaces before re-committing.
-        deleted: Vec<usize>,
+        /// Each `set_preedit(text)` call's text, in order — lets a test assert the
+        /// live preview grew in the IME-owned preedit and was cleared (`""`) at
+        /// stop, all without ever touching committed document text.
+        preedits: Vec<String>,
     }
     impl Surface for FakeSurface {
         fn commit_text(&mut self, text: &str) {
             self.committed.push(text.to_owned());
         }
-        fn delete(&mut self, count: usize) {
-            self.deleted.push(count);
+        fn set_preedit(&mut self, text: &str) {
+            self.preedits.push(text.to_owned());
         }
     }
 
@@ -726,23 +745,6 @@ mod tests {
         assert_eq!(s.state(), State::Idle);
     }
 
-    #[test]
-    fn partial_snippets_type_without_finalizing() {
-        // Streaming translation: the take is ONE conversation. Each partial is
-        // typed into the app as it arrives, but nothing is finalized per
-        // snippet — the daemon commits the whole merged take itself at stop.
-        let mut s = session();
-        s.on_key(Key::Trigger);
-        s.on_recording_status(true);
-
-        s.on_partial_transcript("hello world".to_owned());
-        s.on_partial_transcript(" second snippet".to_owned());
-
-        assert_eq!(s.surface.committed, ["hello world", " second snippet"]);
-        assert_eq!(s.daemon.events, ["toggle"], "no per-snippet finalize");
-        assert_eq!(s.state(), State::Recording, "still mid-take");
-    }
-
     /// Stream `parts` as live partials within an open take (start + recording).
     fn stream_partials(s: &mut Session<FakeDaemon, FakeSurface>, parts: &[&str]) {
         s.on_key(Key::Trigger);
@@ -750,66 +752,6 @@ mod tests {
         for p in parts {
             s.on_partial_transcript((*p).to_owned());
         }
-    }
-
-    #[test]
-    fn reconcile_replaces_preview_with_corrected_final() {
-        // Direct streaming stop: the engine typed a lossy preview live; the daemon
-        // sends the verified full-take text. The engine keeps the common prefix,
-        // backspaces the divergent suffix, and commits the corrected suffix.
-        let mut s = session();
-        stream_partials(&mut s, &["helo world"]);
-
-        s.on_reconcile("hello world".to_owned());
-
-        // "hel" is shared; 7 chars ("o world") are backspaced and "lo world" typed.
-        assert_eq!(s.surface.deleted, [7]);
-        assert_eq!(s.surface.committed, ["helo world", "lo world"]);
-        assert_eq!(s.state(), State::Reviewing);
-    }
-
-    #[test]
-    fn reconcile_run_accumulates_across_multiple_partials() {
-        // The engine tracks the WHOLE typed run, not just the last snippet, so the
-        // backspace count spans every snippet that diverges from the final.
-        let mut s = session();
-        stream_partials(&mut s, &["hello ", "wrld"]);
-
-        s.on_reconcile("hello world".to_owned());
-
-        // typed run "hello wrld" (10 chars); shared prefix "hello w" (7); 3 deleted.
-        assert_eq!(s.surface.deleted, [3]);
-        assert_eq!(s.surface.committed, ["hello ", "wrld", "orld"]);
-        assert_eq!(s.state(), State::Reviewing);
-    }
-
-    #[test]
-    fn reconcile_with_no_preview_commits_full_final() {
-        // Preview typing OFF: no partials were typed, so the engine deletes nothing
-        // and commits the whole verified final — the same code path, 0 backspaces.
-        let mut s = session();
-        s.on_key(Key::Trigger);
-        s.on_recording_status(true);
-
-        s.on_reconcile("the verified text".to_owned());
-
-        assert_eq!(s.surface.deleted, [0]);
-        assert_eq!(s.surface.committed, ["the verified text"]);
-        assert_eq!(s.state(), State::Reviewing);
-    }
-
-    #[test]
-    fn reconcile_with_empty_final_deletes_preview_and_idles() {
-        // The whole-take decode came back empty (silence/noise after previews):
-        // remove the preview entirely and return to idle, committing nothing.
-        let mut s = session();
-        stream_partials(&mut s, &["ghost text"]);
-
-        s.on_reconcile(String::new());
-
-        assert_eq!(s.surface.deleted, [10], "the whole 10-char run is removed");
-        assert_eq!(s.surface.committed, ["ghost text"], "nothing new committed");
-        assert_eq!(s.state(), State::Idle);
     }
 
     #[test]
@@ -862,16 +804,182 @@ mod tests {
         );
     }
 
+    // --- IME-owned preedit preview (new contract) ---------------------------
+    //
+    // The live streaming preview must live in preedit, not committed text, so no
+    // app can auto-transform it and no backspace-reconcile can corrupt the doc.
+
+    #[test]
+    fn partial_snippets_show_in_preedit_not_committed_text() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+
+        s.on_partial_transcript("hello world".to_owned());
+        s.on_partial_transcript(" second snippet".to_owned());
+
+        // The growing preview is the WHOLE preedit region each time (preedit
+        // replaces, not appends), and nothing is committed to the document.
+        assert_eq!(
+            s.surface.preedits,
+            ["hello world", "hello world second snippet"]
+        );
+        assert!(
+            s.surface.committed.is_empty(),
+            "the preview is preedit, never committed text"
+        );
+        assert_eq!(s.daemon.events, ["toggle"], "no per-snippet finalize");
+        assert_eq!(s.state(), State::Recording, "still mid-take");
+    }
+
+    #[test]
+    fn reconcile_clears_preedit_and_commits_only_the_verified_final() {
+        // Direct streaming stop: the lossy preview was preedit-only, so at stop the
+        // engine clears the preedit and commits the verified text exactly once — no
+        // divergence math, no backspaces an auto-closing editor could corrupt.
+        let mut s = session();
+        stream_partials(&mut s, &["helo world"]);
+        assert_eq!(s.surface.preedits, ["helo world"]);
+        assert!(s.surface.committed.is_empty(), "preview not committed yet");
+
+        s.on_reconcile("hello world".to_owned());
+
+        assert_eq!(
+            s.surface.preedits,
+            ["helo world", ""],
+            "the preedit preview is cleared at stop"
+        );
+        assert_eq!(
+            s.surface.committed,
+            ["hello world"],
+            "only the verified full text is committed, once"
+        );
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_preview_accumulates_across_partials_then_commits_once() {
+        let mut s = session();
+        stream_partials(&mut s, &["hello ", "wrld"]);
+        assert_eq!(s.surface.preedits, ["hello ", "hello wrld"]);
+
+        s.on_reconcile("hello world".to_owned());
+
+        assert_eq!(s.surface.preedits, ["hello ", "hello wrld", ""]);
+        assert_eq!(s.surface.committed, ["hello world"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_with_no_preview_shows_no_preedit_and_commits_full_final() {
+        // Preview typing OFF: no partials, so no preedit was ever shown; the engine
+        // just commits the whole verified final. No preedit op, no backspaces.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+
+        s.on_reconcile("the verified text".to_owned());
+
+        assert!(
+            s.surface.preedits.is_empty(),
+            "no preview was ever shown, so no preedit op"
+        );
+        assert_eq!(s.surface.committed, ["the verified text"]);
+        assert_eq!(s.state(), State::Reviewing);
+    }
+
+    #[test]
+    fn reconcile_with_empty_final_clears_preedit_and_idles() {
+        // The whole-take decode came back empty (silence/noise after previews):
+        // clear the preedit preview and return to idle, committing nothing.
+        let mut s = session();
+        stream_partials(&mut s, &["ghost text"]);
+
+        s.on_reconcile(String::new());
+
+        assert_eq!(
+            s.surface.preedits,
+            ["ghost text", ""],
+            "preview shown, then cleared"
+        );
+        assert!(s.surface.committed.is_empty(), "nothing committed");
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn cancel_during_streaming_clears_the_preedit_preview() {
+        // Escape mid-take aborts: the ephemeral preedit preview must visibly clear.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("draft preview".to_owned());
+        assert_eq!(s.surface.preedits, ["draft preview"]);
+
+        assert!(s.on_key(Key::Cancel));
+
+        assert_eq!(s.surface.preedits, ["draft preview", ""]);
+        assert!(s.surface.committed.is_empty(), "nothing committed");
+        assert_eq!(s.daemon.events, ["toggle", "cancel"]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn silent_stop_after_a_preview_clears_the_preedit() {
+        // A streamed take showed a live preview but produced no verified text (the
+        // mic closed with no reconcile): the ephemeral preedit must be cleared.
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("half a thought".to_owned());
+
+        s.on_recording_status(false); // mic closed, no reconcile
+
+        assert_eq!(s.surface.preedits, ["half a thought", ""]);
+        assert!(s.surface.committed.is_empty());
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn error_during_streaming_clears_the_preedit_preview() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("partial".to_owned());
+
+        s.on_error();
+
+        assert_eq!(s.surface.preedits, ["partial", ""]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn reset_to_idle_clears_a_streaming_preedit_preview() {
+        let mut s = session();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("streaming".to_owned());
+
+        s.reset_to_idle();
+
+        assert_eq!(s.surface.preedits, ["streaming", ""]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
     #[test]
     fn partials_outside_a_live_take_are_ignored() {
         let mut s = session();
         s.on_partial_transcript("ghost".to_owned());
+        assert!(s.surface.preedits.is_empty(), "idle: no preedit shown");
         assert!(s.surface.committed.is_empty(), "idle: nothing typed");
 
         // After a finished batch take (review window open, mic closed) a stray
-        // partial must not type either.
+        // partial must not show a preview either.
         dictate(&mut s, "restart traffic");
         s.on_partial_transcript("ghost".to_owned());
+        assert!(
+            s.surface.preedits.is_empty(),
+            "no preedit for a stray partial"
+        );
         assert_eq!(s.surface.committed, ["restart traffic"]);
     }
 

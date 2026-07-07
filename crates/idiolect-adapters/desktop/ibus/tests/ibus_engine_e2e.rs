@@ -292,19 +292,17 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
     drop(conn);
 }
 
-/// Direct STREAMING stop: the engine typed a lossy preview live, then the daemon
-/// sends the verified whole-take text with `reconcile: true`. The engine must
-/// DELETE the divergent suffix of what it typed — synthesised Backspace
-/// `ForwardKeyEvent`s, because we are a keyboard, so this works in any app — and
-/// re-commit only the corrected suffix, leaving the verified text in the field.
-/// Proven over real D-Bus by observing the backspaces and the re-commit.
+/// Direct STREAMING stop: the engine shows a lossy live preview in the IME-owned
+/// preedit (never committed to the document), then the daemon sends the verified
+/// whole-take text with `reconcile: true`. The engine must CLEAR the preedit and
+/// commit ONLY the verified text, exactly once — no backspaces, because the
+/// preview was never real document text an app could have auto-transformed.
+/// Proven over real D-Bus by observing the `UpdatePreeditText` preview, its clear,
+/// and the single verified `CommitText` (in that order).
 #[tokio::test]
-async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
+async fn reconcile_clears_the_preedit_preview_and_commits_the_verified_text() {
     const PREVIEW: &str = "helo world";
     const VERIFIED: &str = "hello world";
-    // "hel" is shared; the 7-char suffix ("o world") is backspaced, "lo world" typed.
-    const SHARED_PREFIX: usize = 3;
-    const BACKSPACES: usize = PREVIEW.len() - SHARED_PREFIX;
 
     let Some(bus) = PrivateBus::start() else {
         panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
@@ -320,10 +318,10 @@ async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
         .receive_signal("CommitText")
         .await
         .expect("subscribe CommitText");
-    let mut key_signals = engine_proxy
-        .receive_signal("ForwardKeyEvent")
+    let mut preedit_signals = engine_proxy
+        .receive_signal("UpdatePreeditText")
         .await
-        .expect("subscribe ForwardKeyEvent");
+        .expect("subscribe UpdatePreeditText");
 
     // Focusing a text field is what sets active_path (the direct-mode target).
     engine_proxy
@@ -331,7 +329,7 @@ async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
         .await
         .expect("FocusIn");
 
-    // Arm the take, then type a live preview snippet (a streamed PARTIAL).
+    // Arm the take, then stream a live preview snippet (a PARTIAL).
     send_line(
         &mut server_writer,
         &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
@@ -345,11 +343,9 @@ async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
             reconcile: false,
         }),
     );
-    assert_eq!(
-        next_commit(&mut commit_signals).await,
-        PREVIEW,
-        "the preview snippet is typed live via CommitText"
-    );
+    let (preview, visible) = next_preedit(&mut preedit_signals).await;
+    assert_eq!(preview, PREVIEW, "the live preview is shown as preedit");
+    assert!(visible, "a non-empty preview is visible preedit");
 
     // Stop: the daemon sends the verified text to RECONCILE the preview.
     send_line(
@@ -362,18 +358,16 @@ async fn reconcile_backspaces_the_preview_and_recommits_the_verified_text() {
         }),
     );
 
-    // The corrected suffix is re-committed only AFTER the backspaces, so once we
-    // observe it every Backspace has already been forwarded.
+    // The preedit is cleared BEFORE the verified text is committed (clear-then-
+    // commit), so the app drops the underlined preview and receives clean text.
+    let (cleared, visible) = next_preedit(&mut preedit_signals).await;
+    assert!(cleared.is_empty(), "the preedit preview is cleared at stop");
+    assert!(!visible, "an empty preedit is hidden");
+
     assert_eq!(
         next_commit(&mut commit_signals).await,
-        "lo world",
-        "only the divergent suffix is re-committed (common prefix is kept)"
-    );
-
-    let presses = drain_backspace_presses(&mut key_signals).await;
-    assert_eq!(
-        presses, BACKSPACES,
-        "the divergent suffix of the live preview is backspaced before re-commit"
+        VERIFIED,
+        "only the verified full text is committed, once"
     );
 
     drop(engine);
@@ -579,27 +573,18 @@ where
     extract_ibus_text(&text)
 }
 
-/// Count Backspace key PRESSES the engine forwarded, draining the `ForwardKeyEvent`
-/// stream until it goes quiet. The body is `(keyval, keycode, state)`; each
-/// backspace is a press (state 0) + release pair, so the press count equals the
-/// number of characters deleted.
-async fn drain_backspace_presses<S>(stream: &mut S) -> usize
+/// Read the next `UpdatePreeditText(v text, u cursor, b visible)` and return the
+/// preview text and its visibility. Empty text with `visible == false` is the
+/// stop-time clear of the live preview.
+async fn next_preedit<S>(stream: &mut S) -> (String, bool)
 where
     S: futures_util::Stream<Item = zbus::Message> + Unpin,
 {
-    use futures_util::StreamExt;
-    let mut presses = 0;
-    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), stream.next()).await
-    {
-        let body = msg.body();
-        let (keyval, _keycode, state): (u32, u32, u32) =
-            body.deserialize().expect("forward-key body");
-        assert_eq!(keyval, KEY_BACKSPACE, "only Backspace is synthesised");
-        if state == 0 {
-            presses += 1;
-        }
-    }
-    presses
+    let msg = next_signal(stream).await;
+    let body = msg.body();
+    let (text, _cursor, visible): (Value<'_>, u32, bool) =
+        body.deserialize().expect("preedit body");
+    (extract_ibus_text(&text), visible)
 }
 
 fn send_line(writer: &mut impl Write, message: &IpcMessage) {

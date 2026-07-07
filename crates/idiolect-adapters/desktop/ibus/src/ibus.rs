@@ -55,11 +55,12 @@ enum SurfaceOp {
     Commit {
         text: String,
     },
-    /// Delete the last `count` characters by synthesising that many backspace key
-    /// events (emitted as IBus `ForwardKeyEvent`s) — used to remove a live-typed
-    /// preview before re-committing the verified text.
-    Delete {
-        count: usize,
+    /// Replace the IME-owned preedit region (the underlined pre-commit preview)
+    /// with `text`, emitted as an IBus `UpdatePreeditText`. An empty string clears
+    /// it. The live streaming preview lives here — apps never auto-transform
+    /// preedit — and only the verified full-take text is ever committed.
+    Preedit {
+        text: String,
     },
 }
 
@@ -70,8 +71,10 @@ impl Surface for PendingSurface {
         });
     }
 
-    fn delete(&mut self, count: usize) {
-        self.ops.push(SurfaceOp::Delete { count });
+    fn set_preedit(&mut self, text: &str) {
+        self.ops.push(SurfaceOp::Preedit {
+            text: text.to_owned(),
+        });
     }
 }
 
@@ -256,36 +259,31 @@ async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops:
                     eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
                 }
             }
-            SurfaceOp::Delete { count } => {
+            SurfaceOp::Preedit { text } => {
+                // `UpdatePreeditText(variant text, uint cursor, bool visible)`.
+                // Non-empty shows the underlined preview with the caret at its end;
+                // empty hides/clears it. Preedit is IME-owned, so the app renders
+                // the preview without ever committing or auto-transforming it.
+                let cursor = text.chars().count() as u32;
+                let visible = !text.is_empty();
                 dbg_edit(&format!(
-                    "emit {count}x ForwardKeyEvent(BackSpace) -> {}",
-                    engine_path.as_str()
+                    "emit UpdatePreeditText -> {} : {:?} (visible={visible})",
+                    engine_path.as_str(),
+                    text
                 ));
-                for _ in 0..count {
-                    emit_backspace(conn, engine_path).await;
+                let result = conn
+                    .emit_signal(
+                        None::<&str>,
+                        engine_path,
+                        ENGINE_IFACE,
+                        "UpdatePreeditText",
+                        &(ibus_text(&text), cursor, visible),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("idiolect-ibus: failed to emit UpdatePreeditText: {error}");
                 }
             }
-        }
-    }
-}
-
-/// Synthesise one Backspace into the focused app via the IBus `ForwardKeyEvent`
-/// signal (signature `(keyval, keycode, state)`): a press followed by a release.
-/// We are a keyboard, so a forwarded Backspace deletes the previous character in
-/// any application — no surrounding-text capability negotiation required.
-async fn emit_backspace(conn: &Connection, engine_path: &OwnedObjectPath) {
-    for state in [0u32, RELEASE_MASK] {
-        let result = conn
-            .emit_signal(
-                None::<&str>,
-                engine_path,
-                ENGINE_IFACE,
-                "ForwardKeyEvent",
-                &(KEY_BACKSPACE, 0u32, state),
-            )
-            .await;
-        if let Err(error) = result {
-            eprintln!("idiolect-ibus: failed to emit ForwardKeyEvent: {error}");
         }
     }
 }
@@ -499,12 +497,13 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     continue;
                 }
                 if update.partial {
-                    // A mid-take snippet of a streamed take: type it and keep
-                    // recording. The daemon finalizes the whole take at stop.
-                    // Re-assert focus on the dictation target first (same dance as
-                    // the final direct commit) so the snippet lands in the app and
-                    // not wherever the WM's focus churn left things — streaming
-                    // dictation hits THIS arm, not the batch one below.
+                    // A mid-take snippet of a streamed take: show it in the
+                    // IME-owned preedit and keep recording. The daemon finalizes the
+                    // whole take at stop. Re-assert focus on the dictation target
+                    // first (same dance as the final direct commit) so the preedit
+                    // shows on the app the user is dictating into and not wherever
+                    // the WM's focus churn left things — streaming dictation hits
+                    // THIS arm, not the batch one below.
                     let target = *shared
                         .dictation_target
                         .lock()
@@ -545,11 +544,11 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                         .expect("dictation_target mutex");
                     restore_dictation_focus(shared.focus.as_ref(), target);
                     if update.reconcile {
-                        // Stop of a direct STREAMING take: replace the live-typed
-                        // preview with the verified full-take text (backspace the
-                        // divergent suffix, re-commit). The daemon already owns and
-                        // committed the streamed session, so the engine does not
-                        // commit again — this is a display reconcile only.
+                        // Stop of a direct STREAMING take: clear the IME-owned
+                        // preedit preview and commit the verified full-take text
+                        // once (no backspace guessing — the preview was never in the
+                        // document). The daemon already owns and committed the
+                        // streamed session, so the engine's commit is display only.
                         shared.run_session(|s| s.on_reconcile(update.text))
                     } else {
                         shared.run_session(|s| s.on_transcript(update.text))
@@ -845,17 +844,26 @@ mod tests {
     use super::{handle_edit_history, restore_dictation_focus, PendingSurface, Surface, SurfaceOp};
 
     #[test]
-    fn pending_surface_records_delete_then_commit_in_order() {
-        // The reconcile path drives the surface as delete(N) then commit(suffix);
-        // the buffered ops must preserve that order so the async layer emits the
-        // backspaces before re-committing the verified text.
+    fn pending_surface_records_preview_then_clear_then_commit_in_order() {
+        // The streaming reconcile path drives the surface as set_preedit(preview)
+        // while recording, then set_preedit("") + commit(verified) at stop. The
+        // buffered ops must preserve that order so the async layer clears the
+        // underlined preview BEFORE committing the verified text (clear-then-commit).
         let mut surface = PendingSurface::default();
-        surface.delete(7);
-        surface.commit_text("lo world");
+        surface.set_preedit("helo world");
+        surface.set_preedit("");
+        surface.commit_text("hello world");
         let ops = surface.take_ops();
         assert!(
-            matches!(ops.as_slice(), [SurfaceOp::Delete { count: 7 }, SurfaceOp::Commit { text }] if text == "lo world"),
-            "expected Delete{{7}} then Commit, got a different op sequence"
+            matches!(
+                ops.as_slice(),
+                [
+                    SurfaceOp::Preedit { text: preview },
+                    SurfaceOp::Preedit { text: cleared },
+                    SurfaceOp::Commit { text: verified },
+                ] if preview == "helo world" && cleared.is_empty() && verified == "hello world"
+            ),
+            "expected Preedit(preview) -> Preedit(\"\") -> Commit(verified), got a different op sequence"
         );
     }
 
