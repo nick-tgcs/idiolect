@@ -10,6 +10,7 @@ bash ci/scripts/test-model-regression.sh
 bash ci/scripts/test-performance.sh
 bash ci/scripts/test-real-adapter-deps.sh
 bash ci/scripts/test-interface-no-backend-leakage.sh
+bash ci/scripts/test-gui-crates-build-standalone.sh
 bash ci/scripts/test-packaging.sh
 bash ci/scripts/test-package-smoke.sh
 bash ci/scripts/test-package-lifecycle.sh

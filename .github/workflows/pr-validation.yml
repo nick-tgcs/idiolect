@@ -160,6 +160,14 @@ jobs:
       - name: Run tests (quick - no doc tests, no coverage)
         run: cargo test --workspace --all-targets --features idiolect-ibus/ibus-engine
 
+      # A full workspace build unifies Cargo features, so a GUI crate missing
+      # its eframe windowing backend (x11/wayland) still links one from a
+      # sibling and looks fine — while an isolated build of that crate produces
+      # a binary that cannot open a window. Build each GUI binary alone to catch
+      # that before it reaches a user's desktop.
+      - name: Check GUI crates build standalone
+        run: bash ci/scripts/test-gui-crates-build-standalone.sh
+
   # =========================================================================
   # FCITX5: Quick validation
   # =========================================================================
