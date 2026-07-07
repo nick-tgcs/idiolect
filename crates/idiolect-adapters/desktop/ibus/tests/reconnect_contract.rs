@@ -60,7 +60,12 @@ fn engine_reconnects_after_daemon_drop_and_resyncs_via_status_push() {
         read_message(&stream)
     });
 
-    let (mut sender, mut reader) = ipc::connect(&socket_path).expect("first connect + handshake");
+    let (mut sender, mut reader, reconcile) =
+        ipc::connect(&socket_path).expect("first connect + handshake");
+    assert!(
+        !reconcile,
+        "server advertised no reconcile, so it must not be negotiated"
+    );
 
     // The server dropped connection 1 → the read loop sees the connection die.
     assert!(
@@ -69,7 +74,12 @@ fn engine_reconnects_after_daemon_drop_and_resyncs_via_status_push() {
     );
 
     // Reconnect: the same sender's socket is swapped underneath it.
-    let mut reader = ipc::reconnect(&socket_path, &sender).expect("reconnect + handshake");
+    let (mut reader, reconcile) =
+        ipc::reconnect(&socket_path, &sender).expect("reconnect + handshake");
+    assert!(
+        !reconcile,
+        "reconnect re-reads the (still absent) reconcile"
+    );
 
     // The daemon resyncs us with its authoritative state.
     match reader.read_message().expect("status push after reconnect") {

@@ -75,17 +75,26 @@ fn client_hello() -> IpcMessage {
 }
 
 /// Send the handshake on `sender` and await the daemon's `ServerHello` on `reader`.
-fn handshake(sender: &mut DaemonSender, reader: &mut DaemonReader) -> io::Result<()> {
+/// Returns whether the daemon accepted [`FEATURE_RECONCILE`]: only then does it
+/// send a stop-time reconcile final, so only then may the engine keep its live
+/// preview in preedit (uncommitted). A daemon that omits it uses the pre-reconcile
+/// fallback — partials then a bare `RecordingStatus(false)` — so the engine must
+/// commit those partials as real text or the dictation would vanish at stop.
+fn handshake(sender: &mut DaemonSender, reader: &mut DaemonReader) -> io::Result<bool> {
     sender.send(&client_hello())?;
     match reader.read_message()? {
-        IpcMessage::ServerHello(_) => Ok(()),
+        IpcMessage::ServerHello(hello) => Ok(hello
+            .accepted_features
+            .iter()
+            .any(|feature| feature == FEATURE_RECONCILE)),
         other => Err(invalid_data(format!("expected ServerHello, got {other:?}"))),
     }
 }
 
 /// Connect to the daemon and complete the handshake, returning a sender/reader
-/// pair over clones of the same connection.
-pub fn connect(socket_path: &Path) -> io::Result<(DaemonSender, DaemonReader)> {
+/// pair over clones of the same connection and whether the daemon negotiated
+/// [`FEATURE_RECONCILE`] (see [`handshake`]).
+pub fn connect(socket_path: &Path) -> io::Result<(DaemonSender, DaemonReader, bool)> {
     let stream = UnixStream::connect(socket_path)?;
     let reader_stream = stream.try_clone()?;
     let mut sender = DaemonSender {
@@ -94,15 +103,15 @@ pub fn connect(socket_path: &Path) -> io::Result<(DaemonSender, DaemonReader)> {
     let mut reader = DaemonReader {
         reader: BufReader::new(reader_stream),
     };
-    handshake(&mut sender, &mut reader)?;
-    Ok((sender, reader))
+    let reconcile = handshake(&mut sender, &mut reader)?;
+    Ok((sender, reader, reconcile))
 }
 
 /// Re-establish a dropped connection, swapping the live socket inside the existing
 /// `sender` (so the session that owns it keeps working) and returning a fresh
 /// reader. The caller resets its session to idle afterwards; the daemon re-pushes
 /// its authoritative `RecordingStatus` to resync.
-pub fn reconnect(socket_path: &Path, sender: &DaemonSender) -> io::Result<DaemonReader> {
+pub fn reconnect(socket_path: &Path, sender: &DaemonSender) -> io::Result<(DaemonReader, bool)> {
     let stream = UnixStream::connect(socket_path)?;
     let reader_stream = stream.try_clone()?;
     sender.replace_stream(Some(stream));
@@ -110,8 +119,8 @@ pub fn reconnect(socket_path: &Path, sender: &DaemonSender) -> io::Result<Daemon
         reader: BufReader::new(reader_stream),
     };
     let mut sender = sender.clone();
-    handshake(&mut sender, &mut reader)?;
-    Ok(reader)
+    let reconcile = handshake(&mut sender, &mut reader)?;
+    Ok((reader, reconcile))
 }
 
 impl DaemonSender {
@@ -192,5 +201,62 @@ impl DaemonReader {
             ));
         }
         decode_json_line(&line).map_err(invalid_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use idiolect_ipc::messages::ServerHello;
+    use std::thread;
+
+    /// Drive `handshake` against a fake daemon that replies with a `ServerHello`
+    /// advertising `accepted`, and return the negotiated reconcile flag.
+    fn negotiated_reconcile(accepted: Vec<String>) -> bool {
+        let (engine, daemon) = UnixStream::pair().expect("socketpair");
+        let reader_stream = engine.try_clone().expect("clone");
+        let mut sender = DaemonSender {
+            stream: Arc::new(Mutex::new(Some(engine))),
+        };
+        let mut reader = DaemonReader {
+            reader: BufReader::new(reader_stream),
+        };
+
+        let daemon_thread = thread::spawn(move || {
+            let mut read = BufReader::new(daemon.try_clone().expect("clone"));
+            let mut line = String::new();
+            read.read_line(&mut line).expect("read ClientHello");
+            assert!(
+                matches!(decode_json_line(&line), Ok(IpcMessage::ClientHello(_))),
+                "engine greets with ClientHello"
+            );
+            let mut write = daemon;
+            let hello = IpcMessage::ServerHello(ServerHello {
+                protocol_version: PROTOCOL_VERSION,
+                accepted_features: accepted,
+            });
+            write
+                .write_all(encode_json_line(&hello).expect("encode").as_bytes())
+                .expect("write ServerHello");
+            write.flush().expect("flush");
+        });
+
+        let reconcile = handshake(&mut sender, &mut reader).expect("handshake");
+        daemon_thread.join().expect("daemon thread");
+        reconcile
+    }
+
+    #[test]
+    fn handshake_reports_reconcile_when_the_daemon_accepts_it() {
+        assert!(negotiated_reconcile(vec![
+            FEATURE_PREEDIT.to_owned(),
+            FEATURE_RECONCILE.to_owned(),
+        ]));
+    }
+
+    #[test]
+    fn handshake_reports_no_reconcile_when_the_daemon_omits_it() {
+        assert!(!negotiated_reconcile(vec![FEATURE_PREEDIT.to_owned()]));
+        assert!(!negotiated_reconcile(vec![]));
     }
 }

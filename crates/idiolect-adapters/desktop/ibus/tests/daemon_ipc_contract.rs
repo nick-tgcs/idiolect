@@ -73,8 +73,8 @@ fn read_preedit(reader: &mut DaemonReader) -> String {
 
 fn connect_with_retry(socket_path: &Path) -> (DaemonSender, DaemonReader) {
     for _ in 0..500 {
-        if let Ok(pair) = ipc::connect(socket_path) {
-            return pair;
+        if let Ok((sender, reader, _reconcile)) = ipc::connect(socket_path) {
+            return (sender, reader);
         }
         thread::sleep(Duration::from_millis(10));
     }
