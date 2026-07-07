@@ -130,7 +130,17 @@ pub struct Session<D, S> {
     /// stop [`Session::on_reconcile`] clears the preedit and commits the verified
     /// full-take text once; abandoning the take (cancel/error/silent-stop/reset)
     /// clears it via [`Session::clear_preview`]. Empty means no preview is showing.
+    /// Only ever populated when [`reconcile_supported`](Self::reconcile_supported).
     preview: String,
+    /// Whether the connected daemon negotiated the stop-time reconcile final
+    /// (`FEATURE_RECONCILE`). Only then does a streamed take end with a reconcile
+    /// message, so only then is it safe to keep the live preview in uncommitted
+    /// preedit. When false, [`on_partial_transcript`](Self::on_partial_transcript)
+    /// commits each partial as real text instead, so a stop that arrives as a bare
+    /// `RecordingStatus(false)` (the pre-reconcile fallback) still leaves the
+    /// dictation in the app. Defaults to false (the safe, always-lands-text mode);
+    /// set from the handshake via [`set_reconcile_supported`](Self::set_reconcile_supported).
+    reconcile_supported: bool,
 }
 
 impl<D, S> Session<D, S>
@@ -146,11 +156,19 @@ where
             review: None,
             recording: false,
             preview: String::new(),
+            reconcile_supported: false,
         }
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Record whether the daemon negotiated the stop-time reconcile final; the
+    /// engine sets this from the handshake (and re-sets it on reconnect). See
+    /// [`reconcile_supported`](Self::reconcile_supported).
+    pub fn set_reconcile_supported(&mut self, supported: bool) {
+        self.reconcile_supported = supported;
     }
 
     /// Mutable access to the surface (the engine drains buffered commit effects
@@ -295,19 +313,32 @@ where
     }
 
     /// The daemon delivered a mid-take snippet of a streamed take (a PARTIAL): show
-    /// it in the IME-owned **preedit** and keep recording. Nothing is finalized —
-    /// the daemon owns the take's single session and commits it at stop — and no
-    /// correction window opens mid-take. The snippet is appended to the running
-    /// preview and the whole preview is set as the preedit region (preedit
-    /// replaces, so we resend the full text), so the stop-time
+    /// it as the live preview and keep recording. Nothing is finalized — the daemon
+    /// owns the take's single session and commits it at stop — and no correction
+    /// window opens mid-take.
+    ///
+    /// With reconcile negotiated (the normal case) the snippet is appended to the
+    /// running preview and the whole preview is set as the IME-owned **preedit**
+    /// region (preedit replaces, so we resend the full text), so the stop-time
     /// [`on_reconcile`](Self::on_reconcile) can clear it and commit the verified
-    /// text without any live-typed preview in the document to reconcile.
+    /// text with no live-typed preview in the document to reconcile. Without
+    /// reconcile the snippet is committed as real text (the pre-reconcile
+    /// fallback), because the take ends with a bare `RecordingStatus(false)` and
+    /// no verified final — a preedit-only preview would be cleared and lost.
     pub fn on_partial_transcript(&mut self, text: String) {
         if self.state != State::Recording || text.is_empty() {
             return; // no live take; ignore a stray/late partial
         }
-        self.preview.push_str(&text);
-        self.surface.set_preedit(&self.preview);
+        if self.reconcile_supported {
+            self.preview.push_str(&text);
+            self.surface.set_preedit(&self.preview);
+        } else {
+            // The daemon did not negotiate a stop-time reconcile, so the take will
+            // end with a bare RecordingStatus(false) and no verified final. Commit
+            // each partial as real text (the pre-reconcile fallback) so the
+            // dictation survives the stop — preedit-only would be cleared and lost.
+            self.surface.commit_text(&text);
+        }
     }
 
     /// The daemon delivered the verified full-take text at the stop of a direct
@@ -508,7 +539,17 @@ mod tests {
         }
     }
 
+    /// The production-normal engine: a daemon that negotiated the stop-time
+    /// reconcile, so streamed previews live in preedit.
     fn session() -> Session<FakeDaemon, FakeSurface> {
+        let mut s = Session::new(FakeDaemon::default(), FakeSurface::default());
+        s.set_reconcile_supported(true);
+        s
+    }
+
+    /// A session talking to a daemon that did NOT negotiate reconcile (the
+    /// pre-reconcile fallback): streamed partials are committed as real text.
+    fn session_without_reconcile() -> Session<FakeDaemon, FakeSurface> {
         Session::new(FakeDaemon::default(), FakeSurface::default())
     }
 
@@ -962,6 +1003,73 @@ mod tests {
         s.reset_to_idle();
 
         assert_eq!(s.surface.preedits, ["streaming", ""]);
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    // --- Pre-reconcile fallback (daemon did NOT negotiate FEATURE_RECONCILE) ----
+    //
+    // Such a daemon streams partials then a bare RecordingStatus(false) with no
+    // verified final. Preedit-only previews would be cleared and the dictation
+    // would vanish, so partials must be COMMITTED as real text instead.
+
+    #[test]
+    fn partials_commit_when_reconcile_is_not_negotiated() {
+        let mut s = session_without_reconcile();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+
+        s.on_partial_transcript("hello ".to_owned());
+        s.on_partial_transcript("world".to_owned());
+
+        assert_eq!(
+            s.surface.committed,
+            ["hello ", "world"],
+            "partials are committed as real text, not preedit"
+        );
+        assert!(
+            s.surface.preedits.is_empty(),
+            "no preedit-only preview when reconcile is not negotiated"
+        );
+        assert_eq!(s.state(), State::Recording, "still mid-take");
+    }
+
+    #[test]
+    fn silent_stop_without_reconcile_keeps_the_committed_dictation() {
+        // The stop arrives as a bare RecordingStatus(false) (no reconcile). The
+        // already-committed partials must survive — nothing is cleared or removed.
+        let mut s = session_without_reconcile();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("keep this text".to_owned());
+
+        s.on_recording_status(false);
+
+        assert_eq!(
+            s.surface.committed,
+            ["keep this text"],
+            "the committed dictation survives the stop"
+        );
+        assert!(s.surface.preedits.is_empty(), "nothing to clear");
+        assert_eq!(s.state(), State::Idle);
+    }
+
+    #[test]
+    fn cancel_without_reconcile_sends_no_preedit_op() {
+        // Commit-mode cancel: the partials were committed (they stay, as before);
+        // there is no ephemeral preedit to clear, so no set_preedit op is emitted.
+        let mut s = session_without_reconcile();
+        s.on_key(Key::Trigger);
+        s.on_recording_status(true);
+        s.on_partial_transcript("draft".to_owned());
+
+        assert!(s.on_key(Key::Cancel));
+
+        assert_eq!(s.surface.committed, ["draft"]);
+        assert!(
+            s.surface.preedits.is_empty(),
+            "no preedit op in commit mode"
+        );
+        assert_eq!(s.daemon.events, ["toggle", "cancel"]);
         assert_eq!(s.state(), State::Idle);
     }
 

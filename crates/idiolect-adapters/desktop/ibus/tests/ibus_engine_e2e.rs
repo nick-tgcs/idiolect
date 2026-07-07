@@ -31,7 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use idiolect_adapter_sqlite::SqliteMetadataStore;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, PROTOCOL_VERSION,
+    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, FEATURE_RECONCILE,
+    PROTOCOL_VERSION,
 };
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{OwnedObjectPath, Value};
@@ -374,6 +375,64 @@ async fn reconcile_clears_the_preedit_preview_and_commits_the_verified_text() {
     drop(conn);
 }
 
+/// A daemon that did NOT negotiate `FEATURE_RECONCILE` uses the pre-reconcile
+/// fallback: it streams partials then a bare `RecordingStatus(false)`, with no
+/// reconcile final. The engine must COMMIT each partial as real text (not
+/// preedit-only) so the dictation survives the stop — otherwise a preedit-only
+/// preview would be cleared and the text would vanish while the daemon has
+/// already recorded the session. Proven over real D-Bus by observing the partial
+/// arrive as a `CommitText`.
+#[tokio::test]
+async fn partials_are_committed_when_the_daemon_does_not_negotiate_reconcile() {
+    const PARTIAL: &str = "keep this text";
+
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-no-reconcile");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    // Pre-reconcile daemon: accept no features, so reconcile is NOT negotiated.
+    let (mut server_writer, _server_reader) = accept_and_handshake_with(&listener, vec![]);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Focusing a text field is what sets active_path (the direct-mode target).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: PARTIAL.to_owned(),
+            review: false,
+            partial: true,
+            reconcile: false,
+        }),
+    );
+
+    // The partial lands as committed text (the fallback), not preedit-only.
+    assert_eq!(
+        next_commit(&mut commit_signals).await,
+        PARTIAL,
+        "without reconcile, a streamed partial is committed as real text"
+    );
+
+    drop(engine);
+    drop(conn);
+}
+
 /// The belt-and-braces behaviour for "no focused context": the SAME direct take as
 /// above but with NO `FocusIn` (so `active_path` stays `None`, as when idiolect is
 /// not the focused IBus context). Rather than silently lose the text into nowhere
@@ -492,7 +551,19 @@ async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
 
 /// Accept the engine's connection and complete the v1 handshake, returning the
 /// (writer, reader) halves the test drives the fake daemon through.
+/// Accept + handshake advertising the stop-time reconcile (the production-normal
+/// daemon), so streamed previews take the preedit path.
 fn accept_and_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixStream>) {
+    accept_and_handshake_with(listener, vec![FEATURE_RECONCILE.to_owned()])
+}
+
+/// As [`accept_and_handshake`] but with an explicit accepted-feature list, so a
+/// test can simulate a pre-reconcile daemon (empty list) that never sends a
+/// reconcile final.
+fn accept_and_handshake_with(
+    listener: &UnixListener,
+    accepted_features: Vec<String>,
+) -> (UnixStream, BufReader<UnixStream>) {
     let (stream, _) = listener.accept().expect("engine connects");
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
@@ -506,7 +577,7 @@ fn accept_and_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixS
         &mut writer,
         &IpcMessage::ServerHello(ServerHello {
             protocol_version: PROTOCOL_VERSION,
-            accepted_features: vec![],
+            accepted_features,
         }),
     );
     (writer, reader)

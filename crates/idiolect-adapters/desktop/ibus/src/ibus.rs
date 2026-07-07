@@ -613,9 +613,25 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 // engine stuck), reconnect and resync from the daemon's authoritative
                 // state push. We retry until the daemon returns, so even a long outage
                 // (an update, a slow restart) self-heals.
-                reader = reconnect_reader(&socket, &sender);
+                let (new_reader, reconcile_supported) = reconnect_reader(&socket, &sender);
+                reader = new_reader;
                 shared.dialog.close();
-                shared.run_session(|s| s.reset_to_idle());
+                // reset_to_idle may clear a preedit preview that was visible when the
+                // socket dropped; emit those ops (below) so stale underlined text is
+                // not left in the app. Re-apply the freshly negotiated reconcile
+                // capability in case the daemon that came back differs.
+                let ops = shared.run_session(|s| {
+                    s.reset_to_idle();
+                    s.set_reconcile_supported(reconcile_supported);
+                });
+                let target = shared
+                    .active_path
+                    .lock()
+                    .expect("active_path mutex")
+                    .clone();
+                if let Some(path) = target {
+                    handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
+                }
                 shared.sync_indicator();
                 continue;
             }
@@ -685,23 +701,24 @@ fn handle_edit_history(
 /// shared `sender` so the session keeps working. The reader thread is dedicated, so
 /// polling here is harmless; never giving up means the engine always recovers when
 /// the daemon returns instead of going permanently deaf.
-fn reconnect_reader(socket: &Path, sender: &DaemonSender) -> DaemonReader {
+fn reconnect_reader(socket: &Path, sender: &DaemonSender) -> (DaemonReader, bool) {
     loop {
         match ipc::reconnect(socket, sender) {
-            Ok(reader) => return reader,
+            Ok(pair) => return pair,
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
 }
 
 /// Connect to the daemon, retrying briefly so engine startup tolerates the
-/// daemon coming up at roughly the same time.
-fn connect_daemon() -> Result<(DaemonSender, DaemonReader), std::io::Error> {
+/// daemon coming up at roughly the same time. The trailing bool is whether the
+/// daemon negotiated the stop-time reconcile (see [`ipc::connect`]).
+fn connect_daemon() -> Result<(DaemonSender, DaemonReader, bool), std::io::Error> {
     let socket = ipc::default_socket_path();
     let mut last = None;
     for _ in 0..50 {
         match ipc::connect(&socket) {
-            Ok(pair) => return Ok(pair),
+            Ok(triple) => return Ok(triple),
             Err(error) => {
                 last = Some(error);
                 std::thread::sleep(Duration::from_millis(100));
@@ -771,11 +788,17 @@ fn resolve_ibus_address() -> Option<String> {
 /// and run until killed.
 pub async fn run() -> zbus::Result<()> {
     // Establish the single daemon connection up front (off the DBus handlers).
-    let (sender, reader) = connect_daemon()
+    let (sender, reader, reconcile_supported) = connect_daemon()
         .map_err(|error| zbus::Error::Failure(format!("daemon connect: {error}")))?;
     // A second handle on the same shared socket so the read loop can swap it on
     // reconnect without disturbing the session that owns the sender.
     let reader_sender = sender.clone();
+
+    // Only keep the live preview in uncommitted preedit if the daemon negotiated
+    // the stop-time reconcile; otherwise a stop arrives as a bare
+    // RecordingStatus(false) and the session commits partials instead.
+    let mut session = Session::new(sender, PendingSurface::default());
+    session.set_reconcile_supported(reconcile_supported);
 
     let builder = match resolve_ibus_address() {
         Some(address) => zbus::connection::Builder::address(address.as_str())?,
@@ -784,7 +807,7 @@ pub async fn run() -> zbus::Result<()> {
     let connection = builder.build().await?;
 
     let shared = Arc::new(Shared {
-        session: Mutex::new(Session::new(sender, PendingSurface::default())),
+        session: Mutex::new(session),
         active_path: Mutex::new(None),
         dialog: Box::new(crate::review::SubprocessReviewDialog::discover()),
         indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
