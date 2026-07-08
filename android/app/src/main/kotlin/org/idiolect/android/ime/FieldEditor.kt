@@ -19,6 +19,9 @@ interface FieldEditor {
     /** Delete the character before the cursor (`InputConnection.deleteSurroundingText`). */
     fun deleteBackward()
 
+    /** Perform the field's declared IME action (`InputConnection.performEditorAction`) — the ⏎ key. */
+    fun performEditorAction(actionId: Int)
+
     /** Select a char range in the field (`InputConnection.setSelection`) — for tap-to-fix. */
     fun setSelection(start: Int, end: Int)
 

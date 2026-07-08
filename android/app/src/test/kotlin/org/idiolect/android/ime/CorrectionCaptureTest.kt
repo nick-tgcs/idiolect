@@ -19,6 +19,7 @@ class CorrectionCaptureTest {
         override fun commitText(text: String) {}
         override fun finishComposingText() {}
         override fun deleteBackward() {}
+        override fun performEditorAction(actionId: Int) {}
         override fun setSelection(start: Int, end: Int) { ops.add("select:$start:$end") }
         override fun fieldText(): String = text
     }

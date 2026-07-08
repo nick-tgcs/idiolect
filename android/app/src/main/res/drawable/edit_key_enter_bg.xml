@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Enter key: a slightly lighter slate disc, so the pair reads left(delete) → right(enter). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@color/idiolect_slate2" />
+</shape>
