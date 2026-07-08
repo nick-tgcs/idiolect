@@ -46,6 +46,15 @@ class EditKeysTest {
     }
 
     @Test
+    fun the_enter_key_honors_a_custom_editor_action_id() {
+        // App-supplied custom action (EditorInfo.actionLabel/actionId): the masked imeOptions
+        // action is UNSPECIFIED, yet the key must perform the custom actionId.
+        val editor = RecordingEditor()
+        EditKeys.enter(editor, EditorInfo.IME_ACTION_UNSPECIFIED, customActionId = 4321)
+        assertEquals(listOf("action:4321"), editor.ops)
+    }
+
+    @Test
     fun the_keys_are_a_no_op_when_no_field_is_focused() {
         // fieldEditor() is null between fields — the keys must not crash.
         EditKeys.delete(null)

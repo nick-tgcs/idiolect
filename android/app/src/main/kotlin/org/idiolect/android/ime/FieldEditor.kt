@@ -16,7 +16,7 @@ interface FieldEditor {
     /** Clear the preedit without committing (`InputConnection.finishComposingText`). */
     fun finishComposingText()
 
-    /** Delete the character before the cursor (`InputConnection.deleteSurroundingText`). */
+    /** Delete the code point before the cursor (`InputConnection.deleteSurroundingTextInCodePoints`). */
     fun deleteBackward()
 
     /** Perform the field's declared IME action (`InputConnection.performEditorAction`) — the ⏎ key. */

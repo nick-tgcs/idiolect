@@ -51,4 +51,22 @@ class EnterActionTest {
         val opts = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_ENTER_ACTION
         assertEquals(EnterAction.Newline, EnterAction.forEditor(opts))
     }
+
+    @Test
+    fun a_custom_action_label_performs_its_action_id_even_when_imeoptions_is_unspecified() {
+        // A field that supplies a custom action via EditorInfo.actionLabel/actionId carries it in
+        // actionId, not the masked imeOptions bits (which stay UNSPECIFIED). The IME must perform
+        // that custom actionId rather than commit a newline.
+        assertEquals(
+            EnterAction.Editor(1234),
+            EnterAction.forEditor(EditorInfo.IME_ACTION_UNSPECIFIED, customActionId = 1234),
+        )
+    }
+
+    @Test
+    fun a_custom_action_is_still_suppressed_by_no_enter_action() {
+        // Opt-out wins over a custom action too — the user asked for a newline.
+        val opts = EditorInfo.IME_ACTION_UNSPECIFIED or EditorInfo.IME_FLAG_NO_ENTER_ACTION
+        assertEquals(EnterAction.Newline, EnterAction.forEditor(opts, customActionId = 1234))
+    }
 }

@@ -13,9 +13,9 @@ object EditKeys {
     }
 
     /** ⏎ — perform the field's editor action, or insert a newline (see [EnterAction]). */
-    fun enter(editor: FieldEditor?, imeOptions: Int) {
+    fun enter(editor: FieldEditor?, imeOptions: Int, customActionId: Int? = null) {
         editor ?: return
-        when (val action = EnterAction.forEditor(imeOptions)) {
+        when (val action = EnterAction.forEditor(imeOptions, customActionId)) {
             is EnterAction.Editor -> editor.performEditorAction(action.actionId)
             EnterAction.Newline -> editor.commitText("\n")
         }

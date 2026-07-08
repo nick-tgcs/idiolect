@@ -87,6 +87,14 @@ class EditKeysE2eTest {
     }
 
     @Test
+    fun the_delete_key_removes_a_whole_emoji_not_half_a_surrogate_pair() {
+        // "a😀" — the emoji is a UTF-16 surrogate pair; one Delete must remove the whole glyph.
+        setField("a😀")
+        device.findObject(By.desc(DELETE_DESC)).click()
+        waitForFieldText("a")
+    }
+
+    @Test
     fun the_enter_key_inserts_a_newline_in_a_field_with_no_ime_action() {
         setField("ab")
         device.findObject(By.desc(ENTER_DESC)).click()

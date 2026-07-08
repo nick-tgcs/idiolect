@@ -269,7 +269,11 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             addView(micKey, LinearLayout.LayoutParams(dp(92), dp(92)))
             addView(
                 buildEditKey(R.drawable.ic_return, R.string.voice_key_enter, R.drawable.edit_key_enter_bg) {
-                    EditKeys.enter(fieldEditor(), currentInputEditorInfo?.imeOptions ?: 0)
+                    val info = currentInputEditorInfo
+                    // A custom action (actionLabel set) isn't in imeOptions — pass its actionId so
+                    // app-specific Submit/Apply buttons fire instead of a stray newline.
+                    val customActionId = info?.takeIf { it.actionLabel != null }?.actionId
+                    EditKeys.enter(fieldEditor(), info?.imeOptions ?: 0, customActionId)
                 },
                 editKeyLp(),
             )

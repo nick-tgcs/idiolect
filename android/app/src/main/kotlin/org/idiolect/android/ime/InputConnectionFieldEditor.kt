@@ -33,7 +33,9 @@ class InputConnectionFieldEditor(
     }
 
     override fun deleteBackward() {
-        post { connection.deleteSurroundingText(1, 0) }
+        // In *code points*, not UTF-16 units — else deleting after an emoji (a surrogate pair)
+        // would strip only half of it and leave a broken glyph behind.
+        post { connection.deleteSurroundingTextInCodePoints(1, 0) }
     }
 
     override fun performEditorAction(actionId: Int) {
