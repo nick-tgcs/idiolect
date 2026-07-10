@@ -32,6 +32,7 @@ import org.idiolect.android.sync.SyncScheduler
 import org.idiolect.ffi.IdiolectCore
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -622,6 +623,11 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         super.onDestroy()
         controller.stop()
         toggleExecutor.shutdown()
+        // Let any queued mic work finish on the still-live core before we release it — e.g. a
+        // discard queued by onStartInputView as focus left for a blocked field. Otherwise that
+        // task would call core.isRecording()/cancel() on a closed IdiolectCore and crash. Bounded
+        // so a pathologically long finalize can't hang teardown (no worse than not waiting).
+        runCatching { toggleExecutor.awaitTermination(2, TimeUnit.SECONDS) }
         LiveReview.bind(null) // stop streaming live partials to this dying surface
         router.unbind(imeCallback) // stop routing core pushes to this dying IME
         coreClosed = true
