@@ -308,6 +308,13 @@ struct Inner {
     /// one-shot take that commits the whole recording once at stop. Set by
     /// [`IdiolectCore::start_continuous`], cleared when recording stops.
     continuous: bool,
+    /// Whether the live take is **ephemeral** (transcription-only): the system
+    /// speech-recognition surface has no `EditorInfo`, so it cannot tell a password/PIN
+    /// field from any other. An ephemeral take commits its transcript to the field but
+    /// persists nothing — no session/history, no source audio, no `last_commit` — so a
+    /// secret dictated there can never reach history or the training/sync pipeline. Set by
+    /// [`IdiolectCore::toggle_ephemeral`], cleared when recording stops.
+    ephemeral: bool,
     /// The live take while recording.
     take: Option<StreamingTake>,
     /// The full preedit accumulated for the current take (for `setComposingText`).
@@ -391,6 +398,7 @@ impl IdiolectCore {
                 streaming_config: streaming_config_from(&VadConfig::default()),
                 recording: false,
                 continuous: false,
+                ephemeral: false,
                 take: None,
                 preedit: String::new(),
                 preedit_started: false,
@@ -461,6 +469,25 @@ impl IdiolectCore {
             inner.stop_recording()
         } else {
             inner.continuous = false;
+            inner.ephemeral = false;
+            inner.start_recording();
+            Ok(())
+        }
+    }
+
+    /// Toggle a **transcription-only** take (the system speech-recognition surface:
+    /// `ACTION_RECOGNIZE_SPEECH` / `RecognitionService` / quick-launch mic). Identical to
+    /// [`Self::toggle`] except the take is marked ephemeral, so at stop the transcript is
+    /// committed to the field but nothing is persisted — no session/history, no source audio,
+    /// no `last_commit`. That surface has no `EditorInfo`, so it cannot detect a password/PIN
+    /// field; not-persisting is the only safe posture against leaking a dictated secret.
+    pub fn toggle_ephemeral(&self) -> Result<(), FfiError> {
+        let mut inner = self.lock();
+        if inner.recording {
+            inner.stop_recording()
+        } else {
+            inner.continuous = false;
+            inner.ephemeral = true;
             inner.start_recording();
             Ok(())
         }
@@ -476,6 +503,7 @@ impl IdiolectCore {
             return Ok(());
         }
         inner.continuous = true;
+        inner.ephemeral = false;
         inner.start_recording();
         Ok(())
     }
@@ -508,6 +536,7 @@ impl IdiolectCore {
         inner.take = None;
         inner.recording = false;
         inner.continuous = false;
+        inner.ephemeral = false;
         let had_preedit = inner.preedit_started;
         inner.preedit.clear();
         inner.preedit_started = false;
@@ -806,6 +835,7 @@ impl Inner {
         let result = self.finalize_outcome(outcome);
         self.recording = false;
         self.continuous = false;
+        self.ephemeral = false;
         self.preedit.clear();
         self.preedit_started = false;
         self.callback.recording_status(false);
@@ -829,6 +859,13 @@ impl Inner {
         };
         if let Some(reason) = &finalized.fallback_reason {
             eprintln!("whole-take decode failed at stop; keeping the previewed text: {reason}");
+        }
+        if self.ephemeral {
+            // Transcription-only: hand the text to the field and stop. No session, no source
+            // audio, no digest, no `dictation.commit`, no `last_commit` — this take may be a
+            // password/PIN field we have no `EditorInfo` for, so persisting could leak a secret.
+            self.callback.commit_text(finalized.final_text);
+            return Ok(());
         }
         let segment = segment_from_samples(&finalized.merged_samples);
         let encoded = self.codec.encode(&segment).map_err(|error| FfiError::Io {

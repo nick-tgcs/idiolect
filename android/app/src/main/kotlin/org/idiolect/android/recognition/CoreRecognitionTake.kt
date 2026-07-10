@@ -40,7 +40,10 @@ class CoreRecognitionTake(context: Context) {
         sink = { frame -> core.pushPcmFrame(frame) },
         sourceFactory = { AndroidPcmSource() },
     )
-    private val mic = MicToggle(CoreRecordingToggle(core), controller, executor)
+    // Ephemeral: the recognition surface has no EditorInfo, so it can't detect a password/PIN
+    // field — the take is transcription-only and the core persists nothing (no history, source
+    // audio, or training pair), so a secret spoken here can't leak into learning/sync.
+    private val mic = MicToggle(CoreRecordingToggle(core, ephemeral = true), controller, executor)
 
     @Volatile
     private var session: RecognitionSession? = null
