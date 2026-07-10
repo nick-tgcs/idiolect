@@ -558,8 +558,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     override fun onFinishInput() {
         // Field going away: capture any pending in-field correction before we lose it,
         // then nudge the outbox so the fresh learning ships when there's a network.
-        // Never read back a password/PIN field — its content is a secret, not training data.
-        if (!fieldIsSecure) correction.capture()
+        // For a password/PIN field, disarm instead of capturing — its content is a secret, and
+        // leaving the baseline armed would let the next field's capture amend the secret take
+        // with unrelated text (a syncable pair minted from a secret).
+        if (fieldIsSecure) correction.disarm() else correction.capture()
         scheduleSync()
         super.onFinishInput()
     }

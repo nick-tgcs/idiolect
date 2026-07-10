@@ -83,6 +83,24 @@ class CorrectionCaptureTest {
     }
 
     @Test
+    fun disarm_drops_the_pending_baseline_so_a_later_capture_reports_nothing() {
+        // A secret take (dictated into a password/PIN field) must never linger: after disarm,
+        // a following capture on an unrelated field records no raw→corrected pair — the secret
+        // is never amended with foreign text, so nothing syncable is produced.
+        val field = FakeField()
+        val reported = mutableListOf<String>()
+        val cc = capture(field, reported = reported)
+        cc.onTakeCommitted("secret")
+
+        cc.disarm()
+
+        field.text = "an unrelated later field"
+        assertFalse(cc.capture())
+        assertTrue(reported.isEmpty())
+        assertTrue(cc.currentChips().isEmpty())
+    }
+
+    @Test
     fun capture_before_any_take_or_without_a_field_is_a_no_op() {
         val reported = mutableListOf<String>()
         // No take committed yet.
