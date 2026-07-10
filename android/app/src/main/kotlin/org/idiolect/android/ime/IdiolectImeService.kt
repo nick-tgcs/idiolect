@@ -89,11 +89,12 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // onFinishInput / a queued capture) from crashing on a destroyed core.
     @Volatile
     private var coreClosed = false
-    // The current field is a password/PIN: its content is a secret. Set per field in
-    // onStartInputView; read on the mic executor thread (MicToggle.canStart) as well as the
-    // main thread (onFinishInput), so @Volatile.
+    // The current field forbids dictation-and-learning: a password/PIN, or a field flagged
+    // IME_FLAG_NO_PERSONALIZED_LEARNING (incognito, promo codes). No take may reach the core.
+    // Set per field in onStartInputView; read on the mic executor thread (MicToggle.canStart)
+    // as well as the main thread (gestures, onFinishInput), so @Volatile.
     @Volatile
-    private var fieldIsSecure = false
+    private var fieldBlocksLearning = false
 
     override fun onCreate() {
         super.onCreate()
@@ -113,10 +114,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             core = CoreRecordingToggle(core),
             capture = controller,
             executor = toggleExecutor,
-            // Never open the mic on a password/PIN field — the secret take must not reach the
-            // core (which would persist its audio + a training row), even if a failed hand-off
-            // left the mic surface visible on such a field.
-            canStart = { !fieldIsSecure },
+            // Never open the mic on a field that forbids learning (password/PIN, or
+            // no-personalized-learning) — the take must not reach the core, which would persist
+            // its audio + a training row, even if a failed hand-off left the mic surface visible.
+            canStart = { !fieldBlocksLearning },
         )
         correction = CorrectionCapture(
             editor = ::fieldEditor,
@@ -153,17 +154,17 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         // Recompute per field, before any early return, so a stale flag never carries over: a
-        // password/PIN field's content is a secret the correction/training capture must skip.
-        fieldIsSecure = info != null && InputFieldPolicy.isSecure(info.inputType)
+        // password/PIN or no-personalized-learning field must never be persisted or trained on.
+        fieldBlocksLearning = info != null && InputFieldPolicy.blocksLearning(info.inputType, info.imeOptions)
         // idiolect was summoned for its OWN review dialog's edit field — it has no keyboard,
         // so hand off to the user's real keyboard and show nothing here.
         if (info?.privateImeOptions == ReviewActivity.REVIEW_FIELD_OPTION) {
             switchToYourKeyboard()
             return
         }
-        // The mic surface is only useful for free text. Numeric, phone, date and password fields
-        // hand off to the user's own keyboard rather than defaulting to a pointless microphone.
-        if (info != null && InputFieldPolicy.handOff(info.inputType)) {
+        // The mic surface is only useful for free text. Numeric, phone, date, password and
+        // no-personalized-learning fields hand off to the user's own keyboard instead.
+        if (info != null && InputFieldPolicy.handOff(info.inputType, info.imeOptions)) {
             switchToYourKeyboard()
             return
         }
@@ -420,17 +421,39 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         // Press-to-talk: show the red Holding look at once (before the core confirms recording),
         // then open the mic. A single tap deliberately does NOT — it stays the accent Listening.
         override fun onHoldStart() {
+            if (refuseRecordingHere()) return
             render(presenter.onHoldStarted())
             startTake()
         }
-        override fun onHoldEnd() = stopTake()
-        override fun onSingleTap() = if (isRecordingUi()) stopTake() else startTake()
+        // Guard on the UI state, not the gesture: if a hold was refused above, nothing is
+        // recording, so releasing it must not render a phantom "Transcribing".
+        override fun onHoldEnd() { if (isRecordingUi()) stopTake() }
+        override fun onSingleTap() = when {
+            isRecordingUi() -> stopTake()
+            refuseRecordingHere() -> Unit
+            else -> startTake()
+        }
         override fun onDoubleTap() = when {
             isRecordingUi() -> stopTake()
+            refuseRecordingHere() -> Unit
             // "Continuous on double-tap" (⚙) off ⇒ a double-tap is just a one-shot take.
             settingsStore.continuousOnDoubleTap() -> startContinuous()
             else -> startTake()
         }
+    }
+
+    /**
+     * A learning-blocked field (password/PIN, or no-personalized-learning) must never record. If
+     * the mic surface is somehow still here — a hand-off that couldn't switch away (no other IME,
+     * or the picker dismissed) — re-attempt the hand-off and refuse the take *before* any
+     * optimistic recording UI is rendered, so the surface never shows a phantom recording state.
+     * Returns true when recording was refused. [MicToggle.canStart] is the executor-thread
+     * backstop that still blocks the take if this UI guard is ever bypassed.
+     */
+    private fun refuseRecordingHere(): Boolean {
+        if (!fieldBlocksLearning) return false
+        switchToYourKeyboard()
+        return true
     }
 
     private val recognizer = MicGestureRecognizer(micGestures, gestureClock)
@@ -568,10 +591,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     override fun onFinishInput() {
         // Field going away: capture any pending in-field correction before we lose it,
         // then nudge the outbox so the fresh learning ships when there's a network.
-        // For a password/PIN field, disarm instead of capturing — its content is a secret, and
-        // leaving the baseline armed would let the next field's capture amend the secret take
-        // with unrelated text (a syncable pair minted from a secret).
-        if (fieldIsSecure) correction.disarm() else correction.capture()
+        // For a learning-blocked field, disarm instead of capturing — leaving the baseline armed
+        // would let the next field's capture amend that take with unrelated text (a syncable pair
+        // minted from a secret / a no-personalized-learning field).
+        if (fieldBlocksLearning) correction.disarm() else correction.capture()
         scheduleSync()
         super.onFinishInput()
     }
