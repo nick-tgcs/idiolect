@@ -255,8 +255,28 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         liveCard = live
 
         render(presenter.status())
-        val stage = FrameLayout(this).apply {
-            addView(micKey, FrameLayout.LayoutParams(dp(92), dp(92), Gravity.CENTER))
+        // Option A: ⌫ delete and ⏎ enter flank the circular mic — the two edits you can't
+        // say by voice. Wiring is [EditKeys]; the mic stays the dominant, central surface.
+        val stage = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(
+                buildEditKey(R.drawable.ic_backspace, R.string.voice_key_delete, R.drawable.edit_key_bg) {
+                    EditKeys.delete(fieldEditor())
+                },
+                editKeyLp(),
+            )
+            addView(micKey, LinearLayout.LayoutParams(dp(92), dp(92)))
+            addView(
+                buildEditKey(R.drawable.ic_return, R.string.voice_key_enter, R.drawable.edit_key_enter_bg) {
+                    val info = currentInputEditorInfo
+                    // A custom action (actionLabel set) isn't in imeOptions — pass its actionId so
+                    // app-specific Submit/Apply buttons fire instead of a stray newline.
+                    val customActionId = info?.takeIf { it.actionLabel != null }?.actionId
+                    EditKeys.enter(fieldEditor(), info?.imeOptions ?: 0, customActionId)
+                },
+                editKeyLp(),
+            )
         }
 
         return LinearLayout(this).apply {
@@ -353,6 +373,26 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     /** Open the settings screen (⚙ on the strip): pairing, dictation modes, model, storage. */
     private fun openSettings() = SettingsActivity.launch(this)
+
+    /**
+     * A flanking edit key on the mic surface (Option A): a slate disc with a grey glyph, a
+     * smaller sibling of the mic. Taps forward to [EditKeys] (delete ⌫ / enter ⏎).
+     */
+    private fun buildEditKey(iconRes: Int, descRes: Int, bgRes: Int, onClick: () -> Unit): ImageButton =
+        ImageButton(this).apply {
+            setImageResource(iconRes)
+            setBackgroundResource(bgRes)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = getString(descRes)
+            imageTintList = ContextCompat.getColorStateList(this@IdiolectImeService, R.color.idiolect_grey)
+            setOnClickListener { onClick() }
+        }
+
+    private fun editKeyLp() = LinearLayout.LayoutParams(dp(60), dp(60)).apply {
+        leftMargin = dp(14)
+        rightMargin = dp(14)
+        gravity = Gravity.CENTER_VERTICAL
+    }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 

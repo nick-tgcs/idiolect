@@ -2,6 +2,7 @@ package org.idiolect.android.e2e
 
 import android.app.Activity
 import android.os.Bundle
+import android.text.InputType
 import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -17,6 +18,9 @@ class EditorHarnessActivity : Activity() {
         val field = EditText(this).apply {
             contentDescription = FIELD_DESC
             hint = "dictate here"
+            // Multiline (no declared IME action) so the ⏎ enter key's newline is observable
+            // and deterministic in the edit-keys e2e — a plain single-line field would strip it.
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
         }
         setContentView(
             LinearLayout(this).apply {

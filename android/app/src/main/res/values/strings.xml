@@ -46,6 +46,10 @@
     <string name="voice_strip_keyboard">Switch to your keyboard</string>
     <string name="voice_strip_review">Review before insert</string>
     <string name="voice_strip_settings">Settings</string>
+    <!-- Flanking edit keys on the mic surface (Option A): ⌫ deletes the char before the
+         cursor, ⏎ performs the field's editor action (search/send/done…) or inserts a newline. -->
+    <string name="voice_key_delete">Delete</string>
+    <string name="voice_key_enter">Enter</string>
 
     <!-- Settings screen (reached via the ⚙ on the mic strip). -->
     <string name="settings_title">Settings</string>
