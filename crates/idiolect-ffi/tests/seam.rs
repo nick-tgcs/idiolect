@@ -193,6 +193,119 @@ fn a_streamed_take_previews_a_partial_then_commits_the_whole_take() {
 }
 
 #[test]
+fn an_ephemeral_take_commits_the_transcript_but_persists_nothing() {
+    // The system speech-recognition surface (ACTION_RECOGNIZE_SPEECH / RecognitionService /
+    // quick-launch) drives the core with NO EditorInfo, so it cannot tell a password/PIN field
+    // from any other. A `toggle_ephemeral` take must deliver the transcript to the field yet
+    // persist NOTHING — no session/history row, no source-audio recording, no `last_commit` — so a
+    // secret dictated through that surface can never reach on-device history or the training/sync
+    // pipeline.
+    let (core, cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("hunter two".to_owned())));
+
+    core.toggle_ephemeral().unwrap(); // mic on, transcription-only
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle_ephemeral().unwrap(); // mic off → decode + commit, no persist
+
+    let events = cb.events();
+    // The transcript is still delivered — recognition must work…
+    assert!(
+        events.contains(&"commit_text:hunter two".to_owned()),
+        "an ephemeral take should still commit the transcript: {events:?}"
+    );
+    assert_eq!(events.last().unwrap(), "recording_status:false");
+    // …but nothing is persisted.
+    assert!(
+        core.recent_history(10).unwrap().is_empty(),
+        "an ephemeral take must persist no history"
+    );
+    // And no `last_commit` is armed, so a later report_correction can't mint a training pair from
+    // the (secret) ephemeral take.
+    core.report_correction("some later unrelated text".to_owned())
+        .unwrap();
+    assert!(
+        core.recent_history(10).unwrap().is_empty(),
+        "no correction pair may be minted from an ephemeral take"
+    );
+}
+
+#[test]
+fn an_ephemeral_take_clears_a_prior_takes_correction_target() {
+    // A normal dictation arms `last_commit`. A following ephemeral (recognition) take must CLEAR
+    // it — otherwise a later report_correction would amend that earlier stored session with
+    // unrelated, possibly secret, field text, shipping a training pair to the outbox despite the
+    // ephemeral mode's "persists nothing" guarantee.
+    let (core, _cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("hello world".to_owned())));
+    core.toggle().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle().unwrap(); // normal take persisted; last_commit armed
+    assert_eq!(core.recent_history(10).unwrap().len(), 1);
+
+    core.install_transcriber(Box::new(FixedTranscriber("a spoken secret".to_owned())));
+    core.toggle_ephemeral().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle_ephemeral().unwrap(); // ephemeral: must clear last_commit
+
+    // A later correction must NOT amend the earlier normal take (its target was cleared).
+    core.report_correction("amended text".to_owned()).unwrap();
+    let history = core.recent_history(10).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].text, "hello world",
+        "the prior take must be untouched after an ephemeral take: {history:?}"
+    );
+}
+
+#[test]
+fn a_silent_ephemeral_take_also_clears_a_prior_correction_target() {
+    // The disarm must apply to a *silent* ephemeral take too (no speech / no model / empty
+    // capture), not just one that produced a transcript — otherwise the prior session stays
+    // correction-armed and a later report_correction could still amend it.
+    let (core, _cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("hello world".to_owned())));
+    core.toggle().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle().unwrap(); // normal take; last_commit armed
+    assert_eq!(core.recent_history(10).unwrap().len(), 1);
+
+    // A silent ephemeral take: start and stop with no audio → TakeOutcome::Silent.
+    core.toggle_ephemeral().unwrap();
+    core.toggle_ephemeral().unwrap();
+
+    core.report_correction("amended text".to_owned()).unwrap();
+    let history = core.recent_history(10).unwrap();
+    assert_eq!(
+        history[0].text, "hello world",
+        "a silent ephemeral take must disarm the prior correction target too: {history:?}"
+    );
+}
+
+#[test]
+fn a_normal_take_after_an_ephemeral_one_persists_as_usual() {
+    // The ephemeral flag must not leak into the next take: a normal dictation still persists.
+    let (core, _cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("ephemeral".to_owned())));
+    core.toggle_ephemeral().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle_ephemeral().unwrap();
+    assert!(core.recent_history(10).unwrap().is_empty());
+
+    core.install_transcriber(Box::new(FixedTranscriber("persisted take".to_owned())));
+    core.toggle().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle().unwrap();
+
+    let history = core.recent_history(10).unwrap();
+    assert_eq!(
+        history.len(),
+        1,
+        "the normal take must persist: {history:?}"
+    );
+    assert_eq!(history[0].text, "persisted take");
+}
+
+#[test]
 fn finalize_idempotency_key_survives_a_process_restart_over_the_same_store() {
     // The take-finalize idempotency key must be unique per *session*, never a
     // per-process in-memory counter. A real phone restarts the IME process freely

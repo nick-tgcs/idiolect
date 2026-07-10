@@ -1,8 +1,10 @@
 package org.idiolect.android.ime
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Executor
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Tests the one-tap mic ordering — the part that must be exactly right so no audio is
@@ -31,6 +33,10 @@ class MicToggleTest {
         override fun startContinuous() {
             recording = true
             calls.add("core.startContinuous")
+        }
+        override fun cancel() {
+            recording = false
+            calls.add("core.cancel")
         }
         override fun start() {
             calls.add("capture.start")
@@ -108,6 +114,90 @@ class MicToggleTest {
         r.calls.clear()
         toggle.stop()
         assertEquals(listOf("capture.stop", "core.finalize"), r.calls)
+    }
+
+    @Test
+    fun a_tap_is_refused_when_starting_is_blocked() {
+        // A blocked start (a password/PIN field) must never toggle the core or begin capture —
+        // the secret take must not reach the core at all (it would persist audio + a training row).
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).onTap()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_hold_is_refused_when_starting_is_blocked() {
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).startHold()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_continuous_take_is_refused_when_starting_is_blocked() {
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).startContinuous()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun stopping_is_allowed_even_when_starting_is_blocked() {
+        // The gate blocks only *starting*; a take already running must still stop and finalize
+        // cleanly (never leave the core recording).
+        val r = Recorder()
+        MicToggle(r, r, direct).onTap() // start a take (allowed)
+        r.calls.clear()
+        MicToggle(r, r, direct, canStart = { false }).stop() // a blocked toggle must still stop it
+        assertEquals(listOf("capture.stop", "core.finalize"), r.calls)
+    }
+
+    @Test
+    fun cancel_discards_a_running_take_without_finalizing() {
+        // Focus landing on a learning-blocked field mid-take must *discard* the take — drain
+        // capture, then cancel in the core (never finalize, which would persist audio/history).
+        val r = Recorder()
+        val toggle = MicToggle(r, r, direct)
+        toggle.onTap() // recording
+        r.calls.clear()
+        toggle.cancel()
+        // Cancel the core *before* draining capture, so frames that drain after the discard are
+        // rejected by the core (NoActiveTake) instead of being finalized/persisted.
+        assertEquals(listOf("core.cancel", "capture.stop"), r.calls)
+    }
+
+    @Test
+    fun cancel_when_idle_is_a_no_op() {
+        val r = Recorder()
+        MicToggle(r, r, direct).cancel()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun cancel_swallows_a_racing_core_error_and_still_stops_capture() {
+        // The core is process-wide (the recognition service drives it too), so a stop on another
+        // surface can leave core.cancel() throwing NoActiveTake after our isRecording() check. It
+        // must not crash the executor thread, and capture must still be stopped.
+        val capture = Recorder()
+        val throwingCore = object : RecordingToggle {
+            override fun isRecording() = true
+            override fun toggle() {}
+            override fun startContinuous() {}
+            override fun cancel(): Unit = throw RuntimeException("NoActiveTake")
+        }
+        MicToggle(throwingCore, capture, direct).cancel() // must not throw
+        assertEquals(listOf("capture.stop"), capture.calls)
+    }
+
+    @Test
+    fun a_task_rejected_by_a_shut_down_executor_does_not_crash() {
+        // During teardown toggleExecutor is shut down; a late gesture timer submitting work must
+        // be a harmless no-op, not an uncaught RejectedExecutionException.
+        val r = Recorder()
+        val rejecting = Executor { throw RejectedExecutionException() }
+        MicToggle(r, r, rejecting).cancel()
+        MicToggle(r, r, rejecting).onTap()
+        MicToggle(r, r, rejecting).startHold()
+        MicToggle(r, r, rejecting).startContinuous()
+        assertTrue(r.calls.isEmpty())
     }
 
     /**

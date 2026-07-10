@@ -32,6 +32,7 @@ import org.idiolect.android.sync.SyncScheduler
 import org.idiolect.ffi.IdiolectCore
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -81,6 +82,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // thread (commitText) → @Volatile.
     @Volatile
     private var reviewEnabled = false
+    // Whether the current press-and-hold actually opened a take (vs. a hold refused on a
+    // learning-blocked field). Main-thread only (gestures), so no @Volatile. Drives onHoldEnd so a
+    // running take always stops on release, and a refused hold never fakes a stop.
+    private var holdStartedTake = false
     // Whether the live take is continuous: review is suppressed for it (reviewing every phrase
     // would be absurd). Set on the UI thread, read on the callback thread → @Volatile.
     @Volatile
@@ -89,6 +94,12 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // onFinishInput / a queued capture) from crashing on a destroyed core.
     @Volatile
     private var coreClosed = false
+    // The current field forbids dictation-and-learning: a password/PIN, or a field flagged
+    // IME_FLAG_NO_PERSONALIZED_LEARNING (incognito, promo codes). No take may reach the core.
+    // Set per field in onStartInputView; read on the mic executor thread (MicToggle.canStart)
+    // as well as the main thread (gestures, onFinishInput), so @Volatile.
+    @Volatile
+    private var fieldBlocksLearning = false
 
     override fun onCreate() {
         super.onCreate()
@@ -101,10 +112,22 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         imeCallback = IdiolectImeCallback(editorProvider = ::fieldEditor, ui = this)
         router.bind(imeCallback)
         controller = DictationController(
-            sink = { frame -> core.pushPcmFrame(frame) },
+            // Drop frames once focus is on a learning-blocked field: in continuous mode this stops
+            // the core receiving (and finalizing/persisting) any phrase spoken there, synchronously
+            // — fieldBlocksLearning is set on the main thread before the async mic.cancel() runs, so
+            // no blocked-field speech races into a committed take. Also skip a closed core in teardown.
+            sink = { frame -> if (!fieldBlocksLearning && !coreClosed) core.pushPcmFrame(frame) },
             sourceFactory = { AndroidPcmSource() },
         )
-        mic = MicToggle(core = CoreRecordingToggle(core), capture = controller, executor = toggleExecutor)
+        mic = MicToggle(
+            core = CoreRecordingToggle(core),
+            capture = controller,
+            executor = toggleExecutor,
+            // Never open the mic on a field that forbids learning (password/PIN, or
+            // no-personalized-learning) — the take must not reach the core, which would persist
+            // its audio + a training row, even if a failed hand-off left the mic surface visible.
+            canStart = { !fieldBlocksLearning },
+        )
         correction = CorrectionCapture(
             editor = ::fieldEditor,
             // Guard against the core being torn down: the framework can fire a final
@@ -139,9 +162,22 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        // Recompute per field, before any early return, so a stale flag never carries over: a
+        // password/PIN or no-personalized-learning field must never be persisted or trained on.
+        fieldBlocksLearning = info != null && InputFieldPolicy.blocksLearning(info.inputType, info.imeOptions)
+        // A take still running as focus lands here (continuous mode, or a hand-off that hasn't
+        // switched away yet) must be discarded, not finalized — finalizing would persist audio,
+        // history and a training row for speech captured in this blocked field.
+        if (fieldBlocksLearning) mic.cancel()
         // idiolect was summoned for its OWN review dialog's edit field — it has no keyboard,
         // so hand off to the user's real keyboard and show nothing here.
         if (info?.privateImeOptions == ReviewActivity.REVIEW_FIELD_OPTION) {
+            switchToYourKeyboard()
+            return
+        }
+        // The mic surface is only useful for free text. Numeric, phone, date, password and
+        // no-personalized-learning fields hand off to the user's own keyboard instead.
+        if (info != null && InputFieldPolicy.handOff(info.inputType, info.imeOptions)) {
             switchToYourKeyboard()
             return
         }
@@ -438,17 +474,46 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         // Press-to-talk: show the red Holding look at once (before the core confirms recording),
         // then open the mic. A single tap deliberately does NOT — it stays the accent Listening.
         override fun onHoldStart() {
+            if (refuseRecordingHere()) return
+            holdStartedTake = true
             render(presenter.onHoldStarted())
             startTake()
         }
-        override fun onHoldEnd() = stopTake()
-        override fun onSingleTap() = if (isRecordingUi()) stopTake() else startTake()
+        // Stop iff this hold actually started a take — not on UI status. A refused hold started
+        // nothing (no phantom "Transcribing" on release); but a hold whose take is still running
+        // must always stop, even if an error push flipped the status away from a recording state.
+        override fun onHoldEnd() {
+            if (holdStartedTake) {
+                holdStartedTake = false
+                stopTake()
+            }
+        }
+        override fun onSingleTap() = when {
+            isRecordingUi() -> stopTake()
+            refuseRecordingHere() -> Unit
+            else -> startTake()
+        }
         override fun onDoubleTap() = when {
             isRecordingUi() -> stopTake()
+            refuseRecordingHere() -> Unit
             // "Continuous on double-tap" (⚙) off ⇒ a double-tap is just a one-shot take.
             settingsStore.continuousOnDoubleTap() -> startContinuous()
             else -> startTake()
         }
+    }
+
+    /**
+     * A learning-blocked field (password/PIN, or no-personalized-learning) must never record. If
+     * the mic surface is somehow still here — a hand-off that couldn't switch away (no other IME,
+     * or the picker dismissed) — re-attempt the hand-off and refuse the take *before* any
+     * optimistic recording UI is rendered, so the surface never shows a phantom recording state.
+     * Returns true when recording was refused. [MicToggle.canStart] is the executor-thread
+     * backstop that still blocks the take if this UI guard is ever bypassed.
+     */
+    private fun refuseRecordingHere(): Boolean {
+        if (!fieldBlocksLearning) return false
+        switchToYourKeyboard()
+        return true
     }
 
     private val recognizer = MicGestureRecognizer(micGestures, gestureClock)
@@ -586,7 +651,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     override fun onFinishInput() {
         // Field going away: capture any pending in-field correction before we lose it,
         // then nudge the outbox so the fresh learning ships when there's a network.
-        correction.capture()
+        // For a learning-blocked field, disarm instead of capturing — leaving the baseline armed
+        // would let the next field's capture amend that take with unrelated text (a syncable pair
+        // minted from a secret / a no-personalized-learning field).
+        if (fieldBlocksLearning) correction.disarm() else correction.capture()
         scheduleSync()
         super.onFinishInput()
     }
@@ -610,6 +678,11 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         super.onDestroy()
         controller.stop()
         toggleExecutor.shutdown()
+        // Let any queued mic work finish on the still-live core before we release it — e.g. a
+        // discard queued by onStartInputView as focus left for a blocked field. Otherwise that
+        // task would call core.isRecording()/cancel() on a closed IdiolectCore and crash. Bounded
+        // so a pathologically long finalize can't hang teardown (no worse than not waiting).
+        runCatching { toggleExecutor.awaitTermination(2, TimeUnit.SECONDS) }
         LiveReview.bind(null) // stop streaming live partials to this dying surface
         router.unbind(imeCallback) // stop routing core pushes to this dying IME
         coreClosed = true
