@@ -258,6 +258,30 @@ fn an_ephemeral_take_clears_a_prior_takes_correction_target() {
 }
 
 #[test]
+fn a_silent_ephemeral_take_also_clears_a_prior_correction_target() {
+    // The disarm must apply to a *silent* ephemeral take too (no speech / no model / empty
+    // capture), not just one that produced a transcript — otherwise the prior session stays
+    // correction-armed and a later report_correction could still amend it.
+    let (core, _cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("hello world".to_owned())));
+    core.toggle().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle().unwrap(); // normal take; last_commit armed
+    assert_eq!(core.recent_history(10).unwrap().len(), 1);
+
+    // A silent ephemeral take: start and stop with no audio → TakeOutcome::Silent.
+    core.toggle_ephemeral().unwrap();
+    core.toggle_ephemeral().unwrap();
+
+    core.report_correction("amended text".to_owned()).unwrap();
+    let history = core.recent_history(10).unwrap();
+    assert_eq!(
+        history[0].text, "hello world",
+        "a silent ephemeral take must disarm the prior correction target too: {history:?}"
+    );
+}
+
+#[test]
 fn a_normal_take_after_an_ephemeral_one_persists_as_usual() {
     // The ephemeral flag must not leak into the next take: a normal dictation still persists.
     let (core, _cb) = new_core();

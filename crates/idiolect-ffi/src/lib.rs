@@ -846,6 +846,14 @@ impl Inner {
     /// pair's audio + digest) and commit it into the field. A silent take stores
     /// nothing.
     fn finalize_outcome(&mut self, outcome: TakeOutcome) -> Result<(), FfiError> {
+        if self.ephemeral {
+            // An ephemeral (transcription-only) take never persists and must not leave a prior
+            // take's correction target armed — a later report_correction could otherwise amend that
+            // stored session with unrelated (secret-adjacent) field text. Applies before the Silent
+            // arm too, so a silent recognition take (no speech / no model / empty capture) disarms
+            // it just the same.
+            self.last_commit = None;
+        }
         let finalized = match outcome {
             TakeOutcome::Silent => {
                 // No usable speech (or no model): clear any live preedit, persist
@@ -862,13 +870,8 @@ impl Inner {
         }
         if self.ephemeral {
             // Transcription-only: hand the text to the field and stop. No session, no source
-            // audio, no digest, no `dictation.commit` — this take may be a password/PIN field we
-            // have no `EditorInfo` for, so persisting could leak a secret.
-            //
-            // Also DISARM any prior take's correction target: an ephemeral take happened, so a
-            // later report_correction must not amend the earlier stored session with unrelated
-            // (possibly secret) field text — which would mint a training pair after all.
-            self.last_commit = None;
+            // audio, no digest, no `dictation.commit`, no `last_commit` (cleared above) — this take
+            // may be a password/PIN field we have no `EditorInfo` for, so persisting could leak it.
             self.callback.commit_text(finalized.final_text);
             return Ok(());
         }
