@@ -89,6 +89,9 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // onFinishInput / a queued capture) from crashing on a destroyed core.
     @Volatile
     private var coreClosed = false
+    // The current field is a password/PIN: its content is a secret, so the correction/training
+    // capture on onFinishInput must skip it. Set per field in onStartInputView.
+    private var fieldIsSecure = false
 
     override fun onCreate() {
         super.onCreate()
@@ -139,9 +142,18 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        // Recompute per field, before any early return, so a stale flag never carries over: a
+        // password/PIN field's content is a secret the correction/training capture must skip.
+        fieldIsSecure = info != null && InputFieldPolicy.isSecure(info.inputType)
         // idiolect was summoned for its OWN review dialog's edit field — it has no keyboard,
         // so hand off to the user's real keyboard and show nothing here.
         if (info?.privateImeOptions == ReviewActivity.REVIEW_FIELD_OPTION) {
+            switchToYourKeyboard()
+            return
+        }
+        // The mic surface is only useful for free text. Numeric, phone, date and password fields
+        // hand off to the user's own keyboard rather than defaulting to a pointless microphone.
+        if (info != null && InputFieldPolicy.handOff(info.inputType)) {
             switchToYourKeyboard()
             return
         }
@@ -546,7 +558,8 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     override fun onFinishInput() {
         // Field going away: capture any pending in-field correction before we lose it,
         // then nudge the outbox so the fresh learning ships when there's a network.
-        correction.capture()
+        // Never read back a password/PIN field — its content is a secret, not training data.
+        if (!fieldIsSecure) correction.capture()
         scheduleSync()
         super.onFinishInput()
     }
