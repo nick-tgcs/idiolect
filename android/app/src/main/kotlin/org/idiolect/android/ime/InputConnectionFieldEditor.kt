@@ -33,9 +33,16 @@ class InputConnectionFieldEditor(
     }
 
     override fun deleteBackward() {
-        // In *code points*, not UTF-16 units — else deleting after an emoji (a surrogate pair)
-        // would strip only half of it and leave a broken glyph behind.
-        post { connection.deleteSurroundingTextInCodePoints(1, 0) }
+        post {
+            // A non-empty selection backspaces to nothing — replace it, like any keyboard would.
+            if (!connection.getSelectedText(0).isNullOrEmpty()) {
+                connection.commitText("", 1)
+                return@post
+            }
+            // Otherwise delete in *code points*, not UTF-16 units — else deleting after an emoji
+            // (a surrogate pair) would strip only half of it and leave a broken glyph behind.
+            connection.deleteSurroundingTextInCodePoints(1, 0)
+        }
     }
 
     override fun performEditorAction(actionId: Int) {
