@@ -32,6 +32,10 @@ class MicToggleTest {
             recording = true
             calls.add("core.startContinuous")
         }
+        override fun cancel() {
+            recording = false
+            calls.add("core.cancel")
+        }
         override fun start() {
             calls.add("capture.start")
         }
@@ -142,6 +146,25 @@ class MicToggleTest {
         r.calls.clear()
         MicToggle(r, r, direct, canStart = { false }).stop() // a blocked toggle must still stop it
         assertEquals(listOf("capture.stop", "core.finalize"), r.calls)
+    }
+
+    @Test
+    fun cancel_discards_a_running_take_without_finalizing() {
+        // Focus landing on a learning-blocked field mid-take must *discard* the take — drain
+        // capture, then cancel in the core (never finalize, which would persist audio/history).
+        val r = Recorder()
+        val toggle = MicToggle(r, r, direct)
+        toggle.onTap() // recording
+        r.calls.clear()
+        toggle.cancel()
+        assertEquals(listOf("capture.stop", "core.cancel"), r.calls)
+    }
+
+    @Test
+    fun cancel_when_idle_is_a_no_op() {
+        val r = Recorder()
+        MicToggle(r, r, direct).cancel()
+        assertEquals(emptyList<String>(), r.calls)
     }
 
     /**

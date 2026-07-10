@@ -18,4 +18,8 @@ class CoreRecordingToggle(private val core: IdiolectCore) : RecordingToggle {
     override fun startContinuous() {
         core.startContinuous()
     }
+
+    override fun cancel() {
+        core.cancel()
+    }
 }

@@ -9,6 +9,9 @@ interface RecordingToggle {
 
     /** Begin a continuous take (the mic's double-tap): `IdiolectCore.startContinuous`. */
     fun startContinuous()
+
+    /** Discard the current take without finalizing (`IdiolectCore.cancel`): nothing persists. */
+    fun cancel()
 }
 
 /** Start/stop of a dictation take's capture (satisfied by [DictationController]). */
@@ -62,6 +65,21 @@ class MicToggle(
     fun stop() {
         executor.execute {
             if (core.isRecording()) stopSequence()
+        }
+    }
+
+    /**
+     * Abort the current take without finalizing — drain capture, then discard the take in the
+     * core so nothing is persisted. Used when focus lands on a learning-blocked field while a
+     * take (typically continuous) is still recording: a finalize there would persist audio,
+     * history and a training row for speech captured in the blocked field.
+     */
+    fun cancel() {
+        executor.execute {
+            if (core.isRecording()) {
+                capture.stop()
+                core.cancel()
+            }
         }
     }
 

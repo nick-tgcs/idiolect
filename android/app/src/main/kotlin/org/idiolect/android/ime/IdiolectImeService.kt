@@ -156,6 +156,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         // Recompute per field, before any early return, so a stale flag never carries over: a
         // password/PIN or no-personalized-learning field must never be persisted or trained on.
         fieldBlocksLearning = info != null && InputFieldPolicy.blocksLearning(info.inputType, info.imeOptions)
+        // A take still running as focus lands here (continuous mode, or a hand-off that hasn't
+        // switched away yet) must be discarded, not finalized — finalizing would persist audio,
+        // history and a training row for speech captured in this blocked field.
+        if (fieldBlocksLearning) mic.cancel()
         // idiolect was summoned for its OWN review dialog's edit field — it has no keyboard,
         // so hand off to the user's real keyboard and show nothing here.
         if (info?.privateImeOptions == ReviewActivity.REVIEW_FIELD_OPTION) {
