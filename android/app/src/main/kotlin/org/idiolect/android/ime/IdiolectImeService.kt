@@ -82,6 +82,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // thread (commitText) → @Volatile.
     @Volatile
     private var reviewEnabled = false
+    // Whether the current press-and-hold actually opened a take (vs. a hold refused on a
+    // learning-blocked field). Main-thread only (gestures), so no @Volatile. Drives onHoldEnd so a
+    // running take always stops on release, and a refused hold never fakes a stop.
+    private var holdStartedTake = false
     // Whether the live take is continuous: review is suppressed for it (reviewing every phrase
     // would be absurd). Set on the UI thread, read on the callback thread → @Volatile.
     @Volatile
@@ -108,7 +112,11 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         imeCallback = IdiolectImeCallback(editorProvider = ::fieldEditor, ui = this)
         router.bind(imeCallback)
         controller = DictationController(
-            sink = { frame -> core.pushPcmFrame(frame) },
+            // Drop frames once focus is on a learning-blocked field: in continuous mode this stops
+            // the core receiving (and finalizing/persisting) any phrase spoken there, synchronously
+            // — fieldBlocksLearning is set on the main thread before the async mic.cancel() runs, so
+            // no blocked-field speech races into a committed take. Also skip a closed core in teardown.
+            sink = { frame -> if (!fieldBlocksLearning && !coreClosed) core.pushPcmFrame(frame) },
             sourceFactory = { AndroidPcmSource() },
         )
         mic = MicToggle(
@@ -427,12 +435,19 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
         // then open the mic. A single tap deliberately does NOT — it stays the accent Listening.
         override fun onHoldStart() {
             if (refuseRecordingHere()) return
+            holdStartedTake = true
             render(presenter.onHoldStarted())
             startTake()
         }
-        // Guard on the UI state, not the gesture: if a hold was refused above, nothing is
-        // recording, so releasing it must not render a phantom "Transcribing".
-        override fun onHoldEnd() { if (isRecordingUi()) stopTake() }
+        // Stop iff this hold actually started a take — not on UI status. A refused hold started
+        // nothing (no phantom "Transcribing" on release); but a hold whose take is still running
+        // must always stop, even if an error push flipped the status away from a recording state.
+        override fun onHoldEnd() {
+            if (holdStartedTake) {
+                holdStartedTake = false
+                stopTake()
+            }
+        }
         override fun onSingleTap() = when {
             isRecordingUi() -> stopTake()
             refuseRecordingHere() -> Unit

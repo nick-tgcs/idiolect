@@ -1,8 +1,10 @@
 package org.idiolect.android.ime
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Executor
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Tests the one-tap mic ordering — the part that must be exactly right so no audio is
@@ -157,7 +159,9 @@ class MicToggleTest {
         toggle.onTap() // recording
         r.calls.clear()
         toggle.cancel()
-        assertEquals(listOf("capture.stop", "core.cancel"), r.calls)
+        // Cancel the core *before* draining capture, so frames that drain after the discard are
+        // rejected by the core (NoActiveTake) instead of being finalized/persisted.
+        assertEquals(listOf("core.cancel", "capture.stop"), r.calls)
     }
 
     @Test
@@ -165,6 +169,35 @@ class MicToggleTest {
         val r = Recorder()
         MicToggle(r, r, direct).cancel()
         assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun cancel_swallows_a_racing_core_error_and_still_stops_capture() {
+        // The core is process-wide (the recognition service drives it too), so a stop on another
+        // surface can leave core.cancel() throwing NoActiveTake after our isRecording() check. It
+        // must not crash the executor thread, and capture must still be stopped.
+        val capture = Recorder()
+        val throwingCore = object : RecordingToggle {
+            override fun isRecording() = true
+            override fun toggle() {}
+            override fun startContinuous() {}
+            override fun cancel(): Unit = throw RuntimeException("NoActiveTake")
+        }
+        MicToggle(throwingCore, capture, direct).cancel() // must not throw
+        assertEquals(listOf("capture.stop"), capture.calls)
+    }
+
+    @Test
+    fun a_task_rejected_by_a_shut_down_executor_does_not_crash() {
+        // During teardown toggleExecutor is shut down; a late gesture timer submitting work must
+        // be a harmless no-op, not an uncaught RejectedExecutionException.
+        val r = Recorder()
+        val rejecting = Executor { throw RejectedExecutionException() }
+        MicToggle(r, r, rejecting).cancel()
+        MicToggle(r, r, rejecting).onTap()
+        MicToggle(r, r, rejecting).startHold()
+        MicToggle(r, r, rejecting).startContinuous()
+        assertTrue(r.calls.isEmpty())
     }
 
     /**

@@ -45,27 +45,21 @@ class MicToggle(
     private val canStart: () -> Boolean = { true },
 ) {
     /** Single tap: toggle — start a one-shot take if idle, stop + finalize if recording. */
-    fun onTap() {
-        executor.execute {
-            when {
-                core.isRecording() -> stopSequence()
-                canStart() -> startSequence()
-            }
+    fun onTap() = submit {
+        when {
+            core.isRecording() -> stopSequence()
+            canStart() -> startSequence()
         }
     }
 
     /** Press-and-hold begins: ensure a take is recording (idempotent under rapid edges). */
-    fun startHold() {
-        executor.execute {
-            if (!core.isRecording() && canStart()) startSequence()
-        }
+    fun startHold() = submit {
+        if (!core.isRecording() && canStart()) startSequence()
     }
 
     /** Hold released, or a stop tap: ensure the take is stopped and finalized. */
-    fun stop() {
-        executor.execute {
-            if (core.isRecording()) stopSequence()
-        }
+    fun stop() = submit {
+        if (core.isRecording()) stopSequence()
     }
 
     /**
@@ -74,23 +68,36 @@ class MicToggle(
      * take (typically continuous) is still recording: a finalize there would persist audio,
      * history and a training row for speech captured in the blocked field.
      */
-    fun cancel() {
-        executor.execute {
-            if (core.isRecording()) {
-                capture.stop()
-                core.cancel()
-            }
+    fun cancel() = submit {
+        if (core.isRecording()) {
+            // Cancel the core FIRST so it stops accepting and finalizing frames, THEN drain
+            // capture — the pump's remaining pushes are rejected (NoActiveTake) and harmlessly
+            // dropped, so no blocked-field speech is committed. This is the *opposite* order to
+            // stop(), which must drain-then-finalize so a real take loses no audio.
+            //
+            // core.cancel() throws NoActiveTake if a stop on another surface (the shared core is
+            // process-wide — the recognition service drives it too) raced our isRecording() check;
+            // swallow it so the executor thread never dies. Capture is still stopped either way.
+            runCatching { core.cancel() }
+            capture.stop()
         }
     }
 
     /** Double-tap: begin a continuous take (ignored if one is already running or refused). */
-    fun startContinuous() {
-        executor.execute {
-            if (!core.isRecording() && canStart()) {
-                core.startContinuous()
-                capture.start()
-            }
+    fun startContinuous() = submit {
+        if (!core.isRecording() && canStart()) {
+            core.startContinuous()
+            capture.start()
         }
+    }
+
+    /**
+     * Run [task] on the executor, tolerating a shut-down executor. During teardown a late gesture
+     * timer can fire after `toggleExecutor.shutdown()`; the rejected task is a harmless no-op, not
+     * an uncaught `RejectedExecutionException` that would crash the app.
+     */
+    private fun submit(task: () -> Unit) {
+        runCatching { executor.execute(task) }
     }
 
     private fun startSequence() {
