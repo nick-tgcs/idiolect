@@ -110,6 +110,40 @@ class MicToggleTest {
         assertEquals(listOf("capture.stop", "core.finalize"), r.calls)
     }
 
+    @Test
+    fun a_tap_is_refused_when_starting_is_blocked() {
+        // A blocked start (a password/PIN field) must never toggle the core or begin capture —
+        // the secret take must not reach the core at all (it would persist audio + a training row).
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).onTap()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_hold_is_refused_when_starting_is_blocked() {
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).startHold()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_continuous_take_is_refused_when_starting_is_blocked() {
+        val r = Recorder()
+        MicToggle(r, r, direct, canStart = { false }).startContinuous()
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun stopping_is_allowed_even_when_starting_is_blocked() {
+        // The gate blocks only *starting*; a take already running must still stop and finalize
+        // cleanly (never leave the core recording).
+        val r = Recorder()
+        MicToggle(r, r, direct).onTap() // start a take (allowed)
+        r.calls.clear()
+        MicToggle(r, r, direct, canStart = { false }).stop() // a blocked toggle must still stop it
+        assertEquals(listOf("capture.stop", "core.finalize"), r.calls)
+    }
+
     /**
      * The heavy work (the finalize `toggle` re-transcribes the whole take) must be
      * dispatched to the executor, never run on the caller's thread — otherwise the IME's

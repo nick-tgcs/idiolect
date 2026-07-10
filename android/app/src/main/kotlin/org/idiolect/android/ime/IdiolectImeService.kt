@@ -89,8 +89,10 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
     // onFinishInput / a queued capture) from crashing on a destroyed core.
     @Volatile
     private var coreClosed = false
-    // The current field is a password/PIN: its content is a secret, so the correction/training
-    // capture on onFinishInput must skip it. Set per field in onStartInputView.
+    // The current field is a password/PIN: its content is a secret. Set per field in
+    // onStartInputView; read on the mic executor thread (MicToggle.canStart) as well as the
+    // main thread (onFinishInput), so @Volatile.
+    @Volatile
     private var fieldIsSecure = false
 
     override fun onCreate() {
@@ -107,7 +109,15 @@ class IdiolectImeService : InputMethodService(), ImeUiHost, KeyboardHandoff {
             sink = { frame -> core.pushPcmFrame(frame) },
             sourceFactory = { AndroidPcmSource() },
         )
-        mic = MicToggle(core = CoreRecordingToggle(core), capture = controller, executor = toggleExecutor)
+        mic = MicToggle(
+            core = CoreRecordingToggle(core),
+            capture = controller,
+            executor = toggleExecutor,
+            // Never open the mic on a password/PIN field — the secret take must not reach the
+            // core (which would persist its audio + a training row), even if a failed hand-off
+            // left the mic surface visible on such a field.
+            canStart = { !fieldIsSecure },
+        )
         correction = CorrectionCapture(
             editor = ::fieldEditor,
             // Guard against the core being torn down: the framework can fire a final

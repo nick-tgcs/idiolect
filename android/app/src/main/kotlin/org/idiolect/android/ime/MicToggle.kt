@@ -36,18 +36,25 @@ class MicToggle(
     private val core: RecordingToggle,
     private val capture: CaptureControl,
     private val executor: Executor,
+    // Gate on *starting* a take. Returns false to refuse (a password/PIN field): the secret take
+    // must never reach the core, which would persist its audio, history and a training row.
+    // Stopping is never gated — a running take must always finalize cleanly.
+    private val canStart: () -> Boolean = { true },
 ) {
     /** Single tap: toggle — start a one-shot take if idle, stop + finalize if recording. */
     fun onTap() {
         executor.execute {
-            if (core.isRecording()) stopSequence() else startSequence()
+            when {
+                core.isRecording() -> stopSequence()
+                canStart() -> startSequence()
+            }
         }
     }
 
     /** Press-and-hold begins: ensure a take is recording (idempotent under rapid edges). */
     fun startHold() {
         executor.execute {
-            if (!core.isRecording()) startSequence()
+            if (!core.isRecording() && canStart()) startSequence()
         }
     }
 
@@ -58,10 +65,10 @@ class MicToggle(
         }
     }
 
-    /** Double-tap: begin a continuous take (ignored if one is already running). */
+    /** Double-tap: begin a continuous take (ignored if one is already running or refused). */
     fun startContinuous() {
         executor.execute {
-            if (!core.isRecording()) {
+            if (!core.isRecording() && canStart()) {
                 core.startContinuous()
                 capture.start()
             }
