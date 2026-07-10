@@ -230,6 +230,34 @@ fn an_ephemeral_take_commits_the_transcript_but_persists_nothing() {
 }
 
 #[test]
+fn an_ephemeral_take_clears_a_prior_takes_correction_target() {
+    // A normal dictation arms `last_commit`. A following ephemeral (recognition) take must CLEAR
+    // it — otherwise a later report_correction would amend that earlier stored session with
+    // unrelated, possibly secret, field text, shipping a training pair to the outbox despite the
+    // ephemeral mode's "persists nothing" guarantee.
+    let (core, _cb) = new_core();
+    core.install_transcriber(Box::new(FixedTranscriber("hello world".to_owned())));
+    core.toggle().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle().unwrap(); // normal take persisted; last_commit armed
+    assert_eq!(core.recent_history(10).unwrap().len(), 1);
+
+    core.install_transcriber(Box::new(FixedTranscriber("a spoken secret".to_owned())));
+    core.toggle_ephemeral().unwrap();
+    push_audio(&core, &speech_and_silence_fixture_16khz_mono());
+    core.toggle_ephemeral().unwrap(); // ephemeral: must clear last_commit
+
+    // A later correction must NOT amend the earlier normal take (its target was cleared).
+    core.report_correction("amended text".to_owned()).unwrap();
+    let history = core.recent_history(10).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].text, "hello world",
+        "the prior take must be untouched after an ephemeral take: {history:?}"
+    );
+}
+
+#[test]
 fn a_normal_take_after_an_ephemeral_one_persists_as_usual() {
     // The ephemeral flag must not leak into the next take: a normal dictation still persists.
     let (core, _cb) = new_core();

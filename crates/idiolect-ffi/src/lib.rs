@@ -862,8 +862,13 @@ impl Inner {
         }
         if self.ephemeral {
             // Transcription-only: hand the text to the field and stop. No session, no source
-            // audio, no digest, no `dictation.commit`, no `last_commit` — this take may be a
-            // password/PIN field we have no `EditorInfo` for, so persisting could leak a secret.
+            // audio, no digest, no `dictation.commit` — this take may be a password/PIN field we
+            // have no `EditorInfo` for, so persisting could leak a secret.
+            //
+            // Also DISARM any prior take's correction target: an ephemeral take happened, so a
+            // later report_correction must not amend the earlier stored session with unrelated
+            // (possibly secret) field text — which would mint a training pair after all.
+            self.last_commit = None;
             self.callback.commit_text(finalized.final_text);
             return Ok(());
         }
