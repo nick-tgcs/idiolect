@@ -3,6 +3,7 @@ package org.idiolect.android.model
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.io.OutputStream
@@ -93,6 +94,23 @@ class ModelDownloaderTest {
         }
         assertFalse(store.isInstalled("base.en"))
         assertFalse("the corrupt partial is discarded", store.partFile("base.en").exists())
+    }
+
+    @Test
+    fun a_cancelled_download_installs_nothing() {
+        val bytes = ByteArray(5000) { (it % 256).toByte() }
+        val store = newStore()
+        // The user cancelled (or a newer download superseded) this one while it was streaming.
+        // Even though the bytes finish and verify, the model must NOT be installed — otherwise
+        // onboarding would advance to Ready with a model the user explicitly abandoned.
+        assertThrows(ModelDownloadCancelledException::class.java) {
+            ModelDownloader(
+                FakeTransport(ModelManifest("base.en", sha256(bytes), bytes.size.toLong()), bytes),
+                store,
+            ).download(isCancelled = { true })
+        }
+        assertFalse("a cancelled download installs nothing", store.isInstalled("base.en"))
+        assertNull("no model becomes active", store.active())
     }
 
     @Test

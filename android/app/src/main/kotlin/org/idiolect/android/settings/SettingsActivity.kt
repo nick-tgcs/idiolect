@@ -237,7 +237,11 @@ class SettingsActivity : ComponentActivity() {
         status.text = getString(R.string.settings_model_downloading, DownloadProgress.label(0, option.size))
         thread(isDaemon = true, name = "idiolect-settings-model") {
             runCatching {
-                ModelDownloader(option.transport(), modelStore()).download { downloaded, total ->
+                // Gate the install on the token, not just the UI: a superseded download (the user
+                // picked another model) must leave nothing installed rather than let an older pick win.
+                ModelDownloader(option.transport(), modelStore()).download(
+                    isCancelled = { token != modelDownloadToken },
+                ) { downloaded, total ->
                     if (token != modelDownloadToken) return@download
                     val line = DownloadProgress.label(downloaded, total)
                     runOnUiThread { if (token == modelDownloadToken) status.text = getString(R.string.settings_model_downloading, line) }

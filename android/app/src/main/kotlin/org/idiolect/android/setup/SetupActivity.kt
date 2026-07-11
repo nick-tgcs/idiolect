@@ -312,7 +312,9 @@ class SetupActivity : ComponentActivity() {
         val downloader = ModelDownloader(transport, modelStore())
         thread(isDaemon = true, name = "idiolect-model-download") {
             runCatching {
-                downloader.download { downloaded, total ->
+                // Gate the install itself, not just the UI: a cancel/supersede that lands after
+                // the bytes verify must leave nothing installed (throws, swallowed below).
+                downloader.download(isCancelled = { token != downloadToken }) { downloaded, total ->
                     if (token != downloadToken) return@download // cancelled / superseded
                     val line = DownloadProgress.label(downloaded, total)
                     runOnUiThread { if (token == downloadToken) status.text = getString(R.string.setup_model_progress, line) }

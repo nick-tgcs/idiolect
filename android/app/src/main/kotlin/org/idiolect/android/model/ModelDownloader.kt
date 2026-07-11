@@ -14,8 +14,17 @@ class ModelDownloader(
     private val store: ModelStore,
     private val digestOf: (java.io.File) -> String = Sha256::ofFile,
 ) {
-    /** Download + verify + install, reporting `(downloaded, total)` progress. */
-    fun download(onProgress: (downloaded: Long, total: Long) -> Unit = { _, _ -> }): InstalledModel {
+    /**
+     * Download + verify + install, reporting `(downloaded, total)` progress. [isCancelled] is
+     * polled once the bytes are verified, immediately before the atomic install: if the caller
+     * has cancelled (or a newer download has superseded this one) the model is left uninstalled
+     * and [ModelDownloadCancelledException] is thrown, so an abandoned download can never advance
+     * onboarding to Ready. The verified `.part` is kept so a later retry resumes instantly.
+     */
+    fun download(
+        isCancelled: () -> Boolean = { false },
+        onProgress: (downloaded: Long, total: Long) -> Unit = { _, _ -> },
+    ): InstalledModel {
         val manifest = transport.fetchManifest()
         val part = store.partFile(manifest.id)
         part.parentFile?.mkdirs()
@@ -38,6 +47,10 @@ class ModelDownloader(
             part.delete()
             throw ModelIntegrityException(manifest.sha256, actual)
         }
+        // Last gate before the point of no return: a cancel/supersede that lands after the bytes
+        // verified must still not install. The window between this check and the rename is a
+        // single fast filesystem op.
+        if (isCancelled()) throw ModelDownloadCancelledException()
         return store.install(manifest.id, manifest.sha256, part)
     }
 
