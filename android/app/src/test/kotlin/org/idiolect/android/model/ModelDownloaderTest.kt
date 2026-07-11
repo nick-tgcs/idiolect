@@ -114,6 +114,26 @@ class ModelDownloaderTest {
     }
 
     @Test
+    fun a_cancel_that_lands_during_install_publishes_nothing() {
+        val bytes = ByteArray(5000) { (it % 256).toByte() }
+        val store = newStore()
+        // The pre-install gate passes, but the cancel/supersede lands *while* install is
+        // committing (on Android the token flips on the UI thread mid-copy). The commit is
+        // gated too, so the model is neither installed nor left active — never published
+        // behind the suppressed UI. `polls++ > 0`: clear on the pre-install poll, cancelled
+        // on the commit poll inside install.
+        var polls = 0
+        assertThrows(ModelDownloadCancelledException::class.java) {
+            ModelDownloader(
+                FakeTransport(ModelManifest("base.en", sha256(bytes), bytes.size.toLong()), bytes),
+                store,
+            ).download(isCancelled = { polls++ > 0 })
+        }
+        assertFalse("a late cancel installs nothing", store.isInstalled("base.en"))
+        assertNull("a late cancel publishes no active model", store.active())
+    }
+
+    @Test
     fun it_reports_progress_to_the_total() {
         val bytes = ByteArray(3000) { 7 }
         var last = -1L to -1L

@@ -16,10 +16,13 @@ class ModelDownloader(
 ) {
     /**
      * Download + verify + install, reporting `(downloaded, total)` progress. [isCancelled] is
-     * polled once the bytes are verified, immediately before the atomic install: if the caller
-     * has cancelled (or a newer download has superseded this one) the model is left uninstalled
-     * and [ModelDownloadCancelledException] is thrown, so an abandoned download can never advance
-     * onboarding to Ready. The verified `.part` is kept so a later retry resumes instantly.
+     * polled once the bytes verify (a cheap early-out before the copy) and again at install's
+     * commit point (after the expensive copy, before the model is published active): if the
+     * caller has cancelled (or a newer download has superseded this one) — even mid-copy — the
+     * model is left uninstalled and [ModelDownloadCancelledException] is thrown, so an abandoned
+     * download can never advance onboarding to Ready. A cancel *before* install keeps the
+     * verified `.part` so a retry resumes instantly; a cancel *during* the commit discards the
+     * staged bytes, so that retry re-downloads.
      */
     fun download(
         isCancelled: () -> Boolean = { false },
@@ -47,11 +50,11 @@ class ModelDownloader(
             part.delete()
             throw ModelIntegrityException(manifest.sha256, actual)
         }
-        // Last gate before the point of no return: a cancel/supersede that lands after the bytes
-        // verified must still not install. The window between this check and the rename is a
-        // single fast filesystem op.
+        // Cheap early-out before the expensive copy: skip install entirely if already cancelled.
+        // The commit inside install is gated on the same signal, so a cancel that lands *during*
+        // the copy still publishes nothing (see ModelStore.install).
         if (isCancelled()) throw ModelDownloadCancelledException()
-        return store.install(manifest.id, manifest.sha256, part)
+        return store.install(manifest.id, manifest.sha256, part, isCancelled)
     }
 
     /** Stream the model into [part], resuming from its current length if it is a valid partial. */
