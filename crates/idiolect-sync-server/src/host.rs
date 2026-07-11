@@ -40,6 +40,10 @@ pub enum SyncHostError {
     Bind(#[source] std::io::Error),
     #[error("failed to mint pairing offer: {0}")]
     Pairing(String),
+    #[error(
+        "embedded sync host does not terminate TLS (tls:true); serve cleartext (tls:false) or run the standalone idiolect-sync-server"
+    )]
+    TlsUnsupported,
 }
 
 /// The live embedded sync server. Obtain via [`SyncHost::start`].
@@ -56,6 +60,13 @@ impl SyncHost {
     /// for the lifetime of the tokio runtime (drop-to-shutdown is not yet
     /// wired — the tokio runtime is process-scoped).
     pub fn start(cfg: SyncHostConfig, rt: &tokio::runtime::Handle) -> Result<Self, SyncHostError> {
+        // This host serves the router with plain `axum::serve` below; it has no TLS acceptor.
+        // Silently downgrading a tls:true request to cleartext would advertise TLS on the
+        // dashboard while any https/pinning pairing URL fails its handshake — so refuse loudly
+        // instead of lying. TLS termination lives in the standalone `idiolect-sync-server`.
+        if cfg.tls {
+            return Err(SyncHostError::TlsUnsupported);
+        }
         let tokens = DeviceTokenStore::open(&cfg.tokens_path).map_err(SyncHostError::TokenStore)?;
         let tokens = Arc::new(Mutex::new(tokens));
         let pairing = Arc::new(PairingServerState::new(tokens.clone()));
@@ -191,6 +202,27 @@ mod tests {
         SyncHost::start(cfg, rt.handle()).expect("start")
         // rt is dropped here; the spawned task will be cancelled, but token
         // store and DB state remain and are what we're testing.
+    }
+
+    #[test]
+    fn start_refuses_tls_because_the_embedded_host_serves_cleartext_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let cfg = SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: true,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        // Rather than bind a cleartext socket while reporting TLS enabled, start must fail.
+        // (SyncHost is not Debug, so match on the Result instead of `expect_err`.)
+        let result = SyncHost::start(cfg, rt.handle());
+        assert!(
+            matches!(result, Err(SyncHostError::TlsUnsupported)),
+            "tls:true must be rejected with TlsUnsupported",
+        );
     }
 
     #[test]
