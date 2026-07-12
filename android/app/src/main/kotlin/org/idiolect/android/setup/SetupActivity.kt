@@ -76,6 +76,9 @@ class SetupActivity : ComponentActivity() {
     private var selectedModel = PublicModelCatalog.default
 
     /** Bumped per download attempt so a cancelled or superseded download's late UI updates are ignored. */
+    // Written on the UI thread (start/cancel), read on the daemon download thread's isCancelled
+    // gate — @Volatile gives the happens-before edge so a cancel/supersede is never missed.
+    @Volatile
     private var downloadToken = 0
 
     /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */

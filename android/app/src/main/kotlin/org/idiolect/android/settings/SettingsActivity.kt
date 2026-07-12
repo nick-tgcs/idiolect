@@ -61,6 +61,9 @@ class SettingsActivity : ComponentActivity() {
     private var manualExpanded = false
 
     /** Bumped per model download so a superseded switch's late UI updates are ignored. */
+    // Written on the UI thread (start/supersede), read on the daemon download thread's isCancelled
+    // gate — @Volatile gives the happens-before edge so a supersede is never missed.
+    @Volatile
     private var modelDownloadToken = 0
 
     /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */
