@@ -6,8 +6,8 @@
 # the build must target the portable baseline everywhere (PR #67 whisper SIGILL).
 #
 # Test levels: CI/build configuration has no unit or e2e seam — the only reachable
-# level is this integration gate over the repo config, the workflows, and the
-# compiled artifact itself.
+# level is this integration gate over the repo config, the workflows, the compiled
+# artifact, and the CMake configuration the build consumed.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -41,10 +41,10 @@ done < <(grep -rn 'key:.*-cargo-portable-.*hashFiles' .github/workflows/ | grep 
 #    This catches any regression path the config checks can't see (e.g. a stale
 #    cache reused past a config change).
 if [[ "$(uname -sm)" == "Linux x86_64" ]]; then
-  binary=$(cargo test -p idiolect-adapter-whisper --no-run --message-format=json 2>/dev/null |
-    jq -r 'select(.reason == "compiler-artifact" and .executable != null)
-           | select(.manifest_path | contains("idiolect-adapter-whisper")) | .executable' |
-    tail -n 1)
+  build_json=$(cargo test -p idiolect-adapter-whisper --no-run --message-format=json 2>/dev/null)
+  binary=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null)
+                  | select(.manifest_path | contains("idiolect-adapter-whisper")) | .executable' \
+    <<<"$build_json" | tail -n 1)
   if [[ -z "$binary" ]]; then
     echo "FAIL: could not locate the idiolect-adapter-whisper test binary" >&2
     fail=1
@@ -56,6 +56,23 @@ if [[ "$(uname -sm)" == "Linux x86_64" ]]; then
       echo "FAIL: $binary contains $evex_count AVX-512/EVEX instructions — the ggml build is not portable" >&2
       fail=1
     fi
+  fi
+
+  # 4. The configuration the build consumed: the [env] pin only works because
+  #    whisper-rs-sys forwards GGML_* env vars as CMake defines. If a future
+  #    whisper-rs bump dropped that passthrough, check 3 would catch it only on
+  #    runners whose CPU can express AVX-512; the CMake cache records the value
+  #    the build received on every runner, deterministically.
+  out_dir=$(jq -r 'select(.reason == "build-script-executed")
+                   | select(.package_id | contains("whisper-rs-sys")) | .out_dir' \
+    <<<"$build_json" | tail -n 1)
+  cmake_cache="${out_dir}/build/CMakeCache.txt"
+  if [[ -z "$out_dir" || ! -f "$cmake_cache" ]]; then
+    echo "FAIL: could not locate the whisper-rs-sys CMakeCache (out_dir='$out_dir')" >&2
+    fail=1
+  elif ! grep -qE '^GGML_NATIVE:[^=]*=OFF$' "$cmake_cache"; then
+    echo "FAIL: $cmake_cache does not record GGML_NATIVE=OFF — the [env] pin did not reach CMake (passthrough regression, or stale local build dir: cargo clean -p whisper-rs-sys)" >&2
+    fail=1
   fi
 fi
 
