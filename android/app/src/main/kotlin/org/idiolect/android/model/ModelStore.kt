@@ -18,24 +18,41 @@ class ModelStore(private val root: File) {
 
     fun isInstalled(id: String): Boolean = modelFile(id).exists()
 
-    /** Atomically place the verified [temp] file as model [id] and record it active. */
-    fun install(id: String, sha256: String, temp: File): InstalledModel {
+    /**
+     * Atomically place the verified [temp] file as model [id] and record it active. The
+     * expensive placement (a rename, or a full copy across mounts) writes a private
+     * `.bin.staging` file that touches neither `{id}.bin` nor `active`; [isCancelled] is then
+     * polled once, and only on a clear does the fast commit run — swap staging over the
+     * destination, then write the active marker. A cancel/supersede landing *during* the copy
+     * therefore discards the staging file and throws [ModelDownloadCancelledException] without
+     * ever publishing the model, so a late/superseded download can never win the `active`
+     * marker behind a suppressed UI.
+     */
+    fun install(id: String, sha256: String, temp: File, isCancelled: () -> Boolean = { false }): InstalledModel {
         root.mkdirs()
         val dest = modelFile(id)
-        // Atomic replace — never delete the existing model first. rename() overwrites the
-        // destination in a single step (same filesystem), so the old model stays fully in
-        // place until the new file is durably there; a crash in this window can never leave
-        // `active` pointing at a missing or half-written model.
-        if (!temp.renameTo(dest)) {
-            // rename can't span mounts: stage a full copy ON the destination's filesystem,
-            // then atomically swap it in. The old model is untouched until that final rename.
-            val staging = File(dest.parentFile, "$id.bin.staging")
+        // Stage the bytes onto the destination's filesystem first. This is the slow part (a
+        // cross-mount copy) and it touches neither `dest` nor `active`, so a cancel during it
+        // publishes nothing. A same-filesystem rename is the fast path; the copy is the mount
+        // fallback.
+        val staging = File(dest.parentFile, "$id.bin.staging")
+        if (!temp.renameTo(staging)) {
             temp.copyTo(staging, overwrite = true)
-            if (!staging.renameTo(dest)) {
-                staging.delete()
-                throw IOException("could not install model $id: atomic replace failed")
-            }
             temp.delete()
+        }
+        // Commit gate: a cancel/supersede that landed while we were copying stops here, leaving
+        // the old model in place and nothing new published.
+        if (isCancelled()) {
+            staging.delete()
+            throw ModelDownloadCancelledException()
+        }
+        // Atomic replace — never delete the existing model first. rename() overwrites the
+        // destination in a single step (same filesystem), so the old model stays fully in place
+        // until the new file is durably there; a crash in this window can never leave `active`
+        // pointing at a missing or half-written model.
+        if (!staging.renameTo(dest)) {
+            staging.delete()
+            throw IOException("could not install model $id: atomic replace failed")
         }
         val model = InstalledModel(id, sha256, dest.absolutePath)
         activeFile().writeText("$id\n$sha256")

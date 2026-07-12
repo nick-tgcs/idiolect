@@ -47,9 +47,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -74,6 +74,9 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --workspace --doc --features idiolect-ibus/ibus-engine
+
+      - name: Hermetic build gate (no machine-specific ISA in ggml)
+        run: bash ci/scripts/test-hermetic-build.sh
 
       - name: Run coverage (80% line coverage gate)
         run: cargo llvm-cov --workspace --features idiolect-ibus/ibus-engine --all-targets --fail-under-lines 80
@@ -140,9 +143,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -188,9 +191,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -247,9 +250,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -286,9 +289,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -328,9 +331,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install /usr/bin/time
         run: sudo apt-get update && sudo apt-get install -y time libasound2-dev libpulse-dev libglib2.0-dev
@@ -372,9 +375,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Run real adapter dependency check
         run: bash ci/scripts/test-real-adapter-deps.sh
@@ -406,9 +409,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Run interface leakage check
         run: bash ci/scripts/test-interface-no-backend-leakage.sh
@@ -440,9 +443,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -499,9 +502,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -544,9 +547,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -598,9 +601,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       # No system packages: every crate below is dependency-pure (no ALSA, DBus,
       # X11, fcitx5, or CUDA), so it builds against the stock macOS toolchain.
@@ -661,9 +664,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Clippy (warnings as errors)
         run: |

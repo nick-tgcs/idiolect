@@ -39,9 +39,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-nightly-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-nightly-
+            ${{ runner.os }}-cargo-portable-nightly-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -158,9 +158,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-weekly-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-weekly-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-weekly-
+            ${{ runner.os }}-cargo-portable-weekly-
 
       - name: Install system dependencies
         run: |
@@ -243,9 +243,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-manual-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-manual-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-manual-
+            ${{ runner.os }}-cargo-portable-manual-
 
       - name: Install system dependencies
         run: |

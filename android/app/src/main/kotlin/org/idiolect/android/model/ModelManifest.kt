@@ -37,3 +37,8 @@ data class InstalledModel(val id: String, val sha256: String, val path: String)
 /** A model download/install failed its SHA-256 integrity check. */
 class ModelIntegrityException(expected: String, actual: String) :
     Exception("model integrity check failed: expected $expected, got $actual")
+
+/** A model download was cancelled (or superseded) after verifying but before install, so
+ *  nothing was installed. */
+class ModelDownloadCancelledException :
+    Exception("model download cancelled before install")

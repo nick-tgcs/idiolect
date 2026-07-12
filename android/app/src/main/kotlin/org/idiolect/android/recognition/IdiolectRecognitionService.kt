@@ -1,8 +1,12 @@
 package org.idiolect.android.recognition
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.speech.RecognitionService
+import androidx.annotation.VisibleForTesting
+import androidx.core.content.ContextCompat
 import org.idiolect.android.audio.MicForegroundService
 import org.idiolect.android.model.ModelStore
 import java.io.File
@@ -22,11 +26,19 @@ class IdiolectRecognitionService : RecognitionService() {
     private var take: CoreRecognitionTake? = null
 
     override fun onStartListening(recognizerIntent: Intent, listener: Callback) {
-        val model = ModelStore(File(filesDir, "models/whisper")).active()
-        if (model == null) {
-            reportError(listener, RecognitionError.MODEL_MISSING)
+        // Unlike the activity, this headless path cannot prompt for a runtime permission, so a
+        // missing mic must be reported to the caller as ERROR_INSUFFICIENT_PERMISSIONS (rather
+        // than letting the AudioRecord path fail later as a generic recognition error). Mic is
+        // checked ahead of the model — see RecognitionPreconditions.
+        startBlocker()?.let {
+            reportError(listener, it)
             return
         }
+        val model = ModelStore(File(filesDir, "models/whisper")).active()
+            ?: run {
+                reportError(listener, RecognitionError.MODEL_MISSING)
+                return
+            }
         runCatching { MicForegroundService.start(this) }
         val live = CoreRecognitionTake(this)
         take = live
@@ -61,6 +73,22 @@ class IdiolectRecognitionService : RecognitionService() {
         take?.cancel()
         cleanup()
     }
+
+    /**
+     * What blocks a take here before any native core is loaded: no `RECORD_AUDIO` (mic first,
+     * since the service can't prompt) or no installed model — the ordering is the unit-tested
+     * [RecognitionPreconditions]. Pulled out so the Android permission/model read is covered by a
+     * Robolectric test; the `Callback` error wiring itself is covered by the connected e2e.
+     */
+    @VisibleForTesting
+    internal fun startBlocker(): RecognitionError? {
+        val model = ModelStore(File(filesDir, "models/whisper")).active()
+        return RecognitionPreconditions.blocker(hasMicPermission(), hasModel = model != null)
+    }
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
     private fun reportError(listener: Callback, error: RecognitionError) {
         runCatching { listener.error(RecognitionErrorCodes.speechRecognizer(error)) }
