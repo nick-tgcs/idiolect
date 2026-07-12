@@ -23,7 +23,8 @@ import java.io.File
  * [VoiceProviderManifestTest]; the once-only/blank logic is the unit-tested [RecognitionSession].
  */
 class IdiolectRecognitionService : RecognitionService() {
-    private var take: CoreRecognitionTake? = null
+    @VisibleForTesting
+    internal var take: RecognitionTake? = null
 
     override fun onStartListening(recognizerIntent: Intent, listener: Callback) {
         // Unlike the activity, this headless path cannot prompt for a runtime permission, so a
@@ -97,6 +98,10 @@ class IdiolectRecognitionService : RecognitionService() {
 
     private fun cleanup() {
         runCatching { MicForegroundService.stop(this) }
+        // Cancel BEFORE release: a take still listening when the service is destroyed (no
+        // onCancel from the framework) would otherwise keep capturing with no owner —
+        // release() alone does not stop the mic. cancel() is a no-op on a spent session.
+        take?.cancel()
         take?.release()
         take = null
     }

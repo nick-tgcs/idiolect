@@ -12,6 +12,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
+import androidx.annotation.VisibleForTesting
 import org.idiolect.android.R
 import org.idiolect.android.ime.EnabledKeyboard
 import org.idiolect.android.ime.ImeReturn
@@ -21,6 +22,7 @@ import org.idiolect.android.recognition.CoreRecognitionTake
 import org.idiolect.android.recognition.RecognitionError
 import org.idiolect.android.recognition.RecognitionOutput
 import org.idiolect.android.recognition.RecognitionPreconditions
+import org.idiolect.android.recognition.RecognitionTake
 import org.idiolect.android.settings.SettingsStore
 import java.io.File
 
@@ -47,7 +49,8 @@ class IdiolectAccessibilityService : AccessibilityService() {
     private val main = Handler(Looper.getMainLooper())
 
     /** A live quick-launch take, or null when idle. Non-null ⇒ a take is listening/transcribing. */
-    private var quickTake: CoreRecognitionTake? = null
+    @VisibleForTesting
+    internal var quickTake: RecognitionTake? = null
 
     private val quickLaunchButton = object : AccessibilityButtonController.AccessibilityButtonCallback() {
         override fun onClicked(controller: AccessibilityButtonController) = onQuickLaunchButton()
@@ -229,6 +232,10 @@ class IdiolectAccessibilityService : AccessibilityService() {
     }
 
     private fun finishQuickTake() {
+        // Cancel BEFORE release: release() drops the core reference but does not stop a
+        // still-listening capture, so a take live at destroy time would keep the mic running
+        // with no owner. cancel() is a no-op once a result/error already spent the session.
+        quickTake?.cancel()
         quickTake?.release()
         quickTake = null
     }

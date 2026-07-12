@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * The orchestration *logic* — emit-exactly-once, blank-is-no-speech — is the unit-tested
  * [RecognitionSession]; this is the Android wiring around it, covered by the connected e2e.
  */
-class CoreRecognitionTake(context: Context) {
+class CoreRecognitionTake(context: Context) : RecognitionTake {
     private val host = IdiolectCoreHost.acquire(context.applicationContext)
     private val core = host.core
 
@@ -59,7 +59,7 @@ class CoreRecognitionTake(context: Context) {
      * fire, so a caller never prompts the user to speak before idiolect is listening). A load
      * failure is reported straight to [output] — the session hasn't entered its listening state.
      */
-    fun begin(model: InstalledModel, output: RecognitionOutput) {
+    override fun begin(model: InstalledModel, output: RecognitionOutput) {
         val live = RecognitionSession(TakeAdapter(), output)
         session = live
         val callbacks = object : NoopInputMethod() {
@@ -89,12 +89,12 @@ class CoreRecognitionTake(context: Context) {
     }
 
     /** End of input — finalize the take; the transcript arrives via the bound callback. */
-    fun stopListening() {
+    override fun stopListening() {
         if (!released.get()) session?.stopListening()
     }
 
     /** Abandon the take with no result. */
-    fun cancel() {
+    override fun cancel() {
         if (!released.get()) session?.cancel()
     }
 
@@ -102,7 +102,7 @@ class CoreRecognitionTake(context: Context) {
      *  task on the executor — so the close never races a native call, and a still-decoding cancelled
      *  take's commit lands on this (spent) session rather than leaking to the IME's base sink.
      *  Idempotent: the core reference is dropped exactly once. */
-    fun release() {
+    override fun release() {
         if (!released.compareAndSet(false, true)) return
         runCatching {
             executor.execute {
