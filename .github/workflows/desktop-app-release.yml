@@ -65,9 +65,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-release-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-portable-release-
 
       - name: Install system dependencies (Linux only)
         if: matrix.os == 'linux'
