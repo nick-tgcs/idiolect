@@ -92,6 +92,26 @@ impl TrainerLauncher {
         })
     }
 
+    /// Test-only: a launcher wired to caller-held channels instead of a subprocess.
+    /// It reports "still running" until something is sent on the done sender.
+    #[cfg(test)]
+    pub(crate) fn test_stub() -> (
+        Self,
+        mpsc::Sender<TrainingProgress>,
+        mpsc::Sender<Result<(), String>>,
+    ) {
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        (
+            Self {
+                progress_rx,
+                done_rx,
+            },
+            progress_tx,
+            done_tx,
+        )
+    }
+
     /// Non-blocking poll. Drains to the latest progress update.
     pub(crate) fn poll(&self) -> PollResult {
         let mut progress = None;

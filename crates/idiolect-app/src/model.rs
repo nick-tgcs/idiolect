@@ -88,7 +88,7 @@ pub(crate) struct TrainingSnapshot {
     pub(crate) progress: Option<TrainingProgress>,
 }
 
-fn default_auto_threshold() -> u32 {
+pub(crate) fn default_auto_threshold() -> u32 {
     25
 }
 
