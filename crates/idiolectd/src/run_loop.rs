@@ -82,6 +82,18 @@ impl RunLoopError {
         }
     }
 
+    /// Whether this error means the CLIENT went away mid-conversation — a peer
+    /// reset surfacing on a daemon WRITE (`EPIPE`/`ECONNRESET`). The read path
+    /// classifies resets inline (see [`is_disconnect`]); a failed write unwinds
+    /// out of [`handle_connection`], so the accept loop uses this to survive it
+    /// exactly like a read-side reset.
+    pub(crate) fn is_client_disconnect(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(is_disconnect)
+    }
+
     fn framing(error: FramingError) -> Self {
         Self {
             message: format!("ipc framing failed: {error}"),
@@ -266,15 +278,45 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
         let (stream, _) = listener
             .accept()
             .map_err(|error| RunLoopError::io("accept client", error))?;
-        handle_connection(
+        // Per-connection state (see [`Live`]) — owned HERE so a write that
+        // unwinds out of `handle_connection` can still be cleaned up below,
+        // exactly like a read-side reset.
+        let mut live = Live {
+            active_session: None,
+            live_capture: None,
+            live_stream: None,
+            status_tx: RecordingStatusTx::new(false),
+            wants_reconcile: false,
+        };
+        match handle_connection(
             stream,
             &config,
             &mut tray,
             &mut clipboard,
             &mut store,
-            &tray_callback_rx,
-            &settings_forward_tx,
-        )?;
+            &TrayChannel {
+                rx: &tray_callback_rx,
+                forward_tx: &settings_forward_tx,
+            },
+            &mut live,
+        ) {
+            Ok(()) => {}
+            // A write racing the peer's reset (EPIPE mid-response) is the same
+            // event as reading the reset: the client went away. The read path
+            // handles it inside `handle_connection`; a failed WRITE unwinds out
+            // of it, so it is converted here — release the mic, cancel
+            // uncommitted work, and accept the next client. Crashing instead
+            // would let any engine restart take the whole daemon down.
+            Err(error) if error.is_client_disconnect() => {
+                drop_live_capture(&mut live.live_capture);
+                cancel_uncommitted_active_session(
+                    &mut store,
+                    &mut live.active_session,
+                    "daemon-disconnect",
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
         if config.shutdown_after_client {
             return Ok(());
         }
@@ -602,14 +644,22 @@ fn refresh_tray_menu(
         .map_err(|error| RunLoopError::tray("tray menu", error))
 }
 
+/// The tray-callback channel pair a connection services: `rx` drains tray
+/// clicks between IPC reads; `forward_tx` lets the Settings window feed its
+/// changes back into the same stream.
+struct TrayChannel<'a> {
+    rx: &'a mpsc::Receiver<TrayCallback>,
+    forward_tx: &'a mpsc::Sender<TrayCallback>,
+}
+
 fn handle_connection(
     mut stream: UnixStream,
     config: &RunLoopConfig,
     tray: &mut KsniTray,
     clipboard: &mut ArboardClipboard,
     store: &mut SqliteMetadataStore,
-    tray_callback_rx: &mpsc::Receiver<TrayCallback>,
-    settings_forward_tx: &mpsc::Sender<TrayCallback>,
+    tray_channel: &TrayChannel<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
     let reader_stream = stream
         .try_clone()
@@ -630,24 +680,11 @@ fn handle_connection(
     let settings_window = crate::settings_launcher::SettingsLauncher::discover();
     // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray).
     let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover();
-    // Per-connection state bundled into `Live`:
-    //  - active_session: the in-flight dictation, if any.
-    //  - live_capture: set only while a real microphone recording is in progress.
-    //  - live_stream: set alongside live.live_capture while translation streams snippets.
-    //  - status_tx: the authoritative recording-state publisher, re-armed at
-    //    handshake once we know whether the client negotiated `recording_status`.
-    let mut live = Live {
-        active_session: None,
-        live_capture: None,
-        live_stream: None,
-        status_tx: RecordingStatusTx::new(false),
-        wants_reconcile: false,
-    };
     let mut line = String::new();
 
     loop {
         // Drain any pending tray callbacks before (and between) IPC reads.
-        while let Ok(callback) = tray_callback_rx.try_recv() {
+        while let Ok(callback) = tray_channel.rx.try_recv() {
             handle_tray_action(
                 callback,
                 &mut stream,
@@ -659,12 +696,12 @@ fn handle_connection(
                     codec: &codec,
                     config,
                 },
-                &mut live,
+                live,
                 &ConfigSurfaces {
                     retention_dialog: &retention_dialog,
                     settings_window: &settings_window,
                     sync_panel: &sync_panel,
-                    settings_forward_tx,
+                    settings_forward_tx: tray_channel.forward_tx,
                 },
             )?;
         }
@@ -680,7 +717,7 @@ fn handle_connection(
                 codec: &codec,
                 config,
             },
-            &mut live,
+            live,
         )?;
         if auto_stop {
             // The user went silent past the auto-stop threshold: the long pause
@@ -695,7 +732,7 @@ fn handle_connection(
                     codec: &codec,
                     config,
                 },
-                &mut live,
+                live,
             )?;
         }
 
@@ -766,7 +803,7 @@ fn handle_connection(
                                 codec: &codec,
                                 config,
                             },
-                            &mut live,
+                            live,
                         )?;
                     } else {
                         start_live_capture(
@@ -778,7 +815,7 @@ fn handle_connection(
                                 codec: &codec,
                                 config,
                             },
-                            &mut live,
+                            live,
                         )?;
                     }
                 } else {
@@ -791,7 +828,7 @@ fn handle_connection(
                             codec: &codec,
                             config,
                         },
-                        &mut live,
+                        live,
                     )?;
                 }
             }
@@ -806,7 +843,7 @@ fn handle_connection(
                             codec: &codec,
                             config,
                         },
-                        &mut live,
+                        live,
                     )?;
                 }
             }
@@ -1392,10 +1429,18 @@ impl RecordingStatusTx {
 /// translated snippet at every pause instead of one transcript on stop.
 /// Per-connection mutable state, bundled so the live-capture handlers stay under
 /// the argument-count lint without threading many `&mut` params individually.
+/// Owned by the accept loop in [`run`] — not by [`handle_connection`] — so a
+/// write that unwinds out of the connection can still be cleaned up like a
+/// read-side reset.
 struct Live {
+    /// The in-flight dictation session, if any.
     active_session: Option<ActiveSession>,
+    /// Set only while a real microphone recording is in progress.
     live_capture: Option<crate::adapters::RuntimeCapture>,
+    /// Set alongside `live_capture` while translation streams snippets.
     live_stream: Option<LiveStreamState>,
+    /// The authoritative recording-state publisher, re-armed at handshake once
+    /// we know whether the client negotiated `recording_status`.
     status_tx: RecordingStatusTx,
     /// Whether the connected client negotiated [`FEATURE_RECONCILE`]. Only such a
     /// client receives the stop-time reconcile final (and may have its live
@@ -2292,9 +2337,11 @@ impl Drop for SocketCleanup {
 mod tests {
     use std::io::{Error, ErrorKind};
 
+    use idiolect_ipc::messages::IpcMessage;
+
     use super::{
-        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix,
-        should_clear_clipboard, RecordingStatusTx,
+        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix, send_ipc_message,
+        should_clear_clipboard, RecordingStatusTx, RunLoopError,
     };
 
     #[test]
@@ -2349,6 +2396,41 @@ mod tests {
         // A genuine fault must still surface as an error, not be swallowed.
         assert!(!is_disconnect(&Error::from(ErrorKind::InvalidData)));
         assert!(!is_disconnect(&Error::from(ErrorKind::PermissionDenied)));
+    }
+
+    #[test]
+    fn a_write_to_a_reset_client_classifies_as_client_disconnect() {
+        // The reset can surface on the daemon's WRITE (EPIPE) instead of its
+        // read when responses race the peer's close — the daemon must classify
+        // that as the client going away, not as a daemon fault.
+        let (mut daemon_side, engine_side) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        drop(engine_side);
+        // The first write can land in the kernel buffer before the reset is
+        // processed; keep writing until the failure surfaces.
+        let error = loop {
+            if let Err(error) = send_ipc_message(&mut daemon_side, &IpcMessage::StartRecording) {
+                break error;
+            }
+        };
+        assert!(
+            error.is_client_disconnect(),
+            "EPIPE on an IPC write means the client went away: {error}"
+        );
+    }
+
+    #[test]
+    fn only_peer_disconnect_io_errors_classify_as_client_disconnect() {
+        let fault = RunLoopError::io("write ipc line", Error::from(ErrorKind::PermissionDenied));
+        assert!(
+            !fault.is_client_disconnect(),
+            "a genuine io fault must stay fatal"
+        );
+        let sourceless = RunLoopError {
+            message: "no source".to_owned(),
+            source: None,
+        };
+        assert!(!sourceless.is_client_disconnect());
     }
 
     #[test]
