@@ -305,15 +305,11 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
             // event as reading the reset: the client went away. The read path
             // handles it inside `handle_connection`; a failed WRITE unwinds out
             // of it, so it is converted here — release the mic, cancel
-            // uncommitted work, and accept the next client. Crashing instead
-            // would let any engine restart take the whole daemon down.
+            // uncommitted work, repaint the tray idle, and accept the next
+            // client. Crashing instead would let any engine restart take the
+            // whole daemon down.
             Err(error) if error.is_client_disconnect() => {
-                drop_live_capture(&mut live.live_capture);
-                cancel_uncommitted_active_session(
-                    &mut store,
-                    &mut live.active_session,
-                    "daemon-disconnect",
-                )?;
+                cleanup_disconnected_client(&mut tray, &mut store, &config, &mut live)?;
             }
             Err(error) => return Err(error),
         }
@@ -607,8 +603,12 @@ fn toggle_preview_typing(store: &mut SqliteMetadataStore) -> Result<(), RunLoopE
 }
 
 /// Rebuilds and installs the tray menu from current storage state.
-fn refresh_tray_menu(
-    tray: &mut KsniTray,
+///
+/// Generic over [`TrayPort`] (the production tray is [`KsniTray`]) so tests can
+/// observe renders through a recording fake — the real StatusNotifier host is a
+/// GUI boundary.
+fn refresh_tray_menu<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
     store: &SqliteMetadataStore,
     config: &RunLoopConfig,
     recording_state: RecordingState,
@@ -739,16 +739,11 @@ fn handle_connection(
         match reader.read_line(&mut line) {
             // A clean EOF (0) or an abrupt reset are both just the peer going away —
             // e.g. an IME engine restarting/reconnecting sends RST, not FIN. Treat
-            // them identically: release the mic, cancel uncommitted work, and accept
-            // the next client. Crashing the daemon on a client reset would let any
-            // engine restart take the whole daemon down.
+            // them identically: release the mic, cancel uncommitted work, repaint
+            // the tray idle, and accept the next client. Crashing the daemon on a
+            // client reset would let any engine restart take the whole daemon down.
             Ok(0) => {
-                drop_live_capture(&mut live.live_capture);
-                cancel_uncommitted_active_session(
-                    store,
-                    &mut live.active_session,
-                    "daemon-disconnect",
-                )?;
+                cleanup_disconnected_client(tray, store, config, live)?;
                 return Ok(());
             }
             Ok(_) => {}
@@ -756,12 +751,7 @@ fn handle_connection(
             // Any partial bytes already read stay buffered in `line`.
             Err(error) if is_read_timeout(&error) => {}
             Err(error) if is_disconnect(&error) => {
-                drop_live_capture(&mut live.live_capture);
-                cancel_uncommitted_active_session(
-                    store,
-                    &mut live.active_session,
-                    "daemon-disconnect",
-                )?;
+                cleanup_disconnected_client(tray, store, config, live)?;
                 return Ok(());
             }
             Err(error) => return Err(RunLoopError::io("read ipc line", error)),
@@ -1324,12 +1314,35 @@ fn drop_live_capture(live_capture: &mut Option<crate::adapters::RuntimeCapture>)
     }
 }
 
-/// The single place recording-state changes are published. The daemon owns the
-/// microphone, so it is the authority: every start/stop/cancel — whether driven by
-/// the keyboard toggle over IPC or by a tray menu click — funnels through here,
-/// which updates the tray icon/menu AND pushes [`IpcMessage::RecordingStatus`] to a
-/// client that negotiated the feature. Because the tray and the push share this one
-/// chokepoint, the keyboard, the tray, and the adapter indicator can never disagree.
+/// The single unwind path for a client that vanished — whether the reset
+/// surfaced on a READ (EOF/ECONNRESET in the read loop) or on a WRITE (EPIPE
+/// unwinding out of [`handle_connection`]): release the microphone, cancel
+/// any uncommitted session, and re-publish Idle to the tray.
+///
+/// The tray render must not be skipped: the client may have died after
+/// `start_live_capture` rendered Recording, and nothing else repaints the tray
+/// before the next take. It also must not touch the dead stream, so it goes
+/// through [`update_tray_recording_state`] directly, never `status_tx.set`.
+fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
+    store: &mut SqliteMetadataStore,
+    config: &RunLoopConfig,
+    live: &mut Live,
+) -> Result<(), RunLoopError> {
+    drop_live_capture(&mut live.live_capture);
+    cancel_uncommitted_active_session(store, &mut live.active_session, "daemon-disconnect")?;
+    update_tray_recording_state(tray, store, config, RecordingState::Idle)
+}
+
+/// The single place recording-state changes are published TO A LIVE CLIENT. The
+/// daemon owns the microphone, so it is the authority: every start/stop/cancel —
+/// whether driven by the keyboard toggle over IPC or by a tray menu click — funnels
+/// through here, which updates the tray icon/menu AND pushes
+/// [`IpcMessage::RecordingStatus`] to a client that negotiated the feature. Because
+/// the tray and the push share this one chokepoint, the keyboard, the tray, and the
+/// adapter indicator can never disagree. The one path that bypasses it is
+/// [`cleanup_disconnected_client`]: with the client gone there is nothing to push
+/// to, so it repaints the tray directly.
 ///
 /// Edge-triggered on the `recording` value: a no-op transition (e.g. a commit after
 /// the mic already stopped) publishes nothing, so clients see one push per real change.
@@ -2287,8 +2300,8 @@ fn parse_index_suffix(action: &str, prefix: &str) -> Option<usize> {
         .and_then(|rest| rest.parse().ok())
 }
 
-fn update_tray_recording_state(
-    tray: &mut KsniTray,
+fn update_tray_recording_state<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
     store: &SqliteMetadataStore,
     config: &RunLoopConfig,
     state: RecordingState,
@@ -2453,6 +2466,153 @@ mod tests {
     // `merge_tail_correction`, `is_noise_transcript`) moved to
     // `idiolect_application::use_cases::streaming` (M2) and is unit-tested there;
     // the daemon's streaming integration tests below still exercise it end to end.
+
+    mod disconnect_cleanup {
+        use std::path::PathBuf;
+
+        use idiolect_adapter_ksni::KsniTrayError;
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
+        use idiolect_ports::storage::{
+            MetadataStorePort, TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus,
+        };
+
+        use crate::adapters::{RuntimeAdapterProfile, FIXTURE_DEVICE};
+        use crate::run_loop::{
+            cleanup_disconnected_client, ActiveSession, Live, RecordingStatusTx, RunLoopConfig,
+        };
+
+        /// Records every render instead of drawing it. The production tray's
+        /// StatusNotifier host is a GUI boundary (a real icon needs a session
+        /// bus plus an SNI watcher — see `KsniTray`), so the cleanup contract
+        /// is pinned here at the [`TrayPort`] seam; the daemon-survives-the-
+        /// disconnect half lives in the `daemon_run_lifecycle` e2e, which runs
+        /// headless with the tray disabled and therefore cannot observe renders.
+        #[derive(Default)]
+        struct RecordingTray {
+            icons: Vec<TrayIcon>,
+            tooltips: Vec<String>,
+            menus: Vec<Vec<TrayMenuItem>>,
+        }
+
+        impl TrayPort for RecordingTray {
+            type Error = KsniTrayError;
+
+            fn set_icon(&mut self, icon: TrayIcon) -> Result<(), Self::Error> {
+                self.icons.push(icon);
+                Ok(())
+            }
+
+            fn set_tooltip(&mut self, tooltip: &str) -> Result<(), Self::Error> {
+                self.tooltips.push(tooltip.to_owned());
+                Ok(())
+            }
+
+            fn set_menu(&mut self, items: Vec<TrayMenuItem>) -> Result<(), Self::Error> {
+                self.menus.push(items);
+                Ok(())
+            }
+
+            fn set_status(&mut self, _status: TrayStatus) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        fn test_config() -> RunLoopConfig {
+            RunLoopConfig {
+                socket_path: PathBuf::new(),
+                database_path: PathBuf::new(),
+                audio_root: PathBuf::new(),
+                decoded_cache_root: PathBuf::new(),
+                user_id: "test-user".to_owned(),
+                shutdown_after_client: true,
+                adapter_profile: RuntimeAdapterProfile {
+                    audio_input_device: FIXTURE_DEVICE.to_owned(),
+                    vad_engine: "energy".to_owned(),
+                    asr_engine: "fixture".to_owned(),
+                    whisper_model_path: PathBuf::new(),
+                    asr_use_gpu: false,
+                    asr_language: "en".to_owned(),
+                    asr_threads: 1,
+                },
+                history_config: HistoryConfig::default(),
+                translation_config: TranslationConfig::default(),
+                vad_config: VadConfig::default(),
+                notify_command: String::new(),
+            }
+        }
+
+        /// Whether any (possibly nested) item is a history entry — the menu
+        /// renders one per `recent_history` row, id `history:<row id>`.
+        fn contains_history_item(items: &[TrayMenuItem]) -> bool {
+            items.iter().any(|item| {
+                item.id.starts_with("history:")
+                    || matches!(
+                        &item.kind,
+                        TrayMenuItemKind::Standard { submenu: Some(sub) }
+                            if contains_history_item(sub)
+                    )
+            })
+        }
+
+        #[test]
+        fn a_disconnect_cleanup_republishes_idle_to_the_tray() {
+            // A client that vanishes mid-take dies AFTER `start_live_capture`
+            // rendered the tray as Recording; nothing else repaints it before
+            // the next take, so the icon would lie ("Recording" with the mic
+            // already released) until some unrelated state change. The unwind
+            // path itself must re-publish Idle — via the tray only, never the
+            // dead stream.
+            let mut tray = RecordingTray::default();
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let config = test_config();
+            // A real uncommitted session: the cleanup's cancel inserts the ONLY
+            // history row, so the re-rendered menu containing a history entry
+            // proves the render ran AFTER the cancel — an earlier render could
+            // not show a row that did not exist yet.
+            let session_id = store
+                .create_session(Some("mid-take words"))
+                .expect("create session");
+            let mut live = Live {
+                active_session: Some(ActiveSession {
+                    session_id,
+                    current_text: "mid-take words".to_owned(),
+                    finalized: false,
+                    tail_text: None,
+                }),
+                live_capture: None,
+                live_stream: None,
+                // As a start leaves it: `true` was the last published value.
+                status_tx: RecordingStatusTx {
+                    feature: true,
+                    last: true,
+                },
+                wants_reconcile: false,
+            };
+
+            cleanup_disconnected_client(&mut tray, &mut store, &config, &mut live)
+                .expect("cleanup succeeds");
+
+            assert_eq!(
+                tray.icons.last(),
+                Some(&TrayIcon::Idle),
+                "the unwind must repaint the tray icon as idle"
+            );
+            assert_eq!(
+                tray.tooltips.last().map(String::as_str),
+                Some("Idiolect — Ready"),
+                "the tooltip must drop the recording banner"
+            );
+            assert!(
+                tray.menus
+                    .last()
+                    .is_some_and(|menu| contains_history_item(menu)),
+                "the re-rendered menu must already show the just-cancelled take: \
+                 the repaint has to happen after the session cancel"
+            );
+        }
+    }
 
     mod capture_persist {
         use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
