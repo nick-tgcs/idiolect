@@ -7,7 +7,10 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use axum::response::IntoResponse;
 
 use crate::device_tokens::{DeviceTokenStore, PairedDevice};
 use crate::pairing::{PairingOffer, PairingServerState};
@@ -44,6 +47,8 @@ pub enum SyncHostError {
         "embedded sync host does not terminate TLS (tls:true); serve cleartext (tls:false) or run the standalone idiolect-sync-server"
     )]
     TlsUnsupported,
+    #[error("sync is disabled")]
+    Disabled,
 }
 
 /// The live embedded sync server. Obtain via [`SyncHost::start`].
@@ -53,6 +58,10 @@ pub struct SyncHost {
     store: Arc<Mutex<SqliteMetadataStore>>,
     pair_url: String,
     tls: bool,
+    /// Shared with the serving task's gate middleware: `false` ⇒ every phone-facing
+    /// route answers 503 and no pairing offer can be minted.
+    enabled: Arc<AtomicBool>,
+    local_addr: SocketAddr,
 }
 
 impl SyncHost {
@@ -97,8 +106,32 @@ impl SyncHost {
 
         let app = crate::build_app(model_cfg, pairing.clone(), Some(ingest_state));
 
+        // The dashboard's "Disable Sync" must actually stop the server from accepting
+        // phone traffic (pairing, ingest, model pulls) — not just relabel the UI — so
+        // every route is gated on this flag. The listener stays bound; re-enabling is
+        // instant and needs no rebind.
+        let enabled = Arc::new(AtomicBool::new(true));
+        let gate = enabled.clone();
+        let app = app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let gate = gate.clone();
+                async move {
+                    if gate.load(Ordering::SeqCst) {
+                        next.run(req).await
+                    } else {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "sync is disabled\n",
+                        )
+                            .into_response()
+                    }
+                }
+            },
+        ));
+
         let bind_addr: SocketAddr = cfg.bind;
         let listener = std::net::TcpListener::bind(bind_addr).map_err(SyncHostError::Bind)?;
+        let local_addr = listener.local_addr().map_err(SyncHostError::Bind)?;
         listener
             .set_nonblocking(true)
             .map_err(SyncHostError::Bind)?;
@@ -114,12 +147,23 @@ impl SyncHost {
             store,
             pair_url: cfg.pair_url,
             tls: cfg.tls,
+            enabled,
+            local_addr,
         })
     }
 
     /// Mint a fresh pairing invitation (code + QR + expiry). The outstanding
-    /// code supersedes any previous one.
+    /// code supersedes any previous one. Refused while the host is disabled —
+    /// the gated routes could never serve the claim anyway.
+    ///
+    /// Mint and [`set_enabled`](Self::set_enabled) must be called from one thread
+    /// (the dashboard's UI thread today): the enabled check here and the
+    /// disable-side invalidation are not one atomic step, so concurrent callers
+    /// could re-arm a code on a disabled host.
     pub fn mint_pairing(&self, fingerprint: Option<&str>) -> Result<PairingOffer, SyncHostError> {
+        if !self.enabled() {
+            return Err(SyncHostError::Disabled);
+        }
         let now = crate::pairing::system_now();
         self.pairing
             .mint_offer(&self.pair_url, fingerprint, now)
@@ -183,6 +227,35 @@ impl SyncHost {
     pub fn tls(&self) -> bool {
         self.tls
     }
+
+    /// Whether the host is currently serving phone traffic.
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    /// Enable/disable serving. While disabled every phone-facing route answers 503
+    /// and [`SyncHost::mint_pairing`] refuses; the listener stays bound so
+    /// re-enabling is instant. Disabling also invalidates any outstanding pairing
+    /// offer: the dashboard stops showing it, so it must not stay silently
+    /// redeemable when the routes reopen within its TTL.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::SeqCst);
+        if !on {
+            self.pairing.cancel_pending();
+        }
+    }
+
+    /// Invalidate the outstanding pairing offer (the dashboard's "Cancel"). The
+    /// routes stay open — only the code dies; without this a cancelled code would
+    /// stay redeemable until its TTL even though the UI no longer shows it.
+    pub fn cancel_pairing(&self) {
+        self.pairing.cancel_pending();
+    }
+
+    /// The address the server is actually bound to (resolves a `:0` bind).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +295,151 @@ mod tests {
         assert!(
             matches!(result, Err(SyncHostError::TlsUnsupported)),
             "tls:true must be rejected with TlsUnsupported",
+        );
+    }
+
+    /// One blocking HTTP/1.1 request, dependency-free (the status line is all we assert on).
+    fn http_get(addr: SocketAddr, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: idiolect-test\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    /// One blocking `POST /v1/pair` claiming `code` — the request a phone that scanned
+    /// the QR would send. Dependency-free like [`http_get`].
+    fn http_post_pair(addr: SocketAddr, code: &str) -> String {
+        use std::io::{Read, Write};
+        let body = format!(r#"{{"code":"{code}","device_id":"phone-under-test"}}"#);
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "POST /v1/pair HTTP/1.1\r\nHost: idiolect-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn disabling_the_host_gates_phone_routes_until_reenabled() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = SyncHost::start(cfg, rt.handle()).expect("start");
+        let addr = host.local_addr();
+
+        assert!(
+            !http_get(addr, "/v1/model/manifest").starts_with("HTTP/1.1 503"),
+            "an enabled host must serve phone routes"
+        );
+
+        host.set_enabled(false);
+        assert!(
+            http_get(addr, "/v1/model/manifest").starts_with("HTTP/1.1 503"),
+            "a disabled host must refuse phone traffic, not serve while the UI says off"
+        );
+
+        host.set_enabled(true);
+        assert!(
+            !http_get(addr, "/v1/model/manifest").starts_with("HTTP/1.1 503"),
+            "re-enabling must restore serving without a rebind"
+        );
+    }
+
+    #[test]
+    fn disabling_the_host_invalidates_the_outstanding_pairing_offer() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = SyncHost::start(cfg, rt.handle()).expect("start");
+        let offer = host.mint_pairing(None).expect("mint");
+
+        // pair → disable → re-enable, all within the code's 10-minute TTL. Disable
+        // hides the offer from the dashboard (and the 503 gate blocks redemption),
+        // so the code must die at the host — not lie in wait, invisible and
+        // uncancellable, for the routes to reopen.
+        host.set_enabled(false);
+        host.set_enabled(true);
+
+        let response = http_post_pair(host.local_addr(), &offer.code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "an offer hidden by disable must not redeem after re-enable, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+        assert!(
+            host.paired_devices().is_empty(),
+            "no device may pair with the invalidated code"
+        );
+    }
+
+    #[test]
+    fn mint_pairing_refuses_while_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = test_host(dir.path());
+
+        host.set_enabled(false);
+
+        assert!(
+            matches!(host.mint_pairing(None), Err(SyncHostError::Disabled)),
+            "a disabled host must not mint pairing offers its gated routes cannot serve"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_pairing_offer_kills_the_code_while_routes_stay_open() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = SyncHost::start(cfg, rt.handle()).expect("start");
+        let offer = host.mint_pairing(None).expect("mint");
+
+        host.cancel_pairing();
+
+        let response = http_post_pair(host.local_addr(), &offer.code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a cancelled code must be refused, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+        // Cancel is not disable: the host must keep serving phone routes.
+        assert!(
+            !http_get(host.local_addr(), "/v1/model/manifest").starts_with("HTTP/1.1 503"),
+            "cancelling a pairing offer must not gate the host"
+        );
+        assert!(
+            host.paired_devices().is_empty(),
+            "no device may pair with the cancelled code"
         );
     }
 

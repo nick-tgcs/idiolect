@@ -39,4 +39,17 @@ class IdiolectRecognitionServiceTest {
         // No model installed in the test's fresh filesDir, so the mic clears and the model blocks.
         assertEquals(RecognitionError.MODEL_MISSING, service().startBlocker())
     }
+
+    @Test
+    fun destroying_the_service_mid_take_cancels_capture_before_releasing() {
+        val service = service()
+        val take = FakeRecognitionTake()
+        service.take = take
+
+        service.onDestroy()
+
+        // release() alone drops the core reference but does NOT stop a still-listening
+        // capture — the mic would keep recording with no owner until the process dies.
+        assertEquals(listOf("cancel", "release"), take.calls)
+    }
 }

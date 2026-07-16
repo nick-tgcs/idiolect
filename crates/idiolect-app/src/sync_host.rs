@@ -19,7 +19,7 @@ pub(crate) fn snapshot(host: &SyncHost) -> Snapshot {
         .collect();
     Snapshot {
         sync: SyncSnapshot {
-            enabled: true,
+            enabled: host.enabled(),
             reachable_url: host.pair_url().to_owned(),
             tls: host.tls(),
         },

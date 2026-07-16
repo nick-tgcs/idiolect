@@ -5,7 +5,7 @@
 use idiolect_application::use_cases::sync_decision::should_auto_train;
 
 use crate::backend::Backend;
-use crate::model::{PairingSnapshot, Snapshot};
+use crate::model::{PairingSnapshot, Snapshot, TrainingProgress};
 use crate::sync_host::{self, SyncHost};
 use crate::trainer_launcher::{TrainerConfig, TrainerLauncher};
 
@@ -28,12 +28,18 @@ pub(crate) struct LocalBackend {
     /// watermark — prevents an endless retrain loop when `trainerctl` does not
     /// decrement the corrections counter in the database.
     auto_train_watermark: u64,
+    /// Training prefs + latest progress line, owned HERE (the host knows nothing
+    /// about training) — `refresh()` re-applies them over each rebuilt snapshot,
+    /// exactly like `sync.enabled` lives in the host rather than the snapshot.
+    auto_train_enabled: bool,
+    auto_train_threshold: u32,
+    training_progress: Option<TrainingProgress>,
 }
 
 impl LocalBackend {
     pub(crate) fn new(host: SyncHost, trainer_cfg: Option<TrainerConfig>) -> Self {
         let last = sync_host::snapshot(&host);
-        Self {
+        let mut backend = Self {
             host,
             last,
             tick: 0,
@@ -41,31 +47,45 @@ impl LocalBackend {
             trainer_cfg,
             trainer: None,
             auto_train_watermark: 0,
-        }
+            auto_train_enabled: false,
+            auto_train_threshold: crate::model::default_auto_threshold(),
+            training_progress: None,
+        };
+        // Compose the initial snapshot the same way every later one is built.
+        backend.refresh();
+        backend
     }
 
     fn refresh(&mut self) {
         self.last = sync_host::snapshot(&self.host);
 
-        // Poll active trainer for progress / completion.
+        // Poll active trainer for progress / completion (mutating only the
+        // backend-owned fields; they are applied to the snapshot below).
         if let Some(t) = &self.trainer {
             let poll = t.poll();
             if let Some(p) = poll.progress {
-                self.last.training.progress = Some(p);
+                self.training_progress = Some(p);
             }
             if let Some(result) = poll.done {
                 if let Err(e) = result {
                     eprintln!("idiolect-app: training failed: {e}");
                 }
                 self.trainer = None;
-                self.last.training.running = false;
-                self.last.training.progress = None;
+                self.training_progress = None;
                 // Advance the watermark to the current corrections count so that
                 // a stale DB (trainerctl didn't decrement the counter) doesn't
                 // cause an immediate re-trigger on the next refresh.
                 self.auto_train_watermark = self.last.learning.new_corrections;
             }
         }
+
+        // Training state is owned by this backend, not the host — re-apply it so
+        // the rebuild above can't reset it (the same failure mode as sync:disable
+        // flipping back, and what made auto-train unable to ever fire).
+        self.last.training.auto_enabled = self.auto_train_enabled;
+        self.last.training.auto_threshold = self.auto_train_threshold;
+        self.last.training.running = self.trainer.is_some();
+        self.last.training.progress = self.training_progress.clone();
 
         // Propagate pairing offer state (countdown / expiry).
         if let Some(offer) = &self.active_pairing {
@@ -110,6 +130,7 @@ impl LocalBackend {
         match TrainerLauncher::start(cfg) {
             Ok(t) => {
                 self.trainer = Some(t);
+                self.training_progress = None;
                 self.last.training.running = true;
                 self.last.training.progress = None;
             }
@@ -133,11 +154,14 @@ impl Backend for LocalBackend {
     fn send(&mut self, action: &str) {
         match action {
             "sync:enable" => {
+                self.host.set_enabled(true);
                 self.last.sync.enabled = true;
             }
             "sync:disable" => {
+                self.host.set_enabled(false);
                 self.last.sync.enabled = false;
                 self.active_pairing = None;
+                self.last.pairing = PairingSnapshot::default();
             }
             "sync:pair" => match self.host.mint_pairing(None) {
                 Ok(offer) => {
@@ -155,14 +179,20 @@ impl Backend for LocalBackend {
                 Err(err) => eprintln!("idiolect-app: mint_pairing: {err}"),
             },
             "sync:cancel_pair" => {
+                // Kill the code at the host too — clearing only the cached offer
+                // would leave it redeemable at /v1/pair for the rest of its TTL.
+                // (sync:disable needs no equivalent: set_enabled(false) invalidates.)
+                self.host.cancel_pairing();
                 self.active_pairing = None;
                 self.last.pairing = PairingSnapshot::default();
             }
             "train:now" => self.start_training(),
             "train:auto:on" => {
+                self.auto_train_enabled = true;
                 self.last.training.auto_enabled = true;
             }
             "train:auto:off" => {
+                self.auto_train_enabled = false;
                 self.last.training.auto_enabled = false;
             }
             _ if action.starts_with("sync:unpair:") => {
@@ -173,7 +203,8 @@ impl Backend for LocalBackend {
             _ if action.starts_with("train:auto_threshold:") => {
                 let n: u32 = action["train:auto_threshold:".len()..]
                     .parse()
-                    .unwrap_or(25);
+                    .unwrap_or_else(|_| crate::model::default_auto_threshold());
+                self.auto_train_threshold = n;
                 self.last.training.auto_threshold = n;
             }
             _ if action.starts_with("prefs:reachable_url:") => {
@@ -234,6 +265,256 @@ mod tests {
     fn auto_train_respects_threshold_below_watermark() {
         // count=15 doesn't meet threshold=25, even though count > watermark=0.
         assert!(!should_trigger_auto_train(true, 15, 0, true, 25));
+    }
+
+    #[test]
+    fn sync_disable_survives_the_next_refresh() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("sync:disable");
+
+        // The first poll tick forces a refresh, which rebuilds `last` from the host
+        // snapshot — the disable must survive that rebuild (be host state), not flip
+        // back to enabled within one refresh interval.
+        let snap = backend.poll_state().expect("tick 1 refreshes");
+        assert!(
+            !snap.sync.enabled,
+            "sync:disable must survive a snapshot refresh, not flip back to enabled"
+        );
+        assert!(!backend.host.enabled(), "disable must gate the host itself");
+
+        backend.send("sync:enable");
+        let snap = (0..60)
+            .find_map(|_| backend.poll_state())
+            .expect("a refresh tick within one interval");
+        assert!(
+            snap.sync.enabled,
+            "sync:enable must survive a snapshot refresh symmetrically"
+        );
+    }
+
+    /// One blocking `POST /v1/pair` claiming `code` against the backend's embedded
+    /// host — the request a phone that scanned the QR would send.
+    fn http_post_pair(addr: std::net::SocketAddr, code: &str) -> String {
+        use std::io::{Read, Write};
+        let body = format!(r#"{{"code":"{code}","device_id":"phone-under-test"}}"#);
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "POST /v1/pair HTTP/1.1\r\nHost: idiolect-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn cancel_pair_invalidates_the_offer_at_the_host() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        backend.send("sync:cancel_pair");
+
+        // Cancel removes the QR from the dashboard; the code it carried must be just
+        // as dead at the host — the routes stay open, so clearing only the cached
+        // offer would leave a code nobody can see redeemable for its full TTL.
+        let response = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a cancelled pairing code must be refused at /v1/pair, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn a_pairing_offer_hidden_by_sync_disable_is_dead_after_reenable() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        backend.send("sync:disable");
+        backend.send("sync:enable");
+
+        // Disable cleared the dashboard's offer; within the TTL the phone must not
+        // be able to redeem the hidden code once the routes reopen.
+        let response = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a code hidden by sync:disable must not redeem after sync:enable, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn training_state_survives_the_next_refresh() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("train:auto:on");
+        backend.send("train:auto_threshold:40");
+        let (stub, _progress_tx, _done_tx) = crate::trainer_launcher::TrainerLauncher::test_stub();
+        backend.trainer = Some(stub);
+
+        // Same failure mode as sync:disable — these live only in the cached snapshot,
+        // so the refresh's rebuild resets them (and the auto-train check then reads
+        // the reset auto_enabled=false, so auto-train could never fire).
+        let snap = backend.poll_state().expect("tick 1 refreshes");
+        assert!(
+            snap.training.auto_enabled,
+            "the auto-train pref must survive a snapshot refresh"
+        );
+        assert_eq!(
+            snap.training.auto_threshold, 40,
+            "the auto-train threshold must survive a snapshot refresh"
+        );
+        assert!(
+            snap.training.running,
+            "a live trainer must keep training.running across refreshes"
+        );
+    }
+
+    #[test]
+    fn a_completed_training_run_clears_running_and_progress() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        let (stub, progress_tx, done_tx) = crate::trainer_launcher::TrainerLauncher::test_stub();
+        backend.trainer = Some(stub);
+        progress_tx
+            .send(crate::model::TrainingProgress {
+                epoch: 2,
+                epochs: 2,
+                sample: 10,
+                total: 10,
+                loss_before: 0.0,
+                loss_now: 0.2,
+            })
+            .expect("send progress");
+        done_tx.send(Ok(())).expect("send done");
+
+        // Progress and done can land on the SAME poll tick — the tick must still
+        // end with the run over and nothing left on the progress bar.
+        let snap = backend.poll_state().expect("tick 1 refreshes");
+        assert!(!snap.training.running, "the done tick must end running");
+        assert!(
+            snap.training.progress.is_none(),
+            "the done tick must clear progress"
+        );
+        assert!(
+            backend.trainer.is_none(),
+            "the trainer handle must be reaped"
+        );
+    }
+
+    #[test]
+    fn training_progress_persists_between_progress_lines() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "0.0.0.0:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        let (stub, progress_tx, _done_tx) = crate::trainer_launcher::TrainerLauncher::test_stub();
+        backend.trainer = Some(stub);
+        progress_tx
+            .send(crate::model::TrainingProgress {
+                epoch: 1,
+                epochs: 2,
+                sample: 3,
+                total: 10,
+                loss_before: 0.0,
+                loss_now: 1.0,
+            })
+            .expect("send progress");
+
+        let snap = backend.poll_state().expect("tick 1 refreshes");
+        assert!(
+            snap.training.progress.is_some(),
+            "a delivered progress line must reach the snapshot"
+        );
+
+        // No new line arrives before the next refresh — the bar must hold the last
+        // value, not flicker back to empty because the rebuild reset it.
+        let snap = (0..60)
+            .find_map(|_| backend.poll_state())
+            .expect("a refresh tick within one interval");
+        assert!(
+            snap.training.progress.is_some(),
+            "progress must persist between trainer output lines"
+        );
     }
 
     #[test]

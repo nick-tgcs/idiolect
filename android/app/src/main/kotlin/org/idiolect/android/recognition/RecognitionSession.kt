@@ -1,11 +1,23 @@
 package org.idiolect.android.recognition
 
+import org.idiolect.android.model.InstalledModel
+
 /** Start/stop of one recognition take's capture + core finalize, injected so the
  *  [RecognitionSession] sequencing is unit-tested. In production this is a thin adapter over the
  *  IME's [org.idiolect.android.ime.MicToggle] (`startHold` / `stop`). */
 interface TakeControl {
     fun start()
     fun stop()
+}
+
+/** The service-facing lifecycle of one whisper take ([CoreRecognitionTake] in production). A seam
+ *  so the hosting services' teardown ordering — cancel a possibly-live capture BEFORE releasing
+ *  the core — is unit-testable without the native core. */
+interface RecognitionTake {
+    fun begin(model: InstalledModel, output: RecognitionOutput)
+    fun stopListening()
+    fun cancel()
+    fun release()
 }
 
 /** Where a take's outcome goes: the `ACTION_RECOGNIZE_SPEECH` activity returns it as
