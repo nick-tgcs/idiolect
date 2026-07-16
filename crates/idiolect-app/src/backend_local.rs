@@ -179,6 +179,10 @@ impl Backend for LocalBackend {
                 Err(err) => eprintln!("idiolect-app: mint_pairing: {err}"),
             },
             "sync:cancel_pair" => {
+                // Kill the code at the host too — clearing only the cached offer
+                // would leave it redeemable at /v1/pair for the rest of its TTL.
+                // (sync:disable needs no equivalent: set_enabled(false) invalidates.)
+                self.host.cancel_pairing();
                 self.active_pairing = None;
                 self.last.pairing = PairingSnapshot::default();
             }
@@ -297,6 +301,93 @@ mod tests {
         assert!(
             snap.sync.enabled,
             "sync:enable must survive a snapshot refresh symmetrically"
+        );
+    }
+
+    /// One blocking `POST /v1/pair` claiming `code` against the backend's embedded
+    /// host — the request a phone that scanned the QR would send.
+    fn http_post_pair(addr: std::net::SocketAddr, code: &str) -> String {
+        use std::io::{Read, Write};
+        let body = format!(r#"{{"code":"{code}","device_id":"phone-under-test"}}"#);
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "POST /v1/pair HTTP/1.1\r\nHost: idiolect-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn cancel_pair_invalidates_the_offer_at_the_host() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        backend.send("sync:cancel_pair");
+
+        // Cancel removes the QR from the dashboard; the code it carried must be just
+        // as dead at the host — the routes stay open, so clearing only the cached
+        // offer would leave a code nobody can see redeemable for its full TTL.
+        let response = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a cancelled pairing code must be refused at /v1/pair, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn a_pairing_offer_hidden_by_sync_disable_is_dead_after_reenable() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        backend.send("sync:disable");
+        backend.send("sync:enable");
+
+        // Disable cleared the dashboard's offer; within the TTL the phone must not
+        // be able to redeem the hidden code once the routes reopen.
+        let response = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a code hidden by sync:disable must not redeem after sync:enable, got: {}",
+            response.lines().next().unwrap_or_default()
         );
     }
 
