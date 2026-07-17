@@ -2,12 +2,17 @@ package org.idiolect.android.recognition
 
 import org.idiolect.android.model.InstalledModel
 
-/** Start/stop of one recognition take's capture + core finalize, injected so the
- *  [RecognitionSession] sequencing is unit-tested. In production this is a thin adapter over the
- *  IME's [org.idiolect.android.ime.MicToggle] (`startHold` / `stop`). */
+/** Start/stop/discard of one recognition take's capture, injected so the [RecognitionSession]
+ *  sequencing is unit-tested. In production this is a thin adapter over the IME's
+ *  [org.idiolect.android.ime.MicToggle] (`startHold` / `stop` / `cancel`). */
 interface TakeControl {
     fun start()
+
+    /** Finalize the take: drain capture, then decode — a transcript (or silence) follows. */
     fun stop()
+
+    /** Discard the take: nothing is decoded and no result will follow. */
+    fun cancel()
 }
 
 /** The service-facing lifecycle of one whisper take ([CoreRecognitionTake] in production). A seam
@@ -80,13 +85,15 @@ class RecognitionSession(
         take.stop()
     }
 
-    /** Abandon the take (back-press / caller cancel): stop capture and suppress any later result. */
+    /** Abandon the take (back-press / caller cancel / host teardown): discard it — never the
+     *  finalize path, whose decode would burn seconds of whisper work on a suppressed result —
+     *  and drop any later commit. */
     @Synchronized
     fun cancel() {
         if (state == State.DONE) return
         val wasListening = state == State.LISTENING
         state = State.DONE
-        if (wasListening) take.stop()
+        if (wasListening) take.cancel()
     }
 
     /** The core finalized the take with [text] (blank ⇒ silence). Acts only while listening. */
