@@ -116,5 +116,6 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
     private inner class TakeAdapter : TakeControl {
         override fun start() = mic.startHold()
         override fun stop() = mic.stop()
+        override fun cancel() = mic.cancel()
     }
 }

@@ -63,10 +63,12 @@ class MicToggle(
     }
 
     /**
-     * Abort the current take without finalizing — drain capture, then discard the take in the
-     * core so nothing is persisted. Used when focus lands on a learning-blocked field while a
-     * take (typically continuous) is still recording: a finalize there would persist audio,
-     * history and a training row for speech captured in the blocked field.
+     * Abort the current take without finalizing — discard it in the core, then drain capture;
+     * nothing is decoded or persisted. Used when focus lands on a learning-blocked field while
+     * a take (typically continuous) is still recording (a finalize there would persist audio,
+     * history and a training row), and when a recognition caller abandons its take (back-press,
+     * `SpeechRecognizer.cancel()`, host teardown), where a finalize would burn a whole whisper
+     * decode on a result the session only suppresses.
      */
     fun cancel() = submit {
         if (core.isRecording()) {

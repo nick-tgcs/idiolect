@@ -16,8 +16,10 @@ class RecognitionSessionTest {
     private class FakeTake : TakeControl {
         var starts = 0
         var stops = 0
+        var cancels = 0
         override fun start() { starts++ }
         override fun stop() { stops++ }
+        override fun cancel() { cancels++ }
     }
 
     private class Out : RecognitionOutput {
@@ -80,15 +82,32 @@ class RecognitionSessionTest {
     }
 
     @Test
-    fun cancel_stops_capture_and_suppresses_any_result() {
+    fun cancel_discards_the_take_and_suppresses_any_result() {
         val take = FakeTake()
         val out = Out()
         val session = RecognitionSession(take, out)
         session.start()
         session.cancel()
         session.onCommitted("ignored")
-        assertEquals("cancel stops the take", 1, take.stops)
+        assertEquals("cancel discards the take", 1, take.cancels)
+        // The finalize path decodes the whole take (seconds of whisper work) for a result the
+        // session would only suppress — an abandoned take must never pay for it.
+        assertEquals("cancel must not finalize", 0, take.stops)
         assertEquals(listOf("ready"), out.events)
+    }
+
+    @Test
+    fun a_cancel_before_the_take_starts_spends_the_session_without_touching_the_take() {
+        // begin() relies on this: a take cancelled while the model is still loading must not
+        // open capture when the queued start() finally runs.
+        val take = FakeTake()
+        val out = Out()
+        val session = RecognitionSession(take, out)
+        session.cancel()
+        session.start()
+        assertEquals(0, take.starts)
+        assertEquals(0, take.cancels)
+        assertTrue(out.events.isEmpty())
     }
 
     @Test

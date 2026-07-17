@@ -152,8 +152,9 @@ class MicToggleTest {
 
     @Test
     fun cancel_discards_a_running_take_without_finalizing() {
-        // Focus landing on a learning-blocked field mid-take must *discard* the take — drain
-        // capture, then cancel in the core (never finalize, which would persist audio/history).
+        // Abandoning a take (a learning-blocked field mid-take, a recognition caller's cancel)
+        // must *discard* it — cancel in the core, then drain capture (never finalize, which
+        // would persist audio/history and decode the whole take).
         val r = Recorder()
         val toggle = MicToggle(r, r, direct)
         toggle.onTap() // recording
