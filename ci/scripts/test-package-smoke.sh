@@ -67,6 +67,7 @@ required_entries=(
   './usr/bin/idiolect-cli'
   './usr/bin/idiolectd'
   './usr/bin/idiolect-train'
+  './usr/bin/idiolect-crash-notify'
   './usr/lib/fcitx5/idiolect.so'
   './usr/lib/systemd/user/idiolectd.service'
   './usr/share/fcitx5/addon/idiolect.conf'

@@ -42,6 +42,7 @@ require_executable "${lifecycle_root}" /usr/bin/idiolect
 require_executable "${lifecycle_root}" /usr/bin/idiolect-cli
 require_executable "${lifecycle_root}" /usr/bin/idiolectd
 require_executable "${lifecycle_root}" /usr/bin/idiolect-train
+require_executable "${lifecycle_root}" /usr/bin/idiolect-crash-notify
 require_file "${lifecycle_root}" /usr/lib/fcitx5/idiolect.so
 require_file "${lifecycle_root}" /usr/share/fcitx5/addon/idiolect.conf
 require_file "${lifecycle_root}" /usr/share/fcitx5/inputmethod/idiolect.conf
