@@ -44,6 +44,14 @@ class MicToggle(
     // Stopping is never gated — a running take must always finalize cleanly.
     private val canStart: () -> Boolean = { true },
 ) {
+    /** Whether the take currently running on the core was started by THIS toggle. The core is
+     *  process-wide (the IME and the recognition surfaces share it), and cancel() is destructive
+     *  — discarding another surface's take throws away that user's in-flight dictation — so only
+     *  the owner may cancel. Confined to the executor thread. Best-effort: a foreign surface
+     *  finalizing our take leaves it stale until the next start (the documented cross-surface
+     *  residual); stop/finalize stays unguarded, as a finalize loses nothing. */
+    private var ownsTake = false
+
     /** Single tap: toggle — start a one-shot take if idle, stop + finalize if recording. */
     fun onTap() = submit {
         when {
@@ -59,7 +67,9 @@ class MicToggle(
 
     /** Hold released, or a stop tap: ensure the take is stopped and finalized. */
     fun stop() = submit {
-        if (core.isRecording()) stopSequence()
+        // No take to stop ⇒ no ownership to claim: drop a stale flag left by a foreign surface
+        // finalizing our take, so a later cancel() can't discard a take we didn't start.
+        if (core.isRecording()) stopSequence() else ownsTake = false
     }
 
     /**
@@ -68,10 +78,12 @@ class MicToggle(
      * a take (typically continuous) is still recording (a finalize there would persist audio,
      * history and a training row), and when a recognition caller abandons its take (back-press,
      * `SpeechRecognizer.cancel()`, host teardown), where a finalize would burn a whole whisper
-     * decode on a result the session only suppresses.
+     * decode on a result the session only suppresses. Only acts on a take THIS toggle started
+     * ([ownsTake]): a misrouted failure or a teardown while a foreign surface's take records
+     * must not destroy that user's dictation.
      */
     fun cancel() = submit {
-        if (core.isRecording()) {
+        if (ownsTake && core.isRecording()) {
             // Cancel the core FIRST so it stops accepting and finalizing frames, THEN drain
             // capture — the pump's remaining pushes are rejected (NoActiveTake) and harmlessly
             // dropped, so no blocked-field speech is committed. This is the *opposite* order to
@@ -83,6 +95,7 @@ class MicToggle(
             runCatching { core.cancel() }
             capture.stop()
         }
+        ownsTake = false
     }
 
     /** Double-tap: begin a continuous take (ignored if one is already running or refused). */
@@ -90,6 +103,7 @@ class MicToggle(
         if (!core.isRecording() && canStart()) {
             core.startContinuous()
             capture.start()
+            ownsTake = true
         }
     }
 
@@ -105,10 +119,12 @@ class MicToggle(
     private fun startSequence() {
         core.toggle()
         capture.start()
+        ownsTake = true
     }
 
     private fun stopSequence() {
         capture.stop()
         core.toggle()
+        ownsTake = false
     }
 }

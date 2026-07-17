@@ -65,7 +65,9 @@ class RecognizeSpeechActivity : ComponentActivity() {
         )
     }
 
-    /** Tap anywhere = "I'm done": finalize the take; the transcript returns via [onResult]. */
+    /** Tap anywhere = "I'm done": finalize the take; the transcript returns via [onResult]. A tap
+     *  while still "Preparing…" (model loading) ends the take as no-speech instead — the mic must
+     *  never open after the user already asked to stop. */
     private fun onSurfaceTapped() {
         if (take == null) return
         status?.setText(R.string.recognize_transcribing)
