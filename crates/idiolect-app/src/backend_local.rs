@@ -277,6 +277,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -321,6 +322,79 @@ mod tests {
         response
     }
 
+    /// One blocking bearer-authenticated GET against the backend's embedded host —
+    /// the request a paired phone sends to the model routes.
+    fn http_get_authed(addr: std::net::SocketAddr, path: &str, token: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: idiolect-test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn a_freshly_paired_phone_downloads_the_model_the_dashboard_serves() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_bytes = b"personal-model-v1";
+        std::fs::write(dir.path().join("model.bin"), model_bytes).expect("write model");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        // The whole onboarding a phone actually performs: the dashboard mints an
+        // offer, the phone redeems the code for a bearer token, then pulls the model.
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        let pair = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            pair.starts_with("HTTP/1.1 201"),
+            "pairing must succeed, got: {}",
+            pair.lines().next().unwrap_or_default()
+        );
+        let token = pair
+            .split(r#""token":""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("pair response carries the bearer token")
+            .to_owned();
+
+        let manifest = http_get_authed(backend.host.local_addr(), "/v1/model/manifest", &token);
+        assert!(
+            manifest.starts_with("HTTP/1.1 200"),
+            "the paired phone's manifest call must succeed, got: {}",
+            manifest.lines().next().unwrap_or_default()
+        );
+        let download = http_get_authed(backend.host.local_addr(), "/v1/model", &token);
+        assert!(
+            download.starts_with("HTTP/1.1 200"),
+            "the paired phone's model download must succeed, got: {}",
+            download.lines().next().unwrap_or_default()
+        );
+        assert!(
+            download.ends_with(std::str::from_utf8(model_bytes).expect("ascii fixture")),
+            "the phone must receive the file the dashboard serves"
+        );
+    }
+
     #[test]
     fn cancel_pair_invalidates_the_offer_at_the_host() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -331,6 +405,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -366,6 +441,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -401,6 +477,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -439,6 +516,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -482,6 +560,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -527,6 +606,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");

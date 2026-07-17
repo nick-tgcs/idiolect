@@ -86,12 +86,16 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
         let pair_url = local_ip()
             .map(|ip| format!("http://{ip}:8765"))
             .unwrap_or_default();
+        // One path, two roles: the trainer publishes here (`--serve`) and the
+        // sync host serves the same file to paired phones (`/v1/model`).
+        let served_model = data.join("model.bin");
         let cfg = sync_host::SyncHostConfig {
             bind: "0.0.0.0:8765".parse().expect("valid addr"),
             pair_url,
             tls: false,
             db_path: data.join("idiolect.db"),
             audio_root: data.join("audio"),
+            model_path: served_model.clone(),
             tokens_path: data.join("device_tokens.json"),
         };
         let trainer_cfg = trainer_launcher::TrainerConfig {
@@ -99,7 +103,7 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
             audio_root: data.join("audio"),
             base_model: data.join("ggml-base.en.bin"),
             output: data.join("personal.bin"),
-            serve: Some(data.join("model.bin")),
+            serve: Some(served_model),
             gpu: false,
         };
         match sync_host::SyncHost::start(cfg, rt) {
