@@ -2,7 +2,7 @@
 //! back to the dashboard. Used by `LocalBackend` in standalone mode.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
@@ -34,11 +34,25 @@ pub(crate) struct PollResult {
     pub(crate) done: Option<Result<(), String>>,
 }
 
+/// Resolve the trainer binary: prefer the `idiolect-trainerctl` shipped beside the
+/// running app (the desktop archive lays the two out side by side, and a GUI launch
+/// does not put that directory on `PATH`), falling back to its plain name (resolved
+/// via `PATH`).
+fn trainerctl_program(app_exe: Option<PathBuf>) -> PathBuf {
+    let name = format!("idiolect-trainerctl{}", std::env::consts::EXE_SUFFIX);
+    app_exe
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(&name))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
 impl TrainerLauncher {
     /// Spawn `idiolect-trainerctl train …` and return immediately. Progress and
     /// completion are delivered via [`poll`].
     pub(crate) fn start(cfg: &TrainerConfig) -> Result<Self, std::io::Error> {
-        let mut cmd = Command::new("idiolect-trainerctl");
+        let mut cmd = Command::new(trainerctl_program(std::env::current_exe().ok()));
         cmd.arg("train")
             .arg("--db")
             .arg(&cfg.db_path)
@@ -120,6 +134,41 @@ impl TrainerLauncher {
         }
         let done = self.done_rx.try_recv().ok();
         PollResult { progress, done }
+    }
+}
+
+/// Installs a fake `idiolect-trainerctl` BESIDE the running test binary — the layout
+/// the desktop archive ships — so spawn-path tests can prove `start` finds the
+/// sibling. One shared mutex, because every test shares that one on-disk path.
+#[cfg(all(test, unix))]
+pub(crate) mod test_sibling {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static SIBLING: Mutex<()> = Mutex::new(());
+
+    /// Write `script` as an executable `idiolect-trainerctl` next to the current
+    /// test binary, run `body`, then remove it — serialized across tests.
+    pub(crate) fn with_fake_trainerctl<R>(script: &str, body: impl FnOnce() -> R) -> R {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = SIBLING.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::current_exe()
+            .expect("current_exe")
+            .parent()
+            .expect("test binary has a parent dir")
+            .join("idiolect-trainerctl");
+        std::fs::write(&path, script).expect("write fake trainerctl");
+        let _cleanup = Cleanup(path.clone());
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake trainerctl");
+        body()
     }
 }
 
@@ -211,5 +260,110 @@ mod tests {
     #[test]
     fn garbage_line_is_ignored() {
         assert!(parse_progress_line("some random output from the trainer").is_none());
+    }
+
+    #[test]
+    fn the_trainerctl_beside_the_app_is_preferred() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = format!("idiolect-trainerctl{}", std::env::consts::EXE_SUFFIX);
+        let sibling = dir.path().join(&name);
+        std::fs::write(&sibling, b"").expect("create sibling");
+
+        let program = trainerctl_program(Some(dir.path().join("idiolect-app")));
+
+        assert_eq!(
+            program, sibling,
+            "the packaged sibling must win over a PATH lookup"
+        );
+    }
+
+    #[test]
+    fn a_missing_sibling_falls_back_to_a_path_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let program = trainerctl_program(Some(dir.path().join("idiolect-app")));
+
+        assert_eq!(
+            program,
+            PathBuf::from(format!(
+                "idiolect-trainerctl{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+            "with nothing shipped beside the app, the plain name keeps PATH working"
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_the_trainer_falls_back_to_a_path_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = format!("idiolect-trainerctl{}", std::env::consts::EXE_SUFFIX);
+        std::fs::create_dir(dir.path().join(&name)).expect("create decoy dir");
+
+        let program = trainerctl_program(Some(dir.path().join("idiolect-app")));
+
+        assert_eq!(
+            program,
+            PathBuf::from(&name),
+            "a non-file dirent beside the app must not shadow a real PATH install"
+        );
+    }
+
+    #[test]
+    fn an_unknown_app_location_falls_back_to_a_path_lookup() {
+        let program = trainerctl_program(None);
+
+        assert_eq!(
+            program,
+            PathBuf::from(format!(
+                "idiolect-trainerctl{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+            "a failed current_exe lookup must not lose training entirely"
+        );
+    }
+
+    /// Poll until the trainer reports completion (or give up after ten seconds).
+    #[cfg(unix)]
+    fn wait_done(launcher: &TrainerLauncher) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(done) = launcher.poll().done {
+                return done;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "trainer did not finish in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // unix-only: the fake trainerctl is a shell script, which Windows cannot exec.
+    // The resolution logic itself is covered cross-platform by the unit tests above.
+    #[cfg(unix)]
+    #[test]
+    fn start_spawns_the_trainerctl_shipped_beside_the_app() {
+        // The desktop archive ships `idiolect-trainerctl` NEXT TO the app binary,
+        // and a GUI launch does not put that directory on PATH — so `start` must
+        // prefer the sibling over a PATH lookup.
+        let script = "#!/bin/sh\nprintf '{\"output\":\"ok\"}'\n";
+        test_sibling::with_fake_trainerctl(script, || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = TrainerConfig {
+                db_path: dir.path().join("db.sqlite"),
+                audio_root: dir.path().join("audio"),
+                base_model: dir.path().join("base.bin"),
+                output: dir.path().join("out.bin"),
+                serve: None,
+                gpu: false,
+            };
+            let launcher =
+                TrainerLauncher::start(&cfg).expect("spawn the trainerctl beside the app");
+            assert_eq!(
+                wait_done(&launcher),
+                Ok(()),
+                "the sibling trainerctl must run to completion"
+            );
+        });
     }
 }
