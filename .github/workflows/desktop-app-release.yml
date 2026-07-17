@@ -83,7 +83,9 @@ jobs:
         run: |
           mkdir -p dist
           cp ${{ matrix.binary }} dist/idiolect-app
-          cp target/release/idiolect-trainerctl dist/idiolect-trainerctl 2>/dev/null || true
+          # The app resolves the trainer BESIDE itself; an archive without it
+          # ships with training silently dead — fail the release instead.
+          cp target/release/idiolect-trainerctl dist/idiolect-trainerctl
           cd dist && tar -czf ../${{ matrix.artifact }} .
 
       - name: Package (Windows)
@@ -92,9 +94,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item ${{ matrix.binary }} dist\idiolect-app.exe
-          if (Test-Path target\release\idiolect-trainerctl.exe) {
-            Copy-Item target\release\idiolect-trainerctl.exe dist\idiolect-trainerctl.exe
-          }
+          # The app resolves the trainer BESIDE itself; an archive without it
+          # ships with training silently dead — fail the release instead.
+          Copy-Item target\release\idiolect-trainerctl.exe dist\idiolect-trainerctl.exe
           Compress-Archive -Path dist\* -DestinationPath ${{ matrix.artifact }}
 
       - name: Upload artifact

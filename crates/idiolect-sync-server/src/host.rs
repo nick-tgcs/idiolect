@@ -28,6 +28,8 @@ pub struct SyncHostConfig {
     pub db_path: PathBuf,
     /// Root directory for audio files.
     pub audio_root: PathBuf,
+    /// Path to the model file served to paired phones (`/v1/model`).
+    pub model_path: PathBuf,
     /// Path to the device token store JSON file.
     pub tokens_path: PathBuf,
 }
@@ -87,11 +89,7 @@ impl SyncHost {
         let audio_store = FileAudioStore::new(cfg.audio_root.clone(), cfg.audio_root.clone());
 
         let model_cfg = Arc::new(crate::model_server::ModelServerConfig {
-            model_path: cfg
-                .audio_root
-                .parent()
-                .unwrap_or(&cfg.audio_root)
-                .to_path_buf(),
+            model_path: cfg.model_path.clone(),
             model_id: "base.en".to_owned(),
             tokens: tokens.clone(),
         });
@@ -270,6 +268,7 @@ mod tests {
             tls: false,
             db_path: dir.join("test.db"),
             audio_root: dir.join("audio"),
+            model_path: dir.join("model.bin"),
             tokens_path: dir.join("tokens.json"),
         };
         SyncHost::start(cfg, rt.handle()).expect("start")
@@ -287,6 +286,7 @@ mod tests {
             tls: true,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         // Rather than bind a cleartext socket while reporting TLS enabled, start must fail.
@@ -329,6 +329,70 @@ mod tests {
         response
     }
 
+    /// One blocking bearer-authenticated GET — the request a PAIRED phone sends to the
+    /// model routes. Dependency-free like [`http_get`].
+    fn http_get_authed(addr: SocketAddr, path: &str, token: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: idiolect-test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn a_paired_device_downloads_the_model_the_host_is_configured_to_serve() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_bytes = b"pretend-ggml-model-bytes";
+        std::fs::write(dir.path().join("model.bin"), model_bytes).expect("write model");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = SyncHost::start(cfg, rt.handle()).expect("start");
+        let token = host.issue_test_token("pixel").expect("token");
+
+        // The manifest must describe the configured model FILE — not 500 on some
+        // path the host derived by convention (this is the phone's onboarding call).
+        let manifest = http_get_authed(host.local_addr(), "/v1/model/manifest", &token);
+        assert!(
+            manifest.starts_with("HTTP/1.1 200"),
+            "an authed manifest for an existing model must succeed, got: {}",
+            manifest.lines().next().unwrap_or_default()
+        );
+        let expected_sha =
+            idiolect_common::digest::file_sha256_hex(dir.path().join("model.bin")).expect("digest");
+        assert!(
+            manifest.contains(&expected_sha),
+            "the manifest must carry the served file's digest"
+        );
+        assert!(
+            manifest.contains(&format!(r#""size":{}"#, model_bytes.len())),
+            "the manifest must carry the served file's size"
+        );
+
+        let download = http_get_authed(host.local_addr(), "/v1/model", &token);
+        assert!(
+            download.starts_with("HTTP/1.1 200"),
+            "an authed model download must succeed, got: {}",
+            download.lines().next().unwrap_or_default()
+        );
+        assert!(
+            download.ends_with(std::str::from_utf8(model_bytes).expect("ascii fixture")),
+            "the download must be byte-identical to the file at the configured model path"
+        );
+    }
+
     #[test]
     fn disabling_the_host_gates_phone_routes_until_reenabled() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -339,6 +403,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
@@ -372,6 +437,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
@@ -419,6 +485,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");

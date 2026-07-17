@@ -7,7 +7,7 @@
 //! Standalone mode (macOS / Windows): no daemon; the app owns its own `SyncHost`.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
@@ -63,6 +63,25 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/idiolect"))
 }
 
+/// Until the first training run publishes a personal model, copy the base
+/// model into the served slot (when present) so a freshly paired phone can
+/// complete onboarding instead of hitting 404. Staged copy + rename, so a
+/// crash mid-copy can't leave a torn file where the host will serve it.
+fn seed_served_model(base: &Path, served: &Path) {
+    if served.exists() || !base.is_file() {
+        return;
+    }
+    let staging = served.with_extension("bin.tmp");
+    let result = std::fs::copy(base, &staging).and_then(|_| std::fs::rename(&staging, served));
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&staging);
+        eprintln!(
+            "idiolect-app: cannot seed served model from {}: {e}",
+            base.display()
+        );
+    }
+}
+
 /// Build the appropriate backend.
 ///
 /// If stdin is a terminal the app was launched directly (standalone mode); we
@@ -86,20 +105,26 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
         let pair_url = local_ip()
             .map(|ip| format!("http://{ip}:8765"))
             .unwrap_or_default();
+        // One path, two roles: the trainer publishes here (`--serve`) and the
+        // sync host serves the same file to paired phones (`/v1/model`).
+        let served_model = data.join("model.bin");
+        let base_model = data.join("ggml-base.en.bin");
+        seed_served_model(&base_model, &served_model);
         let cfg = sync_host::SyncHostConfig {
             bind: "0.0.0.0:8765".parse().expect("valid addr"),
             pair_url,
             tls: false,
             db_path: data.join("idiolect.db"),
             audio_root: data.join("audio"),
+            model_path: served_model.clone(),
             tokens_path: data.join("device_tokens.json"),
         };
         let trainer_cfg = trainer_launcher::TrainerConfig {
             db_path: data.join("idiolect.db"),
             audio_root: data.join("audio"),
-            base_model: data.join("ggml-base.en.bin"),
+            base_model,
             output: data.join("personal.bin"),
-            serve: Some(data.join("model.bin")),
+            serve: Some(served_model),
             gpu: false,
         };
         match sync_host::SyncHost::start(cfg, rt) {
@@ -187,7 +212,63 @@ impl eframe::App for DashboardApp {
 
 #[cfg(test)]
 mod tests {
-    use super::local_ip;
+    use super::{local_ip, seed_served_model};
+
+    // `make_backend` itself is the process-startup boundary (fixed 0.0.0.0:8765
+    // bind, stdin probing), so the seeding rule is pinned here at the unit level
+    // and the serving of whatever file occupies the slot is covered by the
+    // SyncHost/LocalBackend suites.
+    #[test]
+    fn the_base_model_seeds_an_empty_served_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("ggml-base.en.bin");
+        let served = dir.path().join("model.bin");
+        std::fs::write(&base, b"base-model-bytes").expect("write base");
+
+        seed_served_model(&base, &served);
+
+        assert_eq!(
+            std::fs::read(&served).expect("served must exist"),
+            b"base-model-bytes",
+            "a fresh install must serve the base model, not 404, until training \
+             publishes a personal one"
+        );
+        assert!(
+            !dir.path().join("model.bin.tmp").exists(),
+            "the staging file must not be left behind"
+        );
+    }
+
+    #[test]
+    fn an_existing_served_model_is_never_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("ggml-base.en.bin");
+        let served = dir.path().join("model.bin");
+        std::fs::write(&base, b"base-model-bytes").expect("write base");
+        std::fs::write(&served, b"trained-personal-model").expect("write served");
+
+        seed_served_model(&base, &served);
+
+        assert_eq!(
+            std::fs::read(&served).expect("served"),
+            b"trained-personal-model",
+            "seeding must never clobber a trained model already in the slot"
+        );
+    }
+
+    #[test]
+    fn a_missing_base_model_is_a_quiet_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("ggml-base.en.bin");
+        let served = dir.path().join("model.bin");
+
+        seed_served_model(&base, &served);
+
+        assert!(
+            !served.exists(),
+            "with nothing to seed from, the slot stays absent (a clean 404)"
+        );
+    }
 
     #[test]
     fn local_ip_returns_a_non_loopback_address_when_a_network_is_available() {

@@ -122,8 +122,13 @@ impl LocalBackend {
         }
     }
 
-    /// Spawn `idiolect-trainerctl` if a `TrainerConfig` is available.
+    /// Spawn `idiolect-trainerctl` if a `TrainerConfig` is available and no run is
+    /// already in flight — a second trainer would race the first over the same
+    /// `--output`/`--serve` files and could publish a torn model.
     fn start_training(&mut self) {
+        if self.trainer.is_some() {
+            return;
+        }
         let Some(cfg) = &self.trainer_cfg else {
             return;
         };
@@ -277,6 +282,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -321,6 +327,199 @@ mod tests {
         response
     }
 
+    /// One blocking bearer-authenticated GET against the backend's embedded host —
+    /// the request a paired phone sends to the model routes.
+    fn http_get_authed(addr: std::net::SocketAddr, path: &str, token: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: idiolect-test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn a_freshly_paired_phone_downloads_the_model_the_dashboard_serves() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_bytes = b"personal-model-v1";
+        std::fs::write(dir.path().join("model.bin"), model_bytes).expect("write model");
+        let cfg = crate::sync_host::SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
+            tokens_path: dir.path().join("tokens.json"),
+        };
+        let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+        let mut backend = super::LocalBackend::new(host, None);
+
+        // The whole onboarding a phone actually performs: the dashboard mints an
+        // offer, the phone redeems the code for a bearer token, then pulls the model.
+        backend.send("sync:pair");
+        let code = backend
+            .active_pairing
+            .as_ref()
+            .expect("sync:pair mints an offer")
+            .code
+            .clone();
+        let pair = http_post_pair(backend.host.local_addr(), &code);
+        assert!(
+            pair.starts_with("HTTP/1.1 201"),
+            "pairing must succeed, got: {}",
+            pair.lines().next().unwrap_or_default()
+        );
+        let token = pair
+            .split(r#""token":""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("pair response carries the bearer token")
+            .to_owned();
+
+        let manifest = http_get_authed(backend.host.local_addr(), "/v1/model/manifest", &token);
+        assert!(
+            manifest.starts_with("HTTP/1.1 200"),
+            "the paired phone's manifest call must succeed, got: {}",
+            manifest.lines().next().unwrap_or_default()
+        );
+        let download = http_get_authed(backend.host.local_addr(), "/v1/model", &token);
+        assert!(
+            download.starts_with("HTTP/1.1 200"),
+            "the paired phone's model download must succeed, got: {}",
+            download.lines().next().unwrap_or_default()
+        );
+        assert!(
+            download.ends_with(std::str::from_utf8(model_bytes).expect("ascii fixture")),
+            "the phone must receive the file the dashboard serves"
+        );
+    }
+
+    // unix-only: proving "no second spawn" needs a real spawn to count, and the
+    // fake trainerctl is a shell script, which Windows cannot exec.
+    #[cfg(unix)]
+    #[test]
+    fn train_now_while_training_does_not_spawn_a_second_trainer() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Each spawn appends a line; sleep keeps the first run "in flight" while
+        // the second click lands. Two lines = two trainers racing one --output.
+        let marker = dir.path().join("spawns.log");
+        let script = format!(
+            "#!/bin/sh\necho spawned >> {}\nsleep 2\nprintf '{{\"output\":\"ok\"}}'\n",
+            marker.display()
+        );
+        crate::trainer_launcher::test_sibling::with_fake_trainerctl(&script, || {
+            let cfg = crate::sync_host::SyncHostConfig {
+                bind: "127.0.0.1:0".parse().expect("addr"),
+                pair_url: String::new(),
+                tls: false,
+                db_path: dir.path().join("test.db"),
+                audio_root: dir.path().join("audio"),
+                model_path: dir.path().join("model.bin"),
+                tokens_path: dir.path().join("tokens.json"),
+            };
+            let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+            let trainer_cfg = crate::trainer_launcher::TrainerConfig {
+                db_path: dir.path().join("test.db"),
+                audio_root: dir.path().join("audio"),
+                base_model: dir.path().join("base.bin"),
+                output: dir.path().join("out.bin"),
+                serve: None,
+                gpu: false,
+            };
+            let mut backend = super::LocalBackend::new(host, Some(trainer_cfg));
+
+            backend.send("train:now");
+            assert!(backend.trainer.is_some(), "the first click must spawn");
+            // Wait until the first child has provably started before clicking again.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < 1
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first trainer must start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            backend.send("train:now");
+
+            // Give a would-be second child ample time to start and mark itself.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let spawns = std::fs::read_to_string(&marker).unwrap_or_default();
+            assert_eq!(
+                spawns.lines().count(),
+                1,
+                "train:now while a run is in flight must not spawn a second \
+                 trainerctl over the same --output/--serve"
+            );
+        });
+    }
+
+    // unix-only: the fake trainerctl is a shell script, which Windows cannot exec.
+    // The resolution logic is covered cross-platform in trainer_launcher's unit tests.
+    #[cfg(unix)]
+    #[test]
+    fn train_now_runs_the_trainerctl_shipped_beside_the_app() {
+        // e2e for the packaged layout: `idiolect-trainerctl` sits next to the app
+        // binary and that directory is not on PATH — the dashboard's train:now
+        // must still reach it and run training to completion.
+        let script = "#!/bin/sh\nprintf '{\"output\":\"ok\"}'\n";
+        crate::trainer_launcher::test_sibling::with_fake_trainerctl(script, || {
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = crate::sync_host::SyncHostConfig {
+                bind: "127.0.0.1:0".parse().expect("addr"),
+                pair_url: String::new(),
+                tls: false,
+                db_path: dir.path().join("test.db"),
+                audio_root: dir.path().join("audio"),
+                model_path: dir.path().join("model.bin"),
+                tokens_path: dir.path().join("tokens.json"),
+            };
+            let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
+            let trainer_cfg = crate::trainer_launcher::TrainerConfig {
+                db_path: dir.path().join("test.db"),
+                audio_root: dir.path().join("audio"),
+                base_model: dir.path().join("base.bin"),
+                output: dir.path().join("out.bin"),
+                serve: None,
+                gpu: false,
+            };
+            let mut backend = super::LocalBackend::new(host, Some(trainer_cfg));
+
+            backend.send("train:now");
+            assert!(
+                backend.trainer.is_some(),
+                "train:now must spawn the trainerctl shipped beside the app"
+            );
+
+            // Poll until the subprocess is reaped and the snapshot reports idle.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(snap) = backend.poll_state() {
+                    if !snap.training.running {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "training must run to completion"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+    }
+
     #[test]
     fn cancel_pair_invalidates_the_offer_at_the_host() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -331,6 +530,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -366,6 +566,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -401,6 +602,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -439,6 +641,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -482,6 +685,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
@@ -527,6 +731,7 @@ mod tests {
             tls: false,
             db_path: dir.path().join("test.db"),
             audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
