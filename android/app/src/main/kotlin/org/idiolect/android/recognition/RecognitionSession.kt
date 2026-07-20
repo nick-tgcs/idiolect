@@ -78,11 +78,20 @@ class RecognitionSession(
         output.onReadyForSpeech()
     }
 
-    /** End of input: stop capture so the core finalizes; the transcript arrives via [onCommitted]. */
+    /** End of input: stop capture so the core finalizes; the transcript arrives via [onCommitted].
+     *  Before the take has started (the model is still loading), nothing was captured — answer
+     *  [RecognitionError.NO_SPEECH] now and spend the session, so the queued [start] cannot open
+     *  a mic the caller has already asked to stop (and would never stop again). */
     @Synchronized
     fun stopListening() {
-        if (state != State.LISTENING) return
-        take.stop()
+        when (state) {
+            State.LISTENING -> take.stop()
+            State.IDLE -> {
+                state = State.DONE
+                output.onError(RecognitionError.NO_SPEECH)
+            }
+            State.DONE -> {}
+        }
     }
 
     /** Abandon the take (back-press / caller cancel / host teardown): discard it — never the
@@ -105,12 +114,32 @@ class RecognitionSession(
         if (trimmed.isEmpty()) output.onError(RecognitionError.NO_SPEECH) else output.onResult(trimmed)
     }
 
-    /** The core (or model load) reported a failure. Acts only while listening. */
+    /** The core reported a failure. Acts only while listening: before the take starts, a
+     *  `dictationError` reaching us through the router can only be another surface's take
+     *  (ours doesn't exist yet), so it must not spend this session. A failure can fire MID-take
+     *  (a snippet decode error while capture still runs), so the take is discarded here —
+     *  the spent session makes every surface's cancel-before-release a no-op, so this is the
+     *  only cleanup the take will get. Idempotent when the failure came at finalize instead
+     *  (capture already drained; MicToggle's cancel gates on a recording core), and harmless
+     *  when the failure was a misrouted foreign take's (LISTENING over a busy shared core):
+     *  MicToggle only cancels a take it started. */
     @Synchronized
     fun onFailed(error: RecognitionError) {
         if (state != State.LISTENING) return
         state = State.DONE
+        take.cancel()
         output.onError(error)
+    }
+
+    /** The model load failed before the take could start. Reported by [CoreRecognitionTake.begin]'s
+     *  own load task — unlike [onFailed] this cannot be a misrouted foreign take, so it may act
+     *  from IDLE. Spends the session: the caller hears FAILED exactly once, and a later
+     *  stop/start is a no-op. Silent if the caller already cancelled or stopped. */
+    @Synchronized
+    fun onLoadFailed() {
+        if (state != State.IDLE) return
+        state = State.DONE
+        output.onError(RecognitionError.FAILED)
     }
 
     /**

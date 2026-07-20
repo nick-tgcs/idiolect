@@ -173,18 +173,51 @@ class MicToggleTest {
     }
 
     @Test
+    fun cancel_leaves_a_take_this_toggle_did_not_start_alone() {
+        // The core is process-wide: another surface's take can be live when our cancel runs (a
+        // misrouted failure callback, teardown while the IME dictates). Discarding is destructive
+        // — it throws away that user's in-flight dictation — so only the owner may cancel.
+        val r = Recorder()
+        MicToggle(r, r, direct).onTap() // a foreign surface starts the take on the shared core
+        r.calls.clear()
+        MicToggle(r, r, direct).cancel() // this toggle never started it
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_stop_that_finds_no_take_drops_any_stale_ownership_claim() {
+        // Our take can be finalized by another surface's stop (stop is deliberately unguarded).
+        // The owner's next gesture — releasing the hold — must drop the stale claim, or a later
+        // cancel() would pass the ownership gate and discard whatever take a foreign surface
+        // started in the meantime.
+        val r = Recorder()
+        val toggle = MicToggle(r, r, direct)
+        toggle.startHold() // we own the take
+        r.toggle() // a foreign surface finalizes it behind our back
+        toggle.stop() // hold release: nothing to stop — must clear the stale claim
+        MicToggle(r, r, direct).onTap() // a foreign surface starts the next take
+        r.calls.clear()
+        toggle.cancel() // the stale owner must NOT discard the foreign take
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
     fun cancel_swallows_a_racing_core_error_and_still_stops_capture() {
         // The core is process-wide (the recognition service drives it too), so a stop on another
         // surface can leave core.cancel() throwing NoActiveTake after our isRecording() check. It
         // must not crash the executor thread, and capture must still be stopped.
         val capture = Recorder()
         val throwingCore = object : RecordingToggle {
-            override fun isRecording() = true
-            override fun toggle() {}
+            private var recording = false
+            override fun isRecording() = recording
+            override fun toggle() { recording = true } // the start edge; the test cancels after
             override fun startContinuous() {}
             override fun cancel(): Unit = throw RuntimeException("NoActiveTake")
         }
-        MicToggle(throwingCore, capture, direct).cancel() // must not throw
+        val toggle = MicToggle(throwingCore, capture, direct)
+        toggle.onTap() // own the take, so the cancel is allowed to act
+        capture.calls.clear()
+        toggle.cancel() // must not throw
         assertEquals(listOf("capture.stop"), capture.calls)
     }
 

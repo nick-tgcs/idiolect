@@ -82,6 +82,37 @@ class RecognitionSessionTest {
     }
 
     @Test
+    fun a_core_failure_discards_the_take_so_capture_never_outlives_the_answer() {
+        // A dictationError can fire MID-take (a snippet decode error while capture still runs).
+        // The session must discard the take itself: once it is spent, every surface's
+        // cancel-before-release teardown is a no-op, so nobody else will stop the mic.
+        val take = FakeTake()
+        val out = Out()
+        val session = RecognitionSession(take, out)
+        session.start()
+        session.onFailed(RecognitionError.FAILED)
+        assertEquals("a failed take is discarded", 1, take.cancels)
+        assertEquals("never finalized (nothing left to decode)", 0, take.stops)
+        assertEquals(listOf("ready", "error:FAILED"), out.events)
+    }
+
+    @Test
+    fun the_model_load_routing_starts_on_success_and_spends_through_the_session_on_failure() {
+        // Pins begin()'s one branch, extracted as routeModelLoad because the surrounding class
+        // has no headless seam (native core + Context). Failure must go THROUGH the session:
+        // the old direct output.onError left it unspent, so a later stop added a second answer.
+        val ok = Out()
+        routeModelLoad(loaded = true, session = RecognitionSession(FakeTake(), ok))
+        assertEquals(listOf("ready"), ok.events)
+
+        val failed = Out()
+        val session = RecognitionSession(FakeTake(), failed)
+        routeModelLoad(loaded = false, session = session)
+        session.stopListening()
+        assertEquals(listOf("error:FAILED"), failed.events)
+    }
+
+    @Test
     fun cancel_discards_the_take_and_suppresses_any_result() {
         val take = FakeTake()
         val out = Out()
@@ -107,6 +138,52 @@ class RecognitionSessionTest {
         session.start()
         assertEquals(0, take.starts)
         assertEquals(0, take.cancels)
+        assertTrue(out.events.isEmpty())
+    }
+
+    @Test
+    fun a_stop_before_the_take_starts_answers_no_speech_and_kills_the_queued_start() {
+        // begin() relies on this: a stop while the model is still loading must answer the caller
+        // NOW (nothing was captured, so NO_SPEECH) and spend the session — otherwise the queued
+        // start() would open a mic nobody is left to stop, endless capture after the caller
+        // already said stop.
+        val take = FakeTake()
+        val out = Out()
+        val session = RecognitionSession(take, out)
+        session.stopListening()
+        assertEquals(listOf("error:NO_SPEECH"), out.events)
+        assertEquals("nothing to finalize before the take starts", 0, take.stops)
+        // The queued model-load start arrives after: the spent session must not open capture.
+        session.start()
+        assertEquals(0, take.starts)
+        // And a duplicate stop after the session is spent stays silent (exactly-once).
+        session.stopListening()
+        assertEquals(listOf("error:NO_SPEECH"), out.events)
+    }
+
+    @Test
+    fun a_model_load_failure_is_reported_once_and_spends_the_session() {
+        // begin() routes a load failure here rather than straight to the output, so the session
+        // is spent: a later stop or the (impossible, but defensive) queued start must not produce
+        // a second terminal event or open capture.
+        val take = FakeTake()
+        val out = Out()
+        val session = RecognitionSession(take, out)
+        session.onLoadFailed()
+        assertEquals(listOf("error:FAILED"), out.events)
+        session.stopListening()
+        session.start()
+        assertEquals(listOf("error:FAILED"), out.events)
+        assertEquals(0, take.starts)
+    }
+
+    @Test
+    fun a_load_failure_after_cancel_stays_silent() {
+        // The caller abandoned the take — SpeechRecognizer.cancel() promises no further callbacks.
+        val out = Out()
+        val session = RecognitionSession(FakeTake(), out)
+        session.cancel()
+        session.onLoadFailed()
         assertTrue(out.events.isEmpty())
     }
 

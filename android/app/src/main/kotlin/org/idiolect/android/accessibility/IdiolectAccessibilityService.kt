@@ -164,9 +164,10 @@ class IdiolectAccessibilityService : AccessibilityService() {
     // --- Quick-launch: the floating accessibility button → dictate into the focused field -------
 
     /**
-     * A tap on Android's floating accessibility button. Honours the in-app toggle, then tap-to-start
-     * / tap-to-stop a take. The transcript lands in whatever field is focused via the same [inject]
-     * path the review flow uses — so quick-launch works in any app without switching the keyboard.
+     * A tap on Android's floating accessibility button. Honours the in-app toggle for starting
+     * (a live take is always stoppable — see [QuickLaunch]), then tap-to-start / tap-to-stop a
+     * take. The transcript lands in whatever field is focused via the same [inject] path the
+     * review flow uses — so quick-launch works in any app without switching the keyboard.
      */
     private fun onQuickLaunchButton() {
         val enabled = SettingsStore.under(filesDir).quickLaunchEnabled()

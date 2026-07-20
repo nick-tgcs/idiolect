@@ -1,6 +1,7 @@
 package org.idiolect.android.recognition
 
 import android.content.Context
+import androidx.annotation.VisibleForTesting
 import org.idiolect.android.audio.AndroidPcmSource
 import org.idiolect.android.core.IdiolectCoreHost
 import org.idiolect.android.core.NoopInputMethod
@@ -57,7 +58,8 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
      * Begin a take for [model], reporting to [output]. The model load is queued on the executor;
      * once it succeeds the session opens the mic (and only then does [RecognitionOutput.onReadyForSpeech]
      * fire, so a caller never prompts the user to speak before idiolect is listening). A load
-     * failure is reported straight to [output] — the session hasn't entered its listening state.
+     * failure goes through [RecognitionSession.onLoadFailed], spending the session, so the caller
+     * hears FAILED exactly once and a later stop cannot add a second answer.
      */
     override fun begin(model: InstalledModel, output: RecognitionOutput) {
         val live = RecognitionSession(TakeAdapter(), output)
@@ -80,15 +82,17 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
         host.router.acquireOverride(callbacks)
         runCatching {
             executor.execute {
-                // If the take was cancelled before the load finished, live.start() is a no-op
-                // (the session is already spent), so no capture is opened on a doomed take.
+                // If the take was cancelled or stopped before the load finished, the session is
+                // already spent (a pre-start stop was answered NO_SPEECH on the spot), so
+                // starting it is a no-op and no capture is opened on a doomed take.
                 val loaded = runCatching { core.loadModelVerified(model.path, model.sha256) }.isSuccess
-                if (loaded) live.start() else output.onError(RecognitionError.FAILED)
+                routeModelLoad(loaded, live)
             }
         }
     }
 
-    /** End of input — finalize the take; the transcript arrives via the bound callback. */
+    /** End of input — finalize the take so the transcript arrives via the bound callback; before
+     *  the take has started (model still loading) the session answers no-speech instead. */
     override fun stopListening() {
         if (!released.get()) session?.stopListening()
     }
@@ -118,4 +122,13 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
         override fun stop() = mic.stop()
         override fun cancel() = mic.cancel()
     }
+}
+
+/** The one branch of [CoreRecognitionTake.begin]'s load task, extracted because the surrounding
+ *  class has no headless seam (native core + Context): success starts the session; failure spends
+ *  it THROUGH [RecognitionSession.onLoadFailed] — never around it, which would leave the session
+ *  unspent so a later stop added a second answer. */
+@VisibleForTesting
+internal fun routeModelLoad(loaded: Boolean, session: RecognitionSession) {
+    if (loaded) session.start() else session.onLoadFailed()
 }

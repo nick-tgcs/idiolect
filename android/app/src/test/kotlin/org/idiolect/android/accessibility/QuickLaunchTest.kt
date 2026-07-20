@@ -5,16 +5,23 @@ import org.junit.Test
 
 /**
  * What a tap on Android's floating accessibility ("quick-launch") button does, decided purely so
- * the policy is pinned away from the un-headless service wiring: the in-app toggle wins (an
- * off feature never records), and while on, a tap starts a take when idle and stops it when one
- * is running (tap-to-start, tap-to-stop). The take + the inject-into-focused-field that follow
- * are covered by the connected e2e.
+ * the policy is pinned away from the un-headless service wiring: the in-app toggle blocks
+ * *starting* (an off feature never begins recording), and a tap starts a take when idle and
+ * stops it when one is running (tap-to-start, tap-to-stop). The take + the
+ * inject-into-focused-field that follow are covered by the connected e2e.
  */
 class QuickLaunchTest {
     @Test
-    fun the_off_toggle_wins_regardless_of_state() {
+    fun the_off_toggle_blocks_starting_a_take() {
         assertEquals(QuickLaunchAction.Disabled, QuickLaunch.decide(enabled = false, recording = false))
-        assertEquals(QuickLaunchAction.Disabled, QuickLaunch.decide(enabled = false, recording = true))
+    }
+
+    @Test
+    fun a_live_take_is_always_stoppable_even_after_the_toggle_is_turned_off() {
+        // The toggle gates only starting (mirrors MicToggle's canStart). If Disabled won here,
+        // switching the feature off mid-take would leave the mic recording with the very button
+        // that started it answering "enable in settings" — a hot mic with no stop.
+        assertEquals(QuickLaunchAction.Stop, QuickLaunch.decide(enabled = false, recording = true))
     }
 
     @Test
