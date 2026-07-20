@@ -22,7 +22,7 @@ idiolect-ipc = { path = "../../../idiolect-ipc" }
 zbus = { version = "5", optional = true, features = ["tokio"] }
 tokio = { workspace = true, optional = true }
 # X11 focus capture/restore around the review dialog (only with the real engine).
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.14", optional = true }
 
 [[bin]]
 name = "ibus-engine-idiolect"
