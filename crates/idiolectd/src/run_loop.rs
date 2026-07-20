@@ -49,6 +49,9 @@ use crate::retention_dialog::{RetentionDialog, SubprocessRetentionDialog};
 #[derive(Debug)]
 pub(crate) struct RunLoopConfig {
     pub(crate) socket_path: PathBuf,
+    /// The resolved data root, handed to the tray's dashboard subprocess so it
+    /// operates on the daemon's store rather than its own default-path one.
+    pub(crate) data_dir: PathBuf,
     pub(crate) database_path: PathBuf,
     pub(crate) audio_root: PathBuf,
     pub(crate) decoded_cache_root: PathBuf,
@@ -678,8 +681,16 @@ fn handle_connection(
     let retention_dialog = SubprocessRetentionDialog::discover();
     // Out-of-process Settings window ("Settings…" in the tray); discovered once.
     let settings_window = crate::settings_launcher::SettingsLauncher::discover();
-    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray).
-    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover();
+    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
+    // handed the daemon's resolved store so pairing and training act on the
+    // database this daemon writes — not a second, default-path store.
+    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover(
+        crate::sync_panel_launcher::DashboardStore {
+            data_dir: config.data_dir.clone(),
+            database_path: config.database_path.clone(),
+            base_model: config.adapter_profile.whisper_model_path.clone(),
+        },
+    );
     let mut line = String::new();
 
     loop {
@@ -2521,6 +2532,7 @@ mod tests {
         fn test_config() -> RunLoopConfig {
             RunLoopConfig {
                 socket_path: PathBuf::new(),
+                data_dir: PathBuf::new(),
                 database_path: PathBuf::new(),
                 audio_root: PathBuf::new(),
                 decoded_cache_root: PathBuf::new(),

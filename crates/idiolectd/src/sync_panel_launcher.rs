@@ -2,8 +2,16 @@
 //! pairing QR, and training controls.
 //!
 //! Subprocess contract (the daemon side of `idiolect-app`):
-//!   args   : `--standalone` so the app owns its own sync server on first launch.
-//!   stdout : one tray action id per line (`sync:pair`, `train:now`, …).
+//!   args   : `--standalone` so the app owns the sync server in-process (the
+//!            daemon runs none — see docs/future/010 for the deferred
+//!            daemon-embedded mode).
+//!   env    : `IDIOLECT_DATA_DIR` / `IDIOLECT_DB_PATH` / `IDIOLECT_BASE_MODEL`
+//!            — the daemon's resolved store, so the dashboard pairs phones and
+//!            trains against the database the daemon actually writes, never a
+//!            parallel default-path store.
+//!   stdout : forwarded line-by-line as tray actions. The standalone dashboard
+//!            currently emits none (it handles its own actions in-process);
+//!            the reader doubles as the exit reaper that re-arms the launcher.
 //!   exit   : whenever the user closes the window.
 //!
 //! Like every GUI here, it is best-effort: a missing or crashing binary must
@@ -16,35 +24,65 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use idiolect_adapter_ksni::TrayCallback;
+use idiolect_common::config::dashboard_store_env;
+
+/// The daemon-resolved store the dashboard must operate on, passed through the
+/// child's environment ([`dashboard_store_env`] — the same constants
+/// `idiolect-app`'s `main.rs` reads, so the names cannot drift apart).
+pub(crate) struct DashboardStore {
+    /// Root for the sync-owned artifacts the dashboard derives itself
+    /// (device tokens, served/personal model slots, audio).
+    pub(crate) data_dir: PathBuf,
+    /// The daemon's metadata database — `db/idiolect.sqlite` under the data
+    /// root by default, NOT the dashboard's own `idiolect.db` convention.
+    pub(crate) database_path: PathBuf,
+    /// The daemon's active ASR model: the trainer's merge base and the served
+    /// slot's first-run seed.
+    pub(crate) base_model: PathBuf,
+}
 
 pub(crate) struct SyncPanelLauncher {
     binary: PathBuf,
     args: Vec<String>,
+    store: Option<DashboardStore>,
     window_open: Arc<AtomicBool>,
 }
 
 impl SyncPanelLauncher {
-    pub(crate) fn new(binary: impl Into<PathBuf>) -> Self {
-        Self::with_command(binary, Vec::new())
-    }
-
     pub(crate) fn with_command(binary: impl Into<PathBuf>, args: Vec<String>) -> Self {
         Self {
             binary: binary.into(),
             args,
+            store: None,
             window_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    pub(crate) fn with_command_and_store(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        store: DashboardStore,
+    ) -> Self {
+        Self {
+            store: Some(store),
+            ..Self::with_command(binary, args)
+        }
+    }
+
     /// Find the dashboard binary next to the running daemon binary, falling
-    /// back to its plain name (resolved via `PATH`).
-    pub(crate) fn discover() -> Self {
+    /// back to its plain name (resolved via `PATH`); every launch carries the
+    /// daemon's [`DashboardStore`].
+    pub(crate) fn discover(store: DashboardStore) -> Self {
         const NAME: &str = "idiolect-app";
         let beside_daemon = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::new(beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)))
+        Self::with_command_and_store(
+            beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)),
+            Vec::new(),
+            store,
+        )
     }
 
     /// Open the dashboard. Returns immediately; the window is serviced by a
@@ -54,13 +92,20 @@ impl SyncPanelLauncher {
         if self.window_open.swap(true, Ordering::SeqCst) {
             return;
         }
-        let spawned = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(&self.args)
             .arg("--standalone")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        if let Some(store) = &self.store {
+            command
+                .env(dashboard_store_env::DATA_DIR, &store.data_dir)
+                .env(dashboard_store_env::DB_PATH, &store.database_path)
+                .env(dashboard_store_env::BASE_MODEL, &store.base_model);
+        }
+        let spawned = command.spawn();
         let Ok(mut child) = spawned else {
             self.window_open.store(false, Ordering::SeqCst);
             return;
@@ -135,8 +180,50 @@ mod tests {
     }
 
     #[test]
+    fn the_daemon_store_reaches_the_dashboard_environment() {
+        // The dashboard runs standalone but must operate on the DAEMON's store
+        // (its database lives at db/idiolect.sqlite, not the dashboard's own
+        // idiolect.db default — a mismatch silently splits corrections and
+        // training across two stores). The launcher hands the resolved paths
+        // over in the environment; the child echoes them back over the same
+        // stdout channel the action forwarding uses, so this is pinned end to
+        // end against a real subprocess.
+        let launcher = SyncPanelLauncher::with_command_and_store(
+            "sh",
+            vec![
+                "-c".to_owned(),
+                r#"printf '%s\n%s\n%s\n' "${IDIOLECT_DATA_DIR:-unset}" \
+                   "${IDIOLECT_DB_PATH:-unset}" "${IDIOLECT_BASE_MODEL:-unset}""#
+                    .to_owned(),
+            ],
+            DashboardStore {
+                data_dir: "/data/root".into(),
+                database_path: "/data/root/db/idiolect.sqlite".into(),
+                base_model: "/data/root/models/whisper/ggml-base.en.bin".into(),
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        launcher.open(tx);
+
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            let TrayCallback::Activate(line) =
+                rx.recv_timeout(Duration::from_secs(5)).expect("env line");
+            lines.push(line);
+        }
+        assert_eq!(
+            lines,
+            vec![
+                "/data/root".to_owned(),
+                "/data/root/db/idiolect.sqlite".to_owned(),
+                "/data/root/models/whisper/ggml-base.en.bin".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn a_missing_binary_is_a_safe_noop_that_does_not_wedge_the_launcher() {
-        let launcher = SyncPanelLauncher::new("/nonexistent/idiolect-app-xyz");
+        let launcher = SyncPanelLauncher::with_command("/nonexistent/idiolect-app-xyz", Vec::new());
         let (tx, rx) = mpsc::channel();
         launcher.open(tx.clone());
         launcher.open(tx);

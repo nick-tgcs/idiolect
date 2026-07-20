@@ -269,6 +269,7 @@ fn run_daemon_with_tray(
     // The run loop owns the store, tray, clipboard, and background maintenance.
     crate::run_loop::run(RunLoopConfig {
         socket_path: paths.socket_path,
+        data_dir: paths.data_dir,
         database_path: paths.database_path,
         audio_root: paths.audio_dir,
         decoded_cache_root: paths.decoded_cache_dir,
@@ -871,6 +872,7 @@ mod socket_guard_tests {
         ResolvedConfigPaths {
             config_file: inert.clone(),
             socket_path: socket,
+            data_dir: inert.clone(),
             database_path: inert.clone(),
             model_path: inert.clone(),
             models_whisper_dir: inert.clone(),
