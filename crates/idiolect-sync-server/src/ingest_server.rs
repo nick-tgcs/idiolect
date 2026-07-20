@@ -239,6 +239,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ingested_correction_lands_encrypted_when_the_host_carries_the_daemons_key() {
+        // The tray-dashboard case end to end at the server level: the store is
+        // the daemon's encrypted database (opened exactly as SyncHost does,
+        // through host::open_store with the handed-over key), a phone POSTs a
+        // correction, and the resulting ime_text_history row must be
+        // unreadable without the key — not plaintext that bypasses the
+        // daemon's `[history] encrypt_at_rest`. (The full tray→GUI chain has
+        // no headless seam; the launcher env test covers the hand-off half.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("idiolect.sqlite");
+        let key = dir.path().join("history.key");
+        std::fs::write(&key, [7_u8; 32]).expect("the daemon pre-created its key");
+        let mut store = crate::host::open_store(&db, Some(&key)).expect("open ciphered");
+        store.migrate().expect("migrate");
+        let audio_store = FileAudioStore::new(dir.path().join("audio"), dir.path().join("decoded"));
+        let mut tokens = DeviceTokenStore::open(dir.path().join("tokens.json")).expect("tokens");
+        tokens.bind(TOKEN, "pixel", "default").expect("bind token");
+        let state = Arc::new(IngestServerState::new(
+            store,
+            audio_store,
+            Arc::new(Mutex::new(tokens)),
+        ));
+
+        let mut audio = BTreeMap::new();
+        audio.insert("digest-e".to_owned(), b"opus-E".to_vec());
+        let body = batch_bytes(
+            vec![learning("digest-e", "restart trafic", "restart traffic")],
+            audio,
+        );
+        let response = ingest_router(state)
+            .oneshot(post(body, Some(TOKEN)))
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        use idiolect_ports::storage::MetadataStorePort;
+        let plain = crate::host::open_store(&db, None).expect("reopen plain");
+        let stored = plain.recent_history(10).expect("history")[0].text.clone();
+        assert_ne!(stored, "restart traffic");
+        assert!(!stored.contains("restart"));
+
+        let daemon = crate::host::open_store(&db, Some(&key)).expect("reopen ciphered");
+        assert_eq!(
+            daemon.recent_history(10).expect("history")[0].text,
+            "restart traffic"
+        );
+    }
+
+    #[tokio::test]
     async fn a_replayed_batch_is_idempotent() {
         let (_dir, state) = state();
         let mut audio = BTreeMap::new();

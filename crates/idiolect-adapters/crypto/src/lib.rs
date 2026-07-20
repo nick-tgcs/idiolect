@@ -140,23 +140,31 @@ impl FileKey {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
+
+    /// Load-ONLY: the key for a process that borrows another process's key
+    /// (e.g. the dashboard handed the daemon's history key path). A missing
+    /// file is an error (`KeyIo`, kind `NotFound`) — creating one here would
+    /// fork the keyspace under the owner.
+    ///
+    /// # Errors
+    /// Returns a [`CryptoError`] if the file is missing, unreadable, or not
+    /// exactly the key length.
+    pub fn load_key(&self) -> Result<[u8; KEY_LEN], CryptoError> {
+        let bytes = fs::read(&self.path).map_err(CryptoError::KeyIo)?;
+        let len = bytes.len();
+        bytes.try_into().map_err(|_| CryptoError::KeyLength(len))
+    }
 }
 
 impl EncryptionKeyPort for FileKey {
     fn load_or_create_key(&self) -> Result<[u8; KEY_LEN], CryptoError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let len = bytes.len();
-                let key: [u8; KEY_LEN] =
-                    bytes.try_into().map_err(|_| CryptoError::KeyLength(len))?;
-                Ok(key)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match self.load_key() {
+            Err(CryptoError::KeyIo(error)) if error.kind() == io::ErrorKind::NotFound => {
                 let key = random_key();
                 write_key_file(&self.path, &key)?;
                 Ok(key)
             }
-            Err(error) => Err(CryptoError::KeyIo(error)),
+            loaded => loaded,
         }
     }
 }
@@ -289,6 +297,26 @@ mod tests {
             cipher.decrypt("abcd"), // valid hex but shorter than a nonce
             Err(CryptoError::MalformedCiphertext)
         ));
+    }
+
+    #[test]
+    fn file_key_load_only_refuses_to_mint_a_missing_key() {
+        // A process that BORROWS another process's key (the dashboard handed
+        // the daemon's history key path) must fail loudly on a missing file —
+        // creating one would fork the keyspace under the owner.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.key");
+        let provider = FileKey::new(&path);
+
+        assert!(matches!(provider.load_key(), Err(CryptoError::KeyIo(_))));
+        assert!(!path.exists(), "load-only must not create the file");
+
+        let minted = provider.load_or_create_key().unwrap();
+        assert_eq!(
+            provider.load_key().unwrap(),
+            minted,
+            "load-only reads the existing key verbatim"
+        );
     }
 
     #[test]

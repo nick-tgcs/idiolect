@@ -14,6 +14,11 @@
 //!   IDIOLECT_SYNC_ADDR    bind address (default: 127.0.0.1:8765)
 //!   IDIOLECT_DB_PATH      local metadata store; enables ingest (with AUDIO_ROOT)
 //!   IDIOLECT_AUDIO_ROOT   source-audio root; enables ingest (with DB_PATH)
+//!   IDIOLECT_HISTORY_KEY  the owning daemon's at-rest history key file — REQUIRED
+//!                         when the DB belongs to a daemon with
+//!                         `[history] encrypt_at_rest = true`, else ingested phone
+//!                         corrections land as plaintext history rows in its
+//!                         encrypted database; omit for a plaintext store
 //!   IDIOLECT_PAIR_URL     externally-reachable base URL embedded in the pairing QR
 //!                         (default: https://<IDIOLECT_SYNC_ADDR>, or http with --no-tls);
 //!                         set this to the tailnet address the phone can actually reach, not
@@ -39,9 +44,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+use idiolect_adapter_sqlite::FileAudioStore;
+use idiolect_common::config::dashboard_store_env;
 use idiolect_sync_server::build_app;
 use idiolect_sync_server::device_tokens::DeviceTokenStore;
+use idiolect_sync_server::host::open_store;
 use idiolect_sync_server::ingest_server::IngestServerState;
 use idiolect_sync_server::model_server::ModelServerConfig;
 use idiolect_sync_server::pairing::{system_now, PairingServerState};
@@ -244,7 +251,12 @@ fn ingest_state_from_env(
     ) {
         (None, None) => Ok(None),
         (Some(db), Some(audio_root)) => {
-            let mut store = SqliteMetadataStore::open_path(&db)
+            // The env read is this binary's process boundary, like every other
+            // var above; the cipher behavior itself is pinned on `open_store`.
+            let history_key = std::env::var_os(dashboard_store_env::HISTORY_KEY)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let mut store = open_store(Path::new(&db), history_key.as_deref())
                 .map_err(|error| format!("open store {db}: {error}"))?;
             store
                 .migrate()

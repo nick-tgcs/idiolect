@@ -14,7 +14,9 @@ use axum::response::IntoResponse;
 
 use crate::device_tokens::{DeviceTokenStore, PairedDevice};
 use crate::pairing::{PairingOffer, PairingServerState};
+use idiolect_adapter_crypto::{ChaCha20Poly1305Cipher, FileKey};
 use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
+use std::path::Path;
 
 /// Configuration for a [`SyncHost`].
 pub struct SyncHostConfig {
@@ -32,6 +34,12 @@ pub struct SyncHostConfig {
     pub model_path: PathBuf,
     /// Path to the device token store JSON file.
     pub tokens_path: PathBuf,
+    /// The at-rest history key file of the daemon that owns `db_path`, when
+    /// that daemon encrypts history (`None` ⇒ plaintext, the standalone
+    /// default). Sync ingest writes `ime_text_history` rows via
+    /// `commit_session`; opening the daemon's database without its cipher
+    /// would land phone corrections as plaintext in an encrypted store.
+    pub history_key: Option<PathBuf>,
 }
 
 /// An error starting or communicating with the embedded sync server.
@@ -41,6 +49,8 @@ pub enum SyncHostError {
     TokenStore(#[source] std::io::Error),
     #[error("failed to open database: {0}")]
     Database(#[source] idiolect_adapter_sqlite::SqliteStorageError),
+    #[error("failed to load history key: {0}")]
+    HistoryKey(#[source] idiolect_adapter_crypto::CryptoError),
     #[error("failed to bind listener: {0}")]
     Bind(#[source] std::io::Error),
     #[error("failed to mint pairing offer: {0}")]
@@ -51,6 +61,32 @@ pub enum SyncHostError {
     TlsUnsupported,
     #[error("sync is disabled")]
     Disabled,
+}
+
+/// The ONE way a sync server opens its metadata store: with the owning
+/// daemon's history cipher when a key file is configured
+/// ([`SyncHostConfig::history_key`]), plaintext otherwise. Every open in
+/// [`SyncHost::start`] — and the standalone binary's ingest open — must go
+/// through here: a bare `open_path` on an encrypted daemon database would
+/// write plaintext `ime_text_history` rows on ingest.
+pub fn open_store(
+    db_path: &Path,
+    history_key: Option<&Path>,
+) -> Result<SqliteMetadataStore, SyncHostError> {
+    let store = SqliteMetadataStore::open_path(db_path).map_err(SyncHostError::Database)?;
+    match history_key {
+        Some(key_path) => {
+            // Load-ONLY: this host borrows the owning daemon's key (created at
+            // daemon startup, before any dashboard can spawn). A missing file
+            // fails the start loudly — minting a key here would fork the
+            // keyspace under the daemon.
+            let key = FileKey::new(key_path)
+                .load_key()
+                .map_err(SyncHostError::HistoryKey)?;
+            Ok(store.with_history_cipher(Box::new(ChaCha20Poly1305Cipher::new(key))))
+        }
+        None => Ok(store),
+    }
 }
 
 /// The live embedded sync server. Obtain via [`SyncHost::start`].
@@ -82,8 +118,7 @@ impl SyncHost {
         let tokens = Arc::new(Mutex::new(tokens));
         let pairing = Arc::new(PairingServerState::new(tokens.clone()));
 
-        let mut store =
-            SqliteMetadataStore::open_path(&cfg.db_path).map_err(SyncHostError::Database)?;
+        let mut store = open_store(&cfg.db_path, cfg.history_key.as_deref())?;
         store.migrate().map_err(SyncHostError::Database)?;
         let store = Arc::new(Mutex::new(store));
         let audio_store = FileAudioStore::new(cfg.audio_root.clone(), cfg.audio_root.clone());
@@ -94,8 +129,7 @@ impl SyncHost {
             tokens: tokens.clone(),
         });
 
-        let ingest_store =
-            SqliteMetadataStore::open_path(&cfg.db_path).map_err(SyncHostError::Database)?;
+        let ingest_store = open_store(&cfg.db_path, cfg.history_key.as_deref())?;
         let ingest_state = Arc::new(crate::ingest_server::IngestServerState::new(
             ingest_store,
             audio_store,
@@ -259,6 +293,182 @@ impl SyncHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use idiolect_ports::storage::MetadataStorePort;
+
+    #[test]
+    fn open_store_with_a_history_key_encrypts_history_at_rest_like_the_daemon() {
+        // The store this host is handed may be a daemon's encrypted database
+        // (the tray dashboard case): rows this host writes through
+        // `commit_session` must cipher `ime_text_history` exactly as the
+        // daemon does, or phone corrections land readable on disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("idiolect.sqlite");
+        let key = dir.path().join("history.key");
+        std::fs::write(&key, [7_u8; 32]).expect("the daemon pre-created its key");
+
+        let mut store = open_store(&db, Some(&key)).expect("open ciphered");
+        store.migrate().expect("migrate");
+        let session = store
+            .create_session(Some("phone corrected 1234"))
+            .expect("session");
+        store
+            .commit_session(session, "phone corrected 1234", "ingest:test:1")
+            .expect("commit");
+
+        // At rest: a cipher-less open shows the raw column — it must not be
+        // the plaintext (same idiom as the adapter's encryption contract).
+        let plain = open_store(&db, None).expect("open plain");
+        let stored = plain.recent_history(10).expect("history")[0].text.clone();
+        assert_ne!(stored, "phone corrected 1234");
+        assert!(!stored.contains("corrected"));
+
+        // Same key file: the daemon's own view round-trips the plaintext.
+        let same = open_store(&db, Some(&key)).expect("reopen ciphered");
+        assert_eq!(
+            same.recent_history(10).expect("history")[0].text,
+            "phone corrected 1234"
+        );
+    }
+
+    #[test]
+    fn start_fails_loudly_when_the_handed_over_key_is_missing() {
+        // The daemon OWNS the key: it creates the file at startup, before its
+        // tray can spawn a dashboard. This host only BORROWS it — if the file
+        // is missing, minting a fresh one here would silently fork the
+        // keyspace (rows this host ingests become unreadable to the daemon
+        // that handed the path over, and a daemon restart then orphans all
+        // earlier history). Refusing to start is the honest answer.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("history.key");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: dir.path().join("test.db"),
+            audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
+            tokens_path: dir.path().join("tokens.json"),
+            history_key: Some(key.clone()),
+        };
+        let result = SyncHost::start(cfg, rt.handle());
+        assert!(
+            matches!(result, Err(SyncHostError::HistoryKey(_))),
+            "a missing borrowed key must refuse the start, not mint a new key",
+        );
+        assert!(
+            !key.exists(),
+            "the borrower must never create the owner's key"
+        );
+    }
+
+    #[test]
+    fn start_without_a_history_key_creates_none() {
+        // A direct standalone launch (its own store, no daemon) stays
+        // plaintext — no stray key file that a later daemon might pick up.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _host = test_host(dir.path());
+        assert!(!dir.path().join("history.key").exists());
+    }
+
+    /// One encoded sync batch carrying a single corrected learning — the body a
+    /// paired phone POSTs to `/v1/sync`.
+    fn sync_batch_bytes(digest: &str, raw: &str, corrected: &str) -> Vec<u8> {
+        use idiolect_sync::{encode_batch, SyncBatch, SyncBatchEnvelope, SyncLearning};
+        let learning = SyncLearning {
+            training_candidate_id: 1,
+            user_id: "default".to_owned(),
+            utterance_id: format!("u-{digest}"),
+            text_session_id: format!("s-{digest}"),
+            audio_object_key: format!("k-{digest}"),
+            audio_digest: digest.to_owned(),
+            raw_transcript: raw.to_owned(),
+            corrected_transcript: corrected.to_owned(),
+            source_label: "ime".to_owned(),
+            trust_score_bps: 10_000,
+        };
+        let mut audio = std::collections::BTreeMap::new();
+        audio.insert(digest.to_owned(), b"opus-bytes".to_vec());
+        let envelope = SyncBatchEnvelope::new(
+            SyncBatch {
+                device_id: "pixel".to_owned(),
+                batch_id: "batch-live".to_owned(),
+                learnings: vec![learning],
+            },
+            audio,
+        );
+        encode_batch(&envelope).expect("encode")
+    }
+
+    /// One blocking bearer-authenticated `POST /v1/sync` with a binary batch
+    /// body — the ingest request a paired phone sends. Dependency-free like
+    /// [`http_get`].
+    fn http_post_sync(addr: SocketAddr, token: &str, body: &[u8]) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "POST /v1/sync HTTP/1.1\r\nHost: idiolect-test\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write headers");
+        stream.write_all(body).expect("write body");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    #[test]
+    fn a_running_hosts_ingest_writes_encrypted_history_at_rest() {
+        // THE regression pin for the plaintext-ingest P2: through the RUNNING
+        // host — SyncHost::start's own ingest store, not one a test built —
+        // a phone's POST /v1/sync must land its correction as ciphertext.
+        // This guards the exact line that was wrong (the SECOND open inside
+        // `start`): with only the first open ciphered, every other test in
+        // this crate stays green (proven by mutation during review).
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("test.db");
+        let key = dir.path().join("history.key");
+        std::fs::write(&key, [7_u8; 32]).expect("the daemon pre-created its key");
+        let cfg = SyncHostConfig {
+            bind: "127.0.0.1:0".parse().expect("addr"),
+            pair_url: String::new(),
+            tls: false,
+            db_path: db.clone(),
+            audio_root: dir.path().join("audio"),
+            model_path: dir.path().join("model.bin"),
+            tokens_path: dir.path().join("tokens.json"),
+            history_key: Some(key.clone()),
+        };
+        let host = SyncHost::start(cfg, rt.handle()).expect("start");
+        let token = host.issue_test_token("pixel").expect("token");
+
+        let response = http_post_sync(
+            host.local_addr(),
+            &token,
+            &sync_batch_bytes("digest-live", "restart trafic", "restart traffic"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the ingest POST must succeed, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+
+        // At rest (cipher-less view): not the plaintext. The ciphertext is
+        // lowercase hex, which cannot even contain the letters of "restart".
+        let plain = open_store(&db, None).expect("reopen plain");
+        let stored = plain.recent_history(10).expect("history")[0].text.clone();
+        assert_ne!(stored, "restart traffic");
+        assert!(!stored.contains("restart"));
+
+        // The daemon's own view (same key) round-trips the correction.
+        let daemon_view = open_store(&db, Some(&key)).expect("reopen ciphered");
+        assert_eq!(
+            daemon_view.recent_history(10).expect("history")[0].text,
+            "restart traffic"
+        );
+    }
 
     fn test_host(dir: &std::path::Path) -> SyncHost {
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -270,6 +480,7 @@ mod tests {
             audio_root: dir.join("audio"),
             model_path: dir.join("model.bin"),
             tokens_path: dir.join("tokens.json"),
+            history_key: None,
         };
         SyncHost::start(cfg, rt.handle()).expect("start")
         // rt is dropped here; the spawned task will be cancelled, but token
@@ -288,6 +499,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         // Rather than bind a cleartext socket while reporting TLS enabled, start must fail.
         // (SyncHost is not Debug, so match on the Result instead of `expect_err`.)
@@ -358,6 +570,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
         let token = host.issue_test_token("pixel").expect("token");
@@ -405,6 +618,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
         let addr = host.local_addr();
@@ -439,6 +653,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
         let offer = host.mint_pairing(None).expect("mint");
@@ -487,6 +702,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = SyncHost::start(cfg, rt.handle()).expect("start");
         let offer = host.mint_pairing(None).expect("mint");

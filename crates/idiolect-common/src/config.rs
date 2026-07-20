@@ -641,6 +641,12 @@ pub mod dashboard_store_env {
     /// The daemon's active ASR model: the trainer's merge base and the served
     /// slot's first-run seed.
     pub const BASE_MODEL: &str = "IDIOLECT_BASE_MODEL";
+    /// The daemon's at-rest history key file (`history.key` beside its
+    /// database). Set only when the daemon encrypts history — the dashboard's
+    /// sync ingest must then encrypt `ime_text_history` rows with the same
+    /// key, or phone corrections land as plaintext in an encrypted database.
+    /// Absence means "no cipher".
+    pub const HISTORY_KEY: &str = "IDIOLECT_HISTORY_KEY";
 }
 
 #[derive(Debug, Clone)]

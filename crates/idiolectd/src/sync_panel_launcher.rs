@@ -8,7 +8,11 @@
 //!   env    : `IDIOLECT_DATA_DIR` / `IDIOLECT_DB_PATH` / `IDIOLECT_BASE_MODEL`
 //!            — the daemon's resolved store, so the dashboard pairs phones and
 //!            trains against the database the daemon actually writes, never a
-//!            parallel default-path store.
+//!            parallel default-path store. `IDIOLECT_HISTORY_KEY` (only when
+//!            the daemon encrypts history) — the at-rest key file, so the
+//!            dashboard's sync ingest encrypts `ime_text_history` rows the
+//!            same way the daemon does instead of writing plaintext into an
+//!            encrypted database.
 //!   stdout : forwarded line-by-line as tray actions. The standalone dashboard
 //!            currently emits none (it handles its own actions in-process);
 //!            the reader doubles as the exit reaper that re-arms the launcher.
@@ -39,6 +43,11 @@ pub(crate) struct DashboardStore {
     /// The daemon's active ASR model: the trainer's merge base and the served
     /// slot's first-run seed.
     pub(crate) base_model: PathBuf,
+    /// The daemon's at-rest history key file — `Some` only when the daemon
+    /// encrypts history (`[history] encrypt_at_rest`). The dashboard's sync
+    /// ingest writes `ime_text_history` rows through `commit_session`; without
+    /// the key those land as PLAINTEXT in the daemon's encrypted database.
+    pub(crate) history_key: Option<PathBuf>,
 }
 
 pub(crate) struct SyncPanelLauncher {
@@ -104,6 +113,16 @@ impl SyncPanelLauncher {
                 .env(dashboard_store_env::DATA_DIR, &store.data_dir)
                 .env(dashboard_store_env::DB_PATH, &store.database_path)
                 .env(dashboard_store_env::BASE_MODEL, &store.base_model);
+            // Set only when the daemon encrypts: absence tells the app "no
+            // cipher". The remove comes first because the child otherwise
+            // INHERITS the daemon's own environment — a stale
+            // IDIOLECT_HISTORY_KEY there (wrapper script, systemd Environment=)
+            // would make the dashboard cipher a store this daemon reads
+            // plaintext.
+            command.env_remove(dashboard_store_env::HISTORY_KEY);
+            if let Some(history_key) = &store.history_key {
+                command.env(dashboard_store_env::HISTORY_KEY, history_key);
+            }
         }
         let spawned = command.spawn();
         let Ok(mut child) = spawned else {
@@ -192,21 +211,23 @@ mod tests {
             "sh",
             vec![
                 "-c".to_owned(),
-                r#"printf '%s\n%s\n%s\n' "${IDIOLECT_DATA_DIR:-unset}" \
-                   "${IDIOLECT_DB_PATH:-unset}" "${IDIOLECT_BASE_MODEL:-unset}""#
+                r#"printf '%s\n%s\n%s\n%s\n' "${IDIOLECT_DATA_DIR:-unset}" \
+                   "${IDIOLECT_DB_PATH:-unset}" "${IDIOLECT_BASE_MODEL:-unset}" \
+                   "${IDIOLECT_HISTORY_KEY:-unset}""#
                     .to_owned(),
             ],
             DashboardStore {
                 data_dir: "/data/root".into(),
                 database_path: "/data/root/db/idiolect.sqlite".into(),
                 base_model: "/data/root/models/whisper/ggml-base.en.bin".into(),
+                history_key: Some("/data/root/db/history.key".into()),
             },
         );
         let (tx, rx) = mpsc::channel();
         launcher.open(tx);
 
         let mut lines = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let TrayCallback::Activate(line) =
                 rx.recv_timeout(Duration::from_secs(5)).expect("env line");
             lines.push(line);
@@ -217,8 +238,37 @@ mod tests {
                 "/data/root".to_owned(),
                 "/data/root/db/idiolect.sqlite".to_owned(),
                 "/data/root/models/whisper/ggml-base.en.bin".to_owned(),
+                "/data/root/db/history.key".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn an_unencrypted_daemon_leaves_the_history_key_unset() {
+        // Absence IS the contract: the app treats an unset/empty
+        // IDIOLECT_HISTORY_KEY as "no cipher", so a daemon that does not
+        // encrypt must not export the variable at all — exporting a dummy
+        // value would make the dashboard encrypt a store the daemon reads
+        // plaintext.
+        let launcher = SyncPanelLauncher::with_command_and_store(
+            "sh",
+            vec![
+                "-c".to_owned(),
+                r#"printf '%s\n' "${IDIOLECT_HISTORY_KEY:-unset}""#.to_owned(),
+            ],
+            DashboardStore {
+                data_dir: "/data/root".into(),
+                database_path: "/data/root/db/idiolect.sqlite".into(),
+                base_model: "/data/root/models/whisper/ggml-base.en.bin".into(),
+                history_key: None,
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        launcher.open(tx);
+
+        let TrayCallback::Activate(line) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("env line");
+        assert_eq!(line, "unset");
     }
 
     #[test]
