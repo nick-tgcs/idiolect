@@ -49,9 +49,14 @@ class RecognitionCancelIntegrationTest {
         }
     }
 
-    /** Mirrors [CoreRecognitionTake]'s private adapter over [MicToggle]. */
+    /** Mirrors [CoreRecognitionTake]'s private adapter over [MicToggle], refusal hook included:
+     *  unset (the default, as before `begin()` wires it) models the gap before the refusal task
+     *  runs; set, it busy-fails the session the way `begin()` does (production additionally
+     *  releases the router override first — that half is pinned in
+     *  [CoreRecognitionTakeAdmissionTest]). */
     private class TakeAdapter(private val mic: MicToggle) : TakeControl {
-        override fun start() = mic.startHold()
+        var onRefused: () -> Unit = {}
+        override fun start() = mic.startHold(onRefused = onRefused)
         override fun stop() = mic.stop()
         override fun cancel() = mic.cancel()
     }
@@ -125,12 +130,71 @@ class RecognitionCancelIntegrationTest {
     }
 
     @Test
+    fun a_start_that_finds_the_core_taken_busy_fails_through_the_refusal_hook() {
+        // Admission won while the core was idle, then the IME opened its own take before our
+        // capture start ran: startHold's executor-confined check refuses, and the wired refusal
+        // (as begin() installs it) must answer the caller BUSY — never leave it LISTENING on a
+        // capture that never opened — while the ownership-gated discard leaves the IME's take
+        // untouched.
+        val core = Core()
+        MicToggle(core, core, direct).onTap() // the IME's take on the shared, process-wide core
+        val heard = mutableListOf<String>()
+        val out = object : RecognitionOutput {
+            override fun onReadyForSpeech() { heard += "ready" }
+            override fun onResult(text: String) { heard += "result:$text" }
+            override fun onError(error: RecognitionError) { heard += "error:$error" }
+        }
+        val adapter = TakeAdapter(MicToggle(core, core, direct))
+        val session = RecognitionSession(adapter, out)
+        adapter.onRefused = { session.onFailed(RecognitionError.BUSY) }
+        session.start()
+        // With the inline executor the refusal runs INSIDE start(), so the session suppresses
+        // the ready that would otherwise trail the terminal answer. On the production executor
+        // the refusal is a later task: the caller hears ready, then BUSY — either way nothing
+        // follows the terminal event.
+        assertEquals(listOf("error:BUSY"), heard)
+        assertEquals(
+            "the foreign take must survive the refusal's gated discard",
+            listOf("core.start", "capture.start"),
+            core.calls,
+        )
+    }
+
+    @Test
+    fun a_take_spent_while_its_start_is_still_queued_never_opens_capture() {
+        // The start crosses an executor hop. If the session is spent inside that hop —
+        // a foreign take's commit routed through the held override, or the caller's
+        // instant cancel — the queued startSequence must NOT run: it would open a take
+        // and capture that no one is left to stop (the spent session makes every
+        // surface's cancel-before-release a no-op) — a hot mic until the IME's next
+        // tap finalizes ambient audio into the user's field. CoreRecognitionTake wires
+        // the toggle's start gate to the live session for exactly this.
+        val core = Core()
+        val queued = ArrayDeque<Runnable>()
+        val deferred = Executor { queued.add(it) }
+        lateinit var session: RecognitionSession
+        val mic = MicToggle(core, core, deferred, canStart = { session.isListening() })
+        val adapter = TakeAdapter(mic)
+        session = RecognitionSession(adapter, DropOutput)
+        session.start() // queues the hold-start on the executor
+        session.onCommitted("a foreign take's transcript") // spends the session in the hop
+        while (queued.isNotEmpty()) queued.removeFirst().run()
+        assertEquals(
+            "a spent session's queued start must refuse, not open an ownerless capture",
+            emptyList<String>(),
+            core.calls,
+        )
+    }
+
+    @Test
     fun a_misrouted_failure_while_a_foreign_take_records_does_not_kill_it() {
-        // The router override sends ALL core callbacks to a live recognition session — including
-        // a failure from the IME's take when the shared core was already recording (our startHold
-        // no-ops, so we are LISTENING without owning the take). The discard in onFailed must not
-        // reach the foreign take: MicToggle only cancels what it started. The IME user's
-        // in-flight dictation survives; this session is spent and answers its caller once.
+        // The router override sends ALL core callbacks to a live recognition session. In
+        // production, admission refuses a busy core up front — but the IME can still grab the
+        // core after admission won, and its failure can land in the gap between our start and
+        // the queued startHold refusal (this adapter's hook left unset models that gap: we are
+        // LISTENING without owning the take). The discard in onFailed must not reach the foreign
+        // take: MicToggle only cancels what it started. The IME user's in-flight dictation
+        // survives; this session is spent and answers its caller once.
         val core = Core()
         MicToggle(core, core, direct).onTap() // the IME's take on the shared, process-wide core
         val session = session(core)

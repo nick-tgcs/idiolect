@@ -188,6 +188,52 @@ class RecognitionSessionTest {
     }
 
     @Test
+    fun a_take_refused_admission_answers_busy_exactly_once() {
+        // begin() refuses admission while the shared core is busy with another surface's
+        // take (or another headless take holds delivery). The caller hears BUSY now, and
+        // exactly once: the spent session drops the queued start and any later stop.
+        val take = FakeTake()
+        val out = Out()
+        val session = RecognitionSession(take, out)
+        session.onBusy()
+        assertEquals(listOf("error:BUSY"), out.events)
+        session.start()
+        session.stopListening()
+        assertEquals(listOf("error:BUSY"), out.events)
+        assertEquals("a refused take never opens capture", 0, take.starts)
+    }
+
+    @Test
+    fun a_synchronous_start_refusal_never_emits_ready_after_the_terminal_answer() {
+        // take.start() can refuse reentrantly — an inline executor runs MicToggle's refusal
+        // inside start() itself, spending the session before start() returns. The caller must
+        // not hear ready after its terminal BUSY (no events follow a terminal answer).
+        val out = Out()
+        lateinit var session: RecognitionSession
+        val take = object : TakeControl {
+            override fun start() {
+                session.onFailed(RecognitionError.BUSY)
+            }
+            override fun stop() {}
+            override fun cancel() {}
+        }
+        session = RecognitionSession(take, out)
+        session.start()
+        assertEquals(listOf("error:BUSY"), out.events)
+    }
+
+    @Test
+    fun a_busy_refusal_after_cancel_stays_silent() {
+        // The caller abandoned the take before admission was decided —
+        // SpeechRecognizer.cancel() promises no further callbacks.
+        val out = Out()
+        val session = RecognitionSession(FakeTake(), out)
+        session.cancel()
+        session.onBusy()
+        assertTrue(out.events.isEmpty())
+    }
+
+    @Test
     fun a_commit_before_start_is_ignored() {
         val out = Out()
         RecognitionSession(FakeTake(), out).onCommitted("nope")

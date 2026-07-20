@@ -45,6 +45,10 @@ enum class RecognitionError {
     /** The take ran but finalized to nothing — silence. */
     NO_SPEECH,
 
+    /** Another take (the IME's or another recognition caller's) already owns the
+     *  process-wide core; retry once it finishes. */
+    BUSY,
+
     /** The core failed to decode (load/runtime error). */
     FAILED,
 }
@@ -69,13 +73,16 @@ class RecognitionSession(
 
     private var state = State.IDLE
 
-    /** Open the mic and tell the caller to speak. Idempotent — a second call is ignored. */
+    /** Open the mic and tell the caller to speak. Idempotent — a second call is ignored.
+     *  [TakeControl.start] may refuse REENTRANTLY (a same-thread executor runs the toggle's
+     *  refusal inside this call, spending the session through [onFailed]); the re-check below
+     *  keeps the terminal answer last — a caller must never hear ready after BUSY. */
     @Synchronized
     fun start() {
         if (state != State.IDLE) return
         state = State.LISTENING
         take.start()
-        output.onReadyForSpeech()
+        if (state == State.LISTENING) output.onReadyForSpeech()
     }
 
     /** End of input: stop capture so the core finalizes; the transcript arrives via [onCommitted].
@@ -141,6 +148,26 @@ class RecognitionSession(
         state = State.DONE
         output.onError(RecognitionError.FAILED)
     }
+
+    /** The take was refused admission: the process-wide core is busy with another surface's take,
+     *  or another headless take already holds callback delivery. Reported by
+     *  [CoreRecognitionTake.begin]'s own admission check, before the model load and before [start]
+     *  — so like [onLoadFailed] it cannot be a misrouted foreign event and acts from IDLE,
+     *  spending the session: the caller hears BUSY exactly once, the queued start cannot open
+     *  capture, and a later stop stays silent. Silent if the caller already cancelled or stopped. */
+    @Synchronized
+    fun onBusy() {
+        if (state != State.IDLE) return
+        state = State.DONE
+        output.onError(RecognitionError.BUSY)
+    }
+
+    /** Whether the take is live — the toggle's start gate reads this across the executor hop:
+     *  a session spent while its start is still queued (a foreign commit through the held
+     *  override, an instant cancel) must refuse the start rather than open a take and capture
+     *  that no surface is left to stop. */
+    @Synchronized
+    fun isListening(): Boolean = state == State.LISTENING
 
     /**
      * The take finalized — `recordingStatus(false)`, which the core fires LAST and for EVERY

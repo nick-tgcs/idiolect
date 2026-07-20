@@ -60,9 +60,18 @@ class MicToggle(
         }
     }
 
-    /** Press-and-hold begins: ensure a take is recording (idempotent under rapid edges). */
-    fun startHold() = submit {
-        if (!core.isRecording() && canStart()) startSequence()
+    /**
+     * Press-and-hold begins: ensure a take is recording (idempotent under rapid edges).
+     *
+     * [onRefused] runs (on the executor) when NO capture was started — the core is already
+     * recording, or the start gate refused. The IME's hold gesture ignores it (a re-hold over
+     * its own live take is the idempotent case). The recognition surfaces MUST observe it: for
+     * them the recording core is a *foreign* take, and the silent no-op left their caller
+     * hanging forever on a capture that never opened (this executor-confined check is the
+     * authoritative "did we get the core", after any begin-time admission check has raced).
+     */
+    fun startHold(onRefused: () -> Unit = {}) = submit {
+        if (!core.isRecording() && canStart()) startSequence() else onRefused()
     }
 
     /** Hold released, or a stop tap: ensure the take is stopped and finalized. */

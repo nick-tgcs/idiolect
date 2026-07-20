@@ -2,6 +2,8 @@ package org.idiolect.android.core
 
 import org.idiolect.ffi.IdiolectInputMethod
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -99,7 +101,7 @@ class CoreCallbackRouterTest {
         val ime = RecordingSink("ime")
         val take = RecordingSink("take")
         router.bind(ime)
-        router.acquireOverride(take)
+        assertTrue(router.tryAcquireOverride(take))
         router.commitText("voice")
         router.recordingStatus(false)
         assertEquals(listOf("take:commit:voice", "take:recording:false"), take.ops)
@@ -113,7 +115,7 @@ class CoreCallbackRouterTest {
         // or the caller is stuck on "Transcribing…".
         val router = CoreCallbackRouter()
         val take = RecordingSink("take")
-        router.acquireOverride(take)
+        assertTrue(router.tryAcquireOverride(take))
         val ime = RecordingSink("ime")
         router.bind(ime) // IME created mid-take and grabs the base
         router.recordingStatus(false)
@@ -122,12 +124,42 @@ class CoreCallbackRouterTest {
     }
 
     @Test
+    fun a_second_take_cannot_steal_a_held_override() {
+        // The slot is the atomic arbiter between concurrent headless takes. Before this,
+        // acquire simply replaced the slot: a second RECOGNIZE_SPEECH / RecognitionService
+        // request arriving mid-take rerouted the FIRST take's commit and finalize to the
+        // newcomer — the original caller hung and the wrong surface received the transcript.
+        val router = CoreCallbackRouter()
+        val first = RecordingSink("first")
+        val second = RecordingSink("second")
+        assertTrue(router.tryAcquireOverride(first))
+        assertFalse("a held slot must refuse a second take", router.tryAcquireOverride(second))
+        router.commitText("dictation")
+        assertEquals(listOf("first:commit:dictation"), first.ops)
+        assertEquals(emptyList<String>(), second.ops)
+        // The refused take's teardown must not evict the holder either.
+        router.releaseOverride(second)
+        router.recordingStatus(false)
+        assertEquals(listOf("first:commit:dictation", "first:recording:false"), first.ops)
+    }
+
+    @Test
+    fun reacquiring_the_held_override_is_idempotent() {
+        val router = CoreCallbackRouter()
+        val take = RecordingSink("take")
+        assertTrue(router.tryAcquireOverride(take))
+        assertTrue("the holder itself may re-claim", router.tryAcquireOverride(take))
+        router.commitText("x")
+        assertEquals(listOf("take:commit:x"), take.ops)
+    }
+
+    @Test
     fun releasing_the_override_falls_back_to_the_bound_base() {
         val router = CoreCallbackRouter()
         val ime = RecordingSink("ime")
         val take = RecordingSink("take")
         router.bind(ime)
-        router.acquireOverride(take)
+        assertTrue(router.tryAcquireOverride(take))
         router.releaseOverride(take)
         router.commitText("kbd")
         assertEquals(listOf("ime:commit:kbd"), ime.ops)
@@ -135,13 +167,14 @@ class CoreCallbackRouterTest {
     }
 
     @Test
-    fun a_stale_override_release_does_not_disturb_a_newer_override() {
+    fun a_late_duplicate_release_does_not_disturb_the_next_takes_override() {
         val router = CoreCallbackRouter()
         val first = RecordingSink("first")
         val second = RecordingSink("second")
-        router.acquireOverride(first)
-        router.acquireOverride(second)
-        router.releaseOverride(first) // a late release from the finished first take
+        assertTrue(router.tryAcquireOverride(first))
+        router.releaseOverride(first)
+        assertTrue("a released slot is free for the next take", router.tryAcquireOverride(second))
+        router.releaseOverride(first) // a late duplicate release from the finished first take
         router.commitText("x")
         assertEquals(listOf("second:commit:x"), second.ops)
     }

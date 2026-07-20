@@ -10,14 +10,17 @@ import org.idiolect.ffi.IdiolectInputMethod
  * Two layers, so the IME and a headless take don't clobber each other's callbacks:
  *  - **base** ([bind]/[unbind]) — the active IME binds itself; pushes between fields (no base, no
  *    override) are dropped, never crash.
- *  - **override** ([acquireOverride]/[releaseOverride]) — a headless take (the quick-launch button or
- *    the RECOGNIZE_SPEECH / RecognitionService voice provider) takes delivery *above* the base while
- *    it runs. This is load-bearing: the IME can be (re)created and `bind` itself mid-take, and an
- *    override keeps that from stealing the take's finalize callback (the "stuck on Transcribing…"
- *    hang). On [releaseOverride] the base resumes — whatever IME is bound by then.
+ *  - **override** ([tryAcquireOverride]/[releaseOverride]) — a headless take (the quick-launch
+ *    button or the RECOGNIZE_SPEECH / RecognitionService voice provider) takes delivery *above* the
+ *    base while it runs. This is load-bearing: the IME can be (re)created and `bind` itself
+ *    mid-take, and an override keeps that from stealing the take's finalize callback (the "stuck on
+ *    Transcribing…" hang). The slot is single and FIRST-holder-wins: a second headless take must be
+ *    refused (and busy-fail), because replacing the slot would reroute the live take's commit and
+ *    finalize to the newcomer — the original caller hangs and the wrong surface gets the
+ *    transcript. On [releaseOverride] the base resumes — whatever IME is bound by then.
  *
  * `@Volatile` because the core pushes on its callback thread while bind/override happen on other
- * threads.
+ * threads; acquire/release are `@Synchronized` so two takes racing for the slot resolve atomically.
  */
 class CoreCallbackRouter : IdiolectInputMethod {
     @Volatile
@@ -39,12 +42,22 @@ class CoreCallbackRouter : IdiolectInputMethod {
         if (this.base === sink) this.base = null
     }
 
-    /** A headless take takes delivery above the base while it runs (see the class note). */
-    fun acquireOverride(sink: IdiolectInputMethod) {
-        this.override = sink
+    /**
+     * Claim delivery above the base for a headless take (see the class note). Returns `false` —
+     * claiming NOTHING — while a different take holds the slot; the caller must busy-fail its
+     * session rather than run a take whose callbacks would collide with the holder's. Reclaiming
+     * the slot already held by [sink] is an idempotent `true`.
+     */
+    @Synchronized
+    fun tryAcquireOverride(sink: IdiolectInputMethod): Boolean {
+        if (override != null && override !== sink) return false
+        override = sink
+        return true
     }
 
-    /** Drop the take's override; the base (the live IME, if any) resumes. No-op if superseded. */
+    /** Drop the take's override; the base (the live IME, if any) resumes. No-op unless [sink] is
+     *  the holder (a late duplicate release must not evict the next take's claim). */
+    @Synchronized
     fun releaseOverride(sink: IdiolectInputMethod) {
         if (this.override === sink) this.override = null
     }

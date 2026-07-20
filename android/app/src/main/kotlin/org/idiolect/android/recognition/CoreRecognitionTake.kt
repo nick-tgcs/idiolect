@@ -3,6 +3,7 @@ package org.idiolect.android.recognition
 import android.content.Context
 import androidx.annotation.VisibleForTesting
 import org.idiolect.android.audio.AndroidPcmSource
+import org.idiolect.android.core.CoreCallbackRouter
 import org.idiolect.android.core.IdiolectCoreHost
 import org.idiolect.android.core.NoopInputMethod
 import org.idiolect.android.ime.CoreRecordingToggle
@@ -44,7 +45,15 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
     // Ephemeral: the recognition surface has no EditorInfo, so it can't detect a password/PIN
     // field — the take is transcription-only and the core persists nothing (no history, source
     // audio, or training pair), so a secret spoken here can't leak into learning/sync.
-    private val mic = MicToggle(CoreRecordingToggle(core, ephemeral = true), controller, executor)
+    // The start gate reads the LIVE session: the start crosses an executor hop, and a session
+    // spent inside it (a foreign commit through the held override, an instant cancel) must
+    // refuse the queued start — an opened take would have no one left to stop it (hot mic).
+    private val mic = MicToggle(
+        CoreRecordingToggle(core, ephemeral = true),
+        controller,
+        executor,
+        canStart = { session?.isListening() == true },
+    )
 
     @Volatile
     private var session: RecognitionSession? = null
@@ -55,14 +64,30 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
     private val released = AtomicBoolean(false)
 
     /**
-     * Begin a take for [model], reporting to [output]. The model load is queued on the executor;
-     * once it succeeds the session opens the mic (and only then does [RecognitionOutput.onReadyForSpeech]
-     * fire, so a caller never prompts the user to speak before idiolect is listening). A load
-     * failure goes through [RecognitionSession.onLoadFailed], spending the session, so the caller
-     * hears FAILED exactly once and a later stop cannot add a second answer.
+     * Begin a take for [model], reporting to [output]. Admission, the model load, and the start
+     * are all queued on the executor, in that order:
+     *
+     *  1. **Admission** ([admitTake]): the process-wide core must be free and the router's single
+     *     delivery slot claimable — else the session busy-fails NOW. Claiming delivery while
+     *     another surface's take runs would reroute ITS commit/finalize here (that caller hangs,
+     *     this one receives a foreign transcript), so an overlapping HEADLESS take is refused
+     *     atomically at the slot. The IME does not participate in the slot: it can still start on
+     *     the shared core inside our model-load window, in which case its early pushes route to
+     *     the held override until step 3's refusal releases it (the documented residual).
+     *     The claim doubles as delivery ABOVE the IME's base binding for the life of the take, so
+     *     an IME that is (re)created and binds itself mid-take can't steal the finalize callback.
+     *  2. The model load; a failure goes through [RecognitionSession.onLoadFailed], spending the
+     *     session, so the caller hears FAILED exactly once and a later stop cannot add a second
+     *     answer.
+     *  3. The start — and only then does [RecognitionOutput.onReadyForSpeech] fire, so a caller
+     *     never prompts the user to speak before idiolect is listening. If the IME grabbed the
+     *     core between admission and the capture start, [MicToggle]'s executor-confined refusal
+     *     reports through [onStartRefused]: delivery is released and the session busy-fails
+     *     instead of hanging.
      */
     override fun begin(model: InstalledModel, output: RecognitionOutput) {
-        val live = RecognitionSession(TakeAdapter(), output)
+        val adapter = TakeAdapter()
+        val live = RecognitionSession(adapter, output)
         session = live
         val callbacks = object : NoopInputMethod() {
             override fun commitText(text: String) = live.onCommitted(text)
@@ -77,11 +102,17 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
             }
         }
         sink = callbacks
-        // Take delivery ABOVE the IME's base binding for the life of the take, so an IME that is
-        // (re)created and binds itself mid-take can't steal this take's finalize callback.
-        host.router.acquireOverride(callbacks)
+        adapter.onRefused = { onStartRefused(host.router, callbacks, live) }
         runCatching {
             executor.execute {
+                if (!admitTake(
+                        coreRecording = core.isRecording(),
+                        claimDelivery = { host.router.tryAcquireOverride(callbacks) },
+                        session = live,
+                    )
+                ) {
+                    return@execute
+                }
                 // If the take was cancelled or stopped before the load finished, the session is
                 // already spent (a pre-start stop was answered NO_SPEECH on the spot), so
                 // starting it is a no-op and no capture is opened on a doomed take.
@@ -118,7 +149,11 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
     }
 
     private inner class TakeAdapter : TakeControl {
-        override fun start() = mic.startHold()
+        /** Set by [begin] before the executor task runs; invoked on the executor when the
+         *  capture start found the core taken (see [onStartRefused]). */
+        var onRefused: () -> Unit = {}
+
+        override fun start() = mic.startHold(onRefused = onRefused)
         override fun stop() = mic.stop()
         override fun cancel() = mic.cancel()
     }
@@ -131,4 +166,38 @@ class CoreRecognitionTake(context: Context) : RecognitionTake {
 @VisibleForTesting
 internal fun routeModelLoad(loaded: Boolean, session: RecognitionSession) {
     if (loaded) session.start() else session.onLoadFailed()
+}
+
+/** [CoreRecognitionTake.begin]'s admission rule over the process-wide core, extracted like
+ *  [routeModelLoad] (the class has no headless seam). Order is load-bearing: a recording core
+ *  refuses BEFORE the delivery claim is attempted — claiming while a foreign take is live would
+ *  swallow that take's pushes (its commits would land on this spent session and be dropped).
+ *  With the core free, the router's single slot is the atomic arbiter between racing headless
+ *  takes: the loser busy-fails instead of stealing the winner's callbacks. */
+@VisibleForTesting
+internal fun admitTake(
+    coreRecording: Boolean,
+    claimDelivery: () -> Boolean,
+    session: RecognitionSession,
+): Boolean {
+    if (coreRecording || !claimDelivery()) {
+        session.onBusy()
+        return false
+    }
+    return true
+}
+
+/** The refusal path of the take's capture start ([MicToggle.startHold]'s executor-confined
+ *  "core already taken" answer — admission raced the IME's own start): release the delivery
+ *  claim FIRST, so the live take's pushes flow back to the IME's base binding instead of being
+ *  swallowed by this spent session, then busy-fail so the caller is answered rather than left
+ *  hanging on a capture that never opened. */
+@VisibleForTesting
+internal fun onStartRefused(
+    router: CoreCallbackRouter,
+    sink: IdiolectInputMethod,
+    session: RecognitionSession,
+) {
+    router.releaseOverride(sink)
+    session.onFailed(RecognitionError.BUSY)
 }

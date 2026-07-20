@@ -12,6 +12,7 @@ object RecognitionErrorCodes {
         RecognitionError.MIC_PERMISSION -> SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS
         RecognitionError.MODEL_MISSING -> SpeechRecognizer.ERROR_SERVER
         RecognitionError.NO_SPEECH -> SpeechRecognizer.ERROR_NO_MATCH
+        RecognitionError.BUSY -> SpeechRecognizer.ERROR_RECOGNIZER_BUSY
         RecognitionError.FAILED -> SpeechRecognizer.ERROR_CLIENT
     }
 }
