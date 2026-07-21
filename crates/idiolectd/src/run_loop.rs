@@ -49,6 +49,9 @@ use crate::retention_dialog::{RetentionDialog, SubprocessRetentionDialog};
 #[derive(Debug)]
 pub(crate) struct RunLoopConfig {
     pub(crate) socket_path: PathBuf,
+    /// The resolved data root, handed to the tray's dashboard subprocess so it
+    /// operates on the daemon's store rather than its own default-path one.
+    pub(crate) data_dir: PathBuf,
     pub(crate) database_path: PathBuf,
     pub(crate) audio_root: PathBuf,
     pub(crate) decoded_cache_root: PathBuf,
@@ -151,6 +154,17 @@ impl RunLoopError {
     }
 }
 
+/// Where the at-rest history key lives: `history.key` beside the database.
+/// ONE derivation, shared by the daemon's own cipher ([`build_history_cipher`])
+/// and the store handed to the tray's dashboard ([`dashboard_store`]), so the
+/// two processes can never cipher with different keys.
+fn history_key_path(database_path: &Path) -> PathBuf {
+    database_path.parent().map_or_else(
+        || PathBuf::from("history.key"),
+        |parent| parent.join("history.key"),
+    )
+}
+
 /// Builds the at-rest history cipher when `encrypt_at_rest` is enabled. The key
 /// is stored next to the database with `0600` permissions.
 fn build_history_cipher(
@@ -160,14 +174,26 @@ fn build_history_cipher(
     if !config.encrypt_at_rest {
         return Ok(None);
     }
-    let key_path = database_path.parent().map_or_else(
-        || PathBuf::from("history.key"),
-        |parent| parent.join("history.key"),
-    );
-    let key = FileKey::new(key_path)
+    let key = FileKey::new(history_key_path(database_path))
         .load_or_create_key()
         .map_err(|error| RunLoopError::crypto("key load", error))?;
     Ok(Some(Box::new(ChaCha20Poly1305Cipher::new(key))))
+}
+
+/// The store the tray hands to the dashboard subprocess: the daemon's resolved
+/// paths, plus the history key exactly when this daemon ciphers with one
+/// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
+/// overrides it — so this mirrors [`build_history_cipher`]'s decision).
+fn dashboard_store(config: &RunLoopConfig) -> crate::sync_panel_launcher::DashboardStore {
+    crate::sync_panel_launcher::DashboardStore {
+        data_dir: config.data_dir.clone(),
+        database_path: config.database_path.clone(),
+        base_model: config.adapter_profile.whisper_model_path.clone(),
+        history_key: config
+            .history_config
+            .encrypt_at_rest
+            .then(|| history_key_path(&config.database_path)),
+    }
 }
 
 impl Display for RunLoopError {
@@ -678,8 +704,11 @@ fn handle_connection(
     let retention_dialog = SubprocessRetentionDialog::discover();
     // Out-of-process Settings window ("Settings…" in the tray); discovered once.
     let settings_window = crate::settings_launcher::SettingsLauncher::discover();
-    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray).
-    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover();
+    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
+    // handed the daemon's resolved store so pairing and training act on the
+    // database this daemon writes — not a second, default-path store.
+    let sync_panel =
+        crate::sync_panel_launcher::SyncPanelLauncher::discover(dashboard_store(config));
     let mut line = String::new();
 
     loop {
@@ -2479,7 +2508,8 @@ mod tests {
 
         use crate::adapters::{RuntimeAdapterProfile, FIXTURE_DEVICE};
         use crate::run_loop::{
-            cleanup_disconnected_client, ActiveSession, Live, RecordingStatusTx, RunLoopConfig,
+            cleanup_disconnected_client, dashboard_store, ActiveSession, Live, RecordingStatusTx,
+            RunLoopConfig,
         };
 
         /// Records every render instead of drawing it. The production tray's
@@ -2521,6 +2551,7 @@ mod tests {
         fn test_config() -> RunLoopConfig {
             RunLoopConfig {
                 socket_path: PathBuf::new(),
+                data_dir: PathBuf::new(),
                 database_path: PathBuf::new(),
                 audio_root: PathBuf::new(),
                 decoded_cache_root: PathBuf::new(),
@@ -2540,6 +2571,27 @@ mod tests {
                 vad_config: VadConfig::default(),
                 notify_command: String::new(),
             }
+        }
+
+        #[test]
+        fn the_dashboard_store_hands_over_the_history_key_only_when_encryption_is_on() {
+            // The dashboard's sync ingest writes ime_text_history rows into the
+            // daemon's database; when the daemon encrypts at rest, it must hand
+            // the SAME key file it ciphers with (history.key beside the db —
+            // one derivation, shared with build_history_cipher) — and when it
+            // doesn't, it must hand nothing, else the dashboard would encrypt
+            // rows the daemon reads plaintext.
+            let mut config = test_config();
+            config.database_path = PathBuf::from("/data/root/db/idiolect.sqlite");
+
+            config.history_config.encrypt_at_rest = true;
+            assert_eq!(
+                dashboard_store(&config).history_key,
+                Some(PathBuf::from("/data/root/db/history.key")),
+            );
+
+            config.history_config.encrypt_at_rest = false;
+            assert_eq!(dashboard_store(&config).history_key, None);
         }
 
         /// Whether any (possibly nested) item is a history entry — the menu
@@ -3317,6 +3369,24 @@ mod tests {
                 effective_history_config(&store, &defaults).training_retention_days,
                 540
             );
+        }
+
+        // `dashboard_store` hands the history key to the dashboard subprocess
+        // based on the config-file value alone; if a tray override could flip
+        // encryption at runtime, the daemon and the dashboard would cipher the
+        // SAME database differently. Pin that the override layer never touches
+        // it.
+        #[test]
+        fn encrypt_at_rest_is_config_file_only_never_a_tray_override() {
+            use idiolect_ports::storage::MetadataStorePort;
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+                .set_tray_setting("encrypt_at_rest", "true")
+                .expect("stale/hand-edited setting");
+
+            let defaults = HistoryConfig::default();
+            assert!(!effective_history_config(&store, &defaults).encrypt_at_rest);
         }
     }
 }

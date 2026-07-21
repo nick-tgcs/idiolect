@@ -226,6 +226,7 @@ class IdiolectAccessibilityService : AccessibilityService() {
             RecognitionError.NO_SPEECH -> R.string.recognize_no_speech
             RecognitionError.MIC_PERMISSION -> R.string.quicklaunch_mic_needed
             RecognitionError.MODEL_MISSING -> R.string.recognize_no_model
+            RecognitionError.BUSY -> R.string.recognize_busy
             RecognitionError.FAILED -> R.string.recognize_failed
         }
         toast(getString(message))

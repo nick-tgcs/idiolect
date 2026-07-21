@@ -114,6 +114,7 @@
     <string name="recognize_no_speech">Didn\'t catch that — try again</string>
     <string name="recognize_no_model">Open idiolect and download a speech model first</string>
     <string name="recognize_mic_needed">idiolect needs microphone access to transcribe</string>
+    <string name="recognize_busy">Another dictation is running — finish it and try again</string>
     <string name="recognize_failed">Transcription failed — please try again</string>
 
     <!-- Quick-launch mic: Android's floating accessibility button → dictate into any app. -->

@@ -89,6 +89,7 @@ class RecognizeSpeechActivity : ComponentActivity() {
                     RecognitionError.NO_SPEECH -> R.string.recognize_no_speech
                     RecognitionError.MIC_PERMISSION -> R.string.recognize_mic_needed
                     RecognitionError.MODEL_MISSING -> R.string.recognize_no_model
+                    RecognitionError.BUSY -> R.string.recognize_busy
                     RecognitionError.FAILED -> R.string.recognize_failed
                 },
             ),

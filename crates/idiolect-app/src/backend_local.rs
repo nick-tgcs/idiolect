@@ -284,6 +284,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -356,6 +357,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -423,6 +425,7 @@ mod tests {
                 audio_root: dir.path().join("audio"),
                 model_path: dir.path().join("model.bin"),
                 tokens_path: dir.path().join("tokens.json"),
+                history_key: None,
             };
             let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
             let trainer_cfg = crate::trainer_launcher::TrainerConfig {
@@ -485,6 +488,7 @@ mod tests {
                 audio_root: dir.path().join("audio"),
                 model_path: dir.path().join("model.bin"),
                 tokens_path: dir.path().join("tokens.json"),
+                history_key: None,
             };
             let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
             let trainer_cfg = crate::trainer_launcher::TrainerConfig {
@@ -532,6 +536,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -568,6 +573,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -604,6 +610,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -643,6 +650,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -687,6 +695,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);
@@ -733,6 +742,7 @@ mod tests {
             audio_root: dir.path().join("audio"),
             model_path: dir.path().join("model.bin"),
             tokens_path: dir.path().join("tokens.json"),
+            history_key: None,
         };
         let host = crate::sync_host::SyncHost::start(cfg, rt.handle()).expect("start");
         let mut backend = super::LocalBackend::new(host, None);

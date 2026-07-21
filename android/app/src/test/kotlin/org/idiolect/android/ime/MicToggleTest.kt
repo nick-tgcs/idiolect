@@ -1,6 +1,7 @@
 package org.idiolect.android.ime
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Executor
@@ -130,6 +131,39 @@ class MicToggleTest {
         val r = Recorder()
         MicToggle(r, r, direct, canStart = { false }).startHold()
         assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_refused_hold_start_reports_the_refusal_instead_of_dropping_it() {
+        // The recognition surfaces drive their take through startHold. When the shared core
+        // is already busy with a foreign take, the silent no-op left the recognition caller
+        // hanging forever (its session stayed LISTENING with no capture and no finalize to
+        // come). The refusal must be answerable, not swallowed.
+        val r = Recorder()
+        MicToggle(r, r, direct).onTap() // a foreign surface's take is live on the shared core
+        r.calls.clear()
+        var refused = false
+        MicToggle(r, r, direct).startHold(onRefused = { refused = true })
+        assertTrue("the caller must hear that no capture started", refused)
+        assertEquals("a refused start must not touch core or capture", emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_blocked_field_hold_start_reports_the_refusal_too() {
+        val r = Recorder()
+        var refused = false
+        MicToggle(r, r, direct, canStart = { false }).startHold(onRefused = { refused = true })
+        assertTrue(refused)
+        assertEquals(emptyList<String>(), r.calls)
+    }
+
+    @Test
+    fun a_hold_start_that_starts_does_not_report_a_refusal() {
+        val r = Recorder()
+        var refused = false
+        MicToggle(r, r, direct).startHold(onRefused = { refused = true })
+        assertFalse(refused)
+        assertEquals(listOf("core.start", "capture.start"), r.calls)
     }
 
     @Test

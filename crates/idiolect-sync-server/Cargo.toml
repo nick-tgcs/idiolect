@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 idiolect-sync = { path = "../idiolect-sync" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+# At-rest history cipher: an embedded host handed the daemon's store must encrypt
+# ime_text_history the way the daemon does (pure-Rust ChaCha20-Poly1305).
+idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-common = { path = "../idiolect-common" }
 thiserror.workspace = true

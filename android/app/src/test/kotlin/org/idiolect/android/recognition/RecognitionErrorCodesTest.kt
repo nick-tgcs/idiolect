@@ -28,6 +28,17 @@ class RecognitionErrorCodesTest {
     }
 
     @Test
+    fun an_overlapping_take_maps_to_recognizer_busy() {
+        // The framework code exists precisely for this: a second SpeechRecognizer client
+        // starting while another surface's take runs must hear "busy, retry" — not a
+        // generic client error, and never the other take's transcript.
+        assertEquals(
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+            RecognitionErrorCodes.speechRecognizer(RecognitionError.BUSY),
+        )
+    }
+
+    @Test
     fun every_error_has_a_distinct_code() {
         val codes = RecognitionError.entries.map { RecognitionErrorCodes.speechRecognizer(it) }
         assertEquals("each RecognitionError must map to a unique code", codes.size, codes.toSet().size)

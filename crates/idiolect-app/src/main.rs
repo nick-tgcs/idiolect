@@ -4,12 +4,17 @@
 //!   stdin  : newline-delimited JSON state snapshots (see `model::Snapshot`)
 //!   stdout : one action-id per line (`sync:pair`, `train:now`, …)
 //!
-//! Standalone mode (macOS / Windows): no daemon; the app owns its own `SyncHost`.
+//! Standalone mode: the app owns its own `SyncHost`. On macOS / Windows that is
+//! a direct launch with the default store; the Linux daemon's tray also spawns
+//! this mode (`--standalone`), handing over ITS store through the environment
+//! (see [`standalone_store`]) so the dashboard acts on the database the daemon
+//! writes.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use idiolect_common::config::dashboard_store_env;
 
 mod backend;
 mod backend_local;
@@ -55,12 +60,75 @@ fn local_ip() -> Option<std::net::IpAddr> {
 
 /// Returns the data directory for standalone mode.
 fn data_dir() -> PathBuf {
-    std::env::var_os("IDIOLECT_DATA_DIR")
-        .map(PathBuf::from)
+    env_path(dashboard_store_env::DATA_DIR)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/idiolect"))
         })
         .unwrap_or_else(|| PathBuf::from("/tmp/idiolect"))
+}
+
+/// The store a standalone launch operates on. Everything nests under [`data`]
+/// except where the Linux daemon's tray launcher overrode a path through the
+/// environment: the daemon keeps its database at `db/idiolect.sqlite` and its
+/// ASR model under `models/whisper/`, so without the overrides the dashboard
+/// would silently pair phones and train against a second, default-path store
+/// the daemon never writes (env names mirrored in `idiolectd`'s
+/// `sync_panel_launcher.rs`).
+struct StandaloneStore {
+    data: PathBuf,
+    db_path: PathBuf,
+    base_model: PathBuf,
+    /// The daemon's at-rest history key, when the spawning daemon encrypts —
+    /// sync ingest must cipher `ime_text_history` rows the way that daemon
+    /// does. `None` (every direct launch) keeps the store plaintext.
+    history_key: Option<PathBuf>,
+}
+
+/// Pure resolution: `db_env`/`base_env`/`history_key_env` are
+/// [`dashboard_store_env::DB_PATH`] / [`dashboard_store_env::BASE_MODEL`] /
+/// [`dashboard_store_env::HISTORY_KEY`] when set, and the fallbacks are the
+/// historical single-directory plaintext layout of a direct standalone launch
+/// (macOS / Windows).
+fn standalone_store(
+    data: PathBuf,
+    db_env: Option<PathBuf>,
+    base_env: Option<PathBuf>,
+    history_key_env: Option<PathBuf>,
+) -> StandaloneStore {
+    let db_path = db_env.unwrap_or_else(|| data.join("idiolect.db"));
+    let base_model = base_env.unwrap_or_else(|| data.join("ggml-base.en.bin"));
+    StandaloneStore {
+        data,
+        db_path,
+        base_model,
+        history_key: history_key_env,
+    }
+}
+
+/// A path from the environment; unset and empty both mean "not provided".
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The sync-host configuration of a standalone launch, derived from the
+/// resolved [`StandaloneStore`]. Extracted so a test pins that the store's
+/// fields (database, history key) actually reach the host —
+/// [`make_backend`] itself is a process boundary.
+fn standalone_sync_cfg(store: &StandaloneStore, pair_url: String) -> sync_host::SyncHostConfig {
+    sync_host::SyncHostConfig {
+        bind: "0.0.0.0:8765".parse().expect("valid addr"),
+        pair_url,
+        tls: false,
+        db_path: store.db_path.clone(),
+        audio_root: store.data.join("audio"),
+        // One path, two roles: the trainer publishes here (`--serve`) and the
+        // sync host serves the same file to paired phones (`/v1/model`).
+        model_path: store.data.join("model.bin"),
+        tokens_path: store.data.join("device_tokens.json"),
+        history_key: store.history_key.clone(),
+    }
 }
 
 /// Until the first training run publishes a personal model, copy the base
@@ -92,9 +160,15 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
     let standalone =
         std::io::stdin().is_terminal() || std::env::var_os("IDIOLECT_STANDALONE").is_some();
     if standalone {
-        let data = data_dir();
-        for dir in [&data, &data.join("audio")] {
-            if let Err(e) = std::fs::create_dir_all(dir) {
+        let store = standalone_store(
+            data_dir(),
+            env_path(dashboard_store_env::DB_PATH),
+            env_path(dashboard_store_env::BASE_MODEL),
+            env_path(dashboard_store_env::HISTORY_KEY),
+        );
+        let data = &store.data;
+        for dir in [data.clone(), data.join("audio")] {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
                 eprintln!(
                     "idiolect-app: cannot create data dir {}: {e}",
                     dir.display()
@@ -105,26 +179,14 @@ fn make_backend(rt: &tokio::runtime::Handle) -> Box<dyn Backend> {
         let pair_url = local_ip()
             .map(|ip| format!("http://{ip}:8765"))
             .unwrap_or_default();
-        // One path, two roles: the trainer publishes here (`--serve`) and the
-        // sync host serves the same file to paired phones (`/v1/model`).
-        let served_model = data.join("model.bin");
-        let base_model = data.join("ggml-base.en.bin");
-        seed_served_model(&base_model, &served_model);
-        let cfg = sync_host::SyncHostConfig {
-            bind: "0.0.0.0:8765".parse().expect("valid addr"),
-            pair_url,
-            tls: false,
-            db_path: data.join("idiolect.db"),
-            audio_root: data.join("audio"),
-            model_path: served_model.clone(),
-            tokens_path: data.join("device_tokens.json"),
-        };
+        let cfg = standalone_sync_cfg(&store, pair_url);
+        seed_served_model(&store.base_model, &cfg.model_path);
         let trainer_cfg = trainer_launcher::TrainerConfig {
-            db_path: data.join("idiolect.db"),
+            db_path: store.db_path.clone(),
             audio_root: data.join("audio"),
-            base_model,
+            base_model: store.base_model.clone(),
             output: data.join("personal.bin"),
-            serve: Some(served_model),
+            serve: Some(cfg.model_path.clone()),
             gpu: false,
         };
         match sync_host::SyncHost::start(cfg, rt) {
@@ -212,7 +274,85 @@ impl eframe::App for DashboardApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_ip, seed_served_model};
+    use super::{local_ip, seed_served_model, standalone_store, standalone_sync_cfg};
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_sync_host_cfg_carries_the_stores_database_and_history_key() {
+        // `make_backend` itself is a process boundary (fixed bind, real
+        // sockets — see the note below); this seam pins that the resolved
+        // store's fields actually REACH the host config. Dropping the history
+        // key here would silently revert the dashboard to plaintext ingest on
+        // an encrypted daemon store.
+        let store = standalone_store(
+            PathBuf::from("/data/root"),
+            Some(PathBuf::from("/data/root/db/idiolect.sqlite")),
+            Some(PathBuf::from("/data/root/models/whisper/ggml-base.en.bin")),
+            Some(PathBuf::from("/data/root/db/history.key")),
+        );
+        let cfg = standalone_sync_cfg(&store, "http://10.0.0.5:8765".to_owned());
+        assert_eq!(cfg.db_path, PathBuf::from("/data/root/db/idiolect.sqlite"));
+        assert_eq!(
+            cfg.history_key,
+            Some(PathBuf::from("/data/root/db/history.key"))
+        );
+        assert_eq!(cfg.pair_url, "http://10.0.0.5:8765");
+        // The served slot (trainer publish target == phone download source).
+        assert_eq!(cfg.model_path, PathBuf::from("/data/root/model.bin"));
+    }
+
+    #[test]
+    fn daemon_env_points_the_standalone_store_at_the_daemons_layout() {
+        // The Linux tray spawns this app `--standalone` but hands over the
+        // daemon's resolved store in the environment (the daemon's database is
+        // db/idiolect.sqlite and its model lives under models/whisper/ — not
+        // this app's own defaults). Honoring those keeps pairing and training
+        // on the ONE store the daemon actually writes.
+        let store = standalone_store(
+            PathBuf::from("/data/root"),
+            Some(PathBuf::from("/data/root/db/idiolect.sqlite")),
+            Some(PathBuf::from("/data/root/models/whisper/ggml-base.en.bin")),
+            Some(PathBuf::from("/data/root/db/history.key")),
+        );
+        assert_eq!(store.data, PathBuf::from("/data/root"));
+        assert_eq!(
+            store.db_path,
+            PathBuf::from("/data/root/db/idiolect.sqlite")
+        );
+        assert_eq!(
+            store.base_model,
+            PathBuf::from("/data/root/models/whisper/ggml-base.en.bin")
+        );
+        // An encrypting daemon hands its key: sync ingest must cipher
+        // ime_text_history rows, not write plaintext into its database.
+        assert_eq!(
+            store.history_key,
+            Some(PathBuf::from("/data/root/db/history.key"))
+        );
+    }
+
+    #[test]
+    fn without_daemon_env_the_store_derives_from_the_data_dir() {
+        // Direct standalone launches (macOS/Windows, or Linux without the
+        // daemon) keep the historical single-directory layout.
+        let store = standalone_store(
+            PathBuf::from("/home/u/.local/share/idiolect"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            store.db_path,
+            PathBuf::from("/home/u/.local/share/idiolect/idiolect.db")
+        );
+        assert_eq!(
+            store.base_model,
+            PathBuf::from("/home/u/.local/share/idiolect/ggml-base.en.bin")
+        );
+        // No daemon ⇒ no cipher to honor: a direct launch's own store keeps
+        // its historical plaintext posture.
+        assert!(store.history_key.is_none());
+    }
 
     // `make_backend` itself is the process-startup boundary (fixed 0.0.0.0:8765
     // bind, stdin probing), so the seeding rule is pinned here at the unit level
