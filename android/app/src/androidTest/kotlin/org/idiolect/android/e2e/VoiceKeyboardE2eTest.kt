@@ -120,6 +120,24 @@ class VoiceKeyboardE2eTest {
         shell("ime set $IME_ID")
     }
 
+    @Test
+    fun a_numeric_field_hands_off_instead_of_defaulting_to_the_mic() {
+        // idiolect renders no keyboard and dictating a PIN/amount is pointless — focusing a
+        // numeric field must hand off to the user's own keyboard, not show the mic.
+        device.findObject(By.desc(EditorHarnessActivity.NUMBER_FIELD_DESC)).click()
+        assertTrue(
+            "focusing a numeric field did not hand off (idiolect mic still showing)",
+            device.wait(Until.gone(By.descContains(MIC_DESC)), TIMEOUT),
+        )
+        val active = shellOut("settings get secure default_input_method")
+        assertFalse(
+            "the active IME is still idiolect on a numeric field ($active)",
+            active.contains(PKG),
+        )
+        // Restore idiolect so the next test starts from the mic.
+        shell("ime set $IME_ID")
+    }
+
     private fun shell(command: String) {
         device.executeShellCommand(command)
     }

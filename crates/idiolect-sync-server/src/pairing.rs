@@ -18,9 +18,10 @@
 //!   * The code is 8 chars from a 32-symbol alphabet (2^40), stored **only as its
 //!     SHA-256 hash** — a leaked state file can't be replayed, mirroring the token store.
 //!   * At most **one** code is outstanding, it is **single-use**, expires after
-//!     [`PAIRING_CODE_TTL_SECS`], and burns after [`PAIRING_MAX_ATTEMPTS`] wrong guesses.
-//!     Redeem-and-issue happen in one critical section, so a replayed or concurrent
-//!     correct code can never mint two tokens.
+//!     [`PAIRING_CODE_TTL_SECS`], burns after [`PAIRING_MAX_ATTEMPTS`] wrong guesses, and
+//!     dies with the offer that carried it ([`PairingState::cancel`]: the operator
+//!     cancelling pairing or disabling sync). Redeem-and-issue happen in one critical
+//!     section, so a replayed or concurrent correct code can never mint two tokens.
 //!   * Every failure mode collapses to an opaque `401` so the endpoint is not an oracle
 //!     for whether a code is outstanding/expired/wrong.
 //!
@@ -147,6 +148,15 @@ impl PairingState {
         self.pending = None;
     }
 
+    /// Discard the outstanding code, if any, so it can no longer be redeemed — the
+    /// operator-side invalidation (cancelling the offer, disabling sync). Where
+    /// [`consume`](Self::consume) commits a successful redemption, this revokes an
+    /// unredeemed offer: hiding the code from the UI alone would leave it
+    /// redeemable until expiry.
+    pub fn cancel(&mut self) {
+        self.pending = None;
+    }
+
     /// Whether an unexpired code is currently outstanding at `now_secs`.
     #[must_use]
     pub fn has_active_code(&self, now_secs: u64) -> bool {
@@ -184,6 +194,65 @@ impl PairingServerState {
             .expect("pairing mutex poisoned")
             .generate(now_secs)
     }
+
+    /// Mint a fresh code and build the full [`PairingOffer`] in one call: the code,
+    /// its display form, the deep-link URI, the QR bool matrix, and the expiry
+    /// timestamp. The caller supplies `base_url` (phone-facing URL) and optionally a
+    /// `fingerprint` (SPKI sha256 hex, absent for `--no-tls`). A QR encoding error
+    /// is surfaced as `Err` **after disarming the just-minted code** — no caller
+    /// displays a failed offer, so its code must not stay invisibly redeemable.
+    pub fn mint_offer(
+        &self,
+        base_url: &str,
+        fingerprint: Option<&str>,
+        now_secs: u64,
+    ) -> Result<PairingOffer, String> {
+        let code = self.generate_code(now_secs);
+        let display_code = group(&code);
+        let uri = crate::pairing_qr::pairing_uri(base_url, &code, fingerprint);
+        let (qr_matrix, qr_width) = match crate::pairing_qr::qr_matrix(&uri) {
+            Ok(matrix) => matrix,
+            Err(error) => {
+                self.cancel_pending();
+                return Err(error);
+            }
+        };
+        Ok(PairingOffer {
+            display_code,
+            uri,
+            qr_matrix,
+            qr_width,
+            expires_at_secs: now_secs.saturating_add(PAIRING_CODE_TTL_SECS),
+            code,
+        })
+    }
+
+    /// Discard any outstanding pairing code (the operator cancelled the offer or
+    /// disabled sync): `/v1/pair` then refuses the old code even within its TTL.
+    pub fn cancel_pending(&self) {
+        self.pairing
+            .lock()
+            .expect("pairing mutex poisoned")
+            .cancel();
+    }
+}
+
+/// The full description of an outstanding pairing invitation: everything the dashboard
+/// needs to render the QR, show the typed fallback, and display the countdown.
+#[derive(Debug, Clone)]
+pub struct PairingOffer {
+    /// The raw 8-character code from the pairing alphabet (for typed entry).
+    pub code: String,
+    /// The operator-friendly display form: `XXXX-XXXX`.
+    pub display_code: String,
+    /// The deep-link URI encoded in the QR: `idiolect://pair?u=…&c=…[&f=…]`.
+    pub uri: String,
+    /// The QR module matrix (row-major, `true` = dark), without quiet zone.
+    pub qr_matrix: Vec<bool>,
+    /// Side length of the square [`qr_matrix`].
+    pub qr_width: usize,
+    /// Unix timestamp (seconds) when this code expires.
+    pub expires_at_secs: u64,
 }
 
 /// The phone's pairing request: the short code and the device id it proposes for itself.
@@ -441,6 +510,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_code_is_no_longer_redeemable() {
+        let mut state = PairingState::default();
+        let code = state.generate(0);
+        state.cancel();
+        assert_eq!(
+            state.redeem(&code, 0),
+            RedeemOutcome::NoPendingCode,
+            "a cancelled code must not redeem even within its TTL"
+        );
+        assert!(!state.has_active_code(0));
+    }
+
+    #[test]
+    fn cancel_with_nothing_outstanding_is_a_no_op() {
+        let mut state = PairingState::default();
+        state.cancel();
+        assert_eq!(state.redeem("ANYCODE0", 0), RedeemOutcome::NoPendingCode);
+    }
+
+    #[test]
     fn generating_a_new_code_supersedes_the_old() {
         let mut state = PairingState::default();
         let first = state.generate(0);
@@ -643,9 +732,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_rejection_is_an_indistinguishable_401() {
-        // No code ever generated (the binary's default before `--pair`), a wrong code, and
-        // an expired code must produce byte-identical responses, so `/v1/pair` is not an
-        // oracle for whether a code is outstanding / expired / wrong.
+        // No code ever generated (the binary's default before `--pair`), a wrong code, an
+        // expired code, and a cancelled code must produce byte-identical responses, so
+        // `/v1/pair` is not an oracle for whether a code is outstanding / expired / wrong
+        // / revoked by the operator.
         let (_no_code_dir, no_code) = server_state();
 
         let (_wrong_dir, wrong) = server_state();
@@ -654,9 +744,14 @@ mod tests {
         let (_expired_dir, expired) = server_state();
         let expired_code = expired.generate_code(0);
 
+        let (_cancelled_dir, cancelled) = server_state();
+        let cancelled_code = cancelled.generate_code(system_now());
+        cancelled.cancel_pending();
+
         let none = full_response(no_code, pair_request("ANYCODE0", "pixel")).await;
         let bad = full_response(wrong, pair_request("WRONGCOD", "pixel")).await;
         let old = full_response(expired, pair_request(&expired_code, "pixel")).await;
+        let dead = full_response(cancelled, pair_request(&cancelled_code, "pixel")).await;
 
         assert_eq!(none.0, StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -667,6 +762,24 @@ mod tests {
             bad, old,
             "wrong-code and expired-code rejections must be identical"
         );
+        assert_eq!(
+            old, dead,
+            "expired-code and cancelled-code rejections must be identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_code_is_refused_over_http() {
+        let (_dir, state) = server_state();
+        let code = state.generate_code(system_now());
+        state.cancel_pending();
+
+        let response = pair_router(state.clone())
+            .oneshot(pair_request(&code, "pixel"))
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(device_count(&state), 0, "a cancelled code issues no token");
     }
 
     #[tokio::test]
@@ -842,5 +955,105 @@ mod tests {
         assert_eq!(created, 1, "exactly one redeem wins");
         assert_eq!(unauthorized, 7, "every other racer is rejected");
         assert_eq!(device_count(&state), 1, "single-use under real concurrency");
+    }
+}
+
+#[cfg(test)]
+mod pairing_offer_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, Arc<PairingServerState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tokens = crate::device_tokens::DeviceTokenStore::open(dir.path().join("tokens.json"))
+            .expect("tokens");
+        let state = Arc::new(PairingServerState::new(Arc::new(Mutex::new(tokens))));
+        (dir, state)
+    }
+
+    #[test]
+    fn mint_offer_returns_an_eight_char_code_with_grouped_display() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, system_now())
+            .expect("offer");
+        assert_eq!(offer.code.len(), 8);
+        assert_eq!(
+            offer.display_code,
+            format!("{}-{}", &offer.code[..4], &offer.code[4..])
+        );
+    }
+
+    #[test]
+    fn mint_offer_uri_encodes_the_base_url_and_code() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("offer");
+        assert!(
+            offer.uri.contains(&offer.code),
+            "uri must contain the raw code"
+        );
+        assert!(offer.uri.starts_with("idiolect://pair?"));
+    }
+
+    #[test]
+    fn mint_offer_uri_carries_fingerprint_when_supplied() {
+        let (_dir, state) = state();
+        let fp = "0123456789abcdef".repeat(4);
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", Some(&fp), 0)
+            .expect("offer");
+        assert!(offer.uri.contains(&fp), "uri must carry the fingerprint");
+    }
+
+    #[test]
+    fn mint_offer_qr_matrix_is_a_square_of_the_stated_width() {
+        let (_dir, state) = state();
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("offer");
+        assert_eq!(
+            offer.qr_matrix.len(),
+            offer.qr_width * offer.qr_width,
+            "qr_matrix must be a square"
+        );
+        assert!(offer.qr_width >= 21, "QR widths are at least 21 modules");
+    }
+
+    #[test]
+    fn mint_offer_expires_at_is_ten_minutes_after_now() {
+        let (_dir, state) = state();
+        let now = 1_000_000u64;
+        let offer = state
+            .mint_offer("https://10.0.0.1:8765", None, now)
+            .expect("offer");
+        assert_eq!(offer.expires_at_secs, now + PAIRING_CODE_TTL_SECS);
+    }
+
+    #[test]
+    fn a_failed_mint_offer_leaves_no_code_armed() {
+        let (_dir, state) = state();
+        // A base_url too large for any QR symbol: generate_code has already armed
+        // a code by the time encoding fails, and the error path must disarm it —
+        // otherwise a code no UI ever displayed stays redeemable for its TTL.
+        // Reachable in production: the pairing URL is user-typed (Preferences).
+        let minted = state.mint_offer(&"x".repeat(8000), None, 0);
+        assert!(minted.is_err(), "an oversized URL must fail QR encoding");
+        assert!(
+            !state.pairing.lock().expect("pairing").has_active_code(0),
+            "a failed mint must not leave an invisible redeemable code"
+        );
+    }
+
+    #[test]
+    fn consecutive_mint_offers_produce_distinct_codes() {
+        let (_dir, state) = state();
+        let a = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("a");
+        let b = state
+            .mint_offer("https://10.0.0.1:8765", None, 0)
+            .expect("b");
+        assert_ne!(a.code, b.code, "each mint must generate fresh entropy");
     }
 }

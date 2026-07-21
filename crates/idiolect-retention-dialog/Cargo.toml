@@ -10,7 +10,21 @@ name = "idiolect-retention-dialog"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+
+# X11 windowing backend. eframe with default-features off pulls in NO platform
+# backend, so winit fails to build (and the binary cannot open a window) unless
+# a target enables one. A full workspace build hides this via feature
+# unification from sibling GUI crates; an isolated build of this dialog does
+# not — so declare it here. Not needed on macOS or Windows.
+#
+# `default-features = false` is REQUIRED: without it this second declaration
+# re-enables eframe's defaults on Linux (wgpu/wayland/accesskit), and with both
+# `glow` and `wgpu` linked `Renderer::default` picks Wgpu — so a standalone
+# Linux build would silently drop the glow-only config above and could exit
+# instead of opening where wgpu can't init but OpenGL would.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["x11"] }
 
 [lints]
 workspace = true

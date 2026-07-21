@@ -54,7 +54,8 @@ fn engine_client_receives_insert_text_from_the_server() {
         writer.flush().expect("flush");
     });
 
-    let (_sender, mut reader) = ipc::connect(&socket_path).expect("client connects + handshakes");
+    let (_sender, mut reader, _reconcile) =
+        ipc::connect(&socket_path).expect("client connects + handshakes");
     match reader.read_message().expect("read message") {
         IpcMessage::InsertText(insert) => assert_eq!(insert.text, "Deploy traefik and nginx"),
         other => panic!("expected InsertText, got {other:?}"),

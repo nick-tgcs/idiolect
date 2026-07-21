@@ -27,12 +27,15 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import org.idiolect.android.R
 import org.idiolect.android.ime.IdiolectImeService
+import org.idiolect.android.model.DownloadProgress
 import org.idiolect.android.model.HttpModelTransport
 import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
 import org.idiolect.android.model.ModelTransport
-import org.idiolect.android.model.PublicModelTransport
+import org.idiolect.android.model.PublicModelCatalog
+import org.idiolect.android.model.PublicModelOption
 import org.idiolect.android.settings.SettingsActivity
+import org.idiolect.android.ui.EdgeToEdge
 import org.idiolect.android.sync.DeviceId
 import org.idiolect.android.sync.PairingClient
 import org.idiolect.android.sync.PairingDeepLink
@@ -67,6 +70,17 @@ class SetupActivity : ComponentActivity() {
     private lateinit var stepLabel: TextView
     private val dots = mutableListOf<View>()
 
+    /** The tiny/base model chooser (DownloadModel step). Default = the fast catalog default. */
+    private lateinit var modelPicker: LinearLayout
+    private val modelRows = mutableListOf<View>()
+    private var selectedModel = PublicModelCatalog.default
+
+    /** Bumped per download attempt so a cancelled or superseded download's late UI updates are ignored. */
+    // Written on the UI thread (start/cancel), read on the daemon download thread's isCancelled
+    // gate — @Volatile gives the happens-before edge so a cancel/supersede is never missed.
+    @Volatile
+    private var downloadToken = 0
+
     /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */
     private val scanLauncher: ActivityResultLauncher<ScanOptions> =
         registerForActivityResult(ScanContract()) { result ->
@@ -89,6 +103,7 @@ class SetupActivity : ComponentActivity() {
         tokenField = field(R.string.setup_model_token_hint).apply { visibility = View.GONE }
         cta = primary("") {}
 
+        buildModelPicker()
         buildDots()
         stepLabel = TextView(this).apply {
             textSize = 12f
@@ -101,6 +116,7 @@ class SetupActivity : ComponentActivity() {
             background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.review_card_bg)
             setPadding(dp(18), dp(18), dp(18), dp(18))
             addView(status, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(modelPicker, inCardLp())
             addView(scanButton, inCardLp())
             addView(urlField, inCardLp())
             addView(tokenField, inCardLp())
@@ -119,7 +135,11 @@ class SetupActivity : ComponentActivity() {
             addView(stepLabel, topMargin(dp(8)))
             addView(card, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(22) })
         }
-        setContentView(ScrollView(this).apply { setBackgroundColor(bg); addView(root) })
+        val scroll = ScrollView(this).apply { setBackgroundColor(bg); addView(root) }
+        setContentView(scroll)
+        // targetSdk 35 draws under the status/nav bars; inset the scroll root so the logo and
+        // CTA are not hidden behind the clock (the "top gets cut off" bug).
+        EdgeToEdge.enable(this, scroll)
 
         // A pairing link the activity was launched with enrols straight away (camera-free).
         handleDeepLink(intent)
@@ -174,6 +194,8 @@ class SetupActivity : ComponentActivity() {
             }
             ImeSetupStep.DownloadModel -> {
                 status.setText(R.string.setup_model)
+                modelPicker.visibility = View.VISIBLE
+                modelPickerEnabled(true)
                 scanButton.visibility = View.VISIBLE
                 scanButton.isEnabled = true
                 urlField.visibility = View.VISIBLE
@@ -185,6 +207,7 @@ class SetupActivity : ComponentActivity() {
             }
             ImeSetupStep.Ready -> {
                 status.setText(R.string.setup_ready)
+                modelPicker.visibility = View.GONE
                 scanButton.visibility = View.GONE
                 urlField.visibility = View.GONE
                 tokenField.visibility = View.GONE
@@ -211,6 +234,7 @@ class SetupActivity : ComponentActivity() {
 
     private fun bind(statusRes: Int, ctaRes: Int, action: () -> Unit) {
         status.setText(statusRes)
+        modelPicker.visibility = View.GONE
         scanButton.visibility = View.GONE
         urlField.visibility = View.GONE
         tokenField.visibility = View.GONE
@@ -224,7 +248,7 @@ class SetupActivity : ComponentActivity() {
     private fun onDownloadTapped() {
         when (val choice = ModelSourceChoice.from(urlField.text.toString(), tokenField.text.toString())) {
             ModelSourceChoice.NeedDetails -> status.setText(R.string.setup_model_need_details)
-            ModelSourceChoice.Public -> startDownload(PublicModelTransport.recommended(), pcEndpoint = null)
+            ModelSourceChoice.Public -> startDownload(selectedModel.transport(), pcEndpoint = null)
             is ModelSourceChoice.Pc ->
                 startDownload(
                     HttpModelTransport(choice.url, choice.token, choice.pin),
@@ -282,28 +306,58 @@ class SetupActivity : ComponentActivity() {
      * existing endpoint untouched.
      */
     private fun startDownload(transport: ModelTransport, pcEndpoint: ModelSourceChoice.Pc?) {
-        cta.isEnabled = false
+        val token = ++downloadToken
         scanButton.isEnabled = false
+        modelPickerEnabled(false)
+        cta.isEnabled = true
+        cta.setText(R.string.setup_model_cancel)
+        cta.setOnClickListener { cancelDownload() }
         val downloader = ModelDownloader(transport, modelStore())
         thread(isDaemon = true, name = "idiolect-model-download") {
             runCatching {
-                downloader.download { downloaded, total ->
-                    val pct = if (total > 0) (downloaded * 100 / total).toInt() else 0
-                    runOnUiThread { status.text = getString(R.string.setup_model_progress, pct) }
+                // Gate the install itself, not just the UI: a cancel/supersede that lands after
+                // the bytes verify must leave nothing installed (throws, swallowed below).
+                downloader.download(isCancelled = { token != downloadToken }) { downloaded, total ->
+                    if (token != downloadToken) return@download // cancelled / superseded
+                    val line = DownloadProgress.label(downloaded, total)
+                    runOnUiThread { if (token == downloadToken) status.text = getString(R.string.setup_model_progress, line) }
                 }
             }.onSuccess {
+                if (token != downloadToken) return@onSuccess
                 pcEndpoint?.let {
                     SecureSyncConfig.keystoreBacked(filesDir).save(SyncSettings(it.url, it.token, it.pin))
                 }
-                runOnUiThread { render() } // a model is installed now → Ready
+                runOnUiThread { if (token == downloadToken) render() } // a model is installed now → Ready
             }.onFailure { error ->
+                if (token != downloadToken) return@onFailure
                 runOnUiThread {
-                    status.text = getString(R.string.setup_model_error, error.message ?: "")
-                    cta.isEnabled = true
-                    scanButton.isEnabled = true
+                    if (token == downloadToken) {
+                        status.text = getString(R.string.setup_model_error, error.message ?: "")
+                        restoreDownloadCta()
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Abandon the in-flight download's UI immediately so the screen never feels frozen. The
+     * daemon thread finishes streaming the (small) file and is then discarded by the token check
+     * — nothing is installed and the form is usable again to retry or switch model.
+     */
+    private fun cancelDownload() {
+        downloadToken++
+        status.setText(R.string.setup_model_cancelled)
+        restoreDownloadCta()
+    }
+
+    /** Put the model step's CTA back to "Download" (after an error or a cancel). */
+    private fun restoreDownloadCta() {
+        scanButton.isEnabled = true
+        modelPickerEnabled(true)
+        cta.isEnabled = true
+        cta.setText(R.string.setup_model_cta)
+        cta.setOnClickListener { onDownloadTapped() }
     }
 
     /** The PC pairing client: the keystore-backed sync config and this install's device id. */
@@ -355,6 +409,86 @@ class SetupActivity : ComponentActivity() {
         textSize = 14f
         setTextColor(color(R.color.idiolect_muted))
         gravity = Gravity.CENTER
+    }
+
+    /** Build the (initially hidden) tiny/base model chooser shown on the DownloadModel step. */
+    private fun buildModelPicker() {
+        modelPicker = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(
+                TextView(this@SetupActivity).apply {
+                    setText(R.string.setup_model_picker_title)
+                    textSize = 12f
+                    letterSpacing = 0.06f
+                    setTypeface(typeface, Typeface.BOLD)
+                    setTextColor(color(R.color.idiolect_accent_bright))
+                    setPadding(0, 0, 0, dp(6))
+                },
+            )
+        }
+        PublicModelCatalog.options.forEach { option ->
+            val row = modelRow(option)
+            modelRows.add(row)
+            modelPicker.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
+        }
+        renderModelSelection()
+    }
+
+    /** One selectable model row: a radio dot + the catalog label/size/blurb; tap selects it. */
+    private fun modelRow(option: PublicModelOption): View {
+        val dot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(12); topMargin = dp(3) }
+        }
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                TextView(this@SetupActivity).apply {
+                    text = "${option.label} · ${option.sizeLabel}"
+                    textSize = 15f
+                    setTextColor(color(R.color.idiolect_text))
+                },
+            )
+            addView(
+                TextView(this@SetupActivity).apply {
+                    text = option.blurb
+                    textSize = 12f
+                    setTextColor(color(R.color.idiolect_muted))
+                },
+            )
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ContextCompat.getDrawable(this@SetupActivity, R.drawable.review_field_bg)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            tag = option
+            addView(dot)
+            addView(texts)
+            setOnClickListener {
+                if (isEnabled) {
+                    selectedModel = option
+                    renderModelSelection()
+                }
+            }
+        }
+    }
+
+    /** Light the selected row's dot accent, the others slate. */
+    private fun renderModelSelection() {
+        modelRows.forEach { row ->
+            val option = row.tag as PublicModelOption
+            (row as LinearLayout).getChildAt(0).background =
+                oval(if (option == selectedModel) R.color.idiolect_accent else R.color.idiolect_slate)
+        }
+    }
+
+    /** Dim + lock the picker while a download is running (re-enabled on success/cancel/error). */
+    private fun modelPickerEnabled(enabled: Boolean) {
+        modelRows.forEach { row ->
+            row.isEnabled = enabled
+            row.alpha = if (enabled) 1f else 0.5f
+        }
     }
 
     private fun buildDots() {

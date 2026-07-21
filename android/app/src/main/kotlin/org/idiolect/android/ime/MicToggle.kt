@@ -9,6 +9,9 @@ interface RecordingToggle {
 
     /** Begin a continuous take (the mic's double-tap): `IdiolectCore.startContinuous`. */
     fun startContinuous()
+
+    /** Discard the current take without finalizing (`IdiolectCore.cancel`): nothing persists. */
+    fun cancel()
 }
 
 /** Start/stop of a dictation take's capture (satisfied by [DictationController]). */
@@ -36,45 +39,101 @@ class MicToggle(
     private val core: RecordingToggle,
     private val capture: CaptureControl,
     private val executor: Executor,
+    // Gate on *starting* a take. Returns false to refuse (a password/PIN field): the secret take
+    // must never reach the core, which would persist its audio, history and a training row.
+    // Stopping is never gated — a running take must always finalize cleanly.
+    private val canStart: () -> Boolean = { true },
 ) {
+    /** Whether the take currently running on the core was started by THIS toggle. The core is
+     *  process-wide (the IME and the recognition surfaces share it), and cancel() is destructive
+     *  — discarding another surface's take throws away that user's in-flight dictation — so only
+     *  the owner may cancel. Confined to the executor thread. Best-effort: a foreign surface
+     *  finalizing our take leaves it stale until the next start (the documented cross-surface
+     *  residual); stop/finalize stays unguarded, as a finalize loses nothing. */
+    private var ownsTake = false
+
     /** Single tap: toggle — start a one-shot take if idle, stop + finalize if recording. */
-    fun onTap() {
-        executor.execute {
-            if (core.isRecording()) stopSequence() else startSequence()
+    fun onTap() = submit {
+        when {
+            core.isRecording() -> stopSequence()
+            canStart() -> startSequence()
         }
     }
 
-    /** Press-and-hold begins: ensure a take is recording (idempotent under rapid edges). */
-    fun startHold() {
-        executor.execute {
-            if (!core.isRecording()) startSequence()
-        }
+    /**
+     * Press-and-hold begins: ensure a take is recording (idempotent under rapid edges).
+     *
+     * [onRefused] runs (on the executor) when NO capture was started — the core is already
+     * recording, or the start gate refused. The IME's hold gesture ignores it (a re-hold over
+     * its own live take is the idempotent case). The recognition surfaces MUST observe it: for
+     * them the recording core is a *foreign* take, and the silent no-op left their caller
+     * hanging forever on a capture that never opened (this executor-confined check is the
+     * authoritative "did we get the core", after any begin-time admission check has raced).
+     */
+    fun startHold(onRefused: () -> Unit = {}) = submit {
+        if (!core.isRecording() && canStart()) startSequence() else onRefused()
     }
 
     /** Hold released, or a stop tap: ensure the take is stopped and finalized. */
-    fun stop() {
-        executor.execute {
-            if (core.isRecording()) stopSequence()
+    fun stop() = submit {
+        // No take to stop ⇒ no ownership to claim: drop a stale flag left by a foreign surface
+        // finalizing our take, so a later cancel() can't discard a take we didn't start.
+        if (core.isRecording()) stopSequence() else ownsTake = false
+    }
+
+    /**
+     * Abort the current take without finalizing — discard it in the core, then drain capture;
+     * nothing is decoded or persisted. Used when focus lands on a learning-blocked field while
+     * a take (typically continuous) is still recording (a finalize there would persist audio,
+     * history and a training row), and when a recognition caller abandons its take (back-press,
+     * `SpeechRecognizer.cancel()`, host teardown), where a finalize would burn a whole whisper
+     * decode on a result the session only suppresses. Only acts on a take THIS toggle started
+     * ([ownsTake]): a misrouted failure or a teardown while a foreign surface's take records
+     * must not destroy that user's dictation.
+     */
+    fun cancel() = submit {
+        if (ownsTake && core.isRecording()) {
+            // Cancel the core FIRST so it stops accepting and finalizing frames, THEN drain
+            // capture — the pump's remaining pushes are rejected (NoActiveTake) and harmlessly
+            // dropped, so no blocked-field speech is committed. This is the *opposite* order to
+            // stop(), which must drain-then-finalize so a real take loses no audio.
+            //
+            // core.cancel() throws NoActiveTake if a stop on another surface (the shared core is
+            // process-wide — the recognition service drives it too) raced our isRecording() check;
+            // swallow it so the executor thread never dies. Capture is still stopped either way.
+            runCatching { core.cancel() }
+            capture.stop()
+        }
+        ownsTake = false
+    }
+
+    /** Double-tap: begin a continuous take (ignored if one is already running or refused). */
+    fun startContinuous() = submit {
+        if (!core.isRecording() && canStart()) {
+            core.startContinuous()
+            capture.start()
+            ownsTake = true
         }
     }
 
-    /** Double-tap: begin a continuous take (ignored if one is already running). */
-    fun startContinuous() {
-        executor.execute {
-            if (!core.isRecording()) {
-                core.startContinuous()
-                capture.start()
-            }
-        }
+    /**
+     * Run [task] on the executor, tolerating a shut-down executor. During teardown a late gesture
+     * timer can fire after `toggleExecutor.shutdown()`; the rejected task is a harmless no-op, not
+     * an uncaught `RejectedExecutionException` that would crash the app.
+     */
+    private fun submit(task: () -> Unit) {
+        runCatching { executor.execute(task) }
     }
 
     private fun startSequence() {
         core.toggle()
         capture.start()
+        ownsTake = true
     }
 
     private fun stopSequence() {
         capture.stop()
         core.toggle()
+        ownsTake = false
     }
 }

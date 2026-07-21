@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -121,7 +121,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -138,14 +138,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-pr-
+            ${{ runner.os }}-cargo-portable-pr-
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev \
+            libx11-dev libxkbcommon-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -159,6 +160,14 @@ jobs:
       - name: Run tests (quick - no doc tests, no coverage)
         run: cargo test --workspace --all-targets --features idiolect-ibus/ibus-engine
 
+      # A full workspace build unifies Cargo features, so a GUI crate missing
+      # its eframe windowing backend (x11/wayland) still links one from a
+      # sibling and looks fine — while an isolated build of that crate produces
+      # a binary that cannot open a window. Build each GUI binary alone to catch
+      # that before it reaches a user's desktop.
+      - name: Check GUI crates build standalone
+        run: bash ci/scripts/test-gui-crates-build-standalone.sh
+
   # =========================================================================
   # FCITX5: Quick validation
   # =========================================================================
@@ -168,7 +177,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -196,7 +205,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -213,9 +222,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-pr-
+            ${{ runner.os }}-cargo-portable-pr-
 
       - name: Run interface leakage check
         run: bash ci/scripts/test-interface-no-backend-leakage.sh
@@ -229,7 +238,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -246,9 +255,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-pr-
+            ${{ runner.os }}-cargo-portable-pr-
 
       - name: Run real adapter dependency check
         run: bash ci/scripts/test-real-adapter-deps.sh
@@ -263,7 +272,7 @@ jobs:
     needs: [rust-quick, fcitx5-quick]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -280,9 +289,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-pr-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-pr-
+            ${{ runner.os }}-cargo-portable-pr-
 
       - name: Install system dependencies
         run: |
@@ -297,6 +306,52 @@ jobs:
 
       - name: Run coverage map validation
         run: bash ci/scripts/test-coverage-map.sh
+
+  # =========================================================================
+  # DESKTOP APP CROSS-PLATFORM CHECK (idiolect-app on macOS)
+  #
+  # Verifies the idiolect-app dashboard compiles and its tests pass on macOS.
+  # Windows build is covered by the full CI matrix; PR validation uses macOS
+  # as the representative non-Linux check (faster; no system dep installs).
+  # =========================================================================
+  desktop-app-cross-platform:
+    name: Desktop App Cross-Platform (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-portable-pr-
+
+      - name: Clippy idiolect-app (warnings as errors)
+        run: |
+          cargo clippy \
+            -p idiolect-app -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            --all-targets -- -D warnings
+
+      - name: Test idiolect-app
+        run: |
+          cargo test \
+            -p idiolect-app -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            --all-targets
 
   # =========================================================================
   # PR VALIDATION SUMMARY
@@ -314,6 +369,7 @@ jobs:
       - interface-leakage
       - real-adapter-deps
       - coverage-map
+      - desktop-app-cross-platform
     if: always()
     steps:
       - name: Check all required jobs succeeded
@@ -326,7 +382,8 @@ jobs:
              [[ "${{ needs.fcitx5-quick.result }}" != "success" ]] || \
              [[ "${{ needs.interface-leakage.result }}" != "success" ]] || \
              [[ "${{ needs.real-adapter-deps.result }}" != "success" ]] || \
-             [[ "${{ needs.coverage-map.result }}" != "success" ]]; then
+             [[ "${{ needs.coverage-map.result }}" != "success" ]] || \
+             [[ "${{ needs.desktop-app-cross-platform.result }}" != "success" ]]; then
             echo "::error::One or more PR validation checks failed"
             exit 1
           fi

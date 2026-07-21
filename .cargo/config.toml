@@ -4,3 +4,15 @@ rustdocflags = ["-D", "warnings"]
 
 [term]
 color = "auto"
+
+# whisper.cpp (ggml) defaults to GGML_NATIVE=ON, i.e. -march=native: the binary then
+# requires the *build* machine's ISA (e.g. AVX-512) and SIGILLs on any lesser CPU. CI
+# shares target/ caches across GitHub's mixed-ISA runner fleet and the release
+# workflows ship these binaries, so every build must target the portable baseline.
+# whisper-rs-sys forwards GGML_* env vars to CMake; the real environment wins over
+# this default, so a machine-local perf build is `GGML_NATIVE=ON cargo build ...`.
+# NOTE: cargo does not fingerprint this env for whisper-rs-sys — changing any GGML_*
+# value here requires bumping the cargo-portable cache namespace in .github/workflows/
+# (enforced by ci/scripts/test-hermetic-build.sh).
+[env]
+GGML_NATIVE = "OFF"

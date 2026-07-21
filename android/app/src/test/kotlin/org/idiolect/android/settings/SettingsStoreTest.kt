@@ -54,6 +54,21 @@ class SettingsStoreTest {
     }
 
     @Test
+    fun quick_launch_defaults_on_so_the_floating_mic_actually_dictates() {
+        // The floating accessibility button used to do nothing; with this on, a tap dictates.
+        assertTrue("quick-launch mic defaults on", newStore().quickLaunchEnabled())
+    }
+
+    @Test
+    fun quick_launch_round_trips() {
+        val store = newStore()
+        store.setQuickLaunchEnabled(false)
+        assertFalse(store.quickLaunchEnabled())
+        store.setQuickLaunchEnabled(true)
+        assertTrue(store.quickLaunchEnabled())
+    }
+
+    @Test
     fun flags_are_independent() {
         val store = newStore()
         store.setReviewByDefault(true)

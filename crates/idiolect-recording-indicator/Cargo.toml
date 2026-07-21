@@ -17,7 +17,7 @@ path = "src/main.rs"
 # becomes a normal, focus-stealing, dock-listed window. See `viewport()` in main.rs.
 # `wayland` is intentionally omitted: these run as X11/Xwayland clients, so it adds
 # the smithay-clipboard/wayland stack for no benefit here.
-eframe = { version = "0.28", default-features = false, features = ["glow", "x11"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "x11"] }
 
 [lints]
 workspace = true

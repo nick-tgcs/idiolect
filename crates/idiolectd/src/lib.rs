@@ -6,6 +6,7 @@ mod retention_dialog;
 mod run_loop;
 pub mod runtime;
 mod settings_launcher;
+mod sync_panel_launcher;
 
 mod adapters;
 

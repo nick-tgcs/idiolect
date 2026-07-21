@@ -1,16 +1,29 @@
 package org.idiolect.android.accessibility
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityButtonController
 import android.accessibilityservice.AccessibilityService
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.InputMethodManager
+import android.widget.Toast
+import androidx.annotation.VisibleForTesting
+import org.idiolect.android.R
 import org.idiolect.android.ime.EnabledKeyboard
 import org.idiolect.android.ime.ImeReturn
 import org.idiolect.android.ime.ImeSelection
+import org.idiolect.android.model.ModelStore
+import org.idiolect.android.recognition.CoreRecognitionTake
+import org.idiolect.android.recognition.RecognitionError
+import org.idiolect.android.recognition.RecognitionOutput
+import org.idiolect.android.recognition.RecognitionPreconditions
+import org.idiolect.android.recognition.RecognitionTake
+import org.idiolect.android.settings.SettingsStore
 import java.io.File
 
 /**
@@ -32,7 +45,27 @@ import java.io.File
 class IdiolectAccessibilityService : AccessibilityService() {
     private val queue: InjectQueue by lazy { InjectQueue(File(filesDir, PENDING_FILE)) }
 
+    /** Marshals recognition callbacks (core/load threads) back to the main thread for node work. */
+    private val main = Handler(Looper.getMainLooper())
+
+    /** A live quick-launch take, or null when idle. Non-null ⇒ a take is listening/transcribing. */
+    @VisibleForTesting
+    internal var quickTake: RecognitionTake? = null
+
+    private val quickLaunchButton = object : AccessibilityButtonController.AccessibilityButtonCallback() {
+        override fun onClicked(controller: AccessibilityButtonController) = onQuickLaunchButton()
+    }
+
     override fun onInterrupt() = Unit
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        // Make Android's floating accessibility button — when the user has pointed it at idiolect —
+        // start dictation instead of doing nothing (the reported "quick-launch does nothing" bug).
+        // Registering the callback routes its taps to onClicked; flagRequestAccessibilityButton in
+        // accessibility_service.xml makes idiolect an eligible target.
+        runCatching { accessibilityButtonController.registerAccessibilityButtonCallback(quickLaunchButton) }
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -126,6 +159,99 @@ class IdiolectAccessibilityService : AccessibilityService() {
             },
         )
         return true
+    }
+
+    // --- Quick-launch: the floating accessibility button → dictate into the focused field -------
+
+    /**
+     * A tap on Android's floating accessibility button. Honours the in-app toggle for starting
+     * (a live take is always stoppable — see [QuickLaunch]), then tap-to-start / tap-to-stop a
+     * take. The transcript lands in whatever field is focused via the same [inject] path the
+     * review flow uses — so quick-launch works in any app without switching the keyboard.
+     */
+    private fun onQuickLaunchButton() {
+        val enabled = SettingsStore.under(filesDir).quickLaunchEnabled()
+        when (QuickLaunch.decide(enabled = enabled, recording = quickTake != null)) {
+            QuickLaunchAction.Disabled -> toast(getString(R.string.quicklaunch_disabled))
+            QuickLaunchAction.Stop -> {
+                toast(getString(R.string.quicklaunch_transcribing))
+                quickTake?.stopListening()
+            }
+            QuickLaunchAction.Start -> startQuickLaunch()
+        }
+    }
+
+    /** Begin a take (mic + model permitting); the transcript arrives at [onQuickResult]. */
+    private fun startQuickLaunch() {
+        val model = ModelStore(File(filesDir, "models/whisper")).active()
+        val blocker = RecognitionPreconditions.blocker(hasMicPermission(), model != null)
+        if (blocker != null) {
+            val message = if (blocker == RecognitionError.MIC_PERMISSION) {
+                R.string.quicklaunch_mic_needed
+            } else {
+                R.string.recognize_no_model
+            }
+            toast(getString(message))
+            return
+        }
+        if (model == null) return // unreachable once blocker is null; satisfies null-safety
+        val take = CoreRecognitionTake(this)
+        quickTake = take
+        toast(getString(R.string.quicklaunch_listening))
+        take.begin(
+            model,
+            object : RecognitionOutput {
+                override fun onReadyForSpeech() = Unit
+                override fun onResult(text: String) {
+                    main.post { onQuickResult(text) }
+                }
+
+                override fun onError(error: RecognitionError) {
+                    main.post { onQuickError(error) }
+                }
+            },
+        )
+    }
+
+    /** Splice the finished transcript into the focused field; nudge the user if there isn't one. */
+    private fun onQuickResult(text: String) {
+        val field = focusedHostField()
+        val landed = field != null && inject(field, text)
+        if (!landed) toast(getString(R.string.quicklaunch_no_field))
+        finishQuickTake()
+    }
+
+    private fun onQuickError(error: RecognitionError) {
+        val message = when (error) {
+            RecognitionError.NO_SPEECH -> R.string.recognize_no_speech
+            RecognitionError.MIC_PERMISSION -> R.string.quicklaunch_mic_needed
+            RecognitionError.MODEL_MISSING -> R.string.recognize_no_model
+            RecognitionError.BUSY -> R.string.recognize_busy
+            RecognitionError.FAILED -> R.string.recognize_failed
+        }
+        toast(getString(message))
+        finishQuickTake()
+    }
+
+    private fun finishQuickTake() {
+        // Cancel BEFORE release: release() drops the core reference but does not stop a
+        // still-listening capture, so a take live at destroy time would keep the mic running
+        // with no owner. cancel() is a no-op once a result/error already spent the session.
+        quickTake?.cancel()
+        quickTake?.release()
+        quickTake = null
+    }
+
+    private fun hasMicPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onDestroy() {
+        finishQuickTake()
+        super.onDestroy()
     }
 
     companion object {

@@ -141,6 +141,34 @@ fn daemon_survives_a_client_connection_reset() {
 }
 
 #[test]
+fn daemon_survives_a_client_reset_racing_its_writes() {
+    // The same reset class as above, but with NO grace period: dropping the
+    // socket immediately after `start` makes the daemon's own responses
+    // (ServerHello, recording status, preedit) race the RST, so the reset can
+    // surface on a daemon WRITE (EPIPE) rather than on its read — the
+    // interleaving CI hit on a slow runner. Which side sees the reset first is
+    // kernel timing; the daemon must exit cleanly either way.
+    let fixture = DaemonFixture::new("reset-write-race");
+    let daemon = fixture.spawn_daemon();
+    {
+        let mut stream = connect_client(&fixture.socket_path());
+        let hello = encode_json_line(&IpcMessage::ClientHello(ClientHello {
+            client_name: "idiolect-reset-race-test".to_owned(),
+            protocol_version: 1,
+            features: vec!["preedit".to_owned(), "commit".to_owned()],
+        }))
+        .expect("encode hello");
+        stream.write_all(hello.as_bytes()).expect("write hello");
+        let start = encode_json_line(&IpcMessage::StartRecording).expect("encode start");
+        stream.write_all(start.as_bytes()).expect("write start");
+        stream.flush().expect("flush");
+        // drop(stream) with the daemon's responses unread -> RST in flight
+        // while the daemon is still writing.
+    }
+    assert_daemon_exits_successfully(daemon);
+}
+
+#[test]
 fn daemon_rebinds_over_a_stale_socket_file() {
     // A previous daemon that exited uncleanly (or was killed) can leave the unix
     // socket file behind. The daemon must unlink it before binding, otherwise the

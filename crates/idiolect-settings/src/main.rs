@@ -68,6 +68,7 @@ struct Model {
     max_phrase: Choice,
     auto_stop: Choice,
     review_mode: bool,
+    preview_typing: bool,
     translation_enabled: bool,
     input_lang: Choice,
     output_lang: Choice,
@@ -120,6 +121,8 @@ impl Model {
             max_phrase: Choice::new(timing_radio(&MAX_PHRASE_CHOICES_MS, max_phrase_ms, 30_000)),
             auto_stop: Choice::new(timing_radio(&AUTO_STOP_CHOICES_MS, auto_stop_ms, 0)),
             review_mode: bool_field(&state, "review_mode", false),
+            // Default ON: absent ⇒ live preview typing, matching the daemon.
+            preview_typing: bool_field(&state, "preview_typing", true),
             translation_enabled: bool_field(&state, "translation_enabled", false),
             input_lang: Choice::new(translation_input_radio(input_lang)),
             output_lang: Choice::new(translation_output_radio(output_lang)),
@@ -156,6 +159,11 @@ impl Model {
     fn toggle_review(&mut self) -> String {
         self.review_mode = !self.review_mode;
         "review_mode".to_owned()
+    }
+
+    fn toggle_preview_typing(&mut self) -> String {
+        self.preview_typing = !self.preview_typing;
+        "preview_typing".to_owned()
     }
 
     fn toggle_translation(&mut self) -> String {
@@ -256,7 +264,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 144, 161);
 fn install_theme(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -279,16 +287,16 @@ fn install_theme(ctx: &egui::Context) {
     .into();
 
     let mut v = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(8.0);
+    let corner_radius = egui::CornerRadius::same(8);
     v.window_fill = BG;
     v.panel_fill = BG;
     v.extreme_bg_color = FIELD;
     v.override_text_color = Some(TEXT);
-    v.widgets.noninteractive.rounding = rounding;
-    v.widgets.inactive.rounding = rounding;
-    v.widgets.hovered.rounding = rounding;
-    v.widgets.active.rounding = rounding;
-    v.widgets.open.rounding = rounding;
+    v.widgets.noninteractive.corner_radius = corner_radius;
+    v.widgets.inactive.corner_radius = corner_radius;
+    v.widgets.hovered.corner_radius = corner_radius;
+    v.widgets.active.corner_radius = corner_radius;
+    v.widgets.open.corner_radius = corner_radius;
     v.widgets.inactive.bg_fill = SURFACE;
     v.widgets.inactive.weak_bg_fill = SURFACE;
     let surface_hover = egui::Color32::from_rgb(44, 47, 60);
@@ -299,7 +307,7 @@ fn install_theme(ctx: &egui::Context) {
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 /// How long the window must stay unfocused AND stationary before a focus-loss is
@@ -382,7 +390,9 @@ fn emit(action: &str) {
 }
 
 impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // "Click off" closes the window, like the menu it replaces — but a window
         // manager title-bar *move* also drops focus (while streaming the new
         // position), so dismissal is debounced through `Dismiss`: it fires only on
@@ -405,11 +415,11 @@ impl eframe::App for SettingsApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(BG)
-                    .inner_margin(egui::Margin::same(18.0)),
+                    .inner_margin(egui::Margin::same(18)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -454,7 +464,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_source(id)
+                egui::ComboBox::from_id_salt(id)
                     .selected_text(selected_label.to_owned())
                     .width(170.0)
                     .show_ui(ui, |ui| {
@@ -491,6 +501,23 @@ impl SettingsApp {
             egui::RichText::new(
                 "On: the take collects in a dialog you edit and confirm before anything is typed. \
                  Off: each phrase types straight into the app as you pause.",
+            )
+            .small()
+            .color(MUTED),
+        );
+
+        let mut preview = self.model.preview_typing;
+        if ui
+            .checkbox(&mut preview, egui::RichText::new("Preview typing").strong())
+            .changed()
+        {
+            emit(&self.model.toggle_preview_typing());
+        }
+        ui.label(
+            egui::RichText::new(
+                "On: words appear as you speak, then the whole phrase is replaced with the \
+                 verified text when you stop. Off: nothing is typed until you stop, then the \
+                 verified text is inserted once. (Ignored in review mode.)",
             )
             .small()
             .color(MUTED),
@@ -662,7 +689,7 @@ mod tests {
     use super::*;
 
     const STATE: &str = r#"{"pause_ms":700,"min_speech_ms":250,"max_phrase_ms":30000,
-        "auto_stop_ms":0,"review_mode":true,"translation_enabled":true,
+        "auto_stop_ms":0,"review_mode":true,"preview_typing":false,"translation_enabled":true,
         "input_lang":"auto","output_lang":"zh","translator_configured":false,
         "retention_days":30,"max_entries":25,"training_retention_days":365}"#;
 
@@ -672,6 +699,10 @@ mod tests {
         assert_eq!(model.pause.current_label(), "0.7 s (default)");
         assert_eq!(model.auto_stop.current_label(), "Never (default)");
         assert!(model.review_mode);
+        assert!(
+            !model.preview_typing,
+            "the state line says preview typing off"
+        );
         assert!(model.translation_enabled);
         assert_eq!(model.input_lang.current_label(), "Auto detect");
         assert_eq!(model.output_lang.current_label(), "Chinese");
@@ -685,6 +716,10 @@ mod tests {
         let model = Model::from_json_line("not json at all");
         assert_eq!(model.pause.current_label(), "0.7 s (default)");
         assert!(!model.review_mode);
+        assert!(
+            model.preview_typing,
+            "preview typing defaults ON when the daemon omits it"
+        );
         assert_eq!(model.output_lang.current_label(), "English");
     }
 
@@ -703,6 +738,7 @@ mod tests {
             Some("settings:auto_stop:1")
         );
         assert_eq!(model.toggle_review(), "review_mode");
+        assert_eq!(model.toggle_preview_typing(), "preview_typing");
         assert_eq!(model.toggle_translation(), "translation:enabled");
         assert_eq!(
             model.pick_input_language(1).as_deref(),

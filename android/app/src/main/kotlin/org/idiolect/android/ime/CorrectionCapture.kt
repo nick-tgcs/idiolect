@@ -22,6 +22,18 @@ class CorrectionCapture(
     @Synchronized
     fun currentChips(): List<WordChip> = chips
 
+    /**
+     * Drop any pending baseline and chips. Used when the focus moves through a password/PIN
+     * field: the committed take must not be carried forward and later amended with an unrelated
+     * field's text (which would mint a syncable pair from a secret). A following [capture]
+     * reports nothing until a new take arms the baseline again.
+     */
+    @Synchronized
+    fun disarm() {
+        baseline = null
+        chips = emptyList()
+    }
+
     /** A take committed: this becomes the raw baseline and the strip's chips. */
     @Synchronized
     fun onTakeCommitted(text: String): List<WordChip> {

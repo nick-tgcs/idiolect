@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Delete key: a slate disc (the grey glyph sits on top), a smaller sibling of the mic disc. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="@color/idiolect_slate" />
+</shape>

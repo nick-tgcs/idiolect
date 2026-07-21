@@ -26,6 +26,7 @@ install -m 0755 target/release/idiolect-cli "${package_root}/usr/bin/idiolect"
 install -m 0755 target/release/idiolect-cli "${package_root}/usr/bin/idiolect-cli"
 install -m 0755 target/release/idiolectd "${package_root}/usr/bin/idiolectd"
 install -m 0755 target/release/idiolect-trainerctl "${package_root}/usr/bin/idiolect-train"
+install -m 0755 packaging/debian/usr/bin/idiolect-crash-notify "${package_root}/usr/bin/idiolect-crash-notify"
 install -m 0755 fcitx5/idiolect-fcitx5/build/libidiolect-fcitx5.so "${package_root}/usr/lib/fcitx5/idiolect.so"
 install -m 0644 fcitx5/idiolect-fcitx5/data/idiolect-addon.conf "${package_root}/usr/share/fcitx5/addon/idiolect.conf"
 install -m 0644 fcitx5/idiolect-fcitx5/data/idiolect.conf "${package_root}/usr/share/fcitx5/inputmethod/idiolect.conf"
@@ -45,6 +46,7 @@ required_entries=(
   './usr/bin/idiolect-cli'
   './usr/bin/idiolectd'
   './usr/bin/idiolect-train'
+  './usr/bin/idiolect-crash-notify'
   './usr/lib/fcitx5/idiolect.so'
   './usr/lib/systemd/user/idiolectd.service'
   './usr/share/fcitx5/addon/idiolect.conf'

@@ -26,13 +26,18 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import org.idiolect.android.R
 import org.idiolect.android.ime.IdiolectImeService
+import org.idiolect.android.model.DownloadProgress
+import org.idiolect.android.model.ModelDownloader
 import org.idiolect.android.model.ModelStore
+import org.idiolect.android.model.PublicModelCatalog
+import org.idiolect.android.model.PublicModelOption
 import org.idiolect.android.sync.DeviceId
 import org.idiolect.android.sync.PairingClient
 import org.idiolect.android.sync.PairingDeepLink
 import org.idiolect.android.sync.ScanPairing
 import org.idiolect.android.sync.SecureSyncConfig
 import org.idiolect.android.sync.SyncSettings
+import org.idiolect.android.ui.EdgeToEdge
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -55,6 +60,12 @@ class SettingsActivity : ComponentActivity() {
     /** Whether the unpaired card's manual-entry sub-form is expanded (a session-local toggle). */
     private var manualExpanded = false
 
+    /** Bumped per model download so a superseded switch's late UI updates are ignored. */
+    // Written on the UI thread (start/supersede), read on the daemon download thread's isCancelled
+    // gate — @Volatile gives the happens-before edge so a supersede is never missed.
+    @Volatile
+    private var modelDownloadToken = 0
+
     /** The FOSS QR scanner; a decoded pairing QR drives [onScanned], a cancel is ignored. */
     private val scanLauncher: ActivityResultLauncher<ScanOptions> =
         registerForActivityResult(ScanContract()) { result ->
@@ -72,12 +83,14 @@ class SettingsActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(28))
         }
-        setContentView(
-            ScrollView(this).apply {
-                setBackgroundColor(bg)
-                addView(content, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            },
-        )
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(bg)
+            addView(content, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        setContentView(scroll)
+        // targetSdk 35 draws under the status/nav bars; inset the scroll root so the header
+        // and the first card are not hidden behind the clock (the "top gets cut off" bug).
+        EdgeToEdge.enable(this, scroll)
         // A re-pair `idiolect://pair` link (the same one the PC's QR encodes), forwarded here by
         // [SetupActivity] once the device is already paired, enrols straight away — the camera-free
         // path that makes the ⚙ re-pair testable on an emulator and lets a tapped link land in
@@ -111,6 +124,7 @@ class SettingsActivity : ComponentActivity() {
                 reviewByDefault = store.reviewByDefault(),
                 continuousOnDoubleTap = store.continuousOnDoubleTap(),
                 shipCorrections = store.shipCorrections(),
+                quickLaunchMic = store.quickLaunchEnabled(),
             )
             val system = SystemStatus(isEnabled(), isSelected(), hasMicPermission())
             val audioUsed = AudioUsage.bytesOnDisk(File(filesDir, "audio"))
@@ -123,7 +137,7 @@ class SettingsActivity : ComponentActivity() {
         content.removeAllViews()
         content.addView(screenTitle())
         content.addView(connectionCard(state.connection))
-        content.addView(modelCard(state.modelLabel))
+        content.addView(modelCard(state))
         content.addView(dictationCard(state))
         content.addView(learningCard(state))
         content.addView(audioCard(state.audioLabel))
@@ -192,8 +206,72 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    private fun modelCard(label: String): View =
-        card(R.string.settings_section_model).apply { addView(bodyText(label, R.color.idiolect_text)) }
+    /**
+     * The speech-model card: the active model, plus a one-tap switch/download for each other
+     * catalog option (tiny ⇄ base). Switching re-downloads from the public CDN with inline
+     * progress and relabels on success — the runtime half of "let the user pick their model".
+     */
+    private fun modelCard(state: SettingsViewState): View {
+        val card = card(R.string.settings_section_model)
+        card.addView(bodyText(state.modelLabel, R.color.idiolect_text))
+        val status = bodyText("", R.color.idiolect_muted).apply { visibility = View.GONE }
+        PublicModelCatalog.options
+            .filter { it.id != state.modelId }
+            .forEach { option ->
+                val textRes = if (state.modelId == null) R.string.settings_model_get else R.string.settings_model_switch
+                card.addView(
+                    modelButton(getString(textRes, option.label, option.sizeLabel)) {
+                        downloadModel(option, status)
+                    },
+                )
+            }
+        card.addView(status)
+        return card
+    }
+
+    /**
+     * Download (and switch to) [option], reporting progress inline in [status]. A newer request
+     * supersedes any in-flight one (the token guard) so rapid taps don't cross streams; on
+     * success the screen re-reads device state, which relabels the now-active model.
+     */
+    private fun downloadModel(option: PublicModelOption, status: TextView) {
+        val token = ++modelDownloadToken
+        status.visibility = View.VISIBLE
+        status.text = getString(R.string.settings_model_downloading, DownloadProgress.label(0, option.size))
+        thread(isDaemon = true, name = "idiolect-settings-model") {
+            runCatching {
+                // Gate the install on the token, not just the UI: a superseded download (the user
+                // picked another model) must leave nothing installed rather than let an older pick win.
+                ModelDownloader(option.transport(), modelStore()).download(
+                    isCancelled = { token != modelDownloadToken },
+                ) { downloaded, total ->
+                    if (token != modelDownloadToken) return@download
+                    val line = DownloadProgress.label(downloaded, total)
+                    runOnUiThread { if (token == modelDownloadToken) status.text = getString(R.string.settings_model_downloading, line) }
+                }
+            }.onSuccess {
+                if (token == modelDownloadToken) refresh()
+            }.onFailure { error ->
+                if (token == modelDownloadToken) {
+                    runOnUiThread { status.text = getString(R.string.settings_model_error, error.message ?: "") }
+                }
+            }
+        }
+    }
+
+    /** A full-width pill button used by the model card's switch/download actions. */
+    private fun modelButton(text: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(ContextCompat.getColor(this@SettingsActivity, R.color.idiolect_text))
+            background = ContextCompat.getDrawable(this@SettingsActivity, R.drawable.strip_pill)
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(8) }
+        }
 
     private fun dictationCard(state: SettingsViewState): View {
         val card = card(R.string.settings_section_dictation)
@@ -205,6 +283,11 @@ class SettingsActivity : ComponentActivity() {
         card.addView(
             toggleRow(R.string.settings_continuous_label, R.string.settings_continuous_sub, state.continuousOn) { on ->
                 settingsStore().setContinuousOnDoubleTap(on)
+            },
+        )
+        card.addView(
+            toggleRow(R.string.settings_quicklaunch_label, R.string.settings_quicklaunch_sub, state.quickLaunchOn) { on ->
+                settingsStore().setQuickLaunchEnabled(on)
             },
         )
         return card

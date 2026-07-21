@@ -17,6 +17,7 @@ class IdiolectImeCallbackTest {
         override fun commitText(text: String) { ops.add("commit:$text") }
         override fun finishComposingText() { ops.add("finish") }
         override fun deleteBackward() { ops.add("delete") }
+        override fun performEditorAction(actionId: Int) { ops.add("action:$actionId") }
         override fun setSelection(start: Int, end: Int) { ops.add("select:$start:$end") }
         override fun fieldText(): String = ""
     }

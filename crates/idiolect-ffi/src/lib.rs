@@ -308,6 +308,13 @@ struct Inner {
     /// one-shot take that commits the whole recording once at stop. Set by
     /// [`IdiolectCore::start_continuous`], cleared when recording stops.
     continuous: bool,
+    /// Whether the live take is **ephemeral** (transcription-only): the system
+    /// speech-recognition surface has no `EditorInfo`, so it cannot tell a password/PIN
+    /// field from any other. An ephemeral take commits its transcript to the field but
+    /// persists nothing — no session/history, no source audio, no `last_commit` — so a
+    /// secret dictated there can never reach history or the training/sync pipeline. Set by
+    /// [`IdiolectCore::toggle_ephemeral`], cleared when recording stops.
+    ephemeral: bool,
     /// The live take while recording.
     take: Option<StreamingTake>,
     /// The full preedit accumulated for the current take (for `setComposingText`).
@@ -391,6 +398,7 @@ impl IdiolectCore {
                 streaming_config: streaming_config_from(&VadConfig::default()),
                 recording: false,
                 continuous: false,
+                ephemeral: false,
                 take: None,
                 preedit: String::new(),
                 preedit_started: false,
@@ -461,6 +469,25 @@ impl IdiolectCore {
             inner.stop_recording()
         } else {
             inner.continuous = false;
+            inner.ephemeral = false;
+            inner.start_recording();
+            Ok(())
+        }
+    }
+
+    /// Toggle a **transcription-only** take (the system speech-recognition surface:
+    /// `ACTION_RECOGNIZE_SPEECH` / `RecognitionService` / quick-launch mic). Identical to
+    /// [`Self::toggle`] except the take is marked ephemeral, so at stop the transcript is
+    /// committed to the field but nothing is persisted — no session/history, no source audio,
+    /// no `last_commit`. That surface has no `EditorInfo`, so it cannot detect a password/PIN
+    /// field; not-persisting is the only safe posture against leaking a dictated secret.
+    pub fn toggle_ephemeral(&self) -> Result<(), FfiError> {
+        let mut inner = self.lock();
+        if inner.recording {
+            inner.stop_recording()
+        } else {
+            inner.continuous = false;
+            inner.ephemeral = true;
             inner.start_recording();
             Ok(())
         }
@@ -476,6 +503,7 @@ impl IdiolectCore {
             return Ok(());
         }
         inner.continuous = true;
+        inner.ephemeral = false;
         inner.start_recording();
         Ok(())
     }
@@ -508,6 +536,7 @@ impl IdiolectCore {
         inner.take = None;
         inner.recording = false;
         inner.continuous = false;
+        inner.ephemeral = false;
         let had_preedit = inner.preedit_started;
         inner.preedit.clear();
         inner.preedit_started = false;
@@ -806,6 +835,7 @@ impl Inner {
         let result = self.finalize_outcome(outcome);
         self.recording = false;
         self.continuous = false;
+        self.ephemeral = false;
         self.preedit.clear();
         self.preedit_started = false;
         self.callback.recording_status(false);
@@ -816,6 +846,14 @@ impl Inner {
     /// pair's audio + digest) and commit it into the field. A silent take stores
     /// nothing.
     fn finalize_outcome(&mut self, outcome: TakeOutcome) -> Result<(), FfiError> {
+        if self.ephemeral {
+            // An ephemeral (transcription-only) take never persists and must not leave a prior
+            // take's correction target armed — a later report_correction could otherwise amend that
+            // stored session with unrelated (secret-adjacent) field text. Applies before the Silent
+            // arm too, so a silent recognition take (no speech / no model / empty capture) disarms
+            // it just the same.
+            self.last_commit = None;
+        }
         let finalized = match outcome {
             TakeOutcome::Silent => {
                 // No usable speech (or no model): clear any live preedit, persist
@@ -829,6 +867,13 @@ impl Inner {
         };
         if let Some(reason) = &finalized.fallback_reason {
             eprintln!("whole-take decode failed at stop; keeping the previewed text: {reason}");
+        }
+        if self.ephemeral {
+            // Transcription-only: hand the text to the field and stop. No session, no source
+            // audio, no digest, no `dictation.commit`, no `last_commit` (cleared above) — this take
+            // may be a password/PIN field we have no `EditorInfo` for, so persisting could leak it.
+            self.callback.commit_text(finalized.final_text);
+            return Ok(());
         }
         let segment = segment_from_samples(&finalized.merged_samples);
         let encoded = self.codec.encode(&segment).map_err(|error| FfiError::Io {
@@ -887,16 +932,18 @@ fn streaming_config_from(vad: &VadConfig) -> StreamingConfig {
     }
 }
 
-/// Decode threads for on-device whisper. [`WhisperOptions`]'s default of one thread
-/// pins inference to a single core, leaving a multi-core phone mostly idle during the
-/// compute-bound matmuls that dominate a take's cost. Use the device's available
-/// parallelism instead, capped to a sane band so we neither pin to one core nor wildly
-/// oversubscribe (extra threads past the physical cores only add fork/join overhead).
+/// Decode threads for on-device whisper. [`WhisperOptions`]'s default of one thread pins
+/// inference to a single core, leaving a multi-core phone mostly idle during the compute-bound
+/// matmuls that dominate a take's cost. Use the device's available parallelism instead, capped
+/// at 4 — whisper.cpp's own default heuristic, `min(4, ncpu)`. Beyond ~4 threads a phone decode
+/// does not get faster, and on a big.LITTLE SoC scheduling extra threads onto the little cores
+/// behind the big ones makes a take *slower* (the parallel join waits on the slowest thread), so
+/// a higher cap was actively hurting. The band is [1, 4].
 fn on_device_decode_threads() -> u32 {
     std::thread::available_parallelism()
         .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
         .unwrap_or(4)
-        .clamp(1, 8)
+        .clamp(1, 4)
 }
 
 /// Wrap raw 16 kHz mono samples as an [`AudioSegment`] for decode/encode.
@@ -921,18 +968,21 @@ mod tests {
     use idiolect_ports::storage::{HistoryEntry, HistoryState};
 
     #[test]
-    fn on_device_decode_threads_uses_available_cores_not_a_single_thread() {
+    fn on_device_decode_threads_caps_at_the_mobile_performance_band() {
         let threads = on_device_decode_threads();
-        assert!(
-            (1..=8).contains(&threads),
-            "threads must stay in [1, 8]: {threads}"
-        );
-        // The whole point of this helper is to not pin whisper to one core. On any
-        // multi-core host (every CI runner) it must pick more than one decode thread —
-        // a regression to the hard-coded `n_threads: 1` would trip this.
         let cores = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
+        // Match whisper.cpp's own default heuristic, min(4, ncpu): beyond ~4 threads a phone
+        // decode does not speed up, and on a big.LITTLE SoC piling work onto the little cores
+        // behind the big ones makes a take SLOWER (the parallel join waits on the slowest
+        // thread). So use every core up to a cap of 4 — never one (that pins to a single core
+        // and was the original perf bug), never 8 (that dragged on the little cores).
+        let expected = core::cmp::min(4, u32::try_from(cores).unwrap_or(4));
+        assert_eq!(
+            threads, expected,
+            "decode threads should be min(4, {cores} cores), got {threads}",
+        );
         if cores > 1 {
             assert!(
                 threads > 1,

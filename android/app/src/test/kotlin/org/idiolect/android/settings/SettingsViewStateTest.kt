@@ -24,6 +24,7 @@ class SettingsViewStateTest {
             reviewByDefault = false,
             continuousOnDoubleTap = true,
             shipCorrections = true,
+            quickLaunchMic = true,
         ),
         system: SystemStatus = SystemStatus(keyboardEnabled = true, keyboardSelected = true, micGranted = true),
         audioUsedBytes: Long = 0,
@@ -68,6 +69,15 @@ class SettingsViewStateTest {
     }
 
     @Test
+    fun a_known_catalog_model_shows_a_friendly_name_and_size() {
+        // A model from the public catalog reads as its picker label + size, not the raw ggml id.
+        assertEquals(
+            "Tiny (English) · on-device · 31 MB",
+            state(model = InstalledModel("ggml-tiny.en-q5_1", "sha", "/p/ggml-tiny.en-q5_1.bin")).modelLabel,
+        )
+    }
+
+    @Test
     fun no_model_is_stated_plainly() {
         assertEquals("No model yet", state(model = null).modelLabel)
     }
@@ -75,11 +85,31 @@ class SettingsViewStateTest {
     @Test
     fun the_toggles_reflect_the_persisted_prefs() {
         val view = state(
-            prefs = PrefsSnapshot(reviewByDefault = true, continuousOnDoubleTap = false, shipCorrections = false),
+            prefs = PrefsSnapshot(
+                reviewByDefault = true,
+                continuousOnDoubleTap = false,
+                shipCorrections = false,
+                quickLaunchMic = false,
+            ),
         )
         assertTrue(view.reviewOn)
         assertEquals(false, view.continuousOn)
         assertEquals(false, view.shipOn)
+        assertEquals(false, view.quickLaunchOn)
+    }
+
+    @Test
+    fun quick_launch_pref_drives_the_view() {
+        assertTrue(
+            state(
+                prefs = PrefsSnapshot(
+                    reviewByDefault = false,
+                    continuousOnDoubleTap = true,
+                    shipCorrections = true,
+                    quickLaunchMic = true,
+                ),
+            ).quickLaunchOn,
+        )
     }
 
     @Test

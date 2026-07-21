@@ -52,12 +52,27 @@ impl PendingSurface {
 }
 
 enum SurfaceOp {
-    Commit { text: String },
+    Commit {
+        text: String,
+    },
+    /// Replace the IME-owned preedit region (the underlined pre-commit preview)
+    /// with `text`, emitted as an IBus `UpdatePreeditText`. An empty string clears
+    /// it. The live streaming preview lives here — apps never auto-transform
+    /// preedit — and only the verified full-take text is ever committed.
+    Preedit {
+        text: String,
+    },
 }
 
 impl Surface for PendingSurface {
     fn commit_text(&mut self, text: &str) {
         self.ops.push(SurfaceOp::Commit {
+            text: text.to_owned(),
+        });
+    }
+
+    fn set_preedit(&mut self, text: &str) {
+        self.ops.push(SurfaceOp::Preedit {
             text: text.to_owned(),
         });
     }
@@ -223,23 +238,52 @@ fn ibus_text_str(value: &Value<'_>) -> String {
 }
 
 async fn emit_surface_ops(conn: &Connection, engine_path: &OwnedObjectPath, ops: Vec<SurfaceOp>) {
-    for SurfaceOp::Commit { text } in ops {
-        dbg_edit(&format!(
-            "emit CommitText -> {} : {:?}",
-            engine_path.as_str(),
-            text
-        ));
-        let result = conn
-            .emit_signal(
-                None::<&str>,
-                engine_path,
-                ENGINE_IFACE,
-                "CommitText",
-                &(ibus_text(&text),),
-            )
-            .await;
-        if let Err(error) = result {
-            eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+    for op in ops {
+        match op {
+            SurfaceOp::Commit { text } => {
+                dbg_edit(&format!(
+                    "emit CommitText -> {} : {:?}",
+                    engine_path.as_str(),
+                    text
+                ));
+                let result = conn
+                    .emit_signal(
+                        None::<&str>,
+                        engine_path,
+                        ENGINE_IFACE,
+                        "CommitText",
+                        &(ibus_text(&text),),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("idiolect-ibus: failed to emit CommitText: {error}");
+                }
+            }
+            SurfaceOp::Preedit { text } => {
+                // `UpdatePreeditText(variant text, uint cursor, bool visible)`.
+                // Non-empty shows the underlined preview with the caret at its end;
+                // empty hides/clears it. Preedit is IME-owned, so the app renders
+                // the preview without ever committing or auto-transforming it.
+                let cursor = text.chars().count() as u32;
+                let visible = !text.is_empty();
+                dbg_edit(&format!(
+                    "emit UpdatePreeditText -> {} : {:?} (visible={visible})",
+                    engine_path.as_str(),
+                    text
+                ));
+                let result = conn
+                    .emit_signal(
+                        None::<&str>,
+                        engine_path,
+                        ENGINE_IFACE,
+                        "UpdatePreeditText",
+                        &(ibus_text(&text), cursor, visible),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("idiolect-ibus: failed to emit UpdatePreeditText: {error}");
+                }
+            }
         }
     }
 }
@@ -440,8 +484,8 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
         let ops = match reader.read_message() {
             Ok(IpcMessage::PreeditUpdate(update)) => {
                 dbg_edit(&format!(
-                    "transcript <- daemon: {:?} (review={} partial={})",
-                    update.text, update.review, update.partial
+                    "transcript <- daemon: {:?} (review={} partial={} reconcile={})",
+                    update.text, update.review, update.partial, update.reconcile
                 ));
                 if update.partial && update.review {
                     // A display-only snippet of a review-mode take: stream it
@@ -453,12 +497,13 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     continue;
                 }
                 if update.partial {
-                    // A mid-take snippet of a streamed take: type it and keep
-                    // recording. The daemon finalizes the whole take at stop.
-                    // Re-assert focus on the dictation target first (same dance as
-                    // the final direct commit) so the snippet lands in the app and
-                    // not wherever the WM's focus churn left things — streaming
-                    // dictation hits THIS arm, not the batch one below.
+                    // A mid-take snippet of a streamed take: show it in the
+                    // IME-owned preedit and keep recording. The daemon finalizes the
+                    // whole take at stop. Re-assert focus on the dictation target
+                    // first (same dance as the final direct commit) so the preedit
+                    // shows on the app the user is dictating into and not wherever
+                    // the WM's focus churn left things — streaming dictation hits
+                    // THIS arm, not the batch one below.
                     let target = *shared
                         .dictation_target
                         .lock()
@@ -498,7 +543,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                         .lock()
                         .expect("dictation_target mutex");
                     restore_dictation_focus(shared.focus.as_ref(), target);
-                    shared.run_session(|s| s.on_transcript(update.text))
+                    if update.reconcile {
+                        // Stop of a direct STREAMING take: clear the IME-owned
+                        // preedit preview and commit the verified full-take text
+                        // once (no backspace guessing — the preview was never in the
+                        // document). The daemon already owns and committed the
+                        // streamed session, so the engine's commit is display only.
+                        shared.run_session(|s| s.on_reconcile(update.text))
+                    } else {
+                        shared.run_session(|s| s.on_transcript(update.text))
+                    }
                 } else {
                     // Direct take but NO focused context: typing would lose the
                     // text into nowhere AND the daemon would bank a never-landed
@@ -559,9 +613,25 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 // engine stuck), reconnect and resync from the daemon's authoritative
                 // state push. We retry until the daemon returns, so even a long outage
                 // (an update, a slow restart) self-heals.
-                reader = reconnect_reader(&socket, &sender);
+                let (new_reader, reconcile_supported) = reconnect_reader(&socket, &sender);
+                reader = new_reader;
                 shared.dialog.close();
-                shared.run_session(|s| s.reset_to_idle());
+                // reset_to_idle may clear a preedit preview that was visible when the
+                // socket dropped; emit those ops (below) so stale underlined text is
+                // not left in the app. Re-apply the freshly negotiated reconcile
+                // capability in case the daemon that came back differs.
+                let ops = shared.run_session(|s| {
+                    s.reset_to_idle();
+                    s.set_reconcile_supported(reconcile_supported);
+                });
+                let target = shared
+                    .active_path
+                    .lock()
+                    .expect("active_path mutex")
+                    .clone();
+                if let Some(path) = target {
+                    handle.block_on(emit_surface_ops(&shared.connection, &path, ops));
+                }
                 shared.sync_indicator();
                 continue;
             }
@@ -631,23 +701,24 @@ fn handle_edit_history(
 /// shared `sender` so the session keeps working. The reader thread is dedicated, so
 /// polling here is harmless; never giving up means the engine always recovers when
 /// the daemon returns instead of going permanently deaf.
-fn reconnect_reader(socket: &Path, sender: &DaemonSender) -> DaemonReader {
+fn reconnect_reader(socket: &Path, sender: &DaemonSender) -> (DaemonReader, bool) {
     loop {
         match ipc::reconnect(socket, sender) {
-            Ok(reader) => return reader,
+            Ok(pair) => return pair,
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
 }
 
 /// Connect to the daemon, retrying briefly so engine startup tolerates the
-/// daemon coming up at roughly the same time.
-fn connect_daemon() -> Result<(DaemonSender, DaemonReader), std::io::Error> {
+/// daemon coming up at roughly the same time. The trailing bool is whether the
+/// daemon negotiated the stop-time reconcile (see [`ipc::connect`]).
+fn connect_daemon() -> Result<(DaemonSender, DaemonReader, bool), std::io::Error> {
     let socket = ipc::default_socket_path();
     let mut last = None;
     for _ in 0..50 {
         match ipc::connect(&socket) {
-            Ok(pair) => return Ok(pair),
+            Ok(triple) => return Ok(triple),
             Err(error) => {
                 last = Some(error);
                 std::thread::sleep(Duration::from_millis(100));
@@ -717,11 +788,17 @@ fn resolve_ibus_address() -> Option<String> {
 /// and run until killed.
 pub async fn run() -> zbus::Result<()> {
     // Establish the single daemon connection up front (off the DBus handlers).
-    let (sender, reader) = connect_daemon()
+    let (sender, reader, reconcile_supported) = connect_daemon()
         .map_err(|error| zbus::Error::Failure(format!("daemon connect: {error}")))?;
     // A second handle on the same shared socket so the read loop can swap it on
     // reconnect without disturbing the session that owns the sender.
     let reader_sender = sender.clone();
+
+    // Only keep the live preview in uncommitted preedit if the daemon negotiated
+    // the stop-time reconcile; otherwise a stop arrives as a bare
+    // RecordingStatus(false) and the session commits partials instead.
+    let mut session = Session::new(sender, PendingSurface::default());
+    session.set_reconcile_supported(reconcile_supported);
 
     let builder = match resolve_ibus_address() {
         Some(address) => zbus::connection::Builder::address(address.as_str())?,
@@ -730,7 +807,7 @@ pub async fn run() -> zbus::Result<()> {
     let connection = builder.build().await?;
 
     let shared = Arc::new(Shared {
-        session: Mutex::new(Session::new(sender, PendingSurface::default())),
+        session: Mutex::new(session),
         active_path: Mutex::new(None),
         dialog: Box::new(crate::review::SubprocessReviewDialog::discover()),
         indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
@@ -787,7 +864,31 @@ mod tests {
     use crate::ipc::DaemonSender;
     use crate::review::ReviewDialog;
 
-    use super::{handle_edit_history, restore_dictation_focus};
+    use super::{handle_edit_history, restore_dictation_focus, PendingSurface, Surface, SurfaceOp};
+
+    #[test]
+    fn pending_surface_records_preview_then_clear_then_commit_in_order() {
+        // The streaming reconcile path drives the surface as set_preedit(preview)
+        // while recording, then set_preedit("") + commit(verified) at stop. The
+        // buffered ops must preserve that order so the async layer clears the
+        // underlined preview BEFORE committing the verified text (clear-then-commit).
+        let mut surface = PendingSurface::default();
+        surface.set_preedit("helo world");
+        surface.set_preedit("");
+        surface.commit_text("hello world");
+        let ops = surface.take_ops();
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [
+                    SurfaceOp::Preedit { text: preview },
+                    SurfaceOp::Preedit { text: cleared },
+                    SurfaceOp::Commit { text: verified },
+                ] if preview == "helo world" && cleared.is_empty() && verified == "hello world"
+            ),
+            "expected Preedit(preview) -> Preedit(\"\") -> Commit(verified), got a different op sequence"
+        );
+    }
 
     /// Records the windows focus was re-asserted on, so we can assert the direct
     /// commit hands focus back to where the user was dictating.

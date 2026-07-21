@@ -32,8 +32,11 @@
          code, independent of this flag. -->
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
+        android:theme="@style/Theme.Idiolect"
         android:usesCleartextTraffic="true">
 
         <!-- Launcher / onboarding: enable + select the keyboard, grant the mic.
@@ -116,6 +119,38 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service" />
+        </service>
+
+        <!-- Voice provider: make idiolect a selectable mic / speech option in OTHER apps.
+             (1) An Activity answering ACTION_RECOGNIZE_SPEECH — the picker an app's built-in mic
+             button opens (startActivityForResult); this is the list the user found idiolect
+             missing from (only Google + a sibling app showed). (2) A system RecognitionService so
+             idiolect is selectable as the device speech engine and usable via SpeechRecognizer.
+             Both transcribe on-device through the same whisper core. -->
+        <activity
+            android:name=".recognition.RecognizeSpeechActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".recognition.IdiolectRecognitionService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_RECOGNITION_SERVICE">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.speech"
+                android:resource="@xml/recognition_service" />
         </service>
     </application>
 </manifest>

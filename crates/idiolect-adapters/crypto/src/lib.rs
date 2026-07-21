@@ -9,8 +9,11 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+// Unix-only: POSIX file-permission extensions (mode bits, O_CREAT with mode).
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -137,23 +140,31 @@ impl FileKey {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
+
+    /// Load-ONLY: the key for a process that borrows another process's key
+    /// (e.g. the dashboard handed the daemon's history key path). A missing
+    /// file is an error (`KeyIo`, kind `NotFound`) — creating one here would
+    /// fork the keyspace under the owner.
+    ///
+    /// # Errors
+    /// Returns a [`CryptoError`] if the file is missing, unreadable, or not
+    /// exactly the key length.
+    pub fn load_key(&self) -> Result<[u8; KEY_LEN], CryptoError> {
+        let bytes = fs::read(&self.path).map_err(CryptoError::KeyIo)?;
+        let len = bytes.len();
+        bytes.try_into().map_err(|_| CryptoError::KeyLength(len))
+    }
 }
 
 impl EncryptionKeyPort for FileKey {
     fn load_or_create_key(&self) -> Result<[u8; KEY_LEN], CryptoError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let len = bytes.len();
-                let key: [u8; KEY_LEN] =
-                    bytes.try_into().map_err(|_| CryptoError::KeyLength(len))?;
-                Ok(key)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match self.load_key() {
+            Err(CryptoError::KeyIo(error)) if error.kind() == io::ErrorKind::NotFound => {
                 let key = random_key();
                 write_key_file(&self.path, &key)?;
                 Ok(key)
             }
-            Err(error) => Err(CryptoError::KeyIo(error)),
+            loaded => loaded,
         }
     }
 }
@@ -163,9 +174,12 @@ fn write_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), CryptoError> {
         fs::create_dir_all(parent)?;
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     let mut file = options.open(path)?;
     io::Write::write_all(&mut file, key)?;
+    #[cfg(unix)]
     // Ensure permissions are 0600 even if the file already existed.
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -286,6 +300,26 @@ mod tests {
     }
 
     #[test]
+    fn file_key_load_only_refuses_to_mint_a_missing_key() {
+        // A process that BORROWS another process's key (the dashboard handed
+        // the daemon's history key path) must fail loudly on a missing file —
+        // creating one would fork the keyspace under the owner.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.key");
+        let provider = FileKey::new(&path);
+
+        assert!(matches!(provider.load_key(), Err(CryptoError::KeyIo(_))));
+        assert!(!path.exists(), "load-only must not create the file");
+
+        let minted = provider.load_or_create_key().unwrap();
+        assert_eq!(
+            provider.load_key().unwrap(),
+            minted,
+            "load-only reads the existing key verbatim"
+        );
+    }
+
+    #[test]
     fn file_key_generates_then_reuses_a_stable_key() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys").join("history.key");
@@ -295,11 +329,28 @@ mod tests {
         let second = provider.load_or_create_key().unwrap();
         assert_eq!(first, second, "key must persist across loads");
 
-        let permissions = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&permissions) & 0o777,
+                0o600,
+                "key file must be owner-read-write only"
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn file_key_is_created_and_readable_on_non_unix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("history.key");
+        let provider = FileKey::new(&path);
+        let first = provider.load_or_create_key().unwrap();
+        assert!(path.exists(), "key file must be created");
+        // Re-open to verify persistence (no permission check on Windows).
+        let second = FileKey::new(&path).load_or_create_key().unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]

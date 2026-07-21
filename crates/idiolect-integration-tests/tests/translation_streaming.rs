@@ -54,9 +54,11 @@ fn snippets_stream_as_partials_and_finalize_as_one_session() {
         text: SNIPPET.to_owned(),
     }));
 
-    // Stop: the take finalizes daemon-side (the text was already typed), so the
-    // very next push is the stop's recording=false.
+    // Stop: the take finalizes daemon-side, and the engine is sent the verified
+    // whole-recording text to REPLACE the live-typed preview before the stop's
+    // recording=false.
     client.send(IpcMessage::ToggleRecording);
+    client.expect_reconcile_preedit(SNIPPET);
     client.expect_recording_status(false);
 
     drop(client);
@@ -93,6 +95,7 @@ fn streaming_translation_to_english_needs_no_command() {
     client.expect_partial_preedit(" restart traffic");
 
     client.send(IpcMessage::ToggleRecording);
+    client.expect_reconcile_preedit("restart traffic");
     client.expect_recording_status(false);
 
     drop(client);
@@ -209,11 +212,68 @@ fn plain_dictation_streams_without_translation() {
     client.expect_partial_preedit(" restart traffic");
 
     client.send(IpcMessage::ToggleRecording);
+    client.expect_reconcile_preedit("restart traffic");
     client.expect_recording_status(false);
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
     fixture.assert_single_committed_take("restart traffic");
+}
+
+#[test]
+fn a_client_without_reconcile_gets_the_pre_reconcile_behaviour() {
+    // Backward compatibility: a client (e.g. an older engine) that did NOT
+    // negotiate the reconcile capability must keep the pre-reconcile contract —
+    // live partials are typed, and at stop NO take-final PreeditUpdate is sent
+    // (an older engine would treat it as a batch transcript and APPEND it after
+    // the preview). The take still finalizes as one committed session daemon-side.
+    let fixture = DaemonFixture::new("noreconcile");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_without_reconcile();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_partial_preedit(SNIPPET);
+    client.expect_partial_preedit(&format!(" {SNIPPET}"));
+
+    // Stop: the very next push is recording=false — NO reconcile final in between.
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(SNIPPET);
+}
+
+#[test]
+fn preview_typing_off_suppresses_live_partials_and_only_reconciles_at_stop() {
+    // With "Preview typing" OFF nothing is typed while the user speaks: no PARTIAL
+    // ever reaches the client. The verified whole-recording text arrives only at
+    // stop, as a reconcile (the engine commits it fresh — there is no preview to
+    // replace). Driven by auto-stop because, with no partials to wait on, that is
+    // the synchronisation point that proves the clip was fully ingested first.
+    let fixture = DaemonFixture::new("previewoff").with_auto_stop_ms(1_000);
+    fixture.seed_tray_setting("preview_typing", "false");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+
+    // No partials at all (preview off); the long pause auto-stops the take and the
+    // very first push after recording=true is the stop-time reconcile.
+    client.expect_reconcile_preedit(SNIPPET);
+    client.expect_recording_status(false);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+    fixture.assert_single_committed_take(SNIPPET);
 }
 
 #[test]
@@ -235,6 +295,9 @@ fn a_stop_time_decode_failure_keeps_the_previewed_snippet_text() {
     client.expect_partial_preedit(&format!(" {SNIPPET}"));
 
     client.send(IpcMessage::ToggleRecording);
+    // The stop-time decode failed, so the reconcile carries the glued snippet
+    // previews fallback (the engine re-types exactly what it already had).
+    client.expect_reconcile_preedit(&format!("{SNIPPET} {SNIPPET}"));
     client.expect_recording_status(false);
 
     drop(client);
@@ -261,7 +324,9 @@ fn a_long_pause_auto_stops_and_finalizes_the_take() {
     client.expect_partial_preedit(&format!(" {SNIPPET}"));
 
     // No stop is ever sent: the silence after the clip crosses the threshold
-    // and the daemon ends the take itself.
+    // and the daemon ends the take itself — reconciling the preview, then
+    // announcing the stop.
+    client.expect_reconcile_preedit(SNIPPET);
     client.expect_recording_status(false);
 
     drop(client);
@@ -632,14 +697,20 @@ impl DaemonClient {
     }
 
     fn send_hello_with_status(&mut self) {
+        self.send_hello(&["preedit", "commit", "recording_status", "reconcile"]);
+    }
+
+    /// A client that predates the reconcile capability: it advertises everything
+    /// EXCEPT `reconcile`, so the daemon must keep the pre-reconcile behaviour.
+    fn send_hello_without_reconcile(&mut self) {
+        self.send_hello(&["preedit", "commit", "recording_status"]);
+    }
+
+    fn send_hello(&mut self, features: &[&str]) {
         self.send(IpcMessage::ClientHello(ClientHello {
             client_name: "idiolect-translation-streaming-test".to_owned(),
             protocol_version: 1,
-            features: vec![
-                "preedit".to_owned(),
-                "commit".to_owned(),
-                "recording_status".to_owned(),
-            ],
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
         }));
         match self.read() {
             IpcMessage::ServerHello(server) => assert_eq!(server.protocol_version, 1),
@@ -711,6 +782,24 @@ impl DaemonClient {
                 assert!(!update.partial, "the take-final payload is not partial");
             }
             other => panic!("expected final review PreeditUpdate, got {other:?}"),
+        }
+    }
+
+    /// The take-final reconcile payload in direct streaming mode: the verified
+    /// whole-recording text, sent at stop so the engine replaces the preview it
+    /// typed live. Not a partial, not review-routed.
+    fn expect_reconcile_preedit(&mut self, expected: &str) {
+        match self.read() {
+            IpcMessage::PreeditUpdate(update) => {
+                assert_eq!(update.text, expected, "verified full-take text");
+                assert!(update.reconcile, "direct stop reconciles the preview");
+                assert!(!update.partial, "the take-final payload is not partial");
+                assert!(
+                    !update.review,
+                    "direct mode does not route through the dialog"
+                );
+            }
+            other => panic!("expected reconcile PreeditUpdate, got {other:?}"),
         }
     }
 }

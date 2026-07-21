@@ -1,0 +1,38 @@
+[package]
+name = "idiolect-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "idiolect-app"
+path = "src/main.rs"
+
+[dependencies]
+idiolect-application = { path = "../idiolect-application" }
+idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+idiolect-sync-server = { path = "../idiolect-sync-server" }
+idiolect-common = { path = "../idiolect-common" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+# X11 window-type support (needed on Linux so the tray-launched window gets
+# the correct type and does not steal focus). Not required on macOS or Windows.
+#
+# `default-features = false` is REQUIRED: without it this second declaration
+# re-enables eframe's defaults on Linux (wgpu/wayland/accesskit), and with both
+# `glow` and `wgpu` linked `Renderer::default` picks Wgpu — dropping the
+# glow-only config above on a standalone Linux build.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["x11"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

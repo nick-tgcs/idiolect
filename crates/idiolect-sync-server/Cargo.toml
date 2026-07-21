@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 idiolect-sync = { path = "../idiolect-sync" }
 idiolect-adapter-sqlite = { path = "../idiolect-adapter-sqlite" }
+# At-rest history cipher: an embedded host handed the daemon's store must encrypt
+# ime_text_history the way the daemon does (pure-Rust ChaCha20-Poly1305).
+idiolect-adapter-crypto = { path = "../idiolect-adapters/crypto" }
 idiolect-ports = { path = "../idiolect-ports" }
 idiolect-common = { path = "../idiolect-common" }
 thiserror.workspace = true
@@ -36,9 +39,9 @@ percent-encoding = "=2.3.2"
 # exact hyper-util loop `axum::serve` uses internally (axum 0.7 has no pluggable listener,
 # and axum-server 0.7 won't build against this workspace's pinned hyper stack).
 rcgen = "=0.14.8"
-rustls = "=0.23.41"
+rustls = "=0.23.42"
 rustls-pemfile = "=2.2.0"
-tokio-rustls = "=0.26.2"
+tokio-rustls = "=0.26.4"
 hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "service"] }
 
 [dev-dependencies]

@@ -12,12 +12,15 @@
     <string name="setup_select_cta">Choose keyboard</string>
     <string name="setup_mic">Grant the microphone so idiolect can hear you.</string>
     <string name="setup_mic_cta">Grant microphone</string>
-    <string name="setup_model">Tap Download for the recommended speech model (~140 MB; Wi-Fi suggested) — or enter your PC\'s address and pairing token below to pull a custom one.</string>
+    <string name="setup_model">Choose a speech model, then tap Download. Or enter your PC\'s address and pairing token below to pull a custom one.</string>
+    <string name="setup_model_picker_title">Speech model</string>
     <string name="setup_model_cta">Download model</string>
+    <string name="setup_model_cancel">Cancel download</string>
+    <string name="setup_model_cancelled">Download cancelled. Tap Download to try again.</string>
     <string name="setup_model_url_hint">PC server URL (optional, e.g. http://10.0.2.2:8765)</string>
     <string name="setup_model_token_hint">PC pairing token (optional)</string>
-    <string name="setup_model_need_details">Enter both the server URL and pairing token, or leave both blank for the recommended model.</string>
-    <string name="setup_model_progress">Downloading model… %1$d%%</string>
+    <string name="setup_model_need_details">Enter both the server URL and pairing token, or leave both blank for the chosen model.</string>
+    <string name="setup_model_progress">Downloading… %1$s</string>
     <string name="setup_model_error">Download failed: %1$s</string>
     <string name="setup_scan_cta">Scan QR to pair with PC</string>
     <string name="setup_scan_prompt">Point at the QR shown by: idiolect-sync-server --pair</string>
@@ -43,6 +46,10 @@
     <string name="voice_strip_keyboard">Switch to your keyboard</string>
     <string name="voice_strip_review">Review before insert</string>
     <string name="voice_strip_settings">Settings</string>
+    <!-- Flanking edit keys on the mic surface (Option A): ⌫ deletes the char before the
+         cursor, ⏎ performs the field's editor action (search/send/done…) or inserts a newline. -->
+    <string name="voice_key_delete">Delete</string>
+    <string name="voice_key_enter">Enter</string>
 
     <!-- Settings screen (reached via the ⚙ on the mic strip). -->
     <string name="settings_title">Settings</string>
@@ -64,11 +71,17 @@
     <string name="settings_pairing">Pairing with your PC…</string>
     <string name="settings_pairing_error">Pairing failed: %1$s</string>
     <string name="settings_section_model">Speech model</string>
+    <string name="settings_model_switch">Switch to %1$s (%2$s)</string>
+    <string name="settings_model_get">Download %1$s (%2$s)</string>
+    <string name="settings_model_downloading">Downloading… %1$s</string>
+    <string name="settings_model_error">Download failed: %1$s</string>
     <string name="settings_section_dictation">Dictation</string>
     <string name="settings_review_label">Review before insert</string>
     <string name="settings_review_sub">Open each take to edit before it lands</string>
     <string name="settings_continuous_label">Continuous on double-tap</string>
     <string name="settings_continuous_sub">Double-tap the mic to dictate hands-free</string>
+    <string name="settings_quicklaunch_label">Quick-launch mic</string>
+    <string name="settings_quicklaunch_sub">Tap Android\'s floating accessibility button to dictate into any app</string>
     <string name="settings_section_learning">Learning</string>
     <string name="settings_ship_label">Ship corrections to your PC</string>
     <string name="settings_ship_sub">Your edits train your own model at home</string>
@@ -93,4 +106,21 @@
     <!-- Shown in the review card when instant insert isn't enabled yet. -->
     <string name="review_enable_insert">Turn on instant insert so your fix lands in the app automatically.</string>
     <string name="review_enable_cta">Enable</string>
+
+    <!-- The ACTION_RECOGNIZE_SPEECH surface (idiolect as another app's mic / voice-input option). -->
+    <string name="recognize_preparing">Preparing…</string>
+    <string name="recognize_listening">Listening… tap when you\'re done</string>
+    <string name="recognize_transcribing">Transcribing…</string>
+    <string name="recognize_no_speech">Didn\'t catch that — try again</string>
+    <string name="recognize_no_model">Open idiolect and download a speech model first</string>
+    <string name="recognize_mic_needed">idiolect needs microphone access to transcribe</string>
+    <string name="recognize_busy">Another dictation is running — finish it and try again</string>
+    <string name="recognize_failed">Transcription failed — please try again</string>
+
+    <!-- Quick-launch mic: Android's floating accessibility button → dictate into any app. -->
+    <string name="quicklaunch_disabled">Quick-launch mic is off — turn it on in idiolect ▸ Settings</string>
+    <string name="quicklaunch_listening">Listening… tap the button again to stop</string>
+    <string name="quicklaunch_transcribing">Transcribing…</string>
+    <string name="quicklaunch_no_field">Focus a text field, then try quick-launch again</string>
+    <string name="quicklaunch_mic_needed">Grant idiolect microphone access to use quick-launch</string>
 </resources>

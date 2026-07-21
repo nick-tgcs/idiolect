@@ -120,6 +120,17 @@ class SettingsScreenE2eTest {
         assertTrue("flipping the review switch persists the default", store.reviewByDefault())
     }
 
+    @Test
+    fun the_quick_launch_toggle_is_shown_in_dictation_settings() {
+        // Issue 3: the floating-mic on/off lives in Settings so the user can disable it in-app.
+        // The store round-trip is unit-tested; here we just prove the row reaches the real screen.
+        SettingsActivity.launch(ctx)
+        assertTrue(
+            "the Quick-launch mic toggle must appear in dictation settings",
+            device.wait(Until.hasObject(By.text("Quick-launch mic")), TIMEOUT),
+        )
+    }
+
     companion object {
         private const val TIMEOUT = 10_000L
         private const val POLL_MS = 200L

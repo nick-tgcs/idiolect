@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The idiolect app theme: dark, no ActionBar. Every full-screen surface (Setup, Settings)
+  paints its own header on the dark slate background, so the platform ActionBar is removed.
+  Edge-to-edge is opted into in code (EdgeToEdge.enable) and the system bars are transparent
+  over the app's own background; the per-screen inset padding keeps content out from under
+  them (fixes "the settings screen cuts off the top" on Android 15 / targetSdk 35).
+-->
+<resources>
+    <style name="Theme.Idiolect" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/idiolect_bg</item>
+        <item name="android:colorBackground">@color/idiolect_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

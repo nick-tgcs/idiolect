@@ -31,7 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use idiolect_adapter_sqlite::SqliteMetadataStore;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, PROTOCOL_VERSION,
+    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, FEATURE_RECONCILE,
+    PROTOCOL_VERSION,
 };
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{OwnedObjectPath, Value};
@@ -276,6 +277,7 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -286,6 +288,146 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
     );
     // The engine also reports the commit back so the daemon records it.
     expect_commit_preedit(&mut server_reader);
+
+    drop(engine);
+    drop(conn);
+}
+
+/// Direct STREAMING stop: the engine shows a lossy live preview in the IME-owned
+/// preedit (never committed to the document), then the daemon sends the verified
+/// whole-take text with `reconcile: true`. The engine must CLEAR the preedit and
+/// commit ONLY the verified text, exactly once — no backspaces, because the
+/// preview was never real document text an app could have auto-transformed.
+/// Proven over real D-Bus by observing the `UpdatePreeditText` preview, its clear,
+/// and the single verified `CommitText` (in that order).
+#[tokio::test]
+async fn reconcile_clears_the_preedit_preview_and_commits_the_verified_text() {
+    const PREVIEW: &str = "helo world";
+    const VERIFIED: &str = "hello world";
+
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-reconcile");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, _server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+    let mut preedit_signals = engine_proxy
+        .receive_signal("UpdatePreeditText")
+        .await
+        .expect("subscribe UpdatePreeditText");
+
+    // Focusing a text field is what sets active_path (the direct-mode target).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    // Arm the take, then stream a live preview snippet (a PARTIAL).
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: PREVIEW.to_owned(),
+            review: false,
+            partial: true,
+            reconcile: false,
+        }),
+    );
+    let (preview, visible) = next_preedit(&mut preedit_signals).await;
+    assert_eq!(preview, PREVIEW, "the live preview is shown as preedit");
+    assert!(visible, "a non-empty preview is visible preedit");
+
+    // Stop: the daemon sends the verified text to RECONCILE the preview.
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: VERIFIED.to_owned(),
+            review: false,
+            partial: false,
+            reconcile: true,
+        }),
+    );
+
+    // The preedit is cleared BEFORE the verified text is committed (clear-then-
+    // commit), so the app drops the underlined preview and receives clean text.
+    let (cleared, visible) = next_preedit(&mut preedit_signals).await;
+    assert!(cleared.is_empty(), "the preedit preview is cleared at stop");
+    assert!(!visible, "an empty preedit is hidden");
+
+    assert_eq!(
+        next_commit(&mut commit_signals).await,
+        VERIFIED,
+        "only the verified full text is committed, once"
+    );
+
+    drop(engine);
+    drop(conn);
+}
+
+/// A daemon that did NOT negotiate `FEATURE_RECONCILE` uses the pre-reconcile
+/// fallback: it streams partials then a bare `RecordingStatus(false)`, with no
+/// reconcile final. The engine must COMMIT each partial as real text (not
+/// preedit-only) so the dictation survives the stop — otherwise a preedit-only
+/// preview would be cleared and the text would vanish while the daemon has
+/// already recorded the session. Proven over real D-Bus by observing the partial
+/// arrive as a `CommitText`.
+#[tokio::test]
+async fn partials_are_committed_when_the_daemon_does_not_negotiate_reconcile() {
+    const PARTIAL: &str = "keep this text";
+
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-no-reconcile");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    // Pre-reconcile daemon: accept no features, so reconcile is NOT negotiated.
+    let (mut server_writer, _server_reader) = accept_and_handshake_with(&listener, vec![]);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    // Focusing a text field is what sets active_path (the direct-mode target).
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: PARTIAL.to_owned(),
+            review: false,
+            partial: true,
+            reconcile: false,
+        }),
+    );
+
+    // The partial lands as committed text (the fallback), not preedit-only.
+    assert_eq!(
+        next_commit(&mut commit_signals).await,
+        PARTIAL,
+        "without reconcile, a streamed partial is committed as real text"
+    );
 
     drop(engine);
     drop(conn);
@@ -326,6 +468,7 @@ async fn direct_transcript_without_focus_in_is_discarded_not_typed_or_recorded()
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -387,6 +530,7 @@ async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
             text: DRAFT.to_owned(),
             review: false,
             partial: false,
+            reconcile: false,
         }),
     );
 
@@ -407,7 +551,19 @@ async fn destroy_clears_active_path_so_a_later_direct_take_is_discarded() {
 
 /// Accept the engine's connection and complete the v1 handshake, returning the
 /// (writer, reader) halves the test drives the fake daemon through.
+/// Accept + handshake advertising the stop-time reconcile (the production-normal
+/// daemon), so streamed previews take the preedit path.
 fn accept_and_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixStream>) {
+    accept_and_handshake_with(listener, vec![FEATURE_RECONCILE.to_owned()])
+}
+
+/// As [`accept_and_handshake`] but with an explicit accepted-feature list, so a
+/// test can simulate a pre-reconcile daemon (empty list) that never sends a
+/// reconcile final.
+fn accept_and_handshake_with(
+    listener: &UnixListener,
+    accepted_features: Vec<String>,
+) -> (UnixStream, BufReader<UnixStream>) {
     let (stream, _) = listener.accept().expect("engine connects");
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
@@ -421,7 +577,7 @@ fn accept_and_handshake(listener: &UnixListener) -> (UnixStream, BufReader<UnixS
         &mut writer,
         &IpcMessage::ServerHello(ServerHello {
             protocol_version: PROTOCOL_VERSION,
-            accepted_features: vec![],
+            accepted_features,
         }),
     );
     (writer, reader)
@@ -486,6 +642,20 @@ where
     let body = msg.body();
     let (text,): (Value<'_>,) = body.deserialize().expect("commit body");
     extract_ibus_text(&text)
+}
+
+/// Read the next `UpdatePreeditText(v text, u cursor, b visible)` and return the
+/// preview text and its visibility. Empty text with `visible == false` is the
+/// stop-time clear of the live preview.
+async fn next_preedit<S>(stream: &mut S) -> (String, bool)
+where
+    S: futures_util::Stream<Item = zbus::Message> + Unpin,
+{
+    let msg = next_signal(stream).await;
+    let body = msg.body();
+    let (text, _cursor, visible): (Value<'_>, u32, bool) =
+        body.deserialize().expect("preedit body");
+    (extract_ibus_text(&text), visible)
 }
 
 fn send_line(writer: &mut impl Write, message: &IpcMessage) {

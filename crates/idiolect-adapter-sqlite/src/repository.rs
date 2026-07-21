@@ -5,7 +5,7 @@ use std::path::Path;
 use idiolect_adapter_crypto::EncryptionPort;
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::storage::{AudioStorePort, HistoryEntry, HistoryState, MetadataStorePort};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::audio_store::{FileAudioStore, FileAudioStoreError};
 use crate::migrations::migrations;
@@ -392,7 +392,20 @@ impl SqliteMetadataStore {
     }
 
     pub fn open_path<P: AsRef<Path>>(path: P) -> Result<Self, SqliteStorageError> {
-        Self::from_connection(backend_result(Connection::open(path))?)
+        let connection = backend_result(Connection::open(path))?;
+        // This file is opened concurrently by separate PROCESSES (the daemon, the
+        // tray-launched dashboard's SyncHost, a spawned trainerctl). WAL lets
+        // readers proceed under a live writer, and the busy timeout makes a
+        // second writer wait out a lock instead of surfacing SQLITE_BUSY — which
+        // the daemon's run loop treats as a fatal storage error. In-memory
+        // stores skip this: they are single-process by construction and WAL is
+        // meaningless there.
+        // Timeout FIRST: the one-time rollback→WAL conversion below needs a brief
+        // exclusive lock, and without a busy handler a concurrent reader/writer at
+        // that instant would fail the open instantly instead of waiting.
+        backend_result(connection.execute_batch("PRAGMA busy_timeout = 5000"))?;
+        backend_result(connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())))?;
+        Self::from_connection(connection)
     }
 
     /// Enables at-rest encryption of history text using `cipher`. Existing
@@ -410,6 +423,22 @@ impl SqliteMetadataStore {
             connection,
             history_cipher: None,
         })
+    }
+
+    /// A write transaction that takes the write lock UP FRONT (`BEGIN IMMEDIATE`).
+    /// Every transaction in this store mutates, and the file is shared across
+    /// PROCESSES (daemon, the dashboard's SyncHost, trainerctl): a DEFERRED
+    /// transaction that reads before its first write hits `SQLITE_BUSY` at the
+    /// read→write upgrade, which SQLite reports immediately, BYPASSING the busy
+    /// timeout (deadlock avoidance). IMMEDIATE makes contending writers queue on
+    /// the busy timeout instead — and a busy error in the daemon is fatal to it.
+    /// (The interleaving itself has no unit seam — a transaction can't be paused
+    /// mid-call — so the open configuration is pinned by test instead.)
+    fn write_transaction(&mut self) -> Result<Transaction<'_>, SqliteStorageError> {
+        backend_result(
+            self.connection
+                .transaction_with_behavior(TransactionBehavior::Immediate),
+        )
     }
 
     /// Encrypts history text for storage when a cipher is configured.
@@ -462,7 +491,7 @@ impl SqliteMetadataStore {
                 continue;
             }
 
-            let transaction = backend_result(self.connection.transaction())?;
+            let transaction = self.write_transaction()?;
             backend_result(transaction.execute_batch(migration.sql))?;
             backend_result(transaction.execute(
                 "INSERT INTO schema_migrations(version, name, checksum) VALUES (?1, ?2, ?3)",
@@ -482,7 +511,7 @@ impl SqliteMetadataStore {
         registration: AdapterRegistration,
     ) -> Result<(), SqliteStorageError> {
         let metrics = registration.metrics_json()?;
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         Self::ensure_user(&transaction, &registration.user_id)?;
         backend_result(transaction.execute(
             "INSERT INTO adapters(
@@ -517,7 +546,7 @@ impl SqliteMetadataStore {
         user_id: &str,
         adapter_id: &str,
     ) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let current_active = Self::active_adapter_id_in_transaction(&transaction, user_id)?;
         backend_result(transaction.execute(
             "UPDATE adapters SET active = 0 WHERE user_id = ?1",
@@ -554,7 +583,7 @@ impl SqliteMetadataStore {
         adapter_id: &str,
         reason: &str,
     ) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let updated = backend_result(transaction.execute(
             "UPDATE adapters SET active = 0 WHERE user_id = ?1 AND id = ?2",
             params![user_id, adapter_id],
@@ -575,7 +604,7 @@ impl SqliteMetadataStore {
     }
 
     pub fn rollback_adapter(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let current = Self::active_adapter_id_in_transaction(&transaction, user_id)?
             .ok_or_else(|| SqliteStorageError::not_found("active adapter", user_id))?;
         let previous = Self::previous_adapter_id_in_transaction(&transaction, user_id)?
@@ -606,7 +635,7 @@ impl SqliteMetadataStore {
         training_candidate_id: i64,
     ) -> Result<(), SqliteStorageError> {
         let rows = self.adapter_registry_rows(user_id)?;
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         for row in rows {
             if Self::metrics_include_training_candidate(&row.metrics, training_candidate_id) {
                 Self::record_adapter_derivation(
@@ -704,7 +733,7 @@ impl SqliteMetadataStore {
         manifest_id: &str,
         training_candidate_id: i64,
     ) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         Self::ensure_user(&transaction, user_id)?;
         backend_result(transaction.execute(
             "INSERT OR IGNORE INTO manifests(
@@ -781,7 +810,7 @@ impl SqliteMetadataStore {
         // 3. Delete the DB rows atomically. manifest_items reference candidates, so
         //    they go first; then candidates, edit events, history, the session, and
         //    finally its utterance rows.
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         for (session_key, _user_id, utterance_id) in &expired {
             backend_result(transaction.execute(
                 "DELETE FROM manifest_items WHERE training_candidate_id IN
@@ -844,7 +873,7 @@ impl SqliteMetadataStore {
             self.mark_adapters_derived_from_deleted_sample(user_id, training_candidate_id)?;
         }
 
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         Self::ensure_user(&transaction, user_id)?;
         backend_result(transaction.execute(
             "DELETE FROM manifest_items
@@ -1017,7 +1046,7 @@ impl SqliteMetadataStore {
         // the live transaction's `&mut self.connection` would otherwise lock out
         // (mirrors `commit_session`).
         let history_text = self.encode_history_text(corrected_text)?;
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         if !Self::session_exists(&transaction, &session_key)? {
             return Err(SqliteStorageError::not_found(
                 "ime_text_sessions row",
@@ -1299,7 +1328,7 @@ impl SqliteMetadataStore {
         candidate_id: i64,
         text: &str,
     ) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let updated = backend_result(transaction.execute(
             "UPDATE training_candidates
              SET raw_text = ?1,
@@ -1494,6 +1523,35 @@ impl SqliteMetadataStore {
         Ok(count > 0)
     }
 
+    /// Count training candidates that are trainable for `user_id`: all rows whose
+    /// status is not `rejected`, `synced`, or `evicted`. This is the "new corrections"
+    /// count shown in the dashboard and used to gate auto-train.
+    pub fn trainable_count(&self, user_id: &str) -> Result<u64, SqliteStorageError> {
+        let count: i64 = backend_result(self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM training_candidates AS tc
+             JOIN ime_text_sessions AS s ON s.id = tc.text_session_id
+             WHERE s.user_id = ?1
+               AND tc.status NOT IN ('rejected', 'synced', 'evicted')",
+            params![user_id],
+            |row| row.get(0),
+        ))?;
+        Ok(count.unsigned_abs())
+    }
+
+    /// Timestamp of the most recent successfully finished training run for
+    /// `user_id`, in ISO 8601 form. `None` means no training run has ever
+    /// completed.
+    pub fn last_trained_at(&self, user_id: &str) -> Result<Option<String>, SqliteStorageError> {
+        backend_result(self.connection.query_row(
+            "SELECT MAX(finished_at)
+             FROM training_runs
+             WHERE user_id = ?1 AND status = 'completed'",
+            params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        ))
+    }
+
     /// Read back an utterance's stored audio digest. `None` means the column is
     /// still NULL (digest never populated). Test/inspection helper.
     pub fn audio_digest_for_test(
@@ -1508,7 +1566,7 @@ impl SqliteMetadataStore {
     }
 
     pub fn delete_user_data(&mut self, user_id: &str) -> Result<(), SqliteStorageError> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let deletion_count: i64 = backend_result(transaction.query_row(
             "SELECT COUNT(*) FROM event_log
              WHERE aggregate_type = ?1 AND aggregate_id = ?2 AND event_type = ?3",
@@ -2036,7 +2094,7 @@ impl MetadataStorePort for SqliteMetadataStore {
         let session_key = Self::session_key(session_id)?;
         let idempotency_key = format!("session-created:{session_key}");
         let event_payload = raw_stt_text.unwrap_or("");
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
 
         let utterance_id = Self::utterance_key(&session_key);
         let audio_path = Self::audio_path(&utterance_id);
@@ -2152,7 +2210,7 @@ impl MetadataStorePort for SqliteMetadataStore {
         let session_key = Self::session_key(session_id)?;
         let idempotency_key = format!("preedit:{session_key}:{event_index}");
         let event_payload = format!("{from_text}->{to_text}:{event_index}");
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
 
         if Self::is_idempotent_duplicate(
             &transaction,
@@ -2219,7 +2277,7 @@ impl MetadataStorePort for SqliteMetadataStore {
         // Encode before opening the transaction so the cipher's `&self` borrow
         // does not overlap the transaction's `&mut self.connection` borrow.
         let history_text = self.encode_history_text(committed_text)?;
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
 
         if Self::is_idempotent_duplicate(
             &transaction,
@@ -2316,7 +2374,7 @@ impl MetadataStorePort for SqliteMetadataStore {
     ) -> Result<(), Self::Error> {
         let session_key = Self::session_key(session_id)?;
         let history_text = self.encode_history_text("")?;
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
 
         if Self::is_idempotent_duplicate(
             &transaction,
@@ -2415,7 +2473,7 @@ impl MetadataStorePort for SqliteMetadataStore {
     }
 
     fn prune_history(&mut self, older_than_days: u32) -> Result<u64, Self::Error> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let deleted = backend_result(transaction.execute(
             "DELETE FROM ime_text_history
              WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
@@ -2437,7 +2495,7 @@ impl MetadataStorePort for SqliteMetadataStore {
     }
 
     fn delete_history_entry(&mut self, id: i64) -> Result<(), Self::Error> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         let deleted = backend_result(
             transaction.execute("DELETE FROM ime_text_history WHERE id = ?1", params![id]),
         )?;
@@ -2469,7 +2527,7 @@ impl MetadataStorePort for SqliteMetadataStore {
     }
 
     fn set_tray_setting(&mut self, key: &str, value: &str) -> Result<(), Self::Error> {
-        let transaction = backend_result(self.connection.transaction())?;
+        let transaction = self.write_transaction()?;
         backend_result(transaction.execute(
             "INSERT INTO tray_settings (key, value, updated_at)
              VALUES (?1, ?2, datetime('now'))
@@ -2707,5 +2765,204 @@ mod amend_correction_tests {
 
         assert_eq!(post_commit_edits(&store, &key), 0);
         assert_eq!(candidate(&store, &key).2, "accepted_without_edit");
+    }
+}
+
+#[cfg(test)]
+mod open_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn open_path_configures_wal_and_a_busy_timeout_for_cross_process_access() {
+        // The daemon, the tray-launched dashboard's SyncHost, and a spawned
+        // trainerctl all open this same FILE from separate processes. In the
+        // default rollback-journal mode a reader can collide with a writer's
+        // lock, and with no busy timeout the very first collision surfaces as
+        // SQLITE_BUSY — which the daemon's run loop treats as a fatal storage
+        // error. Pin the machine-independent open configuration (WAL: readers
+        // never block on the writer; busy_timeout: a second writer waits
+        // instead of failing) rather than a timing-dependent race.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open_path(dir.path().join("t.db")).expect("open");
+        let mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(mode, "wal");
+        let timeout: i64 = store
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout");
+        assert!(
+            timeout >= 5_000,
+            "cross-process contention must wait, not fail instantly (got {timeout} ms)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dashboard_count_tests {
+    use super::*;
+
+    fn store() -> SqliteMetadataStore {
+        let mut s = SqliteMetadataStore::open_in_memory().expect("store");
+        s.migrate().expect("migrate");
+        s
+    }
+
+    fn add_candidate(store: &mut SqliteMetadataStore, text: &str, key_suffix: u32) -> i64 {
+        let session = store.create_session(Some(text)).expect("create");
+        let audio_key = format!("audio-key-{key_suffix}");
+        store
+            .commit_session(session, text, &audio_key)
+            .expect("commit");
+        store
+            .connection
+            .query_row(
+                "SELECT id FROM training_candidates ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("candidate id")
+    }
+
+    // ---- trainable_count ----
+
+    #[test]
+    fn trainable_count_is_zero_for_empty_store() {
+        let store = store();
+        assert_eq!(store.trainable_count("default").expect("count"), 0);
+    }
+
+    #[test]
+    fn trainable_count_includes_captured_candidates() {
+        let mut store = store();
+        add_candidate(&mut store, "hello", 1);
+        add_candidate(&mut store, "world", 2);
+        assert_eq!(store.trainable_count("default").expect("count"), 2);
+    }
+
+    #[test]
+    fn trainable_count_excludes_rejected_synced_evicted_but_includes_captured() {
+        let mut store = store();
+        let trainable = add_candidate(&mut store, "trainable", 1);
+        let to_reject = add_candidate(&mut store, "to reject", 2);
+        let to_synced = add_candidate(&mut store, "to synced", 3);
+        let to_evicted = add_candidate(&mut store, "to evicted", 4);
+
+        store
+            .reject_training_candidate(to_reject, "bad-audio")
+            .expect("reject");
+        store
+            .connection
+            .execute(
+                "UPDATE training_candidates SET status = 'synced' WHERE id = ?1",
+                params![to_synced],
+            )
+            .expect("synced");
+        store
+            .connection
+            .execute(
+                "UPDATE training_candidates SET status = 'evicted' WHERE id = ?1",
+                params![to_evicted],
+            )
+            .expect("evicted");
+
+        let _ = trainable;
+        assert_eq!(store.trainable_count("default").expect("count"), 1);
+    }
+
+    #[test]
+    fn trainable_count_is_per_user() {
+        let mut store = store();
+        // Create a second user in the users table so we can assign sessions to them.
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO users(id, display_name) VALUES ('alice', 'alice')",
+                [],
+            )
+            .expect("insert alice");
+        // Create a session for default, then re-assign to alice.
+        let session = store.create_session(Some("alice text")).expect("create");
+        store
+            .commit_session(session, "alice text", "audio-alice-1")
+            .expect("commit");
+        let session_id: String = store
+            .connection
+            .query_row(
+                "SELECT text_session_id FROM training_candidates ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("session id");
+        store
+            .connection
+            .execute(
+                "UPDATE ime_text_sessions SET user_id = 'alice' WHERE id = ?1",
+                params![session_id],
+            )
+            .expect("reassign");
+
+        assert_eq!(store.trainable_count("default").expect("default"), 0);
+        assert_eq!(store.trainable_count("alice").expect("alice"), 1);
+    }
+
+    // ---- last_trained_at ----
+
+    #[test]
+    fn last_trained_at_is_none_for_no_runs() {
+        let store = store();
+        assert_eq!(store.last_trained_at("default").expect("query"), None,);
+    }
+
+    #[test]
+    fn last_trained_at_returns_the_max_finished_at_among_completed_runs() {
+        let store = store();
+        for (id, ts, status) in [
+            ("run-1", "2026-01-01T00:00:00.000Z", "completed"),
+            ("run-2", "2026-06-01T00:00:00.000Z", "completed"),
+            ("run-3", "2026-07-01T00:00:00.000Z", "failed"),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO training_runs(id, user_id, manifest_digest, status, finished_at)
+                     VALUES (?1, 'default', 'md', ?3, ?2)",
+                    params![id, ts, status],
+                )
+                .expect("insert run");
+        }
+        assert_eq!(
+            store.last_trained_at("default").expect("query"),
+            Some("2026-06-01T00:00:00.000Z".to_owned()),
+        );
+    }
+
+    #[test]
+    fn last_trained_at_ignores_other_users_runs() {
+        let store = store();
+        // Insert a second user and a completed run belonging to them.
+        store
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO users(id, display_name) VALUES ('alice', 'alice')",
+                [],
+            )
+            .expect("insert alice");
+        store
+            .connection
+            .execute(
+                "INSERT INTO training_runs(id, user_id, manifest_digest, status, finished_at)
+                 VALUES ('run-x', 'alice', 'md', 'completed', '2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("insert run");
+
+        assert_eq!(store.last_trained_at("default").expect("query"), None);
+        assert_eq!(
+            store.last_trained_at("alice").expect("query"),
+            Some("2026-01-01T00:00:00.000Z".to_owned()),
+        );
     }
 }

@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -47,9 +47,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -57,7 +57,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev
+          sudo apt-get install -y libasound2-dev libpulse-dev libglib2.0-dev \
+            libx11-dev libxkbcommon-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -73,6 +74,9 @@ jobs:
 
       - name: Run doc tests
         run: cargo test --workspace --doc --features idiolect-ibus/ibus-engine
+
+      - name: Hermetic build gate (no machine-specific ISA in ggml)
+        run: bash ci/scripts/test-hermetic-build.sh
 
       - name: Run coverage (80% line coverage gate)
         run: cargo llvm-cov --workspace --features idiolect-ibus/ibus-engine --all-targets --fail-under-lines 80
@@ -93,7 +97,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -122,7 +126,7 @@ jobs:
     needs: [rust, fcitx5]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -139,9 +143,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -170,7 +174,7 @@ jobs:
     needs: [rust, fcitx5]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -187,9 +191,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -229,7 +233,7 @@ jobs:
     needs: [rust]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -246,9 +250,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -268,7 +272,7 @@ jobs:
     needs: [rust]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -285,9 +289,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -310,7 +314,7 @@ jobs:
     needs: [rust]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -327,9 +331,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install /usr/bin/time
         run: sudo apt-get update && sudo apt-get install -y time libasound2-dev libpulse-dev libglib2.0-dev
@@ -354,7 +358,7 @@ jobs:
     needs: [rust]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -371,9 +375,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Run real adapter dependency check
         run: bash ci/scripts/test-real-adapter-deps.sh
@@ -388,7 +392,7 @@ jobs:
     needs: [rust]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -405,9 +409,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Run interface leakage check
         run: bash ci/scripts/test-interface-no-backend-leakage.sh
@@ -422,7 +426,7 @@ jobs:
     needs: [rust, fcitx5]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -439,9 +443,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -481,7 +485,7 @@ jobs:
     needs: [rust, fcitx5, integration, e2e, failure-recovery, model-regression, performance, real-adapter-deps, interface-leakage, packaging]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -498,9 +502,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -526,7 +530,7 @@ jobs:
     needs: [rust, fcitx5]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -543,9 +547,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
       - name: Install system dependencies
         run: |
@@ -569,16 +573,78 @@ jobs:
   # MACOS FOUNDATION (portable crates) — see docs/future/009-macos-port.md
   #
   # The macOS port lands phase by phase; this job guards the cross-platform
-  # foundation that already builds on macOS: the hexagonal core, ports, IPC, and
-  # the platform-aware base-dir / sun_path logic in idiolect-common. The pure
-  # `Platform`-keyed code paths mean this runner exercises the *macOS* layout for
-  # real, not just a compile. As whisper-metal, the egui GUIs, and the IMK
-  # component land, add their crates here.
+  # foundation that already builds on macOS: the hexagonal core, ports, IPC,
+  # the platform-aware base-dir / sun_path logic in idiolect-common, and the
+  # idiolect-app dashboard (Phase 2–4). No system packages needed: every crate
+  # here is dependency-pure (no ALSA, DBus, X11, fcitx5, or CUDA).
   # =========================================================================
   macos:
-    name: macOS Foundation (portable crates)
+    name: macOS Foundation (portable crates + idiolect-app)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-portable-
+
+      # No system packages: every crate below is dependency-pure (no ALSA, DBus,
+      # X11, fcitx5, or CUDA), so it builds against the stock macOS toolchain.
+      - name: Clippy (warnings as errors)
+        run: |
+          cargo clippy \
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            -p idiolect-app \
+            --all-targets -- -D warnings
+
+      - name: Test (incl. macOS base-dir + sun_path layout)
+        run: |
+          cargo test \
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+            -p idiolect-sync-server -p idiolect-adapter-sqlite \
+            -p idiolect-app \
+            --all-targets
+
+      - name: Build idiolect-app release binary
+        run: cargo build --release -p idiolect-app
+
+      - name: Upload macOS idiolect-app binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: idiolect-app-macos
+          path: target/release/idiolect-app
+          retention-days: 7
+
+  # =========================================================================
+  # WINDOWS (portable crates + idiolect-app)
+  #
+  # Tests the idiolect-app dashboard and portable core on Windows. No ALSA,
+  # DBus, X11, fcitx5, or CUDA — only the cross-platform subset.
+  # =========================================================================
+  windows:
+    name: Windows (portable crates + idiolect-app)
+    runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -598,25 +664,37 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-portable-
 
-      # No system packages: every crate below is dependency-pure (no ALSA, DBus,
-      # X11, fcitx5, or CUDA), so it builds against the stock macOS toolchain.
       - name: Clippy (warnings as errors)
         run: |
-          cargo clippy \
-            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
-            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+          cargo clippy `
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core `
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc `
+            -p idiolect-sync-server -p idiolect-adapter-sqlite `
+            -p idiolect-app `
             --all-targets -- -D warnings
 
-      - name: Test (incl. macOS base-dir + sun_path layout)
+      - name: Test
         run: |
-          cargo test \
-            -p idiolect-common -p idiolect-core -p idiolect-ml-core \
-            -p idiolect-ports -p idiolect-application -p idiolect-ipc \
+          cargo test `
+            -p idiolect-common -p idiolect-core -p idiolect-ml-core `
+            -p idiolect-ports -p idiolect-application -p idiolect-ipc `
+            -p idiolect-sync-server -p idiolect-adapter-sqlite `
+            -p idiolect-app `
             --all-targets
+
+      - name: Build idiolect-app release binary
+        run: cargo build --release -p idiolect-app
+
+      - name: Upload Windows idiolect-app binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: idiolect-app-windows
+          path: target/release/idiolect-app.exe
+          retention-days: 7
 
   # =========================================================================
   # SUMMARY / GATE
@@ -639,6 +717,7 @@ jobs:
       - coverage-map
       - e2e-headless
       - macos
+      - windows
     if: always()
     steps:
       - name: Check all required jobs succeeded

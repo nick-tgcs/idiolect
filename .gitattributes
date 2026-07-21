@@ -1,0 +1,5 @@
+# Force LF line endings for all text files on all platforms.
+# Without this, git on Windows (core.autocrlf=true) converts LF→CRLF on
+# checkout, which changes the SHA256 embedded by include_str! and breaks
+# migration_checksums_match_embedded_catalog on Windows CI.
+* text=auto eol=lf

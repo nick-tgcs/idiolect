@@ -19,6 +19,7 @@ class CorrectionCaptureTest {
         override fun commitText(text: String) {}
         override fun finishComposingText() {}
         override fun deleteBackward() {}
+        override fun performEditorAction(actionId: Int) {}
         override fun setSelection(start: Int, end: Int) { ops.add("select:$start:$end") }
         override fun fieldText(): String = text
     }
@@ -80,6 +81,24 @@ class CorrectionCaptureTest {
         assertFalse(cc.capture())
         // ...and the chips now reflect the corrected take.
         assertEquals(listOf("send", "them", "the"), cc.currentChips().map { it.text })
+    }
+
+    @Test
+    fun disarm_drops_the_pending_baseline_so_a_later_capture_reports_nothing() {
+        // A secret take (dictated into a password/PIN field) must never linger: after disarm,
+        // a following capture on an unrelated field records no raw→corrected pair — the secret
+        // is never amended with foreign text, so nothing syncable is produced.
+        val field = FakeField()
+        val reported = mutableListOf<String>()
+        val cc = capture(field, reported = reported)
+        cc.onTakeCommitted("secret")
+
+        cc.disarm()
+
+        field.text = "an unrelated later field"
+        assertFalse(cc.capture())
+        assertTrue(reported.isEmpty())
+        assertTrue(cc.currentChips().isEmpty())
     }
 
     @Test

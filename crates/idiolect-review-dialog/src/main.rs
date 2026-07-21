@@ -120,7 +120,7 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 144, 161);
 fn install_theme(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -143,17 +143,17 @@ fn install_theme(ctx: &egui::Context) {
     .into();
 
     let mut v = egui::Visuals::dark();
-    let rounding = egui::Rounding::same(10.0);
-    v.window_rounding = egui::Rounding::same(14.0);
+    let corner_radius = egui::CornerRadius::same(10);
+    v.window_corner_radius = egui::CornerRadius::same(14);
     v.window_fill = BG;
     v.panel_fill = BG;
     v.extreme_bg_color = FIELD;
     v.override_text_color = Some(TEXT);
-    v.widgets.noninteractive.rounding = rounding;
-    v.widgets.inactive.rounding = rounding;
-    v.widgets.hovered.rounding = rounding;
-    v.widgets.active.rounding = rounding;
-    v.widgets.open.rounding = rounding;
+    v.widgets.noninteractive.corner_radius = corner_radius;
+    v.widgets.inactive.corner_radius = corner_radius;
+    v.widgets.hovered.corner_radius = corner_radius;
+    v.widgets.active.corner_radius = corner_radius;
+    v.widgets.open.corner_radius = corner_radius;
     v.widgets.inactive.bg_fill = SURFACE;
     v.widgets.inactive.weak_bg_fill = SURFACE;
     let surface_hover = egui::Color32::from_rgb(44, 47, 60);
@@ -162,15 +162,15 @@ fn install_theme(ctx: &egui::Context) {
     v.selection.bg_fill = ACCENT.gamma_multiply(0.45);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     v.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 6.0),
-        blur: 24.0,
-        spread: 0.0,
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
         color: egui::Color32::from_black_alpha(120),
     };
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(10.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 struct ReviewApp {
@@ -262,15 +262,16 @@ impl ReviewApp {
 }
 
 impl eframe::App for ReviewApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 
 impl ReviewApp {
-    /// The per-frame draw, split out of `eframe::App::update` so it can be
-    /// driven headlessly in tests with a bare `egui::Context` (no `eframe::Frame`).
-    fn ui(&mut self, ctx: &egui::Context) {
+    /// The per-frame draw, split out of `eframe::App::ui` so it can be driven
+    /// headlessly in tests via `egui::Context::run_ui` (no `eframe::Frame`).
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // Drain the engine's feed first so this frame draws the latest state.
         let (lines, eof) = {
             let mut feed = self.feed.lock().expect("feed mutex");
@@ -288,11 +289,11 @@ impl ReviewApp {
         if eof && self.listening {
             // The engine went away before the take finished (cancel, error,
             // daemon restart): close without a result.
-            self.finish(ctx, false);
+            self.finish(&ctx, false);
             return;
         }
 
-        self.center(ctx);
+        self.center(&ctx);
         let mut action: Option<bool> = None; // Some(true)=insert, Some(false)=cancel
                                              // Keys act only if the frame STARTED reviewable — a keystroke racing
                                              // the `final` line must not confirm text the user never saw.
@@ -306,14 +307,14 @@ impl ReviewApp {
         }
 
         // Draggable header (the window is frameless) + title and hint.
-        egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 16.0,
-                bottom: 6.0,
+        egui::Panel::top("header")
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 16,
+                bottom: 6,
             }))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.listening {
                         // A *painted* round recording dot. The header used to
@@ -362,14 +363,14 @@ impl ReviewApp {
             });
 
         // Action buttons pinned to the bottom so they are never clipped.
-        egui::TopBottomPanel::bottom("actions")
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 12.0,
-                bottom: 16.0,
+        egui::Panel::bottom("actions")
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 12,
+                bottom: 16,
             }))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let insert = egui::Button::new(
                         egui::RichText::new("Insert")
@@ -394,13 +395,13 @@ impl ReviewApp {
         // The transcript fills the space between, scrolling if long. Read-only
         // while listening (the daemon owns the text until the take ends).
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin {
-                left: 22.0,
-                right: 22.0,
-                top: 2.0,
-                bottom: 2.0,
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 2,
+                bottom: 2,
             }))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let blurb = if self.listening {
                     "Each pause adds a phrase. Nothing is typed until you finish."
                 } else {
@@ -427,7 +428,7 @@ impl ReviewApp {
             });
 
         if let Some(confirmed) = action {
-            self.finish(ctx, confirmed);
+            self.finish(&ctx, confirmed);
         }
 
         // Poll the feed even while idle so new snippets (and the final text)
@@ -482,7 +483,7 @@ mod tests {
     fn run(app: &mut ReviewApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
-        let _ = ctx.run(input, |ctx| app.ui(ctx));
+        let _ = ctx.run_ui(input, |ui| app.draw(ui));
     }
 
     #[test]

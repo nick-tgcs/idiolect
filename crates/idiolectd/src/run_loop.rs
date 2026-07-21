@@ -21,8 +21,8 @@ use idiolect_adapter_vad::VadAdapter;
 use idiolect_application::use_cases::history::ClipboardPort;
 use idiolect_application::use_cases::maintenance::{MaintenanceUseCase, DEFAULT_PRUNE_INTERVAL};
 use idiolect_application::use_cases::menu::{
-    validate_training_retention_days, MenuUseCase, RecordingState, MAX_ENTRY_CHOICES,
-    RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
+    validate_training_retention_days, MenuUseCase, RecordingState, SyncMenuState,
+    MAX_ENTRY_CHOICES, RETENTION_DAY_CHOICES, TRAINING_RETENTION_CHOICES,
 };
 use idiolect_application::use_cases::streaming::{
     merge_tail_correction, FinalizedTake, StreamObserver, StreamingConfig, StreamingTake,
@@ -35,7 +35,8 @@ use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
     CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
-    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECORDING_STATUS,
+    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECONCILE,
+    FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -48,6 +49,9 @@ use crate::retention_dialog::{RetentionDialog, SubprocessRetentionDialog};
 #[derive(Debug)]
 pub(crate) struct RunLoopConfig {
     pub(crate) socket_path: PathBuf,
+    /// The resolved data root, handed to the tray's dashboard subprocess so it
+    /// operates on the daemon's store rather than its own default-path one.
+    pub(crate) data_dir: PathBuf,
     pub(crate) database_path: PathBuf,
     pub(crate) audio_root: PathBuf,
     pub(crate) decoded_cache_root: PathBuf,
@@ -79,6 +83,18 @@ impl RunLoopError {
             message: format!("io {action} failed: {error}"),
             source: Some(Box::new(error)),
         }
+    }
+
+    /// Whether this error means the CLIENT went away mid-conversation — a peer
+    /// reset surfacing on a daemon WRITE (`EPIPE`/`ECONNRESET`). The read path
+    /// classifies resets inline (see [`is_disconnect`]); a failed write unwinds
+    /// out of [`handle_connection`], so the accept loop uses this to survive it
+    /// exactly like a read-side reset.
+    pub(crate) fn is_client_disconnect(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(is_disconnect)
     }
 
     fn framing(error: FramingError) -> Self {
@@ -138,6 +154,17 @@ impl RunLoopError {
     }
 }
 
+/// Where the at-rest history key lives: `history.key` beside the database.
+/// ONE derivation, shared by the daemon's own cipher ([`build_history_cipher`])
+/// and the store handed to the tray's dashboard ([`dashboard_store`]), so the
+/// two processes can never cipher with different keys.
+fn history_key_path(database_path: &Path) -> PathBuf {
+    database_path.parent().map_or_else(
+        || PathBuf::from("history.key"),
+        |parent| parent.join("history.key"),
+    )
+}
+
 /// Builds the at-rest history cipher when `encrypt_at_rest` is enabled. The key
 /// is stored next to the database with `0600` permissions.
 fn build_history_cipher(
@@ -147,14 +174,26 @@ fn build_history_cipher(
     if !config.encrypt_at_rest {
         return Ok(None);
     }
-    let key_path = database_path.parent().map_or_else(
-        || PathBuf::from("history.key"),
-        |parent| parent.join("history.key"),
-    );
-    let key = FileKey::new(key_path)
+    let key = FileKey::new(history_key_path(database_path))
         .load_or_create_key()
         .map_err(|error| RunLoopError::crypto("key load", error))?;
     Ok(Some(Box::new(ChaCha20Poly1305Cipher::new(key))))
+}
+
+/// The store the tray hands to the dashboard subprocess: the daemon's resolved
+/// paths, plus the history key exactly when this daemon ciphers with one
+/// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
+/// overrides it — so this mirrors [`build_history_cipher`]'s decision).
+fn dashboard_store(config: &RunLoopConfig) -> crate::sync_panel_launcher::DashboardStore {
+    crate::sync_panel_launcher::DashboardStore {
+        data_dir: config.data_dir.clone(),
+        database_path: config.database_path.clone(),
+        base_model: config.adapter_profile.whisper_model_path.clone(),
+        history_key: config
+            .history_config
+            .encrypt_at_rest
+            .then(|| history_key_path(&config.database_path)),
+    }
 }
 
 impl Display for RunLoopError {
@@ -265,15 +304,41 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
         let (stream, _) = listener
             .accept()
             .map_err(|error| RunLoopError::io("accept client", error))?;
-        handle_connection(
+        // Per-connection state (see [`Live`]) — owned HERE so a write that
+        // unwinds out of `handle_connection` can still be cleaned up below,
+        // exactly like a read-side reset.
+        let mut live = Live {
+            active_session: None,
+            live_capture: None,
+            live_stream: None,
+            status_tx: RecordingStatusTx::new(false),
+            wants_reconcile: false,
+        };
+        match handle_connection(
             stream,
             &config,
             &mut tray,
             &mut clipboard,
             &mut store,
-            &tray_callback_rx,
-            &settings_forward_tx,
-        )?;
+            &TrayChannel {
+                rx: &tray_callback_rx,
+                forward_tx: &settings_forward_tx,
+            },
+            &mut live,
+        ) {
+            Ok(()) => {}
+            // A write racing the peer's reset (EPIPE mid-response) is the same
+            // event as reading the reset: the client went away. The read path
+            // handles it inside `handle_connection`; a failed WRITE unwinds out
+            // of it, so it is converted here — release the mic, cancel
+            // uncommitted work, repaint the tray idle, and accept the next
+            // client. Crashing instead would let any engine restart take the
+            // whole daemon down.
+            Err(error) if error.is_client_disconnect() => {
+                cleanup_disconnected_client(&mut tray, &mut store, &config, &mut live)?;
+            }
+            Err(error) => return Err(error),
+        }
         if config.shutdown_after_client {
             return Ok(());
         }
@@ -536,9 +601,40 @@ fn review_mode_enabled(store: &SqliteMetadataStore) -> bool {
         == Some("true")
 }
 
+/// Whether dictation types the live "preview" as you speak (persisted in
+/// `tray_settings`, **default ON**). When on, streamed snippets are typed live and
+/// the verified whole-take text replaces them at stop; when off, no snippets are
+/// streamed and only the verified text is typed once, at stop. Absent ⇒ on, so the
+/// feature is live for everyone without a migration.
+fn preview_typing_enabled(store: &SqliteMetadataStore) -> bool {
+    store
+        .get_tray_setting("preview_typing")
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
+}
+
+/// Flip the persisted "preview typing" setting (off ⇄ on). Mirrors the
+/// review-mode toggle; the tray click / settings checkbox is the GUI boundary.
+fn toggle_preview_typing(store: &mut SqliteMetadataStore) -> Result<(), RunLoopError> {
+    let next = if preview_typing_enabled(store) {
+        "false"
+    } else {
+        "true"
+    };
+    store
+        .set_tray_setting("preview_typing", next)
+        .map_err(|error| RunLoopError::storage("set preview_typing", error))
+}
+
 /// Rebuilds and installs the tray menu from current storage state.
-fn refresh_tray_menu(
-    tray: &mut KsniTray,
+///
+/// Generic over [`TrayPort`] (the production tray is [`KsniTray`]) so tests can
+/// observe renders through a recording fake — the real StatusNotifier host is a
+/// GUI boundary.
+fn refresh_tray_menu<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
     store: &SqliteMetadataStore,
     config: &RunLoopConfig,
     recording_state: RecordingState,
@@ -548,7 +644,12 @@ fn refresh_tray_menu(
     let entries = store
         .recent_history(history.max_entries)
         .map_err(|error| RunLoopError::storage("recent history", error))?;
-    let mut menu = MenuUseCase::new().get_menu(recording_state, &entries, &translation);
+    let mut menu = MenuUseCase::new().get_menu(
+        recording_state,
+        &entries,
+        &translation,
+        &SyncMenuState::default(),
+    );
     menu.push(idiolect_ports::storage::TrayMenuItem {
         id: "review_mode".to_owned(),
         label: "Review before insert".to_owned(),
@@ -557,8 +658,24 @@ fn refresh_tray_menu(
             checked: review_mode_enabled(store),
         },
     });
+    menu.push(idiolect_ports::storage::TrayMenuItem {
+        id: "preview_typing".to_owned(),
+        label: "Preview typing".to_owned(),
+        enabled: true,
+        kind: idiolect_ports::storage::TrayMenuItemKind::Checkable {
+            checked: preview_typing_enabled(store),
+        },
+    });
     tray.set_menu(menu)
         .map_err(|error| RunLoopError::tray("tray menu", error))
+}
+
+/// The tray-callback channel pair a connection services: `rx` drains tray
+/// clicks between IPC reads; `forward_tx` lets the Settings window feed its
+/// changes back into the same stream.
+struct TrayChannel<'a> {
+    rx: &'a mpsc::Receiver<TrayCallback>,
+    forward_tx: &'a mpsc::Sender<TrayCallback>,
 }
 
 fn handle_connection(
@@ -567,8 +684,8 @@ fn handle_connection(
     tray: &mut KsniTray,
     clipboard: &mut ArboardClipboard,
     store: &mut SqliteMetadataStore,
-    tray_callback_rx: &mpsc::Receiver<TrayCallback>,
-    settings_forward_tx: &mpsc::Sender<TrayCallback>,
+    tray_channel: &TrayChannel<'_>,
+    live: &mut Live,
 ) -> Result<(), RunLoopError> {
     let reader_stream = stream
         .try_clone()
@@ -587,23 +704,16 @@ fn handle_connection(
     let retention_dialog = SubprocessRetentionDialog::discover();
     // Out-of-process Settings window ("Settings…" in the tray); discovered once.
     let settings_window = crate::settings_launcher::SettingsLauncher::discover();
-    // Per-connection state bundled into `Live`:
-    //  - active_session: the in-flight dictation, if any.
-    //  - live_capture: set only while a real microphone recording is in progress.
-    //  - live_stream: set alongside live.live_capture while translation streams snippets.
-    //  - status_tx: the authoritative recording-state publisher, re-armed at
-    //    handshake once we know whether the client negotiated `recording_status`.
-    let mut live = Live {
-        active_session: None,
-        live_capture: None,
-        live_stream: None,
-        status_tx: RecordingStatusTx::new(false),
-    };
+    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
+    // handed the daemon's resolved store so pairing and training act on the
+    // database this daemon writes — not a second, default-path store.
+    let sync_panel =
+        crate::sync_panel_launcher::SyncPanelLauncher::discover(dashboard_store(config));
     let mut line = String::new();
 
     loop {
         // Drain any pending tray callbacks before (and between) IPC reads.
-        while let Ok(callback) = tray_callback_rx.try_recv() {
+        while let Ok(callback) = tray_channel.rx.try_recv() {
             handle_tray_action(
                 callback,
                 &mut stream,
@@ -615,11 +725,12 @@ fn handle_connection(
                     codec: &codec,
                     config,
                 },
-                &mut live,
+                live,
                 &ConfigSurfaces {
                     retention_dialog: &retention_dialog,
                     settings_window: &settings_window,
-                    settings_forward_tx,
+                    sync_panel: &sync_panel,
+                    settings_forward_tx: tray_channel.forward_tx,
                 },
             )?;
         }
@@ -635,7 +746,7 @@ fn handle_connection(
                 codec: &codec,
                 config,
             },
-            &mut live,
+            live,
         )?;
         if auto_stop {
             // The user went silent past the auto-stop threshold: the long pause
@@ -650,23 +761,18 @@ fn handle_connection(
                     codec: &codec,
                     config,
                 },
-                &mut live,
+                live,
             )?;
         }
 
         match reader.read_line(&mut line) {
             // A clean EOF (0) or an abrupt reset are both just the peer going away —
             // e.g. an IME engine restarting/reconnecting sends RST, not FIN. Treat
-            // them identically: release the mic, cancel uncommitted work, and accept
-            // the next client. Crashing the daemon on a client reset would let any
-            // engine restart take the whole daemon down.
+            // them identically: release the mic, cancel uncommitted work, repaint
+            // the tray idle, and accept the next client. Crashing the daemon on a
+            // client reset would let any engine restart take the whole daemon down.
             Ok(0) => {
-                drop_live_capture(&mut live.live_capture);
-                cancel_uncommitted_active_session(
-                    store,
-                    &mut live.active_session,
-                    "daemon-disconnect",
-                )?;
+                cleanup_disconnected_client(tray, store, config, live)?;
                 return Ok(());
             }
             Ok(_) => {}
@@ -674,12 +780,7 @@ fn handle_connection(
             // Any partial bytes already read stay buffered in `line`.
             Err(error) if is_read_timeout(&error) => {}
             Err(error) if is_disconnect(&error) => {
-                drop_live_capture(&mut live.live_capture);
-                cancel_uncommitted_active_session(
-                    store,
-                    &mut live.active_session,
-                    "daemon-disconnect",
-                )?;
+                cleanup_disconnected_client(tray, store, config, live)?;
                 return Ok(());
             }
             Err(error) => return Err(RunLoopError::io("read ipc line", error)),
@@ -700,6 +801,10 @@ fn handle_connection(
                     .accepted_features
                     .iter()
                     .any(|feature| feature == FEATURE_RECORDING_STATUS);
+                live.wants_reconcile = response
+                    .accepted_features
+                    .iter()
+                    .any(|feature| feature == FEATURE_RECONCILE);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
                 live.status_tx = RecordingStatusTx::new(wants_status);
                 live.status_tx.sync_initial(&mut stream)?;
@@ -717,7 +822,7 @@ fn handle_connection(
                                 codec: &codec,
                                 config,
                             },
-                            &mut live,
+                            live,
                         )?;
                     } else {
                         start_live_capture(
@@ -729,7 +834,7 @@ fn handle_connection(
                                 codec: &codec,
                                 config,
                             },
-                            &mut live,
+                            live,
                         )?;
                     }
                 } else {
@@ -742,7 +847,7 @@ fn handle_connection(
                             codec: &codec,
                             config,
                         },
-                        &mut live,
+                        live,
                     )?;
                 }
             }
@@ -757,7 +862,7 @@ fn handle_connection(
                             codec: &codec,
                             config,
                         },
-                        &mut live,
+                        live,
                     )?;
                 }
             }
@@ -1092,18 +1197,32 @@ struct DaemonObserver<'a> {
     stream: &'a mut UnixStream,
     store: &'a SqliteMetadataStore,
     config: &'a RunLoopConfig,
+    /// Whether the client negotiated [`FEATURE_RECONCILE`]. Preview typing can only
+    /// be suppressed for such a client (it gets the verified text at stop); a
+    /// client without reconcile must always receive live snippets or nothing would
+    /// ever be typed.
+    wants_reconcile: bool,
 }
 
 impl StreamObserver for DaemonObserver<'_> {
     type Error = RunLoopError;
 
     fn snippet_committed(&mut self, chunk: &str) -> Result<(), RunLoopError> {
+        // "Preview typing" off: type nothing live — the verified whole-take text is
+        // sent once, at stop, as the reconcile final. Only do this for a client that
+        // negotiated reconcile (else it would receive nothing); review mode always
+        // streams display-only snippets into its dialog regardless of the toggle.
+        let review = review_mode_enabled(self.store);
+        if !review && self.wants_reconcile && !preview_typing_enabled(self.store) {
+            return Ok(());
+        }
         send_ipc_message(
             self.stream,
             &IpcMessage::PreeditUpdate(PreeditUpdate {
                 text: chunk.to_owned(),
-                review: review_mode_enabled(self.store),
+                review,
                 partial: true,
+                reconcile: false,
             }),
         )
     }
@@ -1224,12 +1343,35 @@ fn drop_live_capture(live_capture: &mut Option<crate::adapters::RuntimeCapture>)
     }
 }
 
-/// The single place recording-state changes are published. The daemon owns the
-/// microphone, so it is the authority: every start/stop/cancel — whether driven by
-/// the keyboard toggle over IPC or by a tray menu click — funnels through here,
-/// which updates the tray icon/menu AND pushes [`IpcMessage::RecordingStatus`] to a
-/// client that negotiated the feature. Because the tray and the push share this one
-/// chokepoint, the keyboard, the tray, and the adapter indicator can never disagree.
+/// The single unwind path for a client that vanished — whether the reset
+/// surfaced on a READ (EOF/ECONNRESET in the read loop) or on a WRITE (EPIPE
+/// unwinding out of [`handle_connection`]): release the microphone, cancel
+/// any uncommitted session, and re-publish Idle to the tray.
+///
+/// The tray render must not be skipped: the client may have died after
+/// `start_live_capture` rendered Recording, and nothing else repaints the tray
+/// before the next take. It also must not touch the dead stream, so it goes
+/// through [`update_tray_recording_state`] directly, never `status_tx.set`.
+fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
+    store: &mut SqliteMetadataStore,
+    config: &RunLoopConfig,
+    live: &mut Live,
+) -> Result<(), RunLoopError> {
+    drop_live_capture(&mut live.live_capture);
+    cancel_uncommitted_active_session(store, &mut live.active_session, "daemon-disconnect")?;
+    update_tray_recording_state(tray, store, config, RecordingState::Idle)
+}
+
+/// The single place recording-state changes are published TO A LIVE CLIENT. The
+/// daemon owns the microphone, so it is the authority: every start/stop/cancel —
+/// whether driven by the keyboard toggle over IPC or by a tray menu click — funnels
+/// through here, which updates the tray icon/menu AND pushes
+/// [`IpcMessage::RecordingStatus`] to a client that negotiated the feature. Because
+/// the tray and the push share this one chokepoint, the keyboard, the tray, and the
+/// adapter indicator can never disagree. The one path that bypasses it is
+/// [`cleanup_disconnected_client`]: with the client gone there is nothing to push
+/// to, so it repaints the tray directly.
 ///
 /// Edge-triggered on the `recording` value: a no-op transition (e.g. a commit after
 /// the mic already stopped) publishes nothing, so clients see one push per real change.
@@ -1329,11 +1471,25 @@ impl RecordingStatusTx {
 /// translated snippet at every pause instead of one transcript on stop.
 /// Per-connection mutable state, bundled so the live-capture handlers stay under
 /// the argument-count lint without threading many `&mut` params individually.
+/// Owned by the accept loop in [`run`] — not by [`handle_connection`] — so a
+/// write that unwinds out of the connection can still be cleaned up like a
+/// read-side reset.
 struct Live {
+    /// The in-flight dictation session, if any.
     active_session: Option<ActiveSession>,
+    /// Set only while a real microphone recording is in progress.
     live_capture: Option<crate::adapters::RuntimeCapture>,
+    /// Set alongside `live_capture` while translation streams snippets.
     live_stream: Option<LiveStreamState>,
+    /// The authoritative recording-state publisher, re-armed at handshake once
+    /// we know whether the client negotiated `recording_status`.
     status_tx: RecordingStatusTx,
+    /// Whether the connected client negotiated [`FEATURE_RECONCILE`]. Only such a
+    /// client receives the stop-time reconcile final (and may have its live
+    /// snippets suppressed when preview typing is off); clients that did not
+    /// advertise it keep the pre-reconcile behaviour, so they can never mistake
+    /// the reconcile final for an appended batch transcript.
+    wants_reconcile: bool,
 }
 
 /// The long-lived store, codecs, and config a connection's handlers share.
@@ -1370,6 +1526,7 @@ fn start_live_capture(
         live_capture,
         live_stream,
         status_tx,
+        wants_reconcile: _,
     } = live;
     cancel_uncommitted_active_session(store, active_session, "daemon-retry")?;
     match crate::adapters::begin_capture(&config.adapter_profile) {
@@ -1417,8 +1574,10 @@ fn pump_live_stream(
     let Live {
         live_capture,
         live_stream,
+        wants_reconcile,
         ..
     } = live;
+    let wants_reconcile = *wants_reconcile;
     let (Some(capture), Some(state)) = (live_capture.as_mut(), live_stream.as_mut()) else {
         return Ok(false);
     };
@@ -1430,7 +1589,14 @@ fn pump_live_stream(
         }
     };
     for snippet in state.ingest(&drained) {
-        fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+        fold_snippet_into_take(
+            stream,
+            store,
+            config,
+            &mut state.take,
+            snippet,
+            wants_reconcile,
+        )?;
     }
     Ok(state.auto_stop_due())
 }
@@ -1445,6 +1611,7 @@ fn fold_snippet_into_take(
     config: &RunLoopConfig,
     take: &mut StreamingTake,
     snippet: Vec<f32>,
+    wants_reconcile: bool,
 ) -> Result<(), RunLoopError> {
     let mut transcriber = DaemonTranscriber {
         store: &*store,
@@ -1454,6 +1621,7 @@ fn fold_snippet_into_take(
         stream,
         store: &*store,
         config,
+        wants_reconcile,
     };
     take.fold_snippet(&mut transcriber, &mut observer, snippet)
 }
@@ -1470,6 +1638,7 @@ fn finalize_streamed_take(
     ctx: Ctx<'_>,
     active_session: &mut Option<ActiveSession>,
     state: LiveStreamState,
+    wants_reconcile: bool,
 ) -> Result<(), RunLoopError> {
     let Ctx {
         store,
@@ -1488,6 +1657,8 @@ fn finalize_streamed_take(
     let FinalizedTake {
         final_text,
         merged_samples,
+        // Only used in the non-reconcile fallback, where the engine's correction
+        // window opens over the take's final snippet (the pre-reconcile contract).
         last_snippet_text,
         fallback_reason,
     } = match outcome {
@@ -1527,6 +1698,7 @@ fn finalize_streamed_take(
                 text: final_text,
                 review: true,
                 partial: false,
+                reconcile: false,
             }),
         )?;
     } else {
@@ -1534,11 +1706,35 @@ fn finalize_streamed_take(
         store
             .commit_session(session_id, &final_text, &key)
             .map_err(|error| RunLoopError::storage("commit streamed take", error))?;
+        // Direct mode: the daemon owns and has just committed the streamed session.
+        let tail_text = if wants_reconcile {
+            // Send the verified whole-take text so the engine REPLACES the preview
+            // it typed live (backspace + re-commit) — or, with preview typing off,
+            // types it fresh. The in-place correction window then covers the FULL
+            // text, so `tail_text` is None (a later fix amends the whole take; see
+            // the ReportCorrection handler's None branch).
+            send_ipc_message(
+                stream,
+                &IpcMessage::PreeditUpdate(PreeditUpdate {
+                    text: final_text.clone(),
+                    review: false,
+                    partial: false,
+                    reconcile: true,
+                }),
+            )?;
+            None
+        } else {
+            // The client did not negotiate reconcile: keep the pre-reconcile
+            // behaviour — send NO stop-time final (an older engine would append it
+            // after the preview it already typed) and let its correction window
+            // open over the take's final snippet. The preview it typed stands.
+            last_snippet_text
+        };
         *active_session = Some(ActiveSession {
             session_id,
             current_text: final_text,
             finalized: true,
-            tail_text: last_snippet_text,
+            tail_text,
         });
     }
     Ok(())
@@ -1567,7 +1763,9 @@ fn stop_live_and_transcribe(
         live_capture,
         live_stream,
         status_tx,
+        wants_reconcile,
     } = live;
+    let wants_reconcile = *wants_reconcile;
     let Some(capture) = live_capture.take() else {
         return Ok(());
     };
@@ -1581,7 +1779,14 @@ fn stop_live_and_transcribe(
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
-                    fold_snippet_into_take(stream, store, config, &mut state.take, snippet)?;
+                    fold_snippet_into_take(
+                        stream,
+                        store,
+                        config,
+                        &mut state.take,
+                        snippet,
+                        wants_reconcile,
+                    )?;
                 }
                 finalize_streamed_take(
                     stream,
@@ -1593,6 +1798,7 @@ fn stop_live_and_transcribe(
                     },
                     active_session,
                     state,
+                    wants_reconcile,
                 )?;
             }
             Err(error) => {
@@ -1635,6 +1841,7 @@ fn stop_live_and_transcribe(
                     text,
                     review,
                     partial: false,
+                    reconcile: false,
                 }),
             )?;
             // The mic is closed once the take stops, so the authoritative state is
@@ -1686,6 +1893,7 @@ fn start_fixture_oneshot(
                     text,
                     review,
                     partial: false,
+                    reconcile: false,
                 }),
             )?;
             // A fixture one-shot captures and transcribes instantly, so the mic is
@@ -1801,6 +2009,7 @@ fn send_ipc_message(stream: &mut UnixStream, message: &IpcMessage) -> Result<(),
 struct ConfigSurfaces<'a> {
     retention_dialog: &'a dyn RetentionDialog,
     settings_window: &'a crate::settings_launcher::SettingsLauncher,
+    sync_panel: &'a crate::sync_panel_launcher::SyncPanelLauncher,
     settings_forward_tx: &'a mpsc::Sender<TrayCallback>,
 }
 
@@ -1820,6 +2029,11 @@ fn handle_tray_action(
                 settings_state_json(ctx.store, ctx.config),
                 surfaces.settings_forward_tx.clone(),
             );
+        }
+        "open:dashboard" => {
+            surfaces
+                .sync_panel
+                .open(surfaces.settings_forward_tx.clone());
         }
         "start_recording" => {
             if crate::adapters::is_live_capture(&ctx.config.adapter_profile) {
@@ -1881,6 +2095,7 @@ fn settings_state_json(store: &SqliteMetadataStore, config: &RunLoopConfig) -> S
         "max_phrase_ms": vad.max_utterance_ms,
         "auto_stop_ms": vad.auto_stop_silence_ms,
         "review_mode": review_mode_enabled(store),
+        "preview_typing": preview_typing_enabled(store),
         "translation_enabled": translation.enabled,
         "input_lang": translation.input_language,
         "output_lang": translation.output_language,
@@ -2026,6 +2241,9 @@ fn handle_tray_callback(
             .set_tray_setting("review_mode", next)
             .map_err(|error| RunLoopError::storage("set review_mode", error))?;
         refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
+    } else if action == "preview_typing" {
+        toggle_preview_typing(store)?;
+        refresh_tray_menu(tray, store, config, RecordingState::Idle)?;
     } else if apply_translation_tray_action(store, translation_defaults, &action)?
         || apply_dictation_tray_action(store, &action)?
     {
@@ -2111,8 +2329,8 @@ fn parse_index_suffix(action: &str, prefix: &str) -> Option<usize> {
         .and_then(|rest| rest.parse().ok())
 }
 
-fn update_tray_recording_state(
-    tray: &mut KsniTray,
+fn update_tray_recording_state<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
     store: &SqliteMetadataStore,
     config: &RunLoopConfig,
     state: RecordingState,
@@ -2161,9 +2379,11 @@ impl Drop for SocketCleanup {
 mod tests {
     use std::io::{Error, ErrorKind};
 
+    use idiolect_ipc::messages::IpcMessage;
+
     use super::{
-        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix,
-        should_clear_clipboard, RecordingStatusTx,
+        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix, send_ipc_message,
+        should_clear_clipboard, RecordingStatusTx, RunLoopError,
     };
 
     #[test]
@@ -2221,6 +2441,41 @@ mod tests {
     }
 
     #[test]
+    fn a_write_to_a_reset_client_classifies_as_client_disconnect() {
+        // The reset can surface on the daemon's WRITE (EPIPE) instead of its
+        // read when responses race the peer's close — the daemon must classify
+        // that as the client going away, not as a daemon fault.
+        let (mut daemon_side, engine_side) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
+        drop(engine_side);
+        // The first write can land in the kernel buffer before the reset is
+        // processed; keep writing until the failure surfaces.
+        let error = loop {
+            if let Err(error) = send_ipc_message(&mut daemon_side, &IpcMessage::StartRecording) {
+                break error;
+            }
+        };
+        assert!(
+            error.is_client_disconnect(),
+            "EPIPE on an IPC write means the client went away: {error}"
+        );
+    }
+
+    #[test]
+    fn only_peer_disconnect_io_errors_classify_as_client_disconnect() {
+        let fault = RunLoopError::io("write ipc line", Error::from(ErrorKind::PermissionDenied));
+        assert!(
+            !fault.is_client_disconnect(),
+            "a genuine io fault must stay fatal"
+        );
+        let sourceless = RunLoopError {
+            message: "no source".to_owned(),
+            source: None,
+        };
+        assert!(!sourceless.is_client_disconnect());
+    }
+
+    #[test]
     fn id_and_index_parsing_is_total() {
         assert_eq!(parse_id_suffix("delete:42", "delete:"), Some(42));
         assert_eq!(parse_id_suffix("delete:nan", "delete:"), None);
@@ -2240,6 +2495,176 @@ mod tests {
     // `merge_tail_correction`, `is_noise_transcript`) moved to
     // `idiolect_application::use_cases::streaming` (M2) and is unit-tested there;
     // the daemon's streaming integration tests below still exercise it end to end.
+
+    mod disconnect_cleanup {
+        use std::path::PathBuf;
+
+        use idiolect_adapter_ksni::KsniTrayError;
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
+        use idiolect_ports::storage::{
+            MetadataStorePort, TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus,
+        };
+
+        use crate::adapters::{RuntimeAdapterProfile, FIXTURE_DEVICE};
+        use crate::run_loop::{
+            cleanup_disconnected_client, dashboard_store, ActiveSession, Live, RecordingStatusTx,
+            RunLoopConfig,
+        };
+
+        /// Records every render instead of drawing it. The production tray's
+        /// StatusNotifier host is a GUI boundary (a real icon needs a session
+        /// bus plus an SNI watcher — see `KsniTray`), so the cleanup contract
+        /// is pinned here at the [`TrayPort`] seam; the daemon-survives-the-
+        /// disconnect half lives in the `daemon_run_lifecycle` e2e, which runs
+        /// headless with the tray disabled and therefore cannot observe renders.
+        #[derive(Default)]
+        struct RecordingTray {
+            icons: Vec<TrayIcon>,
+            tooltips: Vec<String>,
+            menus: Vec<Vec<TrayMenuItem>>,
+        }
+
+        impl TrayPort for RecordingTray {
+            type Error = KsniTrayError;
+
+            fn set_icon(&mut self, icon: TrayIcon) -> Result<(), Self::Error> {
+                self.icons.push(icon);
+                Ok(())
+            }
+
+            fn set_tooltip(&mut self, tooltip: &str) -> Result<(), Self::Error> {
+                self.tooltips.push(tooltip.to_owned());
+                Ok(())
+            }
+
+            fn set_menu(&mut self, items: Vec<TrayMenuItem>) -> Result<(), Self::Error> {
+                self.menus.push(items);
+                Ok(())
+            }
+
+            fn set_status(&mut self, _status: TrayStatus) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        fn test_config() -> RunLoopConfig {
+            RunLoopConfig {
+                socket_path: PathBuf::new(),
+                data_dir: PathBuf::new(),
+                database_path: PathBuf::new(),
+                audio_root: PathBuf::new(),
+                decoded_cache_root: PathBuf::new(),
+                user_id: "test-user".to_owned(),
+                shutdown_after_client: true,
+                adapter_profile: RuntimeAdapterProfile {
+                    audio_input_device: FIXTURE_DEVICE.to_owned(),
+                    vad_engine: "energy".to_owned(),
+                    asr_engine: "fixture".to_owned(),
+                    whisper_model_path: PathBuf::new(),
+                    asr_use_gpu: false,
+                    asr_language: "en".to_owned(),
+                    asr_threads: 1,
+                },
+                history_config: HistoryConfig::default(),
+                translation_config: TranslationConfig::default(),
+                vad_config: VadConfig::default(),
+                notify_command: String::new(),
+            }
+        }
+
+        #[test]
+        fn the_dashboard_store_hands_over_the_history_key_only_when_encryption_is_on() {
+            // The dashboard's sync ingest writes ime_text_history rows into the
+            // daemon's database; when the daemon encrypts at rest, it must hand
+            // the SAME key file it ciphers with (history.key beside the db —
+            // one derivation, shared with build_history_cipher) — and when it
+            // doesn't, it must hand nothing, else the dashboard would encrypt
+            // rows the daemon reads plaintext.
+            let mut config = test_config();
+            config.database_path = PathBuf::from("/data/root/db/idiolect.sqlite");
+
+            config.history_config.encrypt_at_rest = true;
+            assert_eq!(
+                dashboard_store(&config).history_key,
+                Some(PathBuf::from("/data/root/db/history.key")),
+            );
+
+            config.history_config.encrypt_at_rest = false;
+            assert_eq!(dashboard_store(&config).history_key, None);
+        }
+
+        /// Whether any (possibly nested) item is a history entry — the menu
+        /// renders one per `recent_history` row, id `history:<row id>`.
+        fn contains_history_item(items: &[TrayMenuItem]) -> bool {
+            items.iter().any(|item| {
+                item.id.starts_with("history:")
+                    || matches!(
+                        &item.kind,
+                        TrayMenuItemKind::Standard { submenu: Some(sub) }
+                            if contains_history_item(sub)
+                    )
+            })
+        }
+
+        #[test]
+        fn a_disconnect_cleanup_republishes_idle_to_the_tray() {
+            // A client that vanishes mid-take dies AFTER `start_live_capture`
+            // rendered the tray as Recording; nothing else repaints it before
+            // the next take, so the icon would lie ("Recording" with the mic
+            // already released) until some unrelated state change. The unwind
+            // path itself must re-publish Idle — via the tray only, never the
+            // dead stream.
+            let mut tray = RecordingTray::default();
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            let config = test_config();
+            // A real uncommitted session: the cleanup's cancel inserts the ONLY
+            // history row, so the re-rendered menu containing a history entry
+            // proves the render ran AFTER the cancel — an earlier render could
+            // not show a row that did not exist yet.
+            let session_id = store
+                .create_session(Some("mid-take words"))
+                .expect("create session");
+            let mut live = Live {
+                active_session: Some(ActiveSession {
+                    session_id,
+                    current_text: "mid-take words".to_owned(),
+                    finalized: false,
+                    tail_text: None,
+                }),
+                live_capture: None,
+                live_stream: None,
+                // As a start leaves it: `true` was the last published value.
+                status_tx: RecordingStatusTx {
+                    feature: true,
+                    last: true,
+                },
+                wants_reconcile: false,
+            };
+
+            cleanup_disconnected_client(&mut tray, &mut store, &config, &mut live)
+                .expect("cleanup succeeds");
+
+            assert_eq!(
+                tray.icons.last(),
+                Some(&TrayIcon::Idle),
+                "the unwind must repaint the tray icon as idle"
+            );
+            assert_eq!(
+                tray.tooltips.last().map(String::as_str),
+                Some("Idiolect — Ready"),
+                "the tooltip must drop the recording banner"
+            );
+            assert!(
+                tray.menus
+                    .last()
+                    .is_some_and(|menu| contains_history_item(menu)),
+                "the re-rendered menu must already show the just-cancelled take: \
+                 the repaint has to happen after the session cancel"
+            );
+        }
+    }
 
     mod capture_persist {
         use idiolect_adapter_sqlite::{FileAudioStore, SqliteMetadataStore};
@@ -2605,6 +3030,45 @@ mod tests {
         }
     }
 
+    mod preview_typing_setting {
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_ports::storage::MetadataStorePort;
+
+        use crate::run_loop::{preview_typing_enabled, toggle_preview_typing};
+
+        fn store() -> SqliteMetadataStore {
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+        }
+
+        #[test]
+        fn defaults_on_and_reads_the_stored_value() {
+            let mut store = store();
+            // Absent ⇒ ON, so the live-preview behaviour is on for everyone with no
+            // migration needed.
+            assert!(preview_typing_enabled(&store));
+            store
+                .set_tray_setting("preview_typing", "false")
+                .expect("set");
+            assert!(!preview_typing_enabled(&store));
+            store
+                .set_tray_setting("preview_typing", "true")
+                .expect("set");
+            assert!(preview_typing_enabled(&store));
+        }
+
+        #[test]
+        fn toggle_flips_and_persists() {
+            let mut store = store();
+            // ON by default → first toggle turns it OFF, second back ON.
+            toggle_preview_typing(&mut store).expect("toggle");
+            assert!(!preview_typing_enabled(&store));
+            toggle_preview_typing(&mut store).expect("toggle");
+            assert!(preview_typing_enabled(&store));
+        }
+    }
+
     mod dictation_timing_settings {
         use idiolect_adapter_sqlite::SqliteMetadataStore;
         use idiolect_common::config::VadConfig;
@@ -2905,6 +3369,24 @@ mod tests {
                 effective_history_config(&store, &defaults).training_retention_days,
                 540
             );
+        }
+
+        // `dashboard_store` hands the history key to the dashboard subprocess
+        // based on the config-file value alone; if a tray override could flip
+        // encryption at runtime, the daemon and the dashboard would cipher the
+        // SAME database differently. Pin that the override layer never touches
+        // it.
+        #[test]
+        fn encrypt_at_rest_is_config_file_only_never_a_tray_override() {
+            use idiolect_ports::storage::MetadataStorePort;
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            store.migrate().expect("migrate");
+            store
+                .set_tray_setting("encrypt_at_rest", "true")
+                .expect("stale/hand-edited setting");
+
+            let defaults = HistoryConfig::default();
+            assert!(!effective_history_config(&store, &defaults).encrypt_at_rest);
         }
     }
 }

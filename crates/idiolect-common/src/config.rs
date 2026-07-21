@@ -296,6 +296,10 @@ pub struct TrainingConfig {
     pub trainer: String,
     #[serde(default)]
     pub auto_train: bool,
+    /// How many new corrections must accumulate before an auto-train run fires.
+    /// Ignored when `auto_train = false`. Defaults to 25.
+    #[serde(default = "default_auto_train_threshold")]
+    pub auto_train_threshold: u32,
 }
 
 impl Default for TrainingConfig {
@@ -304,6 +308,7 @@ impl Default for TrainingConfig {
             min_approved_examples: default_training_min_approved_examples(),
             trainer: default_training_trainer(),
             auto_train: false,
+            auto_train_threshold: default_auto_train_threshold(),
         }
     }
 }
@@ -548,9 +553,13 @@ pub fn max_socket_path_len(platform: Platform) -> usize {
 /// kernel turns it into an opaque `EINVAL`. The usable budget is
 /// [`max_socket_path_len`] minus one byte for the NUL terminator.
 pub fn check_socket_path_len(path: &Path, platform: Platform) -> Result<(), ConfigError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let len = path.as_os_str().as_bytes().len();
+    #[cfg(unix)]
+    let len = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    };
+    #[cfg(not(unix))]
+    let len = path.to_string_lossy().len();
     let max = max_socket_path_len(platform);
     if len >= max {
         return Err(ConfigError::SocketPathTooLong { len, max });
@@ -618,10 +627,37 @@ impl PathProvider for XdgPaths {
     }
 }
 
+/// Environment variables through which the daemon's tray hands its resolved
+/// store to the dashboard it spawns (`idiolect-app --standalone`). ONE
+/// definition, shared by the setter (idiolectd's `sync_panel_launcher`) and the
+/// reader (idiolect-app's `main`), so the two sides cannot drift apart.
+pub mod dashboard_store_env {
+    /// Root for the sync-owned artifacts the dashboard derives itself
+    /// (device tokens, served/personal model slots, audio).
+    pub const DATA_DIR: &str = "IDIOLECT_DATA_DIR";
+    /// The daemon's metadata database (`db/idiolect.sqlite` under the data
+    /// root by default — NOT the dashboard's own `idiolect.db` convention).
+    pub const DB_PATH: &str = "IDIOLECT_DB_PATH";
+    /// The daemon's active ASR model: the trainer's merge base and the served
+    /// slot's first-run seed.
+    pub const BASE_MODEL: &str = "IDIOLECT_BASE_MODEL";
+    /// The daemon's at-rest history key file (`history.key` beside its
+    /// database). Set only when the daemon encrypts history — the dashboard's
+    /// sync ingest must then encrypt `ime_text_history` rows with the same
+    /// key, or phone corrections land as plaintext in an encrypted database.
+    /// Absence means "no cipher".
+    pub const HISTORY_KEY: &str = "IDIOLECT_HISTORY_KEY";
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedConfigPaths {
     pub config_file: PathBuf,
     pub socket_path: PathBuf,
+    /// The resolved data root every sibling path below nests under (unless
+    /// individually overridden). Exported so consumers that hand the store to
+    /// another process (the tray's dashboard launcher) pass the SAME value the
+    /// daemon resolved instead of re-deriving it from a sibling path.
+    pub data_dir: PathBuf,
     pub database_path: PathBuf,
     pub model_path: PathBuf,
     pub models_whisper_dir: PathBuf,
@@ -681,6 +717,7 @@ pub fn resolve_xdg_paths(config: &IdiolectConfig, xdg: &XdgBaseDirs) -> Resolved
         manifests_dir: data_root.join("manifests"),
         decoded_cache_dir: xdg.cache_home.join("idiolect").join("decoded"),
         trainer_cache_dir: xdg.cache_home.join("idiolect").join("trainer"),
+        data_dir: data_root,
     }
 }
 
@@ -826,6 +863,10 @@ fn default_history_clipboard_auto_clear_secs() -> u64 {
     30
 }
 
+fn default_auto_train_threshold() -> u32 {
+    25
+}
+
 fn validate_non_empty_string(field: &'static str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         Err(ConfigError::ValidationError {
@@ -840,6 +881,100 @@ fn env_path_or_fallback(name: &str, fallback: PathBuf) -> PathBuf {
     match env::var_os(name) {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => fallback,
+    }
+}
+
+#[cfg(test)]
+mod sync_training_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_sync_section_is_ignored_not_rejected() {
+        // `[sync]` used to be parsed here while NOTHING consumed it — the doc
+        // promised "the embedded sync server starts at daemon launch", which no
+        // daemon code path implements (the dashboard subprocess owns sync; see
+        // docs/future/010 for the deferred daemon integration). The section was
+        // removed rather than shipped as a false promise. A config file that
+        // still carries it (copied from an old example) must keep parsing:
+        // serde ignores unknown sections.
+        let toml = r#"
+[user]
+default_user_id = "default"
+
+[sync]
+enabled = true
+bind = "0.0.0.0:9000"
+"#;
+        let cfg = IdiolectConfig::from_toml_str(toml).expect("stale [sync] must not reject");
+        assert_eq!(cfg.user.default_user_id, "default");
+    }
+
+    #[test]
+    fn auto_train_threshold_defaults_to_25() {
+        let cfg = TrainingConfig::default();
+        assert_eq!(cfg.auto_train_threshold, 25);
+    }
+
+    #[test]
+    fn auto_train_threshold_parses_from_toml() {
+        let toml = r#"
+[user]
+default_user_id = "default"
+
+[training]
+auto_train = true
+auto_train_threshold = 10
+"#;
+        let cfg = IdiolectConfig::from_toml_str(toml).expect("parse");
+        assert!(cfg.training.auto_train);
+        assert_eq!(cfg.training.auto_train_threshold, 10);
+    }
+}
+
+#[cfg(test)]
+mod resolved_paths_tests {
+    use super::{resolve_xdg_paths, IdiolectConfig, Platform, XdgBaseDirs};
+    use std::path::{Path, PathBuf};
+
+    fn xdg() -> XdgBaseDirs {
+        XdgBaseDirs::platform_defaults(Platform::Linux, Path::new("/home/u"), Path::new("/tmp"))
+    }
+
+    #[test]
+    fn resolved_paths_export_the_data_root_explicitly() {
+        // The tray-launched dashboard receives the daemon's store through the
+        // environment (sync_panel_launcher). It must be handed the SAME data
+        // root the daemon resolved — exported as a field, never re-derived from
+        // a sibling path (`audio_dir.parent()` would silently drift the moment
+        // either side's layout changes).
+        let cfg =
+            IdiolectConfig::from_toml_str("[user]\ndefault_user_id = \"default\"").expect("parse");
+        let paths = resolve_xdg_paths(&cfg, &xdg());
+        assert_eq!(
+            paths.data_dir,
+            PathBuf::from("/home/u/.local/share/idiolect")
+        );
+        assert_eq!(paths.audio_dir, paths.data_dir.join("audio"));
+        assert_eq!(
+            paths.database_path,
+            paths.data_dir.join("db").join("idiolect.sqlite"),
+            "the daemon's database lives under db/ — NOT the dashboard's \
+             idiolect.db convention, which is why the exact path must be passed"
+        );
+    }
+
+    #[test]
+    fn a_storage_data_dir_override_moves_the_exported_root_with_it() {
+        let cfg = IdiolectConfig::from_toml_str(
+            "[user]\ndefault_user_id = \"default\"\n\n[storage]\ndata_dir = \"/srv/idio\"",
+        )
+        .expect("parse");
+        let paths = resolve_xdg_paths(&cfg, &xdg());
+        assert_eq!(paths.data_dir, PathBuf::from("/srv/idio"));
+        assert_eq!(
+            paths.database_path,
+            PathBuf::from("/srv/idio/db/idiolect.sqlite")
+        );
     }
 }
 
