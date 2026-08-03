@@ -39,7 +39,7 @@ percent-encoding = "=2.3.2"
 # exact hyper-util loop `axum::serve` uses internally (axum 0.7 has no pluggable listener,
 # and axum-server 0.7 won't build against this workspace's pinned hyper stack).
 rcgen = "=0.14.8"
-rustls = "=0.23.42"
+rustls = "=0.23.43"
 rustls-pemfile = "=2.2.0"
 tokio-rustls = "=0.26.4"
 hyper-util = { version = "=0.1.20", features = ["tokio", "server-auto", "service"] }
