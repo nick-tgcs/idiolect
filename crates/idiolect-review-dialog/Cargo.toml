@@ -10,7 +10,7 @@ name = "idiolect-review-dialog"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 
 # X11 windowing backend. eframe with default-features off pulls in NO platform
 # backend, so winit fails to build (and the binary cannot open a window) unless
