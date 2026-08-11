@@ -134,7 +134,7 @@ impl Indicator {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let center = ui.max_rect().center();
                 let painter = ui.painter();
 
@@ -217,7 +217,11 @@ mod tests {
         };
         let ctx = egui::Context::default();
         // Running a frame must not panic and must move the window to the caret.
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| indicator.draw(ui));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| indicator.draw(ui));
+        // epaint 0.36 added a `Drop` guard that debug-asserts a `TexturesDelta`
+        // was applied. There is no renderer here to apply one to, so discard it
+        // explicitly — the escape hatch the assertion message itself names.
+        output.textures_delta.clear();
         let moved_to_caret = output.viewport_output.values().any(|vp| {
             vp.commands.iter().any(|cmd| {
                 matches!(cmd, egui::ViewportCommand::OuterPosition(p)

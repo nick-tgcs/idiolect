@@ -230,7 +230,7 @@ impl eframe::App for DashboardApp {
             self.model = DashboardModel::from_snapshot(&snap);
         }
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Top bar with prefs toggle.
             ui.horizontal(|ui| {
                 ui.label(
