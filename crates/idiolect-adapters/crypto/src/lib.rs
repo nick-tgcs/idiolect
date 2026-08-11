@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use thiserror::Error;
 
@@ -61,14 +61,17 @@ pub struct ChaCha20Poly1305Cipher {
 impl ChaCha20Poly1305Cipher {
     #[must_use]
     pub fn new(key: [u8; KEY_LEN]) -> Self {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
         Self { cipher }
     }
 }
 
 impl EncryptionPort for ChaCha20Poly1305Cipher {
     fn encrypt(&self, plaintext: &str) -> Result<String, CryptoError> {
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        // 0.11 removed `AeadCore::generate_nonce`; `Generate` replaces it.
+        // `generate()` panics only if the system RNG fails — the same
+        // behaviour as the `OsRng` it replaces, deliberately left unchanged.
+        let nonce = Nonce::generate();
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext.as_bytes())
@@ -85,10 +88,10 @@ impl EncryptionPort for ChaCha20Poly1305Cipher {
             return Err(CryptoError::MalformedCiphertext);
         }
         let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError::MalformedCiphertext)?;
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::Decrypt)?;
         String::from_utf8(plaintext).map_err(|_| CryptoError::Decrypt)
     }
@@ -186,10 +189,7 @@ fn write_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), CryptoError> {
 }
 
 fn random_key() -> [u8; KEY_LEN] {
-    let key = ChaCha20Poly1305::generate_key(&mut OsRng);
-    let mut bytes = [0_u8; KEY_LEN];
-    bytes.copy_from_slice(key.as_slice());
-    bytes
+    <[u8; KEY_LEN]>::generate()
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -234,13 +234,42 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChaCha20Poly1305Cipher, CryptoError, EncryptionKeyPort, EncryptionPort, FileKey,
-        InMemoryKey,
+        ChaCha20Poly1305, ChaCha20Poly1305Cipher, CryptoError, EncryptionKeyPort, EncryptionPort,
+        FileKey, InMemoryKey,
     };
     use tempfile::tempdir;
 
     fn cipher() -> ChaCha20Poly1305Cipher {
         ChaCha20Poly1305Cipher::new([7_u8; 32])
+    }
+
+    // A token produced by chacha20poly1305 0.10.1, pinned verbatim. History
+    // already encrypted on a user's disk must stay readable across dependency
+    // bumps, so this pins the stored layout (`hex(nonce[12] || ciphertext ||
+    // tag[16])`) and the cipher's wire output. A fresh roundtrip cannot: it
+    // would still pass if the format changed on both sides at once.
+    const GOLDEN_KEY: [u8; 32] = [7_u8; 32];
+    const GOLDEN_PLAINTEXT: &str = "golden vector: at-rest format must survive dependency bumps";
+    const GOLDEN_TOKEN: &str = "fff74ddbb1b82d68e737a90d4a38bda8cbc729b89d89bb94e883995cbfe93f45\
+                                2cc13d3da5d9db4a51c92218b05b75818c5e69e04b56ccdd84d0d1756e807082\
+                                80c70ef763f13e50e9dc9a712c3e86c106850b30ca8a85";
+
+    /// 0.10.1 depended on `zeroize` unconditionally and implemented
+    /// `ZeroizeOnDrop` for the cipher. 0.11 made it an opt-in feature that is
+    /// NOT in `default`, and gated the whole body of `Drop::drop` behind it —
+    /// so taking the bump without the feature leaves the 32-byte key in freed
+    /// memory. Pin the guarantee at compile time rather than trusting a
+    /// feature list to stay correct through the next bump.
+    #[test]
+    fn cipher_key_is_zeroized_on_drop() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<ChaCha20Poly1305>();
+    }
+
+    #[test]
+    fn decrypts_a_token_written_by_an_earlier_dependency_version() {
+        let cipher = ChaCha20Poly1305Cipher::new(GOLDEN_KEY);
+        assert_eq!(cipher.decrypt(GOLDEN_TOKEN).unwrap(), GOLDEN_PLAINTEXT);
     }
 
     #[test]
