@@ -419,7 +419,7 @@ impl eframe::App for SettingsApp {
                     .fill(BG)
                     .inner_margin(egui::Margin::same(18)),
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {

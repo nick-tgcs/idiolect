@@ -226,7 +226,7 @@ impl RetentionApp {
                 top: 16,
                 bottom: 6,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new("Keep training data for")
@@ -251,7 +251,7 @@ impl RetentionApp {
                 top: 8,
                 bottom: 16,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let hint = match resolved {
                         Some(days) => format!("≈ {days} days"),
@@ -281,7 +281,7 @@ impl RetentionApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22, 8)))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.amount)
@@ -336,7 +336,11 @@ mod tests {
     fn run(app: &mut RetentionApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
-        let _ = ctx.run_ui(input, |ui| app.draw(ui));
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        // epaint 0.36 added a `Drop` guard that debug-asserts a `TexturesDelta`
+        // was applied. There is no renderer here to apply one to, so discard it
+        // explicitly — the escape hatch the assertion message itself names.
+        output.textures_delta.clear();
     }
 
     #[test]
