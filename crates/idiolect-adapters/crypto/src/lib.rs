@@ -243,6 +243,23 @@ mod tests {
         ChaCha20Poly1305Cipher::new([7_u8; 32])
     }
 
+    // A token produced by chacha20poly1305 0.10.1, pinned verbatim. History
+    // already encrypted on a user's disk must stay readable across dependency
+    // bumps, so this pins the stored layout (`hex(nonce[12] || ciphertext ||
+    // tag[16])`) and the cipher's wire output. A fresh roundtrip cannot: it
+    // would still pass if the format changed on both sides at once.
+    const GOLDEN_KEY: [u8; 32] = [7_u8; 32];
+    const GOLDEN_PLAINTEXT: &str = "golden vector: at-rest format must survive dependency bumps";
+    const GOLDEN_TOKEN: &str = "fff74ddbb1b82d68e737a90d4a38bda8cbc729b89d89bb94e883995cbfe93f45\
+                                2cc13d3da5d9db4a51c92218b05b75818c5e69e04b56ccdd84d0d1756e807082\
+                                80c70ef763f13e50e9dc9a712c3e86c106850b30ca8a85";
+
+    #[test]
+    fn decrypts_a_token_written_by_an_earlier_dependency_version() {
+        let cipher = ChaCha20Poly1305Cipher::new(GOLDEN_KEY);
+        assert_eq!(cipher.decrypt(GOLDEN_TOKEN).unwrap(), GOLDEN_PLAINTEXT);
+    }
+
     #[test]
     fn roundtrip_recovers_plaintext() {
         let cipher = cipher();
