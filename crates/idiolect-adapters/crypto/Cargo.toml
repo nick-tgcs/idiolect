@@ -9,8 +9,14 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-chacha20poly1305 = { version = "=0.11.0", features = ["getrandom"] }
+# `zeroize` was an unconditional dependency in 0.10.1 and is an opt-in feature
+# in 0.11 that `default` does NOT include — without it the whole body of the
+# cipher's `Drop` is compiled out and the key survives in freed memory. Keep it
+# named here; `cipher_key_is_zeroized_on_drop` fails to compile if it is lost.
+chacha20poly1305 = { version = "=0.11.0", features = ["getrandom", "zeroize"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Only to name `ZeroizeOnDrop` in the test that pins it; not a runtime dep.
+zeroize = { version = "=1.9.0", default-features = false }

@@ -234,8 +234,8 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChaCha20Poly1305Cipher, CryptoError, EncryptionKeyPort, EncryptionPort, FileKey,
-        InMemoryKey,
+        ChaCha20Poly1305, ChaCha20Poly1305Cipher, CryptoError, EncryptionKeyPort, EncryptionPort,
+        FileKey, InMemoryKey,
     };
     use tempfile::tempdir;
 
@@ -253,6 +253,18 @@ mod tests {
     const GOLDEN_TOKEN: &str = "fff74ddbb1b82d68e737a90d4a38bda8cbc729b89d89bb94e883995cbfe93f45\
                                 2cc13d3da5d9db4a51c92218b05b75818c5e69e04b56ccdd84d0d1756e807082\
                                 80c70ef763f13e50e9dc9a712c3e86c106850b30ca8a85";
+
+    /// 0.10.1 depended on `zeroize` unconditionally and implemented
+    /// `ZeroizeOnDrop` for the cipher. 0.11 made it an opt-in feature that is
+    /// NOT in `default`, and gated the whole body of `Drop::drop` behind it —
+    /// so taking the bump without the feature leaves the 32-byte key in freed
+    /// memory. Pin the guarantee at compile time rather than trusting a
+    /// feature list to stay correct through the next bump.
+    #[test]
+    fn cipher_key_is_zeroized_on_drop() {
+        fn require_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        require_zeroize_on_drop::<ChaCha20Poly1305>();
+    }
 
     #[test]
     fn decrypts_a_token_written_by_an_earlier_dependency_version() {
