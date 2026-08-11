@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use thiserror::Error;
 
@@ -61,14 +61,17 @@ pub struct ChaCha20Poly1305Cipher {
 impl ChaCha20Poly1305Cipher {
     #[must_use]
     pub fn new(key: [u8; KEY_LEN]) -> Self {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
         Self { cipher }
     }
 }
 
 impl EncryptionPort for ChaCha20Poly1305Cipher {
     fn encrypt(&self, plaintext: &str) -> Result<String, CryptoError> {
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        // 0.11 removed `AeadCore::generate_nonce`; `Generate` replaces it.
+        // `generate()` panics only if the system RNG fails — the same
+        // behaviour as the `OsRng` it replaces, deliberately left unchanged.
+        let nonce = Nonce::generate();
         let ciphertext = self
             .cipher
             .encrypt(&nonce, plaintext.as_bytes())
@@ -85,10 +88,10 @@ impl EncryptionPort for ChaCha20Poly1305Cipher {
             return Err(CryptoError::MalformedCiphertext);
         }
         let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError::MalformedCiphertext)?;
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::Decrypt)?;
         String::from_utf8(plaintext).map_err(|_| CryptoError::Decrypt)
     }
@@ -186,10 +189,7 @@ fn write_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), CryptoError> {
 }
 
 fn random_key() -> [u8; KEY_LEN] {
-    let key = ChaCha20Poly1305::generate_key(&mut OsRng);
-    let mut bytes = [0_u8; KEY_LEN];
-    bytes.copy_from_slice(key.as_slice());
-    bytes
+    <[u8; KEY_LEN]>::generate()
 }
 
 fn to_hex(bytes: &[u8]) -> String {
