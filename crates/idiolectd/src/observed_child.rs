@@ -90,6 +90,7 @@ pub(crate) struct ObservedChild {
     reporter: FailureReporter,
     component: String,
     executable: PathBuf,
+    waited: bool,
 }
 
 impl ObservedChild {
@@ -126,6 +127,7 @@ impl ObservedChild {
             reporter,
             component,
             executable,
+            waited: false,
         })
     }
 
@@ -136,7 +138,18 @@ impl ObservedChild {
     /// Wait and report unless the process exits with one of the explicitly
     /// allowed codes. A non-zero code that writes stderr is still a failure,
     /// which distinguishes a documented silent cancellation from a crash.
-    pub(crate) fn wait(mut self, allowed_exit_codes: &[i32]) -> Option<ExitStatus> {
+    pub(crate) fn wait(self, allowed_exit_codes: &[i32]) -> Option<ExitStatus> {
+        self.wait_with_diagnostic(allowed_exit_codes, None)
+    }
+
+    /// Wait after a caller-side protocol failure, combining that diagnostic
+    /// with the process status and captured stderr in a single report.
+    pub(crate) fn wait_with_diagnostic(
+        mut self,
+        allowed_exit_codes: &[i32],
+        protocol_diagnostic: Option<&str>,
+    ) -> Option<ExitStatus> {
+        self.waited = true;
         let status = match self.child.wait() {
             Ok(status) => status,
             Err(error) => {
@@ -160,12 +173,19 @@ impl ObservedChild {
         let allowed_status = status
             .code()
             .is_some_and(|code| allowed_exit_codes.contains(&code));
-        let nonzero_with_error = status.code() != Some(0) && !captured.text.is_empty();
-        if !allowed_status || nonzero_with_error {
-            let mut diagnostic = match status.code() {
-                Some(code) => format!("exited with status {code}"),
-                None => "terminated by a signal".to_owned(),
-            };
+        let status_failed =
+            !allowed_status || (status.code() != Some(0) && !captured.text.is_empty());
+        if status_failed || protocol_diagnostic.is_some() {
+            let mut diagnostic = protocol_diagnostic.unwrap_or_default().to_owned();
+            if status_failed {
+                if !diagnostic.is_empty() {
+                    diagnostic.push_str("; process ");
+                }
+                diagnostic.push_str(&match status.code() {
+                    Some(code) => format!("exited with status {code}"),
+                    None => "terminated by a signal".to_owned(),
+                });
+            }
             if !captured.text.is_empty() {
                 diagnostic.push_str(": ");
                 diagnostic.push_str(&captured.text);
@@ -181,9 +201,37 @@ impl ObservedChild {
     }
 }
 
+impl Drop for ObservedChild {
+    fn drop(&mut self) {
+        if self.waited {
+            return;
+        }
+
+        // Stop an abandoned helper before reaping it. Close protocol pipes and
+        // detach the stderr reader so descendants retaining a pipe cannot block
+        // the daemon during unwinding.
+        self.child.stdin.take();
+        self.child.stdout.take();
+        let _ = self.child.kill();
+        self.stderr_reader.take();
+
+        let diagnostic = match self.child.wait() {
+            Ok(status) => match status.code() {
+                Some(code) => format!("dropped without wait; exited with status {code}"),
+                None => "dropped without wait; terminated by a signal".to_owned(),
+            },
+            Err(error) => format!("dropped without wait and could not reap process: {error}"),
+        };
+        self.reporter
+            .report(&self.component, &self.executable, &diagnostic);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::NotificationRecorder;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn notification_detail_is_unicode_safe_and_bounded() {
@@ -199,5 +247,45 @@ mod tests {
         let captured = capture_stderr(input.as_slice());
         assert_eq!(captured.text.len(), MAX_STDERR_BYTES);
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn caller_protocol_failure_is_reported_once_after_the_child_is_reaped() {
+        let recorder = NotificationRecorder::new();
+        let reporter = FailureReporter::new(recorder.command().to_owned());
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let child =
+            ObservedChild::spawn(&mut command, "Protocol helper", reporter).expect("spawn helper");
+
+        let status = child
+            .wait_with_diagnostic(&[0], Some("could not read helper output: injected error"))
+            .expect("wait for helper");
+
+        assert!(status.success());
+        let alert = recorder.wait();
+        assert!(alert.contains("could not read helper output"), "{alert}");
+        assert_eq!(alert.matches("Idiolect Protocol helper failed|").count(), 1);
+    }
+
+    #[test]
+    fn dropping_without_wait_reaps_and_reports_without_blocking_on_the_child() {
+        let recorder = NotificationRecorder::new();
+        let reporter = FailureReporter::new(recorder.command().to_owned());
+        let mut command = Command::new("sleep");
+        command.arg("0.5");
+        let child =
+            ObservedChild::spawn(&mut command, "Abandoned helper", reporter).expect("spawn helper");
+
+        let started = Instant::now();
+        drop(child);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "drop blocked until the abandoned child exited"
+        );
+
+        let alert = recorder.wait();
+        assert!(alert.contains("Abandoned helper"), "{alert}");
+        assert!(alert.contains("without wait"), "{alert}");
     }
 }

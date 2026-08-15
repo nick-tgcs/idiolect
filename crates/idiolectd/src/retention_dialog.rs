@@ -63,14 +63,15 @@ impl RetentionDialog for SubprocessRetentionDialog {
         let mut child =
             ObservedChild::spawn(&mut command, "Retention dialog", self.reporter.clone())?;
         let mut stdout = Vec::new();
-        child
-            .child_mut()
-            .stdout
-            .take()?
-            .read_to_end(&mut stdout)
-            .ok()?;
-        let status = child.wait(&[0, 1])?;
-        if status.code() != Some(0) {
+        let read_error = match child.child_mut().stdout.take() {
+            Some(mut pipe) => pipe
+                .read_to_end(&mut stdout)
+                .err()
+                .map(|error| format!("could not read dialog output: {error}")),
+            None => Some("could not read dialog output: stdout pipe unavailable".to_owned()),
+        };
+        let status = child.wait_with_diagnostic(&[0, 1], read_error.as_deref())?;
+        if read_error.is_some() || status.code() != Some(0) {
             return None; // exit 1 is the dialog's documented user-cancel code
         }
         String::from_utf8(stdout)
@@ -85,8 +86,9 @@ impl RetentionDialog for SubprocessRetentionDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::NotificationRecorder;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn reads_a_day_count_from_a_successful_dialog() {
@@ -106,68 +108,39 @@ mod tests {
 
     #[test]
     fn documented_cancel_exit_does_not_alert_the_user() {
-        let dir = tempfile::tempdir().expect("temporary notifier directory");
-        let log = dir.path().join("notifications.log");
-        let notifier = dir.path().join("notify");
-        std::fs::write(
-            &notifier,
-            format!(
-                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                log.display()
-            ),
-        )
-        .expect("write notifier");
-        std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod notifier");
-        let dialog = SubprocessRetentionDialog::with_notifier(
-            "false",
-            notifier.to_string_lossy().into_owned(),
-        );
+        let recorder = NotificationRecorder::new();
+        let dialog =
+            SubprocessRetentionDialog::with_notifier("false", recorder.command().to_owned());
 
         assert_eq!(dialog.prompt_days(365), None);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(!log.exists(), "user cancellation emitted a crash alert");
+        assert!(
+            !recorder.log_path().exists(),
+            "user cancellation emitted a crash alert"
+        );
     }
 
     #[test]
     fn cancel_code_with_stderr_is_treated_as_a_crash() {
-        let dir = tempfile::tempdir().expect("temporary notifier directory");
-        let log = dir.path().join("notifications.log");
-        let notifier = dir.path().join("notify");
+        let recorder = NotificationRecorder::new();
+        let dir = tempfile::tempdir().expect("temporary dialog directory");
         let crashing_dialog = dir.path().join("dialog");
-        std::fs::write(
-            &notifier,
-            format!(
-                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                log.display()
-            ),
-        )
-        .expect("write notifier");
         std::fs::write(
             &crashing_dialog,
             "#!/bin/sh\nprintf 'Glutin BadAttribute\\n' >&2\nexit 1\n",
         )
         .expect("write crashing dialog");
-        for path in [&notifier, &crashing_dialog] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod test executable");
-        }
+        std::fs::set_permissions(&crashing_dialog, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod test executable");
         let dialog = SubprocessRetentionDialog::with_notifier(
             &crashing_dialog,
-            notifier.to_string_lossy().into_owned(),
+            recorder.command().to_owned(),
         );
 
         assert_eq!(dialog.prompt_days(365), None);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(alert) = std::fs::read_to_string(&log) {
-                assert!(alert.contains("status 1"), "{alert}");
-                assert!(alert.contains("Glutin BadAttribute"), "{alert}");
-                break;
-            }
-            assert!(Instant::now() < deadline, "crash alert was not emitted");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let alert = recorder.wait();
+        assert!(alert.contains("status 1"), "{alert}");
+        assert!(alert.contains("Glutin BadAttribute"), "{alert}");
     }
 
     #[test]

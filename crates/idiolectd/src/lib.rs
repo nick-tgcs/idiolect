@@ -10,6 +10,8 @@ mod settings_launcher;
 mod sync_panel_launcher;
 
 mod adapters;
+#[cfg(test)]
+mod test_support;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

@@ -787,45 +787,15 @@ mod tests {
 
     mod notify_user_contract {
         use super::notify_user;
-        use std::time::{Duration, Instant};
-
-        /// Writes a recorder honouring the notify contract: appends
-        /// "<summary>|<body>" to a log file next to the script.
-        fn recorder(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = std::env::temp_dir();
-            let log = dir.join(format!("idiolectd-notify-log-{tag}-{}", std::process::id()));
-            let script = dir.join(format!("idiolectd-notify-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_file(&log);
-            std::fs::write(
-                &script,
-                format!(
-                    "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                    log.display()
-                ),
-            )
-            .expect("write recorder");
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod recorder");
-            (script, log)
-        }
+        use crate::test_support::NotificationRecorder;
 
         #[test]
         fn invokes_the_command_with_summary_and_body() {
-            let (script, log) = recorder("ok");
-            let command = script.to_string_lossy().into_owned();
-            // The spawn is fire-and-forget (reaped off-thread) and can lose a
-            // rare ETXTBSY to a sibling test's fork — retry until the log lands.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                notify_user(&command, "Idiolect", "translation unavailable");
-                std::thread::sleep(Duration::from_millis(50));
-                if log.exists() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "recorder never invoked");
-            }
-            let line = std::fs::read_to_string(&log).expect("log readable");
+            let recorder = NotificationRecorder::new();
+
+            notify_user(recorder.command(), "Idiolect", "translation unavailable");
+
+            let line = recorder.wait();
             assert_eq!(
                 line.lines().next(),
                 Some("Idiolect|translation unavailable"),

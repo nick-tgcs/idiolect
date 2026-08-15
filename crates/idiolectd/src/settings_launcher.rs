@@ -119,45 +119,11 @@ impl SettingsLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::test_support::NotificationRecorder;
     use std::time::{Duration, Instant};
 
     fn script_launcher(script: &str) -> SettingsLauncher {
         SettingsLauncher::with_command("sh", vec!["-c".to_owned(), script.to_owned()])
-    }
-
-    fn notification_recorder(tag: &str) -> (PathBuf, PathBuf) {
-        let log = std::env::temp_dir().join(format!(
-            "idiolect-settings-notify-log-{tag}-{}",
-            std::process::id()
-        ));
-        let script = std::env::temp_dir().join(format!(
-            "idiolect-settings-notify-{tag}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&log);
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                log.display()
-            ),
-        )
-        .expect("write notification recorder");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod notification recorder");
-        (script, log)
-    }
-
-    fn wait_for_file(path: &std::path::Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                return contents;
-            }
-            assert!(Instant::now() < deadline, "notification was not emitted");
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     #[test]
@@ -230,20 +196,20 @@ mod tests {
 
     #[test]
     fn a_crashing_window_alerts_the_user_with_its_exit_and_stderr() {
-        let (notifier, log) = notification_recorder("crash");
+        let recorder = NotificationRecorder::new();
         let launcher = SettingsLauncher::with_command_and_notifier(
             "sh",
             vec![
                 "-c".to_owned(),
                 "printf 'Glutin BadAttribute\\n' >&2; exit 23".to_owned(),
             ],
-            notifier.to_string_lossy().into_owned(),
+            recorder.command().to_owned(),
         );
         let (tx, _rx) = mpsc::channel();
 
         launcher.open(String::new(), tx);
 
-        let alert = wait_for_file(&log);
+        let alert = recorder.wait();
         assert!(alert.contains("Idiolect Settings failed"), "{alert}");
         assert!(alert.contains("status 23"), "{alert}");
         assert!(alert.contains("Glutin BadAttribute"), "{alert}");
@@ -252,17 +218,17 @@ mod tests {
 
     #[test]
     fn a_spawn_failure_alerts_the_user_with_the_os_error() {
-        let (notifier, log) = notification_recorder("spawn");
+        let recorder = NotificationRecorder::new();
         let launcher = SettingsLauncher::with_command_and_notifier(
             "/nonexistent/idiolect-settings-xyz",
             Vec::new(),
-            notifier.to_string_lossy().into_owned(),
+            recorder.command().to_owned(),
         );
         let (tx, _rx) = mpsc::channel();
 
         launcher.open(String::new(), tx);
 
-        let alert = wait_for_file(&log);
+        let alert = recorder.wait();
         assert!(alert.contains("Idiolect Settings failed"), "{alert}");
         assert!(alert.contains("could not start"), "{alert}");
         assert!(alert.contains("No such file or directory"), "{alert}");
@@ -270,11 +236,11 @@ mod tests {
 
     #[test]
     fn a_normal_window_close_does_not_alert() {
-        let (notifier, log) = notification_recorder("clean");
+        let recorder = NotificationRecorder::new();
         let launcher = SettingsLauncher::with_command_and_notifier(
             "sh",
             vec!["-c".to_owned(), "exit 0".to_owned()],
-            notifier.to_string_lossy().into_owned(),
+            recorder.command().to_owned(),
         );
         let (tx, _rx) = mpsc::channel();
 
@@ -286,6 +252,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(100));
-        assert!(!log.exists(), "clean exit emitted an alert");
+        assert!(!recorder.log_path().exists(), "clean exit emitted an alert");
     }
 }
