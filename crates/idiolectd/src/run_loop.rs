@@ -701,14 +701,17 @@ fn handle_connection(
         FileAudioStore::new(config.audio_root.clone(), config.decoded_cache_root.clone());
     let codec = OpusCodec::new();
     // Out-of-process dialog for the "Custom…" retention entry; discovered once.
-    let retention_dialog = SubprocessRetentionDialog::discover();
+    let retention_dialog = SubprocessRetentionDialog::discover(&config.notify_command);
     // Out-of-process Settings window ("Settings…" in the tray); discovered once.
-    let settings_window = crate::settings_launcher::SettingsLauncher::discover();
+    let settings_window =
+        crate::settings_launcher::SettingsLauncher::discover(&config.notify_command);
     // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
     // handed the daemon's resolved store so pairing and training act on the
     // database this daemon writes — not a second, default-path store.
-    let sync_panel =
-        crate::sync_panel_launcher::SyncPanelLauncher::discover(dashboard_store(config));
+    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover(
+        dashboard_store(config),
+        &config.notify_command,
+    );
     let mut line = String::new();
 
     loop {

@@ -27,6 +27,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+use crate::observed_child::{FailureReporter, ObservedChild};
 use idiolect_adapter_ksni::TrayCallback;
 use idiolect_common::config::dashboard_store_env;
 
@@ -54,43 +55,54 @@ pub(crate) struct SyncPanelLauncher {
     binary: PathBuf,
     args: Vec<String>,
     store: Option<DashboardStore>,
+    reporter: FailureReporter,
     window_open: Arc<AtomicBool>,
 }
 
 impl SyncPanelLauncher {
+    #[cfg(test)]
     pub(crate) fn with_command(binary: impl Into<PathBuf>, args: Vec<String>) -> Self {
-        Self {
-            binary: binary.into(),
-            args,
-            store: None,
-            window_open: Arc::new(AtomicBool::new(false)),
-        }
+        Self::configured(binary, args, None, String::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn with_command_and_store(
         binary: impl Into<PathBuf>,
         args: Vec<String>,
         store: DashboardStore,
     ) -> Self {
+        Self::configured(binary, args, Some(store), String::new())
+    }
+
+    fn configured(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        store: Option<DashboardStore>,
+        notify_command: impl Into<String>,
+    ) -> Self {
         Self {
-            store: Some(store),
-            ..Self::with_command(binary, args)
+            binary: binary.into(),
+            args,
+            store,
+            reporter: FailureReporter::new(notify_command),
+            window_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Find the dashboard binary next to the running daemon binary, falling
     /// back to its plain name (resolved via `PATH`); every launch carries the
     /// daemon's [`DashboardStore`].
-    pub(crate) fn discover(store: DashboardStore) -> Self {
+    pub(crate) fn discover(store: DashboardStore, notify_command: &str) -> Self {
         const NAME: &str = "idiolect-app";
         let beside_daemon = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::with_command_and_store(
+        Self::configured(
             beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)),
             Vec::new(),
-            store,
+            Some(store),
+            notify_command,
         )
     }
 
@@ -106,8 +118,7 @@ impl SyncPanelLauncher {
             .args(&self.args)
             .arg("--standalone")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped());
         if let Some(store) = &self.store {
             command
                 .env(dashboard_store_env::DATA_DIR, &store.data_dir)
@@ -124,12 +135,13 @@ impl SyncPanelLauncher {
                 command.env(dashboard_store_env::HISTORY_KEY, history_key);
             }
         }
-        let spawned = command.spawn();
-        let Ok(mut child) = spawned else {
+        let Some(mut child) =
+            ObservedChild::spawn(&mut command, "Corrections Dashboard", self.reporter.clone())
+        else {
             self.window_open.store(false, Ordering::SeqCst);
             return;
         };
-        let stdout = child.stdout.take();
+        let stdout = child.child_mut().stdout.take();
         let window_open = Arc::clone(&self.window_open);
         std::thread::spawn(move || {
             if let Some(stdout) = stdout {
@@ -143,7 +155,7 @@ impl SyncPanelLauncher {
                     }
                 }
             }
-            let _ = child.wait();
+            let _ = child.wait(&[0]);
             window_open.store(false, Ordering::SeqCst);
         });
     }

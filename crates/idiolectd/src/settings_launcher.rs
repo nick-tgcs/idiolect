@@ -20,40 +20,57 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
+use crate::observed_child::{FailureReporter, ObservedChild};
 use idiolect_adapter_ksni::TrayCallback;
 
 pub(crate) struct SettingsLauncher {
     binary: PathBuf,
     args: Vec<String>,
+    reporter: FailureReporter,
     /// True while a window is up — a second "Settings…" click is a no-op
     /// rather than a second window fighting over the same settings.
     window_open: Arc<AtomicBool>,
 }
 
 impl SettingsLauncher {
+    #[cfg(test)]
     pub(crate) fn new(binary: impl Into<PathBuf>) -> Self {
         Self::with_command(binary, Vec::new())
     }
 
     /// Full constructor: binary + fixed arguments. Tests use `sh -c <script>`
     /// stand-ins so no temp script files are ever exec'd.
+    #[cfg(test)]
     pub(crate) fn with_command(binary: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        Self::with_command_and_notifier(binary, args, String::new())
+    }
+
+    pub(crate) fn with_command_and_notifier(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        notify_command: impl Into<String>,
+    ) -> Self {
         Self {
             binary: binary.into(),
             args,
+            reporter: FailureReporter::new(notify_command),
             window_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Find the settings binary next to the running daemon binary, falling
     /// back to its plain name (resolved via `PATH`).
-    pub(crate) fn discover() -> Self {
+    pub(crate) fn discover(notify_command: &str) -> Self {
         const NAME: &str = "idiolect-settings";
         let beside_daemon = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::new(beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)))
+        Self::with_command_and_notifier(
+            beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)),
+            Vec::new(),
+            notify_command,
+        )
     }
 
     /// Open the window with the current state and forward every change it
@@ -64,18 +81,18 @@ impl SettingsLauncher {
         if self.window_open.swap(true, Ordering::SeqCst) {
             return; // one window at a time
         }
-        let spawned = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(&self.args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = spawned else {
+            .stdout(Stdio::piped());
+        let Some(mut child) = ObservedChild::spawn(&mut command, "Settings", self.reporter.clone())
+        else {
             self.window_open.store(false, Ordering::SeqCst);
             return;
         };
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
+        let stdin = child.child_mut().stdin.take();
+        let stdout = child.child_mut().stdout.take();
         let window_open = Arc::clone(&self.window_open);
         std::thread::spawn(move || {
             if let Some(mut stdin) = stdin {
@@ -93,7 +110,7 @@ impl SettingsLauncher {
                     }
                 }
             }
-            let _ = child.wait();
+            let _ = child.wait(&[0]);
             window_open.store(false, Ordering::SeqCst);
         });
     }
@@ -102,10 +119,45 @@ impl SettingsLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
 
     fn script_launcher(script: &str) -> SettingsLauncher {
         SettingsLauncher::with_command("sh", vec!["-c".to_owned(), script.to_owned()])
+    }
+
+    fn notification_recorder(tag: &str) -> (PathBuf, PathBuf) {
+        let log = std::env::temp_dir().join(format!(
+            "idiolect-settings-notify-log-{tag}-{}",
+            std::process::id()
+        ));
+        let script = std::env::temp_dir().join(format!(
+            "idiolect-settings-notify-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                log.display()
+            ),
+        )
+        .expect("write notification recorder");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod notification recorder");
+        (script, log)
+    }
+
+    fn wait_for_file(path: &std::path::Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                return contents;
+            }
+            assert!(Instant::now() < deadline, "notification was not emitted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -174,5 +226,66 @@ mod tests {
             !launcher.window_open.load(Ordering::SeqCst),
             "failed spawn releases the open flag"
         );
+    }
+
+    #[test]
+    fn a_crashing_window_alerts_the_user_with_its_exit_and_stderr() {
+        let (notifier, log) = notification_recorder("crash");
+        let launcher = SettingsLauncher::with_command_and_notifier(
+            "sh",
+            vec![
+                "-c".to_owned(),
+                "printf 'Glutin BadAttribute\\n' >&2; exit 23".to_owned(),
+            ],
+            notifier.to_string_lossy().into_owned(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(String::new(), tx);
+
+        let alert = wait_for_file(&log);
+        assert!(alert.contains("Idiolect Settings failed"), "{alert}");
+        assert!(alert.contains("status 23"), "{alert}");
+        assert!(alert.contains("Glutin BadAttribute"), "{alert}");
+        assert!(alert.contains("journalctl --user -u idiolectd"), "{alert}");
+    }
+
+    #[test]
+    fn a_spawn_failure_alerts_the_user_with_the_os_error() {
+        let (notifier, log) = notification_recorder("spawn");
+        let launcher = SettingsLauncher::with_command_and_notifier(
+            "/nonexistent/idiolect-settings-xyz",
+            Vec::new(),
+            notifier.to_string_lossy().into_owned(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(String::new(), tx);
+
+        let alert = wait_for_file(&log);
+        assert!(alert.contains("Idiolect Settings failed"), "{alert}");
+        assert!(alert.contains("could not start"), "{alert}");
+        assert!(alert.contains("No such file or directory"), "{alert}");
+    }
+
+    #[test]
+    fn a_normal_window_close_does_not_alert() {
+        let (notifier, log) = notification_recorder("clean");
+        let launcher = SettingsLauncher::with_command_and_notifier(
+            "sh",
+            vec!["-c".to_owned(), "exit 0".to_owned()],
+            notifier.to_string_lossy().into_owned(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(String::new(), tx);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while launcher.window_open.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "window did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!log.exists(), "clean exit emitted an alert");
     }
 }

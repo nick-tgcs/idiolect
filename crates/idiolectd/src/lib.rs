@@ -2,6 +2,7 @@
 
 pub mod daemon;
 mod desktop_integration;
+mod observed_child;
 mod retention_dialog;
 mod run_loop;
 pub mod runtime;

@@ -3,8 +3,11 @@
 //! launches the `idiolect-retention-dialog` binary out-of-process and reads the
 //! chosen day-count from its stdout (see that crate for the wire contract).
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use crate::observed_child::{FailureReporter, ObservedChild};
 
 /// Prompts the user for a custom retention window, in days. Returns `None` if the
 /// user cancels or the dialog can't run — the caller then leaves the setting as-is.
@@ -17,36 +20,60 @@ pub(crate) trait RetentionDialog: Send + Sync {
 /// means the dialog's GUI stack never runs inside the daemon.
 pub(crate) struct SubprocessRetentionDialog {
     binary: PathBuf,
+    reporter: FailureReporter,
 }
 
 impl SubprocessRetentionDialog {
+    #[cfg(test)]
     pub(crate) fn new(binary: impl Into<PathBuf>) -> Self {
+        Self::with_notifier(binary, String::new())
+    }
+
+    pub(crate) fn with_notifier(
+        binary: impl Into<PathBuf>,
+        notify_command: impl Into<String>,
+    ) -> Self {
         Self {
             binary: binary.into(),
+            reporter: FailureReporter::new(notify_command),
         }
     }
 
     /// Find the dialog binary next to the running daemon binary, else by name.
-    pub(crate) fn discover() -> Self {
+    pub(crate) fn discover(notify_command: &str) -> Self {
         const NAME: &str = "idiolect-retention-dialog";
         let beside_daemon = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::new(beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)))
+        Self::with_notifier(
+            beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)),
+            notify_command,
+        )
     }
 }
 
 impl RetentionDialog for SubprocessRetentionDialog {
     fn prompt_days(&self, current_days: u32) -> Option<u32> {
-        let output = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg(current_days.to_string())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let mut child =
+            ObservedChild::spawn(&mut command, "Retention dialog", self.reporter.clone())?;
+        let mut stdout = Vec::new();
+        child
+            .child_mut()
+            .stdout
+            .take()?
+            .read_to_end(&mut stdout)
             .ok()?;
-        if !output.status.success() {
-            return None; // cancelled, or the dialog failed to launch
+        let status = child.wait(&[0, 1])?;
+        if status.code() != Some(0) {
+            return None; // exit 1 is the dialog's documented user-cancel code
         }
-        String::from_utf8(output.stdout)
+        String::from_utf8(stdout)
             .ok()?
             .trim()
             .parse::<u32>()
@@ -58,6 +85,8 @@ impl RetentionDialog for SubprocessRetentionDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn reads_a_day_count_from_a_successful_dialog() {
@@ -73,6 +102,72 @@ mod tests {
         // `false` exits non-zero -> treated as a cancel.
         let dialog = SubprocessRetentionDialog::new("false");
         assert_eq!(dialog.prompt_days(365), None);
+    }
+
+    #[test]
+    fn documented_cancel_exit_does_not_alert_the_user() {
+        let dir = tempfile::tempdir().expect("temporary notifier directory");
+        let log = dir.path().join("notifications.log");
+        let notifier = dir.path().join("notify");
+        std::fs::write(
+            &notifier,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                log.display()
+            ),
+        )
+        .expect("write notifier");
+        std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod notifier");
+        let dialog = SubprocessRetentionDialog::with_notifier(
+            "false",
+            notifier.to_string_lossy().into_owned(),
+        );
+
+        assert_eq!(dialog.prompt_days(365), None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!log.exists(), "user cancellation emitted a crash alert");
+    }
+
+    #[test]
+    fn cancel_code_with_stderr_is_treated_as_a_crash() {
+        let dir = tempfile::tempdir().expect("temporary notifier directory");
+        let log = dir.path().join("notifications.log");
+        let notifier = dir.path().join("notify");
+        let crashing_dialog = dir.path().join("dialog");
+        std::fs::write(
+            &notifier,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
+                log.display()
+            ),
+        )
+        .expect("write notifier");
+        std::fs::write(
+            &crashing_dialog,
+            "#!/bin/sh\nprintf 'Glutin BadAttribute\\n' >&2\nexit 1\n",
+        )
+        .expect("write crashing dialog");
+        for path in [&notifier, &crashing_dialog] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod test executable");
+        }
+        let dialog = SubprocessRetentionDialog::with_notifier(
+            &crashing_dialog,
+            notifier.to_string_lossy().into_owned(),
+        );
+
+        assert_eq!(dialog.prompt_days(365), None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(alert) = std::fs::read_to_string(&log) {
+                assert!(alert.contains("status 1"), "{alert}");
+                assert!(alert.contains("Glutin BadAttribute"), "{alert}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "crash alert was not emitted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
