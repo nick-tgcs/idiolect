@@ -230,6 +230,20 @@ impl ReviewDialog for SubprocessReviewDialog {
     }
 }
 
+impl Drop for SubprocessReviewDialog {
+    fn drop(&mut self) {
+        // The engine going away takes any open window with it. That is us
+        // closing the dialog, not the dialog failing — alerting on shutdown
+        // would be pure noise. `lock()` is tolerated failing here: a poisoned
+        // mutex during teardown must not turn into a panic in a `Drop`.
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(running) = guard.take() {
+                running.child.dismiss();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +327,29 @@ mod tests {
         let alert = recorder.wait();
         assert!(alert.contains("Idiolect Review dialog failed"), "{alert}");
         assert!(alert.contains("Glutin BadAttribute"), "{alert}");
+    }
+
+    #[test]
+    fn tearing_the_engine_down_with_a_window_open_does_not_alert() {
+        // The engine owns the dialog for its whole life. When the engine goes
+        // away, any still-open window goes with it — that is us closing it, not
+        // it failing, and an alert on shutdown is pure noise.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = notifying_dialog("sleep 30", recorder.command());
+        dialog.append("listening");
+        assert!(
+            dialog.state.lock().unwrap().is_some(),
+            "the listening window should be open"
+        );
+
+        drop(dialog);
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            recorder.records().is_empty(),
+            "engine teardown alerted the user: {:?}",
+            recorder.records()
+        );
     }
 
     #[test]

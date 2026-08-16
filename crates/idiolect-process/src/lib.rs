@@ -11,13 +11,14 @@
 //! launches helpers — the IBus engine launches the review dialog, and losing
 //! *that* one silently discards a whole dictated take.
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Retained stderr. The reader keeps draining past this so a chatty helper can
 /// never block on a full pipe; only what we KEEP is capped.
@@ -67,10 +68,22 @@ pub fn notify_user(command: &str, summary: &str, body: &str) {
     }
 }
 
+/// How long an identical alert is suppressed for. The journal still records
+/// every occurrence — this only stops the DESKTOP being toasted repeatedly for
+/// one broken thing. A helper missing from a partial install fails on every
+/// attempt, and the IBus engine launches its helpers once per take, so without
+/// this the user gets a notification per utterance and learns to dismiss
+/// Idiolect's notifications without reading them.
+const REPEAT_SUPPRESSION: Duration = Duration::from_secs(60);
+
 /// Where helper failures go: the journal, and the user's notification daemon.
+///
+/// Clones share the suppression window, so the launchers built from one config
+/// do not each get their own allowance to toast the same failure.
 #[derive(Clone)]
 pub struct FailureReporter {
     notify_command: Arc<str>,
+    recent: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl FailureReporter {
@@ -78,6 +91,7 @@ impl FailureReporter {
     pub fn new(notify_command: impl Into<String>) -> Self {
         Self {
             notify_command: Arc::from(notify_command.into()),
+            recent: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -105,6 +119,10 @@ impl FailureReporter {
             eprintln!("helper failure [{reference}] {line}");
         }
 
+        if !self.should_notify(component, diagnostic) {
+            return;
+        }
+
         let summary = format!("Idiolect {component} failed");
         let detail = truncate_keeping_tail(&single_line(diagnostic), MAX_NOTIFICATION_CHARS);
         // Escape AFTER truncating: escaping first could cut an entity in half
@@ -114,6 +132,24 @@ impl FailureReporter {
             escape_markup(&detail)
         );
         notify_user(&self.notify_command, &summary, &body);
+    }
+
+    /// Whether this exact failure is due another desktop notification.
+    ///
+    /// Never suppresses on a poisoned lock: losing an alert is worse than
+    /// showing one twice.
+    fn should_notify(&self, component: &str, diagnostic: &str) -> bool {
+        let Ok(mut recent) = self.recent.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        recent.retain(|_, seen| now.duration_since(*seen) < REPEAT_SUPPRESSION);
+        let key = format!("{component}\u{0}{diagnostic}");
+        if recent.contains_key(&key) {
+            return false;
+        }
+        recent.insert(key, now);
+        true
     }
 }
 

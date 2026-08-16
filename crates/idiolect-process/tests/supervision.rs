@@ -251,6 +251,52 @@ fn a_descendant_holding_stderr_cannot_wedge_the_caller() {
 }
 
 #[test]
+fn an_identical_failure_does_not_toast_the_user_over_and_over() {
+    // One broken thing fails on EVERY attempt: a helper missing from a partial
+    // install fails on every take, and the engine launches its helpers per
+    // take. A toast each time is how a user learns to dismiss Idiolect's
+    // notifications without reading them.
+    let recorder = NotificationRecorder::new();
+    let reporter = FailureReporter::new(recorder.command().to_owned());
+
+    for _ in 0..4 {
+        let mut command = Command::new("/nonexistent/idiolect-helper-xyz");
+        assert!(ObservedChild::spawn(&mut command, "Settings", reporter.clone()).is_none());
+    }
+
+    let alert = recorder.wait();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        recorder.records().len(),
+        1,
+        "four identical failures produced {} notifications: {alert}",
+        recorder.records().len()
+    );
+}
+
+#[test]
+fn a_different_failure_is_still_reported_while_another_is_suppressed() {
+    let recorder = NotificationRecorder::new();
+    let reporter = FailureReporter::new(recorder.command().to_owned());
+
+    let mut missing = Command::new("/nonexistent/idiolect-helper-xyz");
+    assert!(ObservedChild::spawn(&mut missing, "Settings", reporter.clone()).is_none());
+    let mut crashing = shell("printf 'no GPU adapter\\n' >&2; exit 4");
+    let child = ObservedChild::spawn(&mut crashing, "Dashboard", reporter).expect("spawn");
+    wait_within_budget(child, &[0]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while recorder.records().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a distinct failure was suppressed: {:?}",
+            recorder.records()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn a_dismissed_child_is_reaped_without_alerting() {
     // Closing a helper on purpose — a cancelled take, a preview the user shut —
     // is not a failure. Reporting it would train the user to ignore the alerts

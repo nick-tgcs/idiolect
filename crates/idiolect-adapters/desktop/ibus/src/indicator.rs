@@ -94,9 +94,40 @@ impl RecordingIndicator for SubprocessIndicator {
     }
 }
 
+impl Drop for SubprocessIndicator {
+    fn drop(&mut self) {
+        // The engine going away takes any visible overlay with it. That is us
+        // hiding the overlay, not the overlay failing — alerting on shutdown
+        // would be pure noise. `lock()` is tolerated failing here: a poisoned
+        // mutex during teardown must not turn into a panic in a `Drop`.
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(running) = guard.take() {
+                running.child.dismiss();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tearing_the_engine_down_while_showing_does_not_alert() {
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let indicator = SubprocessIndicator::with_notifier("cat", recorder.command().to_owned());
+        indicator.show(30, 30);
+        assert!(indicator.state.lock().unwrap().is_some(), "spawned");
+
+        drop(indicator);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            recorder.records().is_empty(),
+            "engine teardown alerted the user: {:?}",
+            recorder.records()
+        );
+    }
 
     #[test]
     fn show_then_hide_a_short_lived_process() {
