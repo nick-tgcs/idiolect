@@ -75,7 +75,13 @@ pub struct SubprocessReviewDialog {
     binary: PathBuf,
     args: Vec<String>,
     focus: Box<dyn WindowFocus>,
-    reporter: FailureReporter,
+    /// For the FINAL attempt: each failure there is another take discarded, so
+    /// every one of them is reported.
+    final_reporter: FailureReporter,
+    /// For the mid-take preview: it re-spawns on every pause snippet, and none
+    /// of those failures lose anything — the whole transcript is still handed
+    /// to the final attempt. Reporting each one is a notification storm.
+    preview_reporter: FailureReporter,
     state: Mutex<Option<Running>>,
 }
 
@@ -111,16 +117,16 @@ impl SubprocessReviewDialog {
         focus: Box<dyn WindowFocus>,
         notify_command: impl Into<String>,
     ) -> Self {
+        let reporter = FailureReporter::new(notify_command)
+            .with_log_file(crate::notify::diagnostics_log_path());
         Self {
             binary: binary.into(),
             args,
             focus,
-            // Every failure here is another take thrown away, so none of them
-            // are suppressed; and the engine's stderr is /dev/null, so the
-            // diagnostic has to go to a file the user can actually be sent to.
-            reporter: FailureReporter::new(notify_command)
-                .with_log_file(crate::notify::diagnostics_log_path())
-                .reporting_every_occurrence(),
+            // The engine's stderr is /dev/null, so both diagnostics have to go
+            // to a file the user can actually be sent to.
+            final_reporter: reporter.clone().reporting_every_occurrence(),
+            preview_reporter: reporter,
             state: Mutex::new(None),
         }
     }
@@ -128,7 +134,7 @@ impl SubprocessReviewDialog {
     /// The notify command this dialog reports failures through.
     #[cfg(test)]
     pub(crate) fn notify_command(&self) -> &str {
-        self.reporter.notify_command()
+        self.final_reporter.notify_command()
     }
 
     /// Find the dialog binary next to the running engine binary, falling back to
@@ -147,13 +153,25 @@ impl SubprocessReviewDialog {
         )
     }
 
-    fn spawn(&self) -> Option<Running> {
+    /// Exit 1 counts as a cancel ONLY when the dialog said so on its way out.
+    /// libX11's I/O-error handler exits 1 from underneath `main`, so without
+    /// the marker an exit of 1 means the dialog DIED. Shared by both paths that
+    /// reap a dialog, so they cannot drift apart.
+    fn expected_exit_for(stdout: &str) -> ExpectedExit {
+        if stdout == CANCELLED_MARKER {
+            ExpectedExit::holds_user_data(&[0, EXIT_CANCELLED])
+        } else {
+            ExpectedExit::holds_user_data(&[0])
+        }
+    }
+
+    fn spawn(&self, reporter: &FailureReporter) -> Option<Running> {
         let mut command = Command::new(&self.binary);
         command
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        let mut child = ObservedChild::spawn(&mut command, "Review dialog", self.reporter.clone())?;
+        let mut child = ObservedChild::spawn(&mut command, "Review dialog", reporter.clone())?;
         match child.child_mut().stdin.take() {
             Some(stdin) => Some(Running { child, stdin }),
             // No stdin means no protocol; we are closing it on purpose.
@@ -170,7 +188,7 @@ impl SubprocessReviewDialog {
         let line = format!("final {}\n", escape_payload(transcript));
         let mut running = match self.state.lock().expect("dialog mutex").take() {
             Some(running) => running,
-            None => self.spawn()?,
+            None => self.spawn(&self.final_reporter)?,
         };
         let wrote = running
             .stdin
@@ -181,7 +199,7 @@ impl SubprocessReviewDialog {
             // text must not be lost — show it in a fresh dialog. We are the
             // ones tearing this one down, so it is not a failure to report.
             running.child.dismiss();
-            running = self.spawn()?;
+            running = self.spawn(&self.final_reporter)?;
             let _ = running.stdin.write_all(line.as_bytes());
         }
         let Running { mut child, stdin } = running;
@@ -202,12 +220,8 @@ impl SubprocessReviewDialog {
         // without the marker an exit of 1 means the dialog DIED — and the take
         // it was holding is about to be discarded. The user has to be told, or
         // their words vanish without a trace.
-        let expected = if text == CANCELLED_MARKER {
-            ExpectedExit::holds_user_data(&[0, EXIT_CANCELLED])
-        } else {
-            ExpectedExit::holds_user_data(&[0])
-        };
-        let status = child.wait_with_diagnostic(expected, read_error.as_deref())?;
+        let status =
+            child.wait_with_diagnostic(Self::expected_exit_for(&text), read_error.as_deref())?;
         if read_error.is_some() || status.code() != Some(0) {
             return None;
         }
@@ -219,7 +233,7 @@ impl ReviewDialog for SubprocessReviewDialog {
     fn append(&self, chunk: &str) {
         let mut guard = self.state.lock().expect("dialog mutex");
         if guard.is_none() {
-            *guard = self.spawn();
+            *guard = self.spawn(&self.preview_reporter);
         }
         let Some(running) = guard.as_mut() else {
             return; // the dialog is best-effort; dictation must not care
@@ -229,14 +243,18 @@ impl ReviewDialog for SubprocessReviewDialog {
         if wrote.is_err() {
             // Dead dialog: reap it and let review() (or the next take) respawn.
             // Same shape as the overlay: a broken pipe means the window went
-            // away by itself. Reap it so a crash is reported — the user closing
-            // it exits with the cancel code and stays silent — and let
-            // `review()` or the next take open a fresh one.
-            if let Some(dead) = guard.take() {
+            // away by itself, so reap it rather than dismissing it. The exit
+            // code alone is not enough — an X11 death exits 1 too — so read
+            // what it wrote and apply the same marker rule as the final path.
+            if let Some(mut dead) = guard.take() {
                 drop(dead.stdin);
+                let mut farewell = Vec::new();
+                if let Some(mut pipe) = dead.child.child_mut().stdout.take() {
+                    let _ = pipe.read_to_end(&mut farewell);
+                }
                 let _ = dead
                     .child
-                    .wait(ExpectedExit::holds_user_data(&[0, EXIT_CANCELLED]));
+                    .wait(Self::expected_exit_for(&String::from_utf8_lossy(&farewell)));
             }
         }
     }
@@ -343,6 +361,54 @@ mod tests {
 
     /// The cancel marker as a POSIX `printf` escape, for the `sh` stand-ins.
     const CANCEL_ESCAPE: &str = "\\004cancelled";
+
+    #[test]
+    fn a_preview_that_cannot_open_alerts_once_not_once_per_pause() {
+        // `append` respawns on every pause snippet while `state` is None, and
+        // none of those failures lose anything — the whole transcript still
+        // reaches the final attempt. One notification per pause is a storm.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = SubprocessReviewDialog::with_notifier(
+            "/nonexistent/idiolect-review-dialog-xyz",
+            Vec::new(),
+            Box::new(NoopWindowFocus),
+            recorder.command().to_owned(),
+        );
+
+        for snippet in ["one", "two", "three", "four"] {
+            dialog.append(snippet);
+        }
+
+        let alert = recorder.wait();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "four failed previews produced {} notifications: {alert}",
+            recorder.records().len()
+        );
+    }
+
+    #[test]
+    fn a_listening_window_that_dies_without_the_marker_is_reported() {
+        // An X11 death during listening exits 1 with no marker, exactly like a
+        // cancel. Permitting 1 unconditionally on this path classified it as
+        // the user closing the preview and said nothing.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = notifying_dialog(
+            "read line; printf 'X connection to :0 broken\\n' >&2; exit 1",
+            recorder.command(),
+        );
+
+        dialog.append("first");
+        // Let it read the snippet and die before the next write finds the pipe.
+        std::thread::sleep(Duration::from_millis(300));
+        dialog.append("second");
+
+        let alert = recorder.wait();
+        assert!(alert.contains("Idiolect Review dialog failed"), "{alert}");
+        assert!(alert.contains("X connection"), "{alert}");
+    }
 
     #[test]
     fn dying_with_the_cancel_code_but_no_marker_alerts_instead_of_binning_the_take() {
