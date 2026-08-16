@@ -20,8 +20,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use crate::observed_child::{FailureReporter, ObservedChild};
 use idiolect_adapter_ksni::TrayCallback;
+use idiolect_process::{FailureReporter, ObservedChild};
 
 pub(crate) struct SettingsLauncher {
     binary: PathBuf,
@@ -56,6 +56,12 @@ impl SettingsLauncher {
             reporter: FailureReporter::new(notify_command),
             window_open: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The notify command this launcher reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the settings binary next to the running daemon binary, falling
@@ -119,7 +125,7 @@ impl SettingsLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NotificationRecorder;
+    use idiolect_test_support::notifications::NotificationRecorder;
     use std::time::{Duration, Instant};
 
     fn script_launcher(script: &str) -> SettingsLauncher {

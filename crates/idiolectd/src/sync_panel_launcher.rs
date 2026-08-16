@@ -27,9 +27,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use crate::observed_child::{FailureReporter, ObservedChild};
 use idiolect_adapter_ksni::TrayCallback;
 use idiolect_common::config::dashboard_store_env;
+use idiolect_process::{FailureReporter, ObservedChild};
 
 /// The daemon-resolved store the dashboard must operate on, passed through the
 /// child's environment ([`dashboard_store_env`] — the same constants
@@ -87,6 +87,12 @@ impl SyncPanelLauncher {
             reporter: FailureReporter::new(notify_command),
             window_open: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The notify command this launcher reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the dashboard binary next to the running daemon binary, falling

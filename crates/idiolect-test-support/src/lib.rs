@@ -2,6 +2,7 @@
 
 pub mod fakes;
 pub mod fixtures;
+pub mod notifications;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

@@ -2,7 +2,6 @@
 
 pub mod daemon;
 mod desktop_integration;
-mod observed_child;
 mod retention_dialog;
 mod run_loop;
 pub mod runtime;
@@ -10,8 +9,6 @@ mod settings_launcher;
 mod sync_panel_launcher;
 
 mod adapters;
-#[cfg(test)]
-mod test_support;
 
 /// Returns this crate's package name for smoke tests.
 #[must_use]

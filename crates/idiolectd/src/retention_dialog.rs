@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::observed_child::{FailureReporter, ObservedChild};
+use idiolect_process::{FailureReporter, ObservedChild};
 
 /// Prompts the user for a custom retention window, in days. Returns `None` if the
 /// user cancels or the dialog can't run — the caller then leaves the setting as-is.
@@ -37,6 +37,12 @@ impl SubprocessRetentionDialog {
             binary: binary.into(),
             reporter: FailureReporter::new(notify_command),
         }
+    }
+
+    /// The notify command this launcher reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the dialog binary next to the running daemon binary, else by name.
@@ -70,9 +76,11 @@ impl RetentionDialog for SubprocessRetentionDialog {
                 .map(|error| format!("could not read dialog output: {error}")),
             None => Some("could not read dialog output: stdout pipe unavailable".to_owned()),
         };
+        // 0 = saved, 1 = cancelled; anything else means the dialog could not
+        // run and has already been reported.
         let status = child.wait_with_diagnostic(&[0, 1], read_error.as_deref())?;
         if read_error.is_some() || status.code() != Some(0) {
-            return None; // exit 1 is the dialog's documented user-cancel code
+            return None;
         }
         String::from_utf8(stdout)
             .ok()?
@@ -86,8 +94,7 @@ impl RetentionDialog for SubprocessRetentionDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::NotificationRecorder;
-    use std::os::unix::fs::PermissionsExt;
+    use idiolect_test_support::notifications::{write_executable_script, NotificationRecorder};
     use std::time::Duration;
 
     #[test]
@@ -106,40 +113,56 @@ mod tests {
         assert_eq!(dialog.prompt_days(365), None);
     }
 
+    /// Writes a stand-in dialog. `write_executable_script` blocks until the file
+    /// can actually be exec'd — writing and exec'ing it immediately races with
+    /// sibling test threads forking, which fails with `ETXTBSY`.
+    fn stub_dialog(dir: &tempfile::TempDir, script: &str) -> PathBuf {
+        let path = dir.path().join("dialog");
+        write_executable_script(&path, script);
+        path
+    }
+
     #[test]
-    fn documented_cancel_exit_does_not_alert_the_user() {
+    fn cancelling_does_not_alert_even_when_the_gl_stack_printed_a_warning() {
+        // The real dialog exits 1 to mean "cancelled", and a healthy GL stack
+        // still writes driver noise to stderr on this very machine. Treating
+        // that pair as a crash alerted the user on every cancel.
         let recorder = NotificationRecorder::new();
+        let dir = tempfile::tempdir().expect("temporary dialog directory");
+        let dialog = stub_dialog(
+            &dir,
+            "#!/bin/sh\nprintf 'glx: failed to create dri3 screen\\n' >&2\nexit 1\n",
+        );
         let dialog =
-            SubprocessRetentionDialog::with_notifier("false", recorder.command().to_owned());
+            SubprocessRetentionDialog::with_notifier(&dialog, recorder.command().to_owned());
 
         assert_eq!(dialog.prompt_days(365), None);
+
         std::thread::sleep(Duration::from_millis(100));
+        // The recorder proved it can record when it was constructed, so an
+        // empty log here means nothing was notified — not that it is broken.
         assert!(
-            !recorder.log_path().exists(),
-            "user cancellation emitted a crash alert"
+            recorder.records().is_empty(),
+            "user cancellation emitted a crash alert: {:?}",
+            recorder.records()
         );
     }
 
     #[test]
-    fn cancel_code_with_stderr_is_treated_as_a_crash() {
+    fn a_dialog_that_cannot_start_alerts_the_user_with_its_reason() {
         let recorder = NotificationRecorder::new();
         let dir = tempfile::tempdir().expect("temporary dialog directory");
-        let crashing_dialog = dir.path().join("dialog");
-        std::fs::write(
-            &crashing_dialog,
-            "#!/bin/sh\nprintf 'Glutin BadAttribute\\n' >&2\nexit 1\n",
-        )
-        .expect("write crashing dialog");
-        std::fs::set_permissions(&crashing_dialog, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod test executable");
-        let dialog = SubprocessRetentionDialog::with_notifier(
-            &crashing_dialog,
-            recorder.command().to_owned(),
+        let dialog = stub_dialog(
+            &dir,
+            "#!/bin/sh\nprintf 'Glutin BadAttribute\\n' >&2\nexit 2\n",
         );
+        let dialog =
+            SubprocessRetentionDialog::with_notifier(&dialog, recorder.command().to_owned());
 
         assert_eq!(dialog.prompt_days(365), None);
+
         let alert = recorder.wait();
-        assert!(alert.contains("status 1"), "{alert}");
+        assert!(alert.contains("status 2"), "{alert}");
         assert!(alert.contains("Glutin BadAttribute"), "{alert}");
     }
 

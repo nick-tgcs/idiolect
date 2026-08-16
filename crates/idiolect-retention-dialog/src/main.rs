@@ -6,6 +6,13 @@
 //!   args[1] : optional current retention, in days, used to prefill the field.
 //!   stdout  : on save, the chosen retention as a whole number of DAYS; exits 0.
 //!   exit 1  : the user cancelled (nothing written).
+//!   exit 2  : the dialog could not start at all; reason on stderr.
+//!
+//! Cancel and "could not start" MUST NOT share an exit code. They did while
+//! this was `fn main() -> eframe::Result<()>`, because `Termination` turns an
+//! `Err` into exit 1 as well — leaving the daemon to tell a crash from a cancel
+//! by guessing at stderr, which made every cancel look like a crash on any
+//! machine whose GL driver prints a warning.
 //!
 //! This is one interchangeable implementation; the daemon only knows the
 //! args/stdout contract, never egui.
@@ -40,7 +47,12 @@ struct Outcome {
     confirmed: bool,
 }
 
-fn main() -> eframe::Result<()> {
+/// The user closed the dialog without choosing.
+const EXIT_CANCELLED: i32 = 1;
+/// The dialog never got as far as showing anything.
+const EXIT_UNAVAILABLE: i32 = 2;
+
+fn main() {
     let prefill_days: u32 = std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse().ok())
@@ -60,22 +72,23 @@ fn main() -> eframe::Result<()> {
     };
 
     let app_outcome = Arc::clone(&outcome);
-    eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "idiolect-retention",
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx);
             Ok(Box::new(RetentionApp::new(prefill_days, app_outcome)))
         }),
-    )?;
+    ) {
+        eprintln!("retention dialog could not start: {error}");
+        std::process::exit(EXIT_UNAVAILABLE);
+    }
 
     let outcome = outcome.lock().expect("outcome mutex");
-    if outcome.confirmed {
-        print!("{}", outcome.days);
-        Ok(())
-    } else {
-        std::process::exit(1);
+    if !outcome.confirmed {
+        std::process::exit(EXIT_CANCELLED);
     }
+    print!("{}", outcome.days);
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);

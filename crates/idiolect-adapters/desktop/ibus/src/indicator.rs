@@ -5,8 +5,10 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
+
+use idiolect_process::{FailureReporter, ObservedChild};
 
 /// Shows the recording indicator at a caret position, repositions it while it's
 /// already showing, and hides it. All calls are idempotent.
@@ -17,7 +19,7 @@ pub trait RecordingIndicator: Send + Sync {
 }
 
 struct Running {
-    child: Child,
+    child: ObservedChild,
     stdin: ChildStdin,
 }
 
@@ -26,25 +28,36 @@ struct Running {
 /// means the overlay's GUI stack never runs inside the async IME.
 pub struct SubprocessIndicator {
     binary: PathBuf,
+    reporter: FailureReporter,
     state: Mutex<Option<Running>>,
 }
 
 impl SubprocessIndicator {
     pub fn new(binary: impl Into<PathBuf>) -> Self {
+        Self::with_notifier(binary, String::new())
+    }
+
+    /// As [`Self::new`], plus the command used to tell the user when the
+    /// overlay fails.
+    pub fn with_notifier(binary: impl Into<PathBuf>, notify_command: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            reporter: FailureReporter::new(notify_command),
             state: Mutex::new(None),
         }
     }
 
     /// Find the overlay binary next to the running engine binary, else by name.
-    pub fn discover() -> Self {
+    pub fn discover(notify_command: &str) -> Self {
         const NAME: &str = "idiolect-recording-indicator";
         let beside_engine = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::new(beside_engine.unwrap_or_else(|| PathBuf::from(NAME)))
+        Self::with_notifier(
+            beside_engine.unwrap_or_else(|| PathBuf::from(NAME)),
+            notify_command,
+        )
     }
 }
 
@@ -57,27 +70,26 @@ impl RecordingIndicator for SubprocessIndicator {
             let _ = running.stdin.flush();
             return;
         }
-        if let Ok(mut child) = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg(x.to_string())
             .arg(y.to_string())
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stdout(Stdio::null());
+        if let Some(mut child) =
+            ObservedChild::spawn(&mut command, "Recording indicator", self.reporter.clone())
         {
-            match child.stdin.take() {
+            match child.child_mut().stdin.take() {
                 Some(stdin) => *guard = Some(Running { child, stdin }),
-                None => {
-                    let _ = child.kill();
-                }
+                // No stdin means no protocol; we are closing it on purpose.
+                None => child.dismiss(),
             }
         }
     }
 
     fn hide(&self) {
-        if let Some(mut running) = self.state.lock().expect("indicator mutex").take() {
-            let _ = running.child.kill();
-            let _ = running.child.wait();
+        if let Some(running) = self.state.lock().expect("indicator mutex").take() {
+            running.child.dismiss();
         }
     }
 }

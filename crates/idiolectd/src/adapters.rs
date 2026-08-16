@@ -395,28 +395,7 @@ fn unsupported_asr_engine(engine: &str) -> RuntimeAdapterError {
     )
 }
 
-/// Surface a daemon-side problem to the USER as a desktop notification, via the
-/// configured command (`<command> <summary> <body>`; notify-send by default,
-/// empty = disabled). Dictation must never fail because telling the user about
-/// a failure failed: spawn errors are swallowed, and the child is reaped on a
-/// detached thread so a slow notifier can't stall the run-loop tick.
-pub(crate) fn notify_user(command: &str, summary: &str, body: &str) {
-    if command.is_empty() {
-        return;
-    }
-    let spawned = std::process::Command::new(command)
-        .arg(summary)
-        .arg(body)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
+pub(crate) use idiolect_process::notify_user;
 
 /// Extract the spoken audio for transcription. Recording runs from the user's
 /// Super+T (start) to Super+T (stop); VAD is used only to drop leading/trailing
@@ -585,7 +564,7 @@ mod tests {
     use idiolect_common::config::TranslationConfig;
 
     use super::{
-        begin_capture, finish_capture, is_live_capture, notify_user, transcribe_translated,
+        begin_capture, finish_capture, is_live_capture, transcribe_translated,
         RuntimeAdapterProfile, RuntimeCapture,
     };
 
@@ -782,31 +761,6 @@ mod tests {
             let mut resampler = StreamingResampler::new(16_000);
             let chunk = vec![0.5_f32; 160];
             assert_eq!(resampler.push(&chunk), chunk);
-        }
-    }
-
-    mod notify_user_contract {
-        use super::notify_user;
-        use crate::test_support::NotificationRecorder;
-
-        #[test]
-        fn invokes_the_command_with_summary_and_body() {
-            let recorder = NotificationRecorder::new();
-
-            notify_user(recorder.command(), "Idiolect", "translation unavailable");
-
-            let line = recorder.wait();
-            assert_eq!(
-                line.lines().next(),
-                Some("Idiolect|translation unavailable"),
-                "summary and body arrive as the two positional args"
-            );
-        }
-
-        #[test]
-        fn missing_binary_and_empty_command_are_silent_noops() {
-            notify_user("/nonexistent/idiolect-notifier-xyz", "s", "b"); // must not panic
-            notify_user("", "s", "b"); // disabled — must not panic or spawn
         }
     }
 }

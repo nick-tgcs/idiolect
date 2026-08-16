@@ -184,6 +184,38 @@ fn build_history_cipher(
 /// paths, plus the history key exactly when this daemon ciphers with one
 /// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
 /// overrides it — so this mirrors [`build_history_cipher`]'s decision).
+/// The three out-of-process helpers the tray can open, discovered together.
+///
+/// Grouped so the daemon's notify command reaches all of them from ONE place.
+/// Wired per-call-site, it is invisible when one of them silently loses the
+/// ability to tell the user anything — the whole feature can be disabled by
+/// three characters with every test still green.
+pub(crate) struct HelperLaunchers {
+    /// Backs the "Custom…" retention entry.
+    pub(crate) retention_dialog: SubprocessRetentionDialog,
+    /// Backs "Settings…".
+    pub(crate) settings_window: crate::settings_launcher::SettingsLauncher,
+    /// Backs "Corrections Dashboard…", handed the daemon's resolved store so
+    /// pairing and training act on the database this daemon writes — not a
+    /// second, default-path store.
+    pub(crate) sync_panel: crate::sync_panel_launcher::SyncPanelLauncher,
+}
+
+impl HelperLaunchers {
+    pub(crate) fn discover(config: &RunLoopConfig) -> Self {
+        Self {
+            retention_dialog: SubprocessRetentionDialog::discover(&config.notify_command),
+            settings_window: crate::settings_launcher::SettingsLauncher::discover(
+                &config.notify_command,
+            ),
+            sync_panel: crate::sync_panel_launcher::SyncPanelLauncher::discover(
+                dashboard_store(config),
+                &config.notify_command,
+            ),
+        }
+    }
+}
+
 fn dashboard_store(config: &RunLoopConfig) -> crate::sync_panel_launcher::DashboardStore {
     crate::sync_panel_launcher::DashboardStore {
         data_dir: config.data_dir.clone(),
@@ -700,18 +732,7 @@ fn handle_connection(
     let audio_store =
         FileAudioStore::new(config.audio_root.clone(), config.decoded_cache_root.clone());
     let codec = OpusCodec::new();
-    // Out-of-process dialog for the "Custom…" retention entry; discovered once.
-    let retention_dialog = SubprocessRetentionDialog::discover(&config.notify_command);
-    // Out-of-process Settings window ("Settings…" in the tray); discovered once.
-    let settings_window =
-        crate::settings_launcher::SettingsLauncher::discover(&config.notify_command);
-    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
-    // handed the daemon's resolved store so pairing and training act on the
-    // database this daemon writes — not a second, default-path store.
-    let sync_panel = crate::sync_panel_launcher::SyncPanelLauncher::discover(
-        dashboard_store(config),
-        &config.notify_command,
-    );
+    let helpers = HelperLaunchers::discover(config);
     let mut line = String::new();
 
     loop {
@@ -730,9 +751,9 @@ fn handle_connection(
                 },
                 live,
                 &ConfigSurfaces {
-                    retention_dialog: &retention_dialog,
-                    settings_window: &settings_window,
-                    sync_panel: &sync_panel,
+                    retention_dialog: &helpers.retention_dialog,
+                    settings_window: &helpers.settings_window,
+                    sync_panel: &helpers.sync_panel,
                     settings_forward_tx: tray_channel.forward_tx,
                 },
             )?;
@@ -2574,6 +2595,30 @@ mod tests {
                 vad_config: VadConfig::default(),
                 notify_command: String::new(),
             }
+        }
+
+        #[test]
+        fn every_helper_launcher_reports_through_the_configured_notify_command() {
+            // This is the ONLY line joining the supervision code to a real
+            // desktop. Nothing downstream of it can tell a misdirected notifier
+            // from a working one: replacing these arguments with "" disables
+            // every helper-failure alert in production, and `notify_user`
+            // treats an empty command as "notifications off", so the whole
+            // feature goes quiet with the suite still green.
+            let mut config = test_config();
+            config.notify_command = "/opt/custom-notifier".to_owned();
+
+            let helpers = crate::run_loop::HelperLaunchers::discover(&config);
+
+            assert_eq!(
+                helpers.retention_dialog.notify_command(),
+                "/opt/custom-notifier"
+            );
+            assert_eq!(
+                helpers.settings_window.notify_command(),
+                "/opt/custom-notifier"
+            );
+            assert_eq!(helpers.sync_panel.notify_command(), "/opt/custom-notifier");
         }
 
         #[test]

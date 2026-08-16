@@ -4309,9 +4309,13 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "idiolect-adapter-sqlite",
+ "idiolect-common",
  "idiolect-ipc",
  "idiolect-ports",
+ "idiolect-process",
+ "idiolect-test-support",
  "idiolectd",
+ "tempfile",
  "tokio",
  "x11rb 0.14.0",
  "zbus",
@@ -4370,6 +4374,14 @@ dependencies = [
  "idiolect-common",
  "idiolect-core",
  "idiolect-ml-core",
+]
+
+[[package]]
+name = "idiolect-process"
+version = "0.1.0"
+dependencies = [
+ "idiolect-test-support",
+ "tempfile",
 ]
 
 [[package]]
@@ -4459,6 +4471,7 @@ dependencies = [
  "chrono",
  "idiolect-common",
  "idiolect-ports",
+ "tempfile",
 ]
 
 [[package]]
@@ -4509,6 +4522,7 @@ dependencies = [
  "idiolect-common",
  "idiolect-ipc",
  "idiolect-ports",
+ "idiolect-process",
  "idiolect-test-support",
  "serde_json",
  "tempfile",

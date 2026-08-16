@@ -12,11 +12,13 @@
 //! boundary (`SubprocessReviewDialog`), so the toolkit is swappable with zero
 //! impact on the engine and the GUI's heavy dependencies stay out of the IME.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+
+use idiolect_process::{FailureReporter, ObservedChild};
 
 use crate::focus::{default_window_focus, NoopWindowFocus, WindowFocus};
 
@@ -46,8 +48,13 @@ fn escape_payload(text: &str) -> String {
     text.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
+/// The dialog's documented user-cancel code. Anything else non-zero means it
+/// could not run, which must NOT be mistaken for a cancel — that mistake threw
+/// the user's whole dictated take away silently.
+const EXIT_CANCELLED: i32 = 1;
+
 struct Running {
-    child: Child,
+    child: ObservedChild,
     stdin: ChildStdin,
 }
 
@@ -66,6 +73,7 @@ pub struct SubprocessReviewDialog {
     binary: PathBuf,
     args: Vec<String>,
     focus: Box<dyn WindowFocus>,
+    reporter: FailureReporter,
     state: Mutex<Option<Running>>,
 }
 
@@ -87,41 +95,54 @@ impl SubprocessReviewDialog {
         args: Vec<String>,
         focus: Box<dyn WindowFocus>,
     ) -> Self {
+        Self::with_notifier(binary, args, focus, String::new())
+    }
+
+    /// As [`Self::with_command`], plus the command used to tell the user when
+    /// the dialog fails.
+    pub fn with_notifier(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        focus: Box<dyn WindowFocus>,
+        notify_command: impl Into<String>,
+    ) -> Self {
         Self {
             binary: binary.into(),
             args,
             focus,
+            reporter: FailureReporter::new(notify_command),
             state: Mutex::new(None),
         }
     }
 
     /// Find the dialog binary next to the running engine binary, falling back to
     /// its plain name (resolved via `PATH`), with the platform focus manager.
-    pub fn discover() -> Self {
+    pub fn discover(notify_command: &str) -> Self {
         const NAME: &str = "idiolect-review-dialog";
         let beside_engine = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::with_command(
+        Self::with_notifier(
             beside_engine.unwrap_or_else(|| PathBuf::from(NAME)),
             Vec::new(),
             default_window_focus(),
+            notify_command,
         )
     }
 
     fn spawn(&self) -> Option<Running> {
-        let mut child = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(&self.args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        match child.stdin.take() {
+            .stdout(Stdio::piped());
+        let mut child = ObservedChild::spawn(&mut command, "Review dialog", self.reporter.clone())?;
+        match child.child_mut().stdin.take() {
             Some(stdin) => Some(Running { child, stdin }),
+            // No stdin means no protocol; we are closing it on purpose.
             None => {
-                let _ = child.kill();
+                child.dismiss();
                 None
             }
         }
@@ -141,21 +162,32 @@ impl SubprocessReviewDialog {
             .and_then(|()| running.stdin.flush());
         if wrote.is_err() {
             // The listening window died mid-take (closed, crashed): the final
-            // text must not be lost — show it in a fresh dialog.
-            let _ = running.child.kill();
-            let _ = running.child.wait();
+            // text must not be lost — show it in a fresh dialog. We are the
+            // ones tearing this one down, so it is not a failure to report.
+            running.child.dismiss();
             running = self.spawn()?;
             let _ = running.stdin.write_all(line.as_bytes());
         }
-        let Running { child, stdin } = running;
+        let Running { mut child, stdin } = running;
         // EOF after `final`: the dialog stays open for editing and we wait for
         // its exit (closing first avoids a pipe deadlock).
         drop(stdin);
-        let output = child.wait_with_output().ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        let mut edited = Vec::new();
+        let read_error = match child.child_mut().stdout.take() {
+            Some(mut pipe) => pipe
+                .read_to_end(&mut edited)
+                .err()
+                .map(|error| format!("could not read the edited text: {error}")),
+            None => Some("could not read the edited text: stdout pipe unavailable".to_owned()),
+        };
+        // Exit 1 is the user cancelling. Anything else means the dialog could
+        // not do its job, and the take it was holding is about to be discarded
+        // — the user has to be told, or their words vanish without a trace.
+        let status = child.wait_with_diagnostic(&[0, EXIT_CANCELLED], read_error.as_deref())?;
+        if read_error.is_some() || status.code() != Some(0) {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&edited).into_owned())
     }
 }
 
@@ -172,9 +204,8 @@ impl ReviewDialog for SubprocessReviewDialog {
             .and_then(|()| running.stdin.flush());
         if wrote.is_err() {
             // Dead dialog: reap it and let review() (or the next take) respawn.
-            if let Some(mut dead) = guard.take() {
-                let _ = dead.child.kill();
-                let _ = dead.child.wait();
+            if let Some(dead) = guard.take() {
+                dead.child.dismiss();
             }
         }
     }
@@ -193,9 +224,8 @@ impl ReviewDialog for SubprocessReviewDialog {
     }
 
     fn close(&self) {
-        if let Some(mut running) = self.state.lock().expect("dialog mutex").take() {
-            let _ = running.child.kill();
-            let _ = running.child.wait();
+        if let Some(running) = self.state.lock().expect("dialog mutex").take() {
+            running.child.dismiss();
         }
     }
 }
@@ -257,6 +287,51 @@ mod tests {
         )
     }
 
+    fn notifying_dialog(script: &str, notify_command: &str) -> SubprocessReviewDialog {
+        SubprocessReviewDialog::with_notifier(
+            "sh",
+            vec!["-c".to_owned(), script.to_owned()],
+            Box::new(NoopWindowFocus),
+            notify_command.to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_dialog_that_cannot_start_alerts_instead_of_silently_binning_the_take() {
+        // The engine maps `None` onto cancel_reviewed(), which discards the
+        // take. So a dialog that CRASHED was indistinguishable from the user
+        // pressing Cancel: everything they had just dictated disappeared, with
+        // nothing in the journal and nothing on screen.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = notifying_dialog(
+            "printf 'Glutin BadAttribute\n' >&2; exit 2",
+            recorder.command(),
+        );
+
+        assert_eq!(dialog.review("every word of the take"), None);
+
+        let alert = recorder.wait();
+        assert!(alert.contains("Idiolect Review dialog failed"), "{alert}");
+        assert!(alert.contains("Glutin BadAttribute"), "{alert}");
+    }
+
+    #[test]
+    fn cancelling_the_dialog_stays_silent() {
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = notifying_dialog("exit 1", recorder.command());
+
+        assert_eq!(dialog.review("every word of the take"), None);
+
+        std::thread::sleep(Duration::from_millis(150));
+        // The recorder proved it can record when constructed, so an empty log
+        // means nothing was notified rather than a broken recorder.
+        assert!(
+            recorder.records().is_empty(),
+            "cancelling alerted the user: {:?}",
+            recorder.records()
+        );
+    }
+
     #[test]
     fn fake_dialog_returns_its_reply() {
         let dialog = FakeDialog {
@@ -300,7 +375,9 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_exit_is_cancel() {
+    fn the_documented_cancel_exit_code_yields_no_text() {
+        // Only exit 1 means cancel now; any OTHER non-zero code is a failure
+        // the user is told about, not a silent discard.
         let dialog = script_dialog("exit 1");
         assert_eq!(dialog.review("hello"), None);
     }
