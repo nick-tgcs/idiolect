@@ -17,12 +17,22 @@
 //!            Payloads escape backslash as `\\` and newline as `\n`.
 //!            EOF before any `final` means the take was cancelled: close.
 //!   stdout : on confirm, the final edited text; process exits 0.
-//!   exit 1 : the user cancelled (nothing written).
+//!   exit 1 : the user cancelled — `dialog::CANCELLED_MARKER` on stdout first.
+//!   exit 2 : the dialog could not start at all; reason on stderr.
+//!
+//! The MARKER, not the exit code, is what proves a cancel. libX11's default
+//! I/O-error handler calls `exit(1)` itself when the X connection drops, so on
+//! the commonest runtime GUI death `main` never runs at all and cannot pick a
+//! different code. Without something written on the way out, a dialog that
+//! died holding the user's take was indistinguishable from Cancel — and the
+//! engine discarded every word of it without saying so.
 //!
 //! This is one interchangeable implementation; the engine only knows the
 //! stdin/stdout contract, never egui.
 
 use std::io::BufRead;
+
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED, EXIT_UNAVAILABLE};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -61,7 +71,7 @@ fn unescape_payload(payload: &str) -> String {
     output
 }
 
-fn main() -> eframe::Result<()> {
+fn main() {
     let feed = Arc::new(Mutex::new(Feed::default()));
     let reader_feed = Arc::clone(&feed);
     std::thread::spawn(move || {
@@ -91,22 +101,26 @@ fn main() -> eframe::Result<()> {
     };
 
     let app_outcome = Arc::clone(&outcome);
-    eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "idiolect-review",
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx);
             Ok(Box::new(ReviewApp::new(feed, app_outcome)))
         }),
-    )?;
+    ) {
+        eprintln!("review dialog could not start: {error}");
+        std::process::exit(EXIT_UNAVAILABLE);
+    }
 
     let outcome = outcome.lock().expect("outcome mutex");
-    if outcome.confirmed {
-        print!("{}", outcome.text);
-        Ok(())
-    } else {
-        std::process::exit(1);
+    if !outcome.confirmed {
+        print!("{CANCELLED_MARKER}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(EXIT_CANCELLED);
     }
+    print!("{}", outcome.text);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);

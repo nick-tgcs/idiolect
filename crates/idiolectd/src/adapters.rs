@@ -395,28 +395,7 @@ fn unsupported_asr_engine(engine: &str) -> RuntimeAdapterError {
     )
 }
 
-/// Surface a daemon-side problem to the USER as a desktop notification, via the
-/// configured command (`<command> <summary> <body>`; notify-send by default,
-/// empty = disabled). Dictation must never fail because telling the user about
-/// a failure failed: spawn errors are swallowed, and the child is reaped on a
-/// detached thread so a slow notifier can't stall the run-loop tick.
-pub(crate) fn notify_user(command: &str, summary: &str, body: &str) {
-    if command.is_empty() {
-        return;
-    }
-    let spawned = std::process::Command::new(command)
-        .arg(summary)
-        .arg(body)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
+pub(crate) use idiolect_process::notify_user;
 
 /// Extract the spoken audio for transcription. Recording runs from the user's
 /// Super+T (start) to Super+T (stop); VAD is used only to drop leading/trailing
@@ -585,7 +564,7 @@ mod tests {
     use idiolect_common::config::TranslationConfig;
 
     use super::{
-        begin_capture, finish_capture, is_live_capture, notify_user, transcribe_translated,
+        begin_capture, finish_capture, is_live_capture, transcribe_translated,
         RuntimeAdapterProfile, RuntimeCapture,
     };
 
@@ -782,61 +761,6 @@ mod tests {
             let mut resampler = StreamingResampler::new(16_000);
             let chunk = vec![0.5_f32; 160];
             assert_eq!(resampler.push(&chunk), chunk);
-        }
-    }
-
-    mod notify_user_contract {
-        use super::notify_user;
-        use std::time::{Duration, Instant};
-
-        /// Writes a recorder honouring the notify contract: appends
-        /// "<summary>|<body>" to a log file next to the script.
-        fn recorder(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = std::env::temp_dir();
-            let log = dir.join(format!("idiolectd-notify-log-{tag}-{}", std::process::id()));
-            let script = dir.join(format!("idiolectd-notify-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_file(&log);
-            std::fs::write(
-                &script,
-                format!(
-                    "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                    log.display()
-                ),
-            )
-            .expect("write recorder");
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod recorder");
-            (script, log)
-        }
-
-        #[test]
-        fn invokes_the_command_with_summary_and_body() {
-            let (script, log) = recorder("ok");
-            let command = script.to_string_lossy().into_owned();
-            // The spawn is fire-and-forget (reaped off-thread) and can lose a
-            // rare ETXTBSY to a sibling test's fork — retry until the log lands.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                notify_user(&command, "Idiolect", "translation unavailable");
-                std::thread::sleep(Duration::from_millis(50));
-                if log.exists() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "recorder never invoked");
-            }
-            let line = std::fs::read_to_string(&log).expect("log readable");
-            assert_eq!(
-                line.lines().next(),
-                Some("Idiolect|translation unavailable"),
-                "summary and body arrive as the two positional args"
-            );
-        }
-
-        #[test]
-        fn missing_binary_and_empty_command_are_silent_noops() {
-            notify_user("/nonexistent/idiolect-notifier-xyz", "s", "b"); // must not panic
-            notify_user("", "s", "b"); // disabled — must not panic or spawn
         }
     }
 }

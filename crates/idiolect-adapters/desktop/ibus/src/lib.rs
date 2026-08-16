@@ -8,8 +8,10 @@
 //!   the IBus bus.
 
 pub mod focus;
+pub mod helpers;
 pub mod indicator;
 pub mod ipc;
+pub mod notify;
 pub mod review;
 pub mod session;
 

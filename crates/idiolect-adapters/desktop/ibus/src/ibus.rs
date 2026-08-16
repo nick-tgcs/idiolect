@@ -797,6 +797,9 @@ pub async fn run() -> zbus::Result<()> {
     // Only keep the live preview in uncommitted preedit if the daemon negotiated
     // the stop-time reconcile; otherwise a stop arrives as a bare
     // RecordingStatus(false) and the session commits partials instead.
+    // The engine launches GUI helpers of its own; when one dies it has to be
+    // able to tell the user, using the notifier from the user's config.
+    let helpers = crate::helpers::EngineHelpers::discover();
     let mut session = Session::new(sender, PendingSurface::default());
     session.set_reconcile_supported(reconcile_supported);
 
@@ -809,8 +812,8 @@ pub async fn run() -> zbus::Result<()> {
     let shared = Arc::new(Shared {
         session: Mutex::new(session),
         active_path: Mutex::new(None),
-        dialog: Box::new(crate::review::SubprocessReviewDialog::discover()),
-        indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
+        dialog: Box::new(helpers.dialog),
+        indicator: Box::new(helpers.indicator),
         caret: Mutex::new((400, 400)),
         connection: connection.clone(),
         focus: crate::focus::default_window_focus(),

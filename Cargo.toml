@@ -29,6 +29,7 @@ members = [
     "crates/idiolect-settings",
     "crates/idiolect-recording-indicator",
     "crates/idiolect-retention-dialog",
+    "crates/idiolect-process",
     "crates/idiolect-test-support",
     "crates/idiolect-app",
     "crates/idiolect-integration-tests",

@@ -27,6 +27,7 @@ idiolect-application = { path = "../idiolect-application" }
 idiolect-common = { path = "../idiolect-common" }
 idiolect-ipc = { path = "../idiolect-ipc" }
 idiolect-ports = { path = "../idiolect-ports" }
+idiolect-process = { path = "../idiolect-process" }
 idiolect-test-support = { path = "../idiolect-test-support" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

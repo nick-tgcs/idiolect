@@ -4309,9 +4309,13 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "idiolect-adapter-sqlite",
+ "idiolect-common",
  "idiolect-ipc",
  "idiolect-ports",
+ "idiolect-process",
+ "idiolect-test-support",
  "idiolectd",
+ "tempfile",
  "tokio",
  "x11rb 0.14.0",
  "zbus",
@@ -4373,6 +4377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "idiolect-process"
+version = "0.1.0"
+dependencies = [
+ "idiolect-test-support",
+ "tempfile",
+]
+
+[[package]]
 name = "idiolect-recording-indicator"
 version = "0.1.0"
 dependencies = [
@@ -4384,6 +4396,7 @@ name = "idiolect-retention-dialog"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "idiolect-process",
 ]
 
 [[package]]
@@ -4391,6 +4404,7 @@ name = "idiolect-review-dialog"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "idiolect-process",
 ]
 
 [[package]]
@@ -4459,6 +4473,7 @@ dependencies = [
  "chrono",
  "idiolect-common",
  "idiolect-ports",
+ "tempfile",
 ]
 
 [[package]]
@@ -4509,6 +4524,7 @@ dependencies = [
  "idiolect-common",
  "idiolect-ipc",
  "idiolect-ports",
+ "idiolect-process",
  "idiolect-test-support",
  "serde_json",
  "tempfile",
