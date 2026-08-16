@@ -10,6 +10,9 @@ name = "idiolect-retention-dialog"
 path = "src/main.rs"
 
 [dependencies]
+# Zero-dependency crate holding the exit-code/marker contract this binary
+# shares with whatever launched it, so the two ends cannot drift apart.
+idiolect-process = { path = "../idiolect-process" }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 
 # X11 windowing backend. eframe with default-features off pulls in NO platform

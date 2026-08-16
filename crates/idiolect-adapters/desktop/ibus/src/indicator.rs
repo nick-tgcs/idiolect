@@ -33,6 +33,7 @@ pub struct SubprocessIndicator {
 }
 
 impl SubprocessIndicator {
+    #[cfg(test)]
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self::with_notifier(binary, String::new())
     }
@@ -42,9 +43,19 @@ impl SubprocessIndicator {
     pub fn with_notifier(binary: impl Into<PathBuf>, notify_command: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
-            reporter: FailureReporter::new(notify_command),
+            // The overlay is cosmetic and `show` runs on every caret update,
+            // so repeats are suppressed; its diagnostics still need a file,
+            // because the engine's stderr is discarded.
+            reporter: FailureReporter::new(notify_command)
+                .with_log_file(crate::notify::diagnostics_log_path()),
             state: Mutex::new(None),
         }
+    }
+
+    /// The notify command this overlay reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the overlay binary next to the running engine binary, else by name.
@@ -119,8 +130,14 @@ mod tests {
         indicator.show(30, 30);
         assert!(indicator.state.lock().unwrap().is_some(), "spawned");
 
+        let started = std::time::Instant::now();
         drop(indicator);
 
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "teardown waited for the overlay instead of closing it: {:?}",
+            started.elapsed()
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
             recorder.records().is_empty(),

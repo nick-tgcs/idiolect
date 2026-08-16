@@ -17,19 +17,22 @@
 //!            Payloads escape backslash as `\\` and newline as `\n`.
 //!            EOF before any `final` means the take was cancelled: close.
 //!   stdout : on confirm, the final edited text; process exits 0.
-//!   exit 1 : the user cancelled (nothing written).
+//!   exit 1 : the user cancelled — `dialog::CANCELLED_MARKER` on stdout first.
 //!   exit 2 : the dialog could not start at all; reason on stderr.
 //!
-//! Cancel and "could not start" MUST NOT share an exit code. They did while
-//! this was `fn main() -> eframe::Result<()>`, because `Termination` turns an
-//! `Err` into exit 1 as well — so a dialog that crashed on startup was
-//! indistinguishable from the user pressing Cancel, and the engine discarded
-//! the whole dictated take without a word.
+//! The MARKER, not the exit code, is what proves a cancel. libX11's default
+//! I/O-error handler calls `exit(1)` itself when the X connection drops, so on
+//! the commonest runtime GUI death `main` never runs at all and cannot pick a
+//! different code. Without something written on the way out, a dialog that
+//! died holding the user's take was indistinguishable from Cancel — and the
+//! engine discarded every word of it without saying so.
 //!
 //! This is one interchangeable implementation; the engine only knows the
 //! stdin/stdout contract, never egui.
 
 use std::io::BufRead;
+
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED, EXIT_UNAVAILABLE};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -67,11 +70,6 @@ fn unescape_payload(payload: &str) -> String {
     }
     output
 }
-
-/// The user closed the dialog without confirming.
-const EXIT_CANCELLED: i32 = 1;
-/// The dialog never got as far as showing anything.
-const EXIT_UNAVAILABLE: i32 = 2;
 
 fn main() {
     let feed = Arc::new(Mutex::new(Feed::default()));
@@ -117,9 +115,12 @@ fn main() {
 
     let outcome = outcome.lock().expect("outcome mutex");
     if !outcome.confirmed {
+        print!("{CANCELLED_MARKER}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         std::process::exit(EXIT_CANCELLED);
     }
     print!("{}", outcome.text);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);

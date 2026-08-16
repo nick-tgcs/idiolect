@@ -18,9 +18,13 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use idiolect_process::{FailureReporter, ObservedChild};
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED};
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
 
-use crate::focus::{default_window_focus, NoopWindowFocus, WindowFocus};
+use crate::focus::{default_window_focus, WindowFocus};
+// Only the test-only constructors need the no-op focus manager.
+#[cfg(test)]
+use crate::focus::NoopWindowFocus;
 
 /// After restoring focus, give the window manager + application a moment to
 /// process the focus-in and re-establish their input context before the engine
@@ -35,8 +39,11 @@ pub trait ReviewDialog: Send + Sync {
     /// snippet. Best-effort: must never block dictation on a broken GUI.
     fn append(&self, chunk: &str);
     /// Deliver the take's final text and block until the user confirms
-    /// (`Some(edited)`) or cancels (`None`). Reuses the listening dialog when
-    /// one is open, else opens fresh (a take can end without any pause).
+    /// (`Some(edited)`). `None` means the take is being discarded — either the
+    /// user cancelled, or the dialog failed and the user has been told, since
+    /// the caller cannot tell those apart and must drop the take either way.
+    /// Reuses the listening dialog when one is open, else opens fresh (a take
+    /// can end without any pause).
     fn review(&self, transcript: &str) -> Option<String>;
     /// Tear the dialog down without a result (cancelled take, daemon error).
     fn close(&self);
@@ -47,11 +54,6 @@ pub trait ReviewDialog: Send + Sync {
 fn escape_payload(text: &str) -> String {
     text.replace('\\', "\\\\").replace('\n', "\\n")
 }
-
-/// The dialog's documented user-cancel code. Anything else non-zero means it
-/// could not run, which must NOT be mistaken for a cancel — that mistake threw
-/// the user's whole dictated take away silently.
-const EXIT_CANCELLED: i32 = 1;
 
 struct Running {
     child: ObservedChild,
@@ -79,17 +81,20 @@ pub struct SubprocessReviewDialog {
 
 impl SubprocessReviewDialog {
     /// Construct with no focus management (capture is a no-op). Used by tests.
+    #[cfg(test)]
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self::with_command(binary, Vec::new(), Box::new(NoopWindowFocus))
     }
 
     /// Construct with an explicit focus manager (used to inject a fake in tests).
+    #[cfg(test)]
     pub fn with_focus(binary: impl Into<PathBuf>, focus: Box<dyn WindowFocus>) -> Self {
         Self::with_command(binary, Vec::new(), focus)
     }
 
     /// Full constructor: binary, fixed arguments, focus manager. Tests use
     /// `sh -c <script>` stand-ins so no temp script files are ever exec'd.
+    #[cfg(test)]
     pub fn with_command(
         binary: impl Into<PathBuf>,
         args: Vec<String>,
@@ -110,9 +115,20 @@ impl SubprocessReviewDialog {
             binary: binary.into(),
             args,
             focus,
-            reporter: FailureReporter::new(notify_command),
+            // Every failure here is another take thrown away, so none of them
+            // are suppressed; and the engine's stderr is /dev/null, so the
+            // diagnostic has to go to a file the user can actually be sent to.
+            reporter: FailureReporter::new(notify_command)
+                .with_log_file(crate::notify::diagnostics_log_path())
+                .reporting_every_occurrence(),
             state: Mutex::new(None),
         }
+    }
+
+    /// The notify command this dialog reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the dialog binary next to the running engine binary, falling back to
@@ -180,14 +196,22 @@ impl SubprocessReviewDialog {
                 .map(|error| format!("could not read the edited text: {error}")),
             None => Some("could not read the edited text: stdout pipe unavailable".to_owned()),
         };
-        // Exit 1 is the user cancelling. Anything else means the dialog could
-        // not do its job, and the take it was holding is about to be discarded
-        // — the user has to be told, or their words vanish without a trace.
-        let status = child.wait_with_diagnostic(&[0, EXIT_CANCELLED], read_error.as_deref())?;
+        let text = String::from_utf8_lossy(&edited).into_owned();
+        // Exit 1 counts as a cancel ONLY when the dialog said so on its way
+        // out. libX11's I/O-error handler exits 1 from underneath `main`, so
+        // without the marker an exit of 1 means the dialog DIED — and the take
+        // it was holding is about to be discarded. The user has to be told, or
+        // their words vanish without a trace.
+        let expected = if text == CANCELLED_MARKER {
+            ExpectedExit::holds_user_data(&[0, EXIT_CANCELLED])
+        } else {
+            ExpectedExit::holds_user_data(&[0])
+        };
+        let status = child.wait_with_diagnostic(expected, read_error.as_deref())?;
         if read_error.is_some() || status.code() != Some(0) {
             return None;
         }
-        Some(String::from_utf8_lossy(&edited).into_owned())
+        Some(text)
     }
 }
 
@@ -310,6 +334,28 @@ mod tests {
         )
     }
 
+    /// The cancel marker as a POSIX `printf` escape, for the `sh` stand-ins.
+    const CANCEL_ESCAPE: &str = "\\004cancelled";
+
+    #[test]
+    fn dying_with_the_cancel_code_but_no_marker_alerts_instead_of_binning_the_take() {
+        // This is what an X connection loss looks like: libX11's I/O-error
+        // handler calls exit(1) itself, so the dialog never reaches its cancel
+        // path and never writes the marker. Judged on the exit code alone this
+        // is indistinguishable from Cancel, and the engine throws the take away.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let dialog = notifying_dialog(
+            "printf 'X connection to :0 broken (explicit kill or server shutdown)\\n' >&2; exit 1",
+            recorder.command(),
+        );
+
+        assert_eq!(dialog.review("every word of the take"), None);
+
+        let alert = recorder.wait();
+        assert!(alert.contains("Idiolect Review dialog failed"), "{alert}");
+        assert!(alert.contains("X connection"), "{alert}");
+    }
+
     #[test]
     fn a_dialog_that_cannot_start_alerts_instead_of_silently_binning_the_take() {
         // The engine maps `None` onto cancel_reviewed(), which discards the
@@ -342,8 +388,14 @@ mod tests {
             "the listening window should be open"
         );
 
+        let started = std::time::Instant::now();
         drop(dialog);
 
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "teardown waited for the window instead of closing it: {:?}",
+            started.elapsed()
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             recorder.records().is_empty(),
@@ -355,7 +407,10 @@ mod tests {
     #[test]
     fn cancelling_the_dialog_stays_silent() {
         let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
-        let dialog = notifying_dialog("exit 1", recorder.command());
+        let dialog = notifying_dialog(
+            &format!("printf '{}'; exit 1", CANCEL_ESCAPE),
+            recorder.command(),
+        );
 
         assert_eq!(dialog.review("every word of the take"), None);
 
@@ -413,9 +468,9 @@ mod tests {
 
     #[test]
     fn the_documented_cancel_exit_code_yields_no_text() {
-        // Only exit 1 means cancel now; any OTHER non-zero code is a failure
-        // the user is told about, not a silent discard.
-        let dialog = script_dialog("exit 1");
+        // Exit 1 WITH the marker is the user cancelling; without it, or with
+        // any other code, the dialog failed and the user is told.
+        let dialog = script_dialog(&format!("printf '{CANCEL_ESCAPE}'; exit 1"));
         assert_eq!(dialog.review("hello"), None);
     }
 

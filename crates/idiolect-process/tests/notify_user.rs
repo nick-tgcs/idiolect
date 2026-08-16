@@ -25,14 +25,24 @@ fn a_missing_binary_and_an_empty_command_are_silent_noops() {
 }
 
 #[test]
-fn an_empty_command_does_not_run_anything() {
+fn a_configured_command_receives_every_notification() {
+    // The counterpart to the empty-command case: this one CAN fail, because
+    // the recorder is actually wired in. Asserting that an empty command
+    // produces nothing in a recorder that was never given that command is
+    // unfalsifiable — no implementation could ever write to it.
     let recorder = NotificationRecorder::new();
 
-    notify_user("", "Idiolect", "should never be delivered");
+    for body in ["first", "second"] {
+        notify_user(recorder.command(), "Idiolect", body);
+    }
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(
-        recorder.records().is_empty(),
-        "an empty notify command must disable notifications entirely"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while recorder.records().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of 2 notifications arrived",
+            recorder.records().len()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

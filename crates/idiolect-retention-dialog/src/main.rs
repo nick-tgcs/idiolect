@@ -5,14 +5,14 @@
 //! Protocol (so the toolkit stays swappable behind the daemon's `RetentionDialog`):
 //!   args[1] : optional current retention, in days, used to prefill the field.
 //!   stdout  : on save, the chosen retention as a whole number of DAYS; exits 0.
-//!   exit 1  : the user cancelled (nothing written).
+//!   exit 1  : the user cancelled — `dialog::CANCELLED_MARKER` on stdout first.
 //!   exit 2  : the dialog could not start at all; reason on stderr.
 //!
-//! Cancel and "could not start" MUST NOT share an exit code. They did while
-//! this was `fn main() -> eframe::Result<()>`, because `Termination` turns an
-//! `Err` into exit 1 as well — leaving the daemon to tell a crash from a cancel
-//! by guessing at stderr, which made every cancel look like a crash on any
-//! machine whose GL driver prints a warning.
+//! The MARKER, not the exit code, is what proves a cancel. libX11's default
+//! I/O-error handler calls `exit(1)` itself when the X connection drops, so on
+//! the commonest runtime GUI death `main` never runs at all and cannot pick a
+//! different code. Only something written on the way out distinguishes "the
+//! user cancelled" from "the dialog died holding the answer".
 //!
 //! This is one interchangeable implementation; the daemon only knows the
 //! args/stdout contract, never egui.
@@ -20,6 +20,7 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED, EXIT_UNAVAILABLE};
 
 /// Months are approximated as 30 days — matching the tray presets (1 month = 30).
 const DAYS_PER_MONTH: u32 = 30;
@@ -46,11 +47,6 @@ struct Outcome {
     days: u32,
     confirmed: bool,
 }
-
-/// The user closed the dialog without choosing.
-const EXIT_CANCELLED: i32 = 1;
-/// The dialog never got as far as showing anything.
-const EXIT_UNAVAILABLE: i32 = 2;
 
 fn main() {
     let prefill_days: u32 = std::env::args()
@@ -86,9 +82,12 @@ fn main() {
 
     let outcome = outcome.lock().expect("outcome mutex");
     if !outcome.confirmed {
+        print!("{CANCELLED_MARKER}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         std::process::exit(EXIT_CANCELLED);
     }
     print!("{}", outcome.days);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);

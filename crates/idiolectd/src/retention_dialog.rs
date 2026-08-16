@@ -7,7 +7,10 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use idiolect_process::{FailureReporter, ObservedChild};
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED};
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
+
+use crate::DAEMON_UNIT;
 
 /// Prompts the user for a custom retention window, in days. Returns `None` if the
 /// user cancels or the dialog can't run — the caller then leaves the setting as-is.
@@ -35,7 +38,7 @@ impl SubprocessRetentionDialog {
     ) -> Self {
         Self {
             binary: binary.into(),
-            reporter: FailureReporter::new(notify_command),
+            reporter: FailureReporter::new(notify_command).with_journal_unit(DAEMON_UNIT),
         }
     }
 
@@ -76,18 +79,20 @@ impl RetentionDialog for SubprocessRetentionDialog {
                 .map(|error| format!("could not read dialog output: {error}")),
             None => Some("could not read dialog output: stdout pipe unavailable".to_owned()),
         };
-        // 0 = saved, 1 = cancelled; anything else means the dialog could not
-        // run and has already been reported.
-        let status = child.wait_with_diagnostic(&[0, 1], read_error.as_deref())?;
+        let text = String::from_utf8_lossy(&stdout).into_owned();
+        // Exit 1 counts as a cancel ONLY when the dialog said so on its way
+        // out. libX11's I/O-error handler exits 1 from underneath `main`, so
+        // without the marker an exit of 1 means the dialog died instead.
+        let expected = if text == CANCELLED_MARKER {
+            ExpectedExit::shares_our_lifecycle(&[0, EXIT_CANCELLED])
+        } else {
+            ExpectedExit::shares_our_lifecycle(&[0])
+        };
+        let status = child.wait_with_diagnostic(expected, read_error.as_deref())?;
         if read_error.is_some() || status.code() != Some(0) {
             return None;
         }
-        String::from_utf8(stdout)
-            .ok()?
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|days| *days >= 1)
+        text.trim().parse::<u32>().ok().filter(|days| *days >= 1)
     }
 }
 
@@ -107,8 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_or_cancelled_dialog_yields_none() {
-        // `false` exits non-zero -> treated as a cancel.
+    fn a_dialog_that_produces_no_value_leaves_the_setting_alone() {
+        // `false` exits 1 with no marker — a death, not a cancel — but either
+        // way the caller must not change the retention window.
         let dialog = SubprocessRetentionDialog::new("false");
         assert_eq!(dialog.prompt_days(365), None);
     }
@@ -124,14 +130,14 @@ mod tests {
 
     #[test]
     fn cancelling_does_not_alert_even_when_the_gl_stack_printed_a_warning() {
-        // The real dialog exits 1 to mean "cancelled", and a healthy GL stack
-        // still writes driver noise to stderr on this very machine. Treating
-        // that pair as a crash alerted the user on every cancel.
+        // A cancel announces itself with the marker; a healthy GL stack still
+        // writes driver noise to stderr on this very machine. Treating that
+        // pair as a crash alerted the user on every cancel.
         let recorder = NotificationRecorder::new();
         let dir = tempfile::tempdir().expect("temporary dialog directory");
         let dialog = stub_dialog(
             &dir,
-            "#!/bin/sh\nprintf 'glx: failed to create dri3 screen\\n' >&2\nexit 1\n",
+            "#!/bin/sh\nprintf 'glx: failed to create dri3 screen\\n' >&2\nprintf '\\004cancelled'\nexit 1\n",
         );
         let dialog =
             SubprocessRetentionDialog::with_notifier(&dialog, recorder.command().to_owned());
@@ -146,6 +152,27 @@ mod tests {
             "user cancellation emitted a crash alert: {:?}",
             recorder.records()
         );
+    }
+
+    #[test]
+    fn dying_with_the_cancel_code_but_no_marker_alerts_the_user() {
+        // libX11's I/O-error handler exits 1 from underneath `main`, so the
+        // dialog never reaches its cancel path. Judged on the code alone this
+        // looks exactly like Cancel and the failure disappears.
+        let recorder = NotificationRecorder::new();
+        let dir = tempfile::tempdir().expect("temporary dialog directory");
+        let dialog = stub_dialog(
+            &dir,
+            "#!/bin/sh\nprintf 'X connection to :0 broken\\n' >&2\nexit 1\n",
+        );
+        let dialog =
+            SubprocessRetentionDialog::with_notifier(&dialog, recorder.command().to_owned());
+
+        assert_eq!(dialog.prompt_days(365), None);
+
+        let alert = recorder.wait();
+        assert!(alert.contains("status 1"), "{alert}");
+        assert!(alert.contains("X connection"), "{alert}");
     }
 
     #[test]

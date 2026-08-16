@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_returns_only_a_complete_line() {
+    fn wait_blocks_until_a_notification_actually_arrives() {
         let recorder = NotificationRecorder::new();
         let command = recorder.command().to_owned();
         let writer = std::thread::spawn(move || {
@@ -200,6 +200,48 @@ mod tests {
 
         assert!(recorded.ends_with('\n'));
         assert_eq!(recorded.trim_end(), "Idiolect|late");
+    }
+
+    #[test]
+    fn a_script_becomes_executable_even_while_another_process_holds_it_open_for_write() {
+        // This is the ETXTBSY race the retry exists for: a sibling test's fork
+        // inherits an open write descriptor, and `execve` fails until that
+        // descriptor closes. Without the retry the caller's notifier simply
+        // never runs — which is the ~9% flake this helper was written to end.
+        let directory = tempfile::tempdir().expect("temporary script directory");
+        let script = directory.path().join("held");
+        let ready = directory.path().join("opened");
+        let marker = directory.path().join("ran");
+        std::fs::write(&script, "#!/bin/sh\n").expect("seed the script");
+
+        // Append, not truncate, so the holder cannot clobber what we write.
+        let mut holder = Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "exec 3>>'{}'; : > '{}'; sleep 1",
+                    script.display(),
+                    ready.display()
+                ),
+            ])
+            .spawn()
+            .expect("spawn the descriptor holder");
+        let deadline = Instant::now() + DEADLINE;
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "holder never opened the script");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        write_executable_script(
+            &script,
+            &format!("#!/bin/sh\nprintf 'ran\\n' >> \"{}\"\n", marker.display()),
+        );
+
+        let _ = holder.wait();
+        assert!(
+            marker.exists(),
+            "gave up on a busy script instead of retrying"
+        );
     }
 
     #[test]

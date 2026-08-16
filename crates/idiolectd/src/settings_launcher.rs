@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use idiolect_adapter_ksni::TrayCallback;
-use idiolect_process::{FailureReporter, ObservedChild};
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
+
+use crate::DAEMON_UNIT;
 
 pub(crate) struct SettingsLauncher {
     binary: PathBuf,
@@ -53,7 +55,7 @@ impl SettingsLauncher {
         Self {
             binary: binary.into(),
             args,
-            reporter: FailureReporter::new(notify_command),
+            reporter: FailureReporter::new(notify_command).with_journal_unit(DAEMON_UNIT),
             window_open: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -116,7 +118,7 @@ impl SettingsLauncher {
                     }
                 }
             }
-            let _ = child.wait(&[0]);
+            let _ = child.wait(ExpectedExit::shares_our_lifecycle(&[0]));
             window_open.store(false, Ordering::SeqCst);
         });
     }

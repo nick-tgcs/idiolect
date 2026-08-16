@@ -1,21 +1,26 @@
-//! Where the engine gets the user's notification command.
+//! How the IBus engine tells the user its helpers failed.
 //!
-//! The engine is launched by IBus with no arguments, so unlike the daemon —
-//! which systemd starts with an explicit `--config` — it has to resolve the
-//! config file itself. It reads the same path the packaged unit uses, so one
-//! setting governs both processes.
+//! The engine's environment differs from the daemon's in two ways that matter:
+//!
+//! * It is launched by ibus-daemon from the component `<exec>`, with no
+//!   arguments — so unlike the daemon, which systemd starts with an explicit
+//!   `--config`, it has to resolve the config file itself. It uses the same
+//!   resolver as the rest of the workspace ([`XdgBaseDirs`]), which is what
+//!   `ResolvedConfigPaths::config_file` uses.
+//! * **Its stderr is discarded.** ibus-daemon gives the engine `/dev/null`
+//!   (which `ibus.rs` already relies on for its trace log), so writing a
+//!   diagnostic to stderr records nothing at all. Engine-side failures go to a
+//!   log file instead, and the notification points the user at that file rather
+//!   than at a journal unit that will never contain it.
 
 use std::path::{Path, PathBuf};
 
-use idiolect_common::config::{DaemonConfig, IdiolectConfig};
+use idiolect_common::config::{DaemonConfig, IdiolectConfig, Platform, XdgBaseDirs};
 
 /// The user's configured notify command.
 #[must_use]
 pub fn configured_notify_command() -> String {
-    config_path().map_or_else(
-        || DaemonConfig::default().notify_command,
-        |path| notify_command_from(&path),
-    )
+    notify_command_from(&config_path())
 }
 
 /// Read the command out of a specific config file.
@@ -35,11 +40,24 @@ pub fn notify_command_from(config_path: &Path) -> String {
         )
 }
 
-fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("idiolect").join("config.toml"))
+/// Where the engine's helper-failure diagnostics are written, since its stderr
+/// goes nowhere. The notification names this path.
+#[must_use]
+pub fn diagnostics_log_path() -> PathBuf {
+    base_dirs().data_home.join("idiolect").join("engine.log")
+}
+
+/// The same path `ResolvedConfigPaths::config_file` computes, so the engine and
+/// the rest of the workspace agree. (The packaged systemd unit hands the daemon
+/// a hardcoded `%h/.config/idiolect/config.toml`, so a user who sets
+/// `XDG_CONFIG_HOME` moves this file for the engine but not for that unit —
+/// a pre-existing quirk of the unit, not something to reproduce here.)
+fn config_path() -> PathBuf {
+    base_dirs().config_home.join("idiolect").join("config.toml")
+}
+
+fn base_dirs() -> XdgBaseDirs {
+    XdgBaseDirs::for_platform(Platform::host())
 }
 
 #[cfg(test)]
@@ -94,5 +112,33 @@ mod tests {
         let path = config_file(&dir, "[user]\ndefault_user_id = \"default\"\n");
 
         assert_eq!(notify_command_from(&path), "notify-send");
+    }
+
+    #[test]
+    fn the_config_path_is_the_one_the_rest_of_the_workspace_resolves() {
+        // Hand-rolling this resolution is how the engine ends up reading a
+        // different file from everything else — an empty `XDG_CONFIG_HOME`
+        // yields a CWD-relative path if you just join onto the raw value.
+        let expected = XdgBaseDirs::for_platform(Platform::host())
+            .config_home
+            .join("idiolect")
+            .join("config.toml");
+
+        assert_eq!(config_path(), expected);
+    }
+
+    #[test]
+    fn the_diagnostics_log_sits_under_the_data_home_not_the_cache() {
+        // The notification tells the user to grep this file, so it must not be
+        // somewhere a cleaner is entitled to delete.
+        let log = diagnostics_log_path();
+        let base = XdgBaseDirs::for_platform(Platform::host());
+
+        assert!(log.starts_with(&base.data_home), "{}", log.display());
+        assert!(!log.starts_with(&base.cache_home), "{}", log.display());
+        assert_eq!(
+            log.file_name().and_then(|name| name.to_str()),
+            Some("engine.log")
+        );
     }
 }

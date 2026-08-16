@@ -4396,6 +4396,7 @@ name = "idiolect-retention-dialog"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "idiolect-process",
 ]
 
 [[package]]
@@ -4403,6 +4404,7 @@ name = "idiolect-review-dialog"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "idiolect-process",
 ]
 
 [[package]]

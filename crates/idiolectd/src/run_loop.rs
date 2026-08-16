@@ -180,10 +180,6 @@ fn build_history_cipher(
     Ok(Some(Box::new(ChaCha20Poly1305Cipher::new(key))))
 }
 
-/// The store the tray hands to the dashboard subprocess: the daemon's resolved
-/// paths, plus the history key exactly when this daemon ciphers with one
-/// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
-/// overrides it — so this mirrors [`build_history_cipher`]'s decision).
 /// The three out-of-process helpers the tray can open, discovered together.
 ///
 /// Grouped so the daemon's notify command reaches all of them from ONE place.
@@ -216,6 +212,10 @@ impl HelperLaunchers {
     }
 }
 
+/// The store the tray hands to the dashboard subprocess: the daemon's resolved
+/// paths, plus the history key exactly when this daemon ciphers with one
+/// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
+/// overrides it — so this mirrors [`build_history_cipher`]'s decision).
 fn dashboard_store(config: &RunLoopConfig) -> crate::sync_panel_launcher::DashboardStore {
     crate::sync_panel_launcher::DashboardStore {
         data_dir: config.data_dir.clone(),

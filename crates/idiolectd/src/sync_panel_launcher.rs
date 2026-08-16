@@ -29,7 +29,9 @@ use std::sync::{mpsc, Arc};
 
 use idiolect_adapter_ksni::TrayCallback;
 use idiolect_common::config::dashboard_store_env;
-use idiolect_process::{FailureReporter, ObservedChild};
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
+
+use crate::DAEMON_UNIT;
 
 /// The daemon-resolved store the dashboard must operate on, passed through the
 /// child's environment ([`dashboard_store_env`] — the same constants
@@ -66,6 +68,15 @@ impl SyncPanelLauncher {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_command_and_notifier(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        notify_command: impl Into<String>,
+    ) -> Self {
+        Self::configured(binary, args, None, notify_command)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_command_and_store(
         binary: impl Into<PathBuf>,
         args: Vec<String>,
@@ -84,7 +95,7 @@ impl SyncPanelLauncher {
             binary: binary.into(),
             args,
             store,
-            reporter: FailureReporter::new(notify_command),
+            reporter: FailureReporter::new(notify_command).with_journal_unit(DAEMON_UNIT),
             window_open: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -161,7 +172,7 @@ impl SyncPanelLauncher {
                     }
                 }
             }
-            let _ = child.wait(&[0]);
+            let _ = child.wait(ExpectedExit::shares_our_lifecycle(&[0]));
             window_open.store(false, Ordering::SeqCst);
         });
     }
@@ -170,10 +181,79 @@ impl SyncPanelLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use idiolect_test_support::notifications::NotificationRecorder;
+    use std::time::{Duration, Instant};
 
     fn script_launcher(script: &str) -> SyncPanelLauncher {
         SyncPanelLauncher::with_command("sh", vec!["-c".to_owned(), script.to_owned()])
+    }
+
+    fn notifying_launcher(script: &str, notify_command: &str) -> SyncPanelLauncher {
+        SyncPanelLauncher::with_command_and_notifier(
+            "sh",
+            vec!["-c".to_owned(), script.to_owned()],
+            notify_command.to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_crashing_dashboard_alerts_the_user_with_its_exit_and_stderr() {
+        let recorder = NotificationRecorder::new();
+        let launcher = notifying_launcher(
+            "printf 'no GPU adapter found\n' >&2; exit 23",
+            recorder.command(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let alert = recorder.wait();
+        assert!(
+            alert.contains("Idiolect Corrections Dashboard failed"),
+            "{alert}"
+        );
+        assert!(alert.contains("status 23"), "{alert}");
+        assert!(alert.contains("no GPU adapter found"), "{alert}");
+    }
+
+    #[test]
+    fn a_dashboard_that_cannot_start_alerts_the_user() {
+        let recorder = NotificationRecorder::new();
+        let launcher = SyncPanelLauncher::with_command_and_notifier(
+            "/nonexistent/idiolect-app-xyz",
+            Vec::new(),
+            recorder.command().to_owned(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let alert = recorder.wait();
+        assert!(alert.contains("could not start"), "{alert}");
+        assert!(alert.contains("No such file or directory"), "{alert}");
+    }
+
+    #[test]
+    fn closing_the_dashboard_normally_does_not_alert() {
+        let recorder = NotificationRecorder::new();
+        let launcher = notifying_launcher("exit 0", recorder.command());
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while launcher.window_open.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "dashboard did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // The recorder proved it can record when constructed, so an empty log
+        // means nothing was notified rather than a broken recorder.
+        assert!(
+            recorder.records().is_empty(),
+            "a clean close alerted the user: {:?}",
+            recorder.records()
+        );
     }
 
     #[test]
