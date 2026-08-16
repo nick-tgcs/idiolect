@@ -6,7 +6,17 @@
 //!   arguments — so unlike the daemon, which systemd starts with an explicit
 //!   `--config`, it has to resolve the config file itself. It uses the same
 //!   resolver as the rest of the workspace ([`XdgBaseDirs`]), which is what
-//!   `ResolvedConfigPaths::config_file` uses.
+//!   `ResolvedConfigPaths::config_file` uses, and honours `IDIOLECT_CONFIG`
+//!   for a deployment that keeps its config somewhere else.
+//!
+//!   This cannot be fully authoritative: only the daemon knows which config it
+//!   was actually started with. The engine is default-oriented by construction
+//!   — [`crate::ipc::default_socket_path`] finds the daemon the same way, by
+//!   assuming the standard location and reading no config at all — so a daemon
+//!   run with a genuinely non-default `--config` is already unreachable unless
+//!   its socket path matches the default too. Making this authoritative means
+//!   having the daemon publish its resolved settings, which the engine cannot
+//!   rely on here: helpers are launched, and can fail, before it connects.
 //! * **Its stderr is discarded.** ibus-daemon gives the engine `/dev/null`
 //!   (which `ibus.rs` already relies on for its trace log), so writing a
 //!   diagnostic to stderr records nothing at all. Engine-side failures go to a
@@ -16,6 +26,10 @@
 use std::path::{Path, PathBuf};
 
 use idiolect_common::config::{DaemonConfig, IdiolectConfig, Platform, XdgBaseDirs};
+
+/// Points the engine at the config the daemon was started with, when that is
+/// not the standard path.
+pub const CONFIG_PATH_ENV: &str = "IDIOLECT_CONFIG";
 
 /// The user's configured notify command.
 #[must_use]
@@ -53,7 +67,18 @@ pub fn diagnostics_log_path() -> PathBuf {
 /// `XDG_CONFIG_HOME` moves this file for the engine but not for that unit —
 /// a pre-existing quirk of the unit, not something to reproduce here.)
 fn config_path() -> PathBuf {
-    base_dirs().config_home.join("idiolect").join("config.toml")
+    config_path_from(std::env::var_os(CONFIG_PATH_ENV))
+}
+
+/// `IDIOLECT_CONFIG` wins when it names something, so a deployment that keeps
+/// its config off the standard path can point the engine at the same file the
+/// daemon was given. An empty value is ignored rather than treated as the
+/// relative path `""`, matching `idiolect_common`'s own resolver.
+fn config_path_from(override_path: Option<std::ffi::OsString>) -> PathBuf {
+    match override_path {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => base_dirs().config_home.join("idiolect").join("config.toml"),
+    }
 }
 
 fn base_dirs() -> XdgBaseDirs {
@@ -115,6 +140,27 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_config_path_overrides_the_standard_one() {
+        // The daemon takes `--config <path>`, so a deployment can put its
+        // config anywhere; without this the engine reads a DIFFERENT file and
+        // silently ignores a `notify_command = ""` that turned alerts off.
+        let chosen = PathBuf::from("/etc/idiolect/custom.toml");
+
+        assert_eq!(
+            config_path_from(Some(chosen.clone().into_os_string())),
+            chosen
+        );
+    }
+
+    #[test]
+    fn an_empty_override_falls_back_rather_than_reading_the_working_directory() {
+        let standard = config_path_from(None);
+
+        assert_eq!(config_path_from(Some(std::ffi::OsString::new())), standard);
+        assert!(standard.is_absolute(), "{}", standard.display());
+    }
+
+    #[test]
     fn the_config_path_is_the_one_the_rest_of_the_workspace_resolves() {
         // Hand-rolling this resolution is how the engine ends up reading a
         // different file from everything else — an empty `XDG_CONFIG_HOME`
@@ -124,7 +170,7 @@ mod tests {
             .join("idiolect")
             .join("config.toml");
 
-        assert_eq!(config_path(), expected);
+        assert_eq!(config_path_from(None), expected);
     }
 
     #[test]
