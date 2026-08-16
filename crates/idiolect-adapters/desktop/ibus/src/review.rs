@@ -228,8 +228,15 @@ impl ReviewDialog for SubprocessReviewDialog {
             .and_then(|()| running.stdin.flush());
         if wrote.is_err() {
             // Dead dialog: reap it and let review() (or the next take) respawn.
+            // Same shape as the overlay: a broken pipe means the window went
+            // away by itself. Reap it so a crash is reported — the user closing
+            // it exits with the cancel code and stays silent — and let
+            // `review()` or the next take open a fresh one.
             if let Some(dead) = guard.take() {
-                dead.child.dismiss();
+                drop(dead.stdin);
+                let _ = dead
+                    .child
+                    .wait(ExpectedExit::holds_user_data(&[0, EXIT_CANCELLED]));
             }
         }
     }

@@ -2,6 +2,11 @@
 
 pub mod fakes;
 pub mod fixtures;
+// Shells out to `/bin/sh` and sets Unix permission bits, so it only exists
+// where that means something. `idiolect-application` depends on this crate and
+// is built for Windows, which is where an unconditional `PermissionsExt`
+// import breaks the build.
+#[cfg(unix)]
 pub mod notifications;
 
 /// Returns this crate's package name for smoke tests.

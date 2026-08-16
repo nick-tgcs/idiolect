@@ -467,6 +467,24 @@ fn turning_notifications_off_does_not_turn_the_record_off() {
 }
 
 #[test]
+fn the_record_is_written_even_when_its_directory_does_not_exist_yet() {
+    // The engine's log lives under the XDG data home, which may never have been
+    // created. `OpenOptions::create` makes the FILE, not its parents, and the
+    // error is discarded — so the record silently goes nowhere while the
+    // notification sends the user to grep a file that was never written.
+    let directory = tempfile::tempdir().expect("temporary log directory");
+    let log = directory.path().join("idiolect").join("engine.log");
+    let reporter = FailureReporter::new(String::new()).with_log_file(&log);
+    let mut command = shell("printf 'FATAL: adapter lost\n' >&2; exit 3");
+
+    let child = ObservedChild::spawn(&mut command, "Review dialog", reporter).expect("spawn");
+    wait_within_budget(child, CLEAN_EXIT);
+
+    let recorded = std::fs::read_to_string(&log).expect("the failure was not recorded");
+    assert!(recorded.contains("FATAL: adapter lost"), "{recorded}");
+}
+
+#[test]
 fn every_recorded_line_carries_the_reference_the_user_is_told_to_grep() {
     // One failure can be hundreds of lines. The body sends the user after a
     // single reference, so it has to appear on all of them, not just the first.

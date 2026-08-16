@@ -273,6 +273,12 @@ impl FailureReporter {
         let _ = std::io::stderr().write_all(record.as_bytes());
 
         if let Some(path) = &self.log_file {
+            // `create` makes the FILE, not its parents. The engine's log lives
+            // under the XDG data home, which may never have been created — and
+            // the notification is about to tell the user to grep this path.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

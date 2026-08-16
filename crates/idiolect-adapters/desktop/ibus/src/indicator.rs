@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 
-use idiolect_process::{FailureReporter, ObservedChild};
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
 
 /// Shows the recording indicator at a caret position, repositions it while it's
 /// already showing, and hides it. All calls are idempotent.
@@ -77,9 +77,18 @@ impl RecordingIndicator for SubprocessIndicator {
         let mut guard = self.state.lock().expect("indicator mutex");
         if let Some(running) = guard.as_mut() {
             // Already showing — stream the new caret position so it follows.
-            let _ = writeln!(running.stdin, "{x} {y}");
-            let _ = running.stdin.flush();
-            return;
+            let wrote = writeln!(running.stdin, "{x} {y}").and_then(|()| running.stdin.flush());
+            if wrote.is_ok() {
+                return;
+            }
+            // The pipe is broken, so the overlay died on its own — a
+            // deliberate teardown goes through `hide`. Reap it so the failure
+            // is reported, then fall through and start a fresh one; leaving the
+            // corpse in place meant no overlay for the rest of the recording.
+            if let Some(dead) = guard.take() {
+                drop(dead.stdin);
+                let _ = dead.child.wait(ExpectedExit::shares_our_lifecycle(&[0]));
+            }
         }
         let mut command = Command::new(&self.binary);
         command
@@ -122,6 +131,35 @@ impl Drop for SubprocessIndicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlay_that_dies_on_its_own_is_reported_and_then_replaced() {
+        // A crash AFTER a successful spawn left the dead child in place: the
+        // next `show` wrote into a broken pipe and ignored the error, so the
+        // overlay never came back for the rest of the recording and the user
+        // was never told why.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let directory = tempfile::tempdir().expect("temporary overlay directory");
+        let overlay = directory.path().join("overlay");
+        idiolect_test_support::notifications::write_executable_script(
+            &overlay,
+            "#!/bin/sh\nprintf 'GL context lost\\n' >&2\nexit 23\n",
+        );
+        let indicator = SubprocessIndicator::with_notifier(&overlay, recorder.command().to_owned());
+
+        indicator.show(30, 30);
+        // Let the overlay die before the reposition that finds the dead pipe.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        indicator.show(40, 50);
+
+        let alert = recorder.wait();
+        assert!(
+            alert.contains("Idiolect Recording indicator failed"),
+            "{alert}"
+        );
+        assert!(alert.contains("status 23"), "{alert}");
+        assert!(alert.contains("GL context lost"), "{alert}");
+    }
 
     #[test]
     fn tearing_the_engine_down_while_showing_does_not_alert() {
