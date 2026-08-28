@@ -91,11 +91,23 @@ impl Phase {
     }
 }
 
-fn caret_to_window(x: f32, y: f32) -> egui::Pos2 {
-    egui::pos2(
-        (x + MIC_RIGHT - MIC_CENTER.x).max(0.0),
-        (y - MIC_CENTER.y).max(0.0),
-    )
+/// Where to put the window so its badge lands on the caret, kept wholly on the
+/// monitor when one is known.
+///
+/// The window is far wider than the badge — the caption is drawn to the right of
+/// the microphone — so near a monitor's right or bottom edge the label would
+/// hang off the display. There the window is pushed back on screen and the badge
+/// sits a little left of the caret, which is the lesser evil: a badge slightly
+/// off the cursor still reads as "this is happening now", a caption cut in half
+/// by the screen edge does not.
+fn caret_to_window(x: f32, y: f32, monitor: Option<egui::Vec2>) -> egui::Pos2 {
+    let mut position = egui::pos2(x + MIC_RIGHT - MIC_CENTER.x, y - MIC_CENTER.y);
+    if let Some(monitor) = monitor {
+        position.x = position.x.min(monitor.x - WIN.x);
+        position.y = position.y.min(monitor.y - WIN.y);
+    }
+    // Last, so a monitor smaller than the window still gives an on-screen origin.
+    egui::pos2(position.x.max(0.0), position.y.max(0.0))
 }
 
 /// Parse an `"x y [phase]"` line streamed on stdin. Returns `None` for malformed
@@ -254,7 +266,9 @@ fn viewport(x: f32, y: f32, phase: Phase) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
         .with_visible(phase.is_visible())
         .with_inner_size(WIN)
-        .with_position(caret_to_window(x, y))
+        // No monitor is known before the window exists; the first frame's
+        // `OuterPosition` above applies the clamp.
+        .with_position(caret_to_window(x, y, None))
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
@@ -298,8 +312,9 @@ impl Indicator {
             caret: (cx, cy),
             phase,
         } = *self.overlay.lock().expect("overlay mutex");
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(caret_to_window(
-            cx, cy,
+            cx, cy, monitor,
         )));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(phase.is_visible()));
         if !phase.is_visible() {
@@ -443,12 +458,38 @@ mod tests {
         // that centre happens to be. Pinned against the anchor rather than the
         // window size, because the window has to be wide enough for the
         // transcribing label and the badge must NOT move when it grew.
-        let p = caret_to_window(400.0, 400.0);
+        let p = caret_to_window(400.0, 400.0, None);
         assert_eq!(p.x + MIC_CENTER.x, 400.0 + MIC_RIGHT);
         assert_eq!(p.y + MIC_CENTER.y, 400.0);
         // Near the screen edge the position is clamped, never negative.
-        let edge = caret_to_window(0.0, 0.0);
+        let edge = caret_to_window(0.0, 0.0, None);
         assert_eq!(edge, egui::pos2(0.0, 0.0));
+    }
+
+    #[test]
+    fn the_whole_badge_stays_on_the_monitor_at_the_right_edge() {
+        // The window grew from 48 px square to 184 px wide to hold the caption,
+        // and the caption is drawn to the RIGHT of the microphone. Clamping only
+        // against zero therefore left the label hanging off the display for any
+        // caret in the last ~150 px — a maximised terminal puts the cursor there
+        // routinely, and a label nobody can read is the failure this whole
+        // feature exists to avoid.
+        let monitor = egui::vec2(2560.0, 1440.0);
+        let edge = caret_to_window(2555.0, 1435.0, Some(monitor));
+        assert!(
+            edge.x + WIN.x <= monitor.x,
+            "{edge:?} + {WIN:?} runs off a {monitor:?} monitor",
+        );
+        assert!(edge.y + WIN.y <= monitor.y, "{edge:?} runs off the bottom");
+
+        // Away from the edges nothing moves: the badge must stay on the caret.
+        let middle = caret_to_window(1200.0, 700.0, Some(monitor));
+        assert_eq!(middle, caret_to_window(1200.0, 700.0, None));
+
+        // A monitor smaller than the window still yields an on-screen origin
+        // rather than a negative one.
+        let tiny = caret_to_window(10.0, 10.0, Some(egui::vec2(100.0, 40.0)));
+        assert_eq!(tiny, egui::pos2(0.0, 0.0));
     }
 
     #[test]
@@ -829,10 +870,53 @@ mod tests {
         let moved_to_caret = output.viewport_output.values().any(|vp| {
             vp.commands.iter().any(|cmd| {
                 matches!(cmd, egui::ViewportCommand::OuterPosition(p)
-                    if *p == caret_to_window(250.0, 150.0))
+                    if *p == caret_to_window(250.0, 150.0, None))
             })
         });
         assert!(moved_to_caret, "indicator should reposition onto the caret");
+    }
+
+    #[test]
+    fn a_painted_frame_positions_the_window_using_the_monitor_it_is_on() {
+        // The clamp is only worth anything if the paint loop actually feeds it
+        // the monitor — `viewport()` cannot, because no window exists yet, so
+        // this frame is the only place the real bounds are known.
+        let monitor = egui::vec2(2560.0, 1440.0);
+        let mut indicator = Indicator {
+            overlay: Arc::new(Mutex::new(Overlay {
+                caret: (2555.0, 1435.0),
+                phase: Phase::Recording,
+            })),
+            clock: PhaseClock::default(),
+            engine_gone: Arc::new(AtomicBool::new(false)),
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .monitor_size = Some(monitor);
+
+        let mut output = ctx.run_ui(input, |ui| indicator.draw(ui));
+        output.textures_delta.clear();
+
+        let positions: Vec<egui::Pos2> = output
+            .viewport_output
+            .values()
+            .flat_map(|vp| vp.commands.iter())
+            .filter_map(|cmd| match cmd {
+                egui::ViewportCommand::OuterPosition(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert!(!positions.is_empty(), "a frame must position the window");
+        for position in positions {
+            assert!(
+                position.x + WIN.x <= monitor.x && position.y + WIN.y <= monitor.y,
+                "{position:?} puts part of the badge off a {monitor:?} monitor",
+            );
+        }
     }
 
     #[test]
@@ -848,7 +932,7 @@ mod tests {
         assert_eq!(vb.mouse_passthrough, Some(true));
         assert_eq!(vb.taskbar, Some(false));
         // Still positioned on the caret it was launched at.
-        assert_eq!(vb.position, Some(caret_to_window(400.0, 400.0)));
+        assert_eq!(vb.position, Some(caret_to_window(400.0, 400.0, None)));
     }
 
     #[test]

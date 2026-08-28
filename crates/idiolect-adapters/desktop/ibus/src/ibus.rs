@@ -162,6 +162,14 @@ impl Shared {
     /// Record whether the daemon's phase pushes can still reach the session.
     /// Separate from [`Self::run_session`] because this emits no surface ops by
     /// construction, so there is nothing for the caller to forward.
+    ///
+    /// THE RULE: every blocking call made on the reader thread must bracket
+    /// itself with `false` … `true` and a [`Self::sync_indicator`] on each side.
+    /// While that thread is blocked the daemon's phase pushes queue up unread,
+    /// so the phase the session holds is frozen — and a frozen decode phase
+    /// drawn as a live spinner claims work that may already be over. There are
+    /// two such calls, both `ReviewDialog::review`: the stop-of-take review, and
+    /// the retroactive history edit.
     fn set_phase_channel_live(&self, live: bool) {
         self.session
             .lock()
@@ -665,7 +673,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     "edit_history <- daemon: id={} text={:?}",
                     edit.id, edit.text
                 ));
+                // Blocks this reader thread for as long as the user edits, in
+                // exactly the way the stop-of-take review above does — and a
+                // history edit can be opened while a take is still running, so
+                // the badge would sit there showing whatever phase the take was
+                // in when the dialog opened, however long that is.
+                shared.set_phase_channel_live(false);
+                shared.sync_indicator();
                 handle_edit_history(&*shared.dialog, &mut sender, edit);
+                shared.set_phase_channel_live(true);
+                shared.sync_indicator();
                 continue;
             }
             Ok(_) => continue,
