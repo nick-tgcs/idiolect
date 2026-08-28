@@ -1547,6 +1547,22 @@ impl RecordingStatusTx {
     }
 }
 
+/// Tell the client which decode phase the take has entered. Call only once the
+/// microphone has been stopped AND drained, so the badge never claims the mic is
+/// shut while it is still collecting samples.
+fn announce_decode_phase(
+    stream: &mut UnixStream,
+    tray: &mut KsniTray,
+    store: &SqliteMetadataStore,
+    config: &RunLoopConfig,
+    status_tx: &mut RecordingStatusTx,
+) -> Result<(), RunLoopError> {
+    let phase = decode_phase(crate::adapters::asr_model_is_resident(
+        &config.adapter_profile,
+    ));
+    status_tx.set_phase(stream, tray, store, config, phase)
+}
+
 /// Which decode phase to announce, given whether the speech model is already in
 /// memory. A cold start pays a multi-second model load before any decoding
 /// happens; calling that "transcribing" makes an ordinary wait look like a hang.
@@ -1866,28 +1882,23 @@ fn stop_live_and_transcribe(
         return Ok(());
     };
 
-    // The microphone is now shut but the take is not finished: everything below
-    // decodes, which on CPU is seconds of apparent nothing. Announce the phase
-    // BEFORE that work so the caret overlay can stop showing a live-microphone
-    // badge and show progress instead — `recording` deliberately stays true, as
-    // the transcript is still to come and the engine only accepts one while its
-    // take is open.
-    status_tx.set_phase(
-        stream,
-        tray,
-        store,
-        config,
-        decode_phase(crate::adapters::asr_model_is_resident(
-            &config.adapter_profile,
-        )),
-    )?;
-
+    // NOTE: the microphone is still OPEN here. `live_capture.take()` only moves
+    // the capture out of `Live`; the stream keeps collecting until
+    // `finish_capture` stops and drains it. So the decode phase is announced
+    // below, once per branch, immediately after that call — announcing it here
+    // would tell the user the mic had closed while it was still recording them,
+    // and fold whatever they said during the tray/IPC round-trip into the take.
     if let Some(mut state) = live_stream.take() {
         // Streaming stop: drain the final capture chunk, flush the segmenter's
         // tail, fold the remaining utterances into the take, then finalize the
         // WHOLE take as one session — there is no batch transcription.
         match crate::adapters::finish_capture(capture) {
             Ok(tail) => {
+                // Microphone now stopped and drained; everything below decodes,
+                // which on CPU is seconds of apparent nothing. `recording`
+                // deliberately stays true — the transcript is still to come and
+                // the engine only accepts one while its take is open.
+                announce_decode_phase(stream, tray, store, config, status_tx)?;
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
@@ -1941,6 +1952,9 @@ fn stop_live_and_transcribe(
             return Ok(());
         }
     };
+
+    // As above: only now is the microphone actually stopped and drained.
+    announce_decode_phase(stream, tray, store, config, status_tx)?;
 
     match materialize_session(store, audio_store, codec, config, segment)? {
         StartSessionOutcome::Started(session) => {

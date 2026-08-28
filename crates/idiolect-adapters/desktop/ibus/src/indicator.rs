@@ -150,12 +150,18 @@ impl SubprocessIndicator {
         let word = phase_word(phase);
         let mut last = self.last.lock().expect("indicator last mutex");
         let mut guard = self.state.lock().expect("indicator mutex");
-        if guard.is_some() && *last == Some((x, y, phase)) {
-            // The overlay is already in this exact state. Worth suppressing
-            // rather than writing anyway: `sync_indicator` runs on every key
-            // event and every caret report, and apps report a caret rect on
-            // every keystroke — so an idle, hidden overlay would be told to hide
-            // again, and woken to draw nothing, for every character typed.
+        if phase == ActivityPhase::Idle && guard.is_some() && *last == Some((x, y, phase)) {
+            // A HIDDEN overlay already in this state is told nothing. Worth
+            // suppressing: `sync_indicator` runs on every key event and every
+            // caret report, and apps report a caret rect on every keystroke — so
+            // an idle overlay would be told to hide again, and woken to draw
+            // nothing, for every character typed.
+            //
+            // Deliberately never applied to a VISIBLE phase, however repetitive.
+            // A failed write is the only thing that detects an overlay which
+            // exited on its own, and mid-take the caret frequently sits still,
+            // so suppressing identical shows would leave the badge missing for
+            // the rest of the take with nothing to notice it.
             return;
         }
         *last = Some((x, y, phase));
@@ -271,6 +277,35 @@ mod tests {
         );
         assert!(alert.contains("status 23"), "{alert}");
         assert!(alert.contains("GL context lost"), "{alert}");
+    }
+
+    #[test]
+    fn a_repeated_show_still_notices_an_overlay_that_died() {
+        // A write failing on the broken pipe is the ONLY thing that detects an
+        // overlay which exited on its own. While a take is in progress the caret
+        // often sits still, so every sync carries an identical tuple —
+        // suppressing those would leave the badge missing for the rest of the
+        // take, which is the exact symptom the whole feature exists to fix.
+        // Suppression is therefore only ever applied to a hidden overlay.
+        let recorder = idiolect_test_support::notifications::NotificationRecorder::new();
+        let directory = tempfile::tempdir().expect("temporary overlay directory");
+        let overlay = directory.path().join("dies");
+        idiolect_test_support::notifications::write_executable_script(
+            &overlay,
+            "#!/bin/sh\nexit 23\n",
+        );
+        let indicator = SubprocessIndicator::with_notifier(&overlay, recorder.command().to_owned());
+
+        indicator.show(30, 30, ActivityPhase::Recording);
+        // Let the overlay die before the identical re-show that finds the pipe.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        indicator.show(30, 30, ActivityPhase::Recording);
+
+        let alert = recorder.wait();
+        assert!(
+            alert.contains("Recording indicator"),
+            "an identical re-show must still reach the dead pipe: {alert:?}",
+        );
     }
 
     #[test]
@@ -435,14 +470,20 @@ mod tests {
         indicator.hide(); // already hidden: nothing to say
         indicator.hide();
         indicator.show(30, 40, ActivityPhase::Recording);
-        indicator.show(30, 40, ActivityPhase::Recording); // same spot, same phase
-        indicator.show(31, 40, ActivityPhase::Recording); // moved: must be sent
+        indicator.show(31, 40, ActivityPhase::Recording);
+        indicator.hide();
+        indicator.hide();
 
         let lines = overlay_lines(directory.path());
         assert_eq!(
             lines,
-            ["0 0 hidden", "30 40 recording", "31 40 recording"],
-            "only changes reach the overlay, and every change does",
+            [
+                "0 0 hidden",
+                "30 40 recording",
+                "31 40 recording",
+                "31 40 hidden"
+            ],
+            "repeated hides collapse; every move and every show is still sent",
         );
     }
 
