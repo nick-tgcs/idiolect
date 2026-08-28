@@ -813,27 +813,23 @@ fn logical_cpus() -> u32 {
         .unwrap_or(1)
 }
 
-/// Physical cpu cores, counted as the number of distinct SMT sibling groups.
+/// Physical cpu cores — SMT siblings counted once.
 ///
-/// Reading the sibling groups (rather than halving the logical count) keeps the
-/// answer right on machines with no SMT at all and on those with more than two
-/// threads per core. Returns `None` where the platform does not publish the
-/// topology, leaving the caller to fall back.
-#[cfg(target_os = "linux")]
-fn physical_cores() -> Option<u32> {
-    let mut groups = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
-        let siblings = entry.path().join("topology/thread_siblings_list");
-        if let Ok(group) = std::fs::read_to_string(siblings) {
-            groups.insert(group.trim().to_owned());
-        }
-    }
-    u32::try_from(groups.len()).ok().filter(|count| *count > 0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn physical_cores() -> Option<u32> {
-    None
+/// Delegated rather than hand-rolled because it is genuinely per-platform: sysfs
+/// topology (then `/proc/cpuinfo`) on Linux, `hw.physicalcpu` on macOS,
+/// `GetLogicalProcessorInformation` on Windows. A Linux-only sysfs reader that
+/// halved the logical count whenever it could not read the topology was wrong in
+/// the direction that costs the most: on any machine with no SMT — Apple
+/// Silicon, an ARM container with no sysfs — it handed whisper HALF the cores it
+/// was allowed. On an 8-cpu box that is 4 threads where 7 is safe, slower than
+/// even the fixed 8 this policy replaced.
+///
+/// Reports the HOST's cores; see [`clamp_decode_threads`] for what happens under
+/// a cpu quota or an affinity mask.
+fn physical_cores() -> u32 {
+    u32::try_from(num_cpus::get_physical())
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 /// Fit a desired decode-thread count to a machine with `logical` cpus.
@@ -858,9 +854,7 @@ fn clamp_decode_threads(desired: u32, logical: u32) -> u32 {
 /// the two counts are equal and the cap binds, giving physical-minus-one — still
 /// the right answer, because the headroom is what the cap is for.
 fn default_asr_threads() -> u32 {
-    let logical = logical_cpus();
-    let desired = physical_cores().unwrap_or_else(|| logical.div_ceil(2));
-    clamp_decode_threads(desired, logical)
+    clamp_decode_threads(physical_cores(), logical_cpus())
 }
 
 fn default_storage_audio_codec() -> String {
@@ -1188,16 +1182,52 @@ mod decode_thread_policy_tests {
     }
 
     #[test]
-    fn default_asr_threads_prefers_physical_cores_when_reported() {
+    fn default_asr_threads_prefers_physical_cores() {
         // SMT siblings share execution units and cache, so a second worker on
         // the same physical core buys no throughput on a compute-bound decode.
-        // Where the platform reports the real core count, that is the pool size.
-        let Some(physical) = physical_cores() else {
-            return;
-        };
+        // The real core count is the pool size.
         assert_eq!(
             default_asr_threads(),
-            clamp_decode_threads(physical, logical_cpus()),
+            clamp_decode_threads(physical_cores(), logical_cpus()),
+        );
+    }
+
+    #[test]
+    fn the_core_count_matches_the_kernel_topology_rather_than_a_guess() {
+        // The previous reader was Linux-sysfs-only and fell back to `logical / 2`
+        // — assuming two-way SMT — everywhere else. On a machine that has none
+        // (Apple Silicon, an ARM container without sysfs) that is half the cores
+        // the process may use: 4 threads on 8 cpus where 7 is safe, slower than
+        // the fixed 8 it replaced.
+        //
+        // What this test can and cannot do, stated plainly: it compares the
+        // count against the kernel's own SMT sibling groups, which catches a
+        // count that is simply wrong (reporting the logical figure fails here at
+        // 48 vs 24). It CANNOT catch the halved guess on this hardware, because
+        // on a two-way SMT box `logical / 2` and the true core count are the
+        // same number — a mutation reintroducing it passes. The protection
+        // against the guess is structural instead: `physical_cores` no longer
+        // has a fallback to guess with, on any platform. Linux only, since that
+        // file is the only ground truth readable from a unit test.
+        assert!(physical_cores() >= 1, "a machine has at least one core");
+
+        let mut groups = std::collections::BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let siblings = entry.path().join("topology/thread_siblings_list");
+            if let Ok(group) = std::fs::read_to_string(siblings) {
+                groups.insert(group.trim().to_owned());
+            }
+        }
+        if groups.is_empty() {
+            return; // topology not published here; nothing to compare against
+        }
+        assert_eq!(
+            physical_cores() as usize,
+            groups.len(),
+            "the core count must match the kernel's SMT sibling groups",
         );
     }
 }
