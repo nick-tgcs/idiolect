@@ -92,19 +92,33 @@ impl Phase {
 }
 
 /// Where to put the window so its badge lands on the caret, kept wholly on the
-/// monitor when one is known.
+/// display where that can be known safely.
 ///
 /// The window is far wider than the badge — the caption is drawn to the right of
-/// the microphone — so near a monitor's right or bottom edge the label would
-/// hang off the display. There the window is pushed back on screen and the badge
-/// sits a little left of the caret, which is the lesser evil: a badge slightly
-/// off the cursor still reads as "this is happening now", a caption cut in half
-/// by the screen edge does not.
+/// the microphone — so near a screen's right or bottom edge the caption would
+/// hang off it. There the window is pushed back and the badge sits a little left
+/// of the caret, which is the lesser evil: a badge slightly off the cursor still
+/// reads as "this is happening now", a caption cut in half does not.
+///
+/// The catch is that egui reports a monitor SIZE and no origin, while the caret
+/// arrives in root-desktop coordinates. On a multi-monitor desktop a caret on a
+/// secondary screen would be clamped as though that screen began at (0, 0) — two
+/// 1920-wide monitors side by side turn x = 2500 into x = 1736, throwing the
+/// badge onto the FIRST monitor, far from the user. That is worse than the
+/// clipping it set out to fix, so each axis is clamped only while the caret is
+/// still within the reported extent, which is exactly the case where the origin
+/// is known to be zero. Elsewhere the position is left alone. Clamping properly
+/// everywhere needs the caret's monitor rectangle (a RandR CRTC lookup), which
+/// this deliberately dependency-free binary cannot do.
 fn caret_to_window(x: f32, y: f32, monitor: Option<egui::Vec2>) -> egui::Pos2 {
     let mut position = egui::pos2(x + MIC_RIGHT - MIC_CENTER.x, y - MIC_CENTER.y);
     if let Some(monitor) = monitor {
-        position.x = position.x.min(monitor.x - WIN.x);
-        position.y = position.y.min(monitor.y - WIN.y);
+        if x < monitor.x {
+            position.x = position.x.min(monitor.x - WIN.x);
+        }
+        if y < monitor.y {
+            position.y = position.y.min(monitor.y - WIN.y);
+        }
     }
     // Last, so a monitor smaller than the window still gives an on-screen origin.
     egui::pos2(position.x.max(0.0), position.y.max(0.0))
@@ -490,6 +504,35 @@ mod tests {
         // rather than a negative one.
         let tiny = caret_to_window(10.0, 10.0, Some(egui::vec2(100.0, 40.0)));
         assert_eq!(tiny, egui::pos2(0.0, 0.0));
+    }
+
+    #[test]
+    fn the_badge_is_never_dragged_onto_a_different_monitor() {
+        // egui reports a monitor SIZE and no origin, so a caret on a secondary
+        // monitor cannot be clamped: with two 1920-wide screens side by side,
+        // treating x=2500 as if its monitor began at 0 puts the badge at 1736 —
+        // on the FIRST monitor, nowhere near the user. Teleporting the badge to
+        // another screen is worse than the clipped caption the clamp is for, so
+        // the clamp applies only where the origin is known to be zero.
+        let monitor = egui::vec2(1920.0, 1080.0);
+        let secondary = caret_to_window(2500.0, 500.0, Some(monitor));
+        assert_eq!(
+            secondary,
+            caret_to_window(2500.0, 500.0, None),
+            "a caret beyond the monitor's width is on another screen: leave it",
+        );
+
+        // On the first monitor the origin IS zero, so the clamp applies and the
+        // caption stays on screen.
+        let edge = caret_to_window(1900.0, 1070.0, Some(monitor));
+        assert!(
+            edge.x + WIN.x <= monitor.x,
+            "{edge:?} overflows {monitor:?}"
+        );
+        assert!(
+            edge.y + WIN.y <= monitor.y,
+            "{edge:?} overflows {monitor:?}"
+        );
     }
 
     #[test]
