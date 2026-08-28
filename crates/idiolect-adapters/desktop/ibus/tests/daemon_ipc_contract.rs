@@ -60,12 +60,12 @@ fn ibus_ipc_client_cancel_records_nothing() {
 }
 
 fn read_preedit(reader: &mut DaemonReader) -> String {
-    // The client negotiates `recording_status`, so the daemon interleaves
-    // RecordingStatus pushes (initial sync + transitions); skip them.
+    // The client negotiates `recording_status` and `activity_status`, so the
+    // daemon interleaves status pushes (initial sync + transitions); skip them.
     loop {
         match reader.read_message().expect("daemon should send a message") {
             IpcMessage::PreeditUpdate(update) => return update.text,
-            IpcMessage::RecordingStatus(_) => continue,
+            IpcMessage::RecordingStatus(_) | IpcMessage::ActivityStatus(_) => continue,
             other => panic!("expected PreeditUpdate, got {other:?}"),
         }
     }

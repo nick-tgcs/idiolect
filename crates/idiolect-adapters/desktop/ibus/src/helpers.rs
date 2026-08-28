@@ -14,7 +14,7 @@ use crate::review::SubprocessReviewDialog;
 pub struct EngineHelpers {
     /// Shows the take and takes the user's correction. Holds their words.
     pub dialog: SubprocessReviewDialog,
-    /// The "voice is live" overlay. Cosmetic.
+    /// The caret badge naming the take's phase. Cosmetic.
     pub indicator: SubprocessIndicator,
 }
 

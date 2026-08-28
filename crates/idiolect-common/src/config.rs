@@ -806,8 +806,61 @@ fn default_asr_use_gpu() -> bool {
     true
 }
 
+/// Logical cpus the process may run on, or 1 when the platform will not say.
+fn logical_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| u32::try_from(count.get()).unwrap_or(u32::MAX))
+        .unwrap_or(1)
+}
+
+/// Physical cpu cores, counted as the number of distinct SMT sibling groups.
+///
+/// Reading the sibling groups (rather than halving the logical count) keeps the
+/// answer right on machines with no SMT at all and on those with more than two
+/// threads per core. Returns `None` where the platform does not publish the
+/// topology, leaving the caller to fall back.
+#[cfg(target_os = "linux")]
+fn physical_cores() -> Option<u32> {
+    let mut groups = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+        let siblings = entry.path().join("topology/thread_siblings_list");
+        if let Ok(group) = std::fs::read_to_string(siblings) {
+            groups.insert(group.trim().to_owned());
+        }
+    }
+    u32::try_from(groups.len()).ok().filter(|count| *count > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn physical_cores() -> Option<u32> {
+    None
+}
+
+/// Fit a desired decode-thread count to a machine with `logical` cpus.
+///
+/// The ceiling is one below the logical count: ggml's workers busy-wait between
+/// graph nodes, so a pool that occupies every cpu leaves the kernel nothing to
+/// schedule with and decode time collapses — measured at over two minutes for a
+/// take that runs in ~3 s one-worker-per-core. This shapes the DEFAULT only; an
+/// explicit `asr.threads` is passed through as written (validation rejects just
+/// zero), so the README warns the user off the logical count directly.
+fn clamp_decode_threads(desired: u32, logical: u32) -> u32 {
+    desired.clamp(1, logical.saturating_sub(1).max(1))
+}
+
+/// Default Whisper decode threads: one per physical core, kept under the
+/// logical count.
+///
+/// Whisper decode is compute- and memory-bandwidth-bound, so the pool should
+/// match the machine rather than a fixed guess. The previous fixed `8` left a
+/// 24-core desktop running a take three times slower than it needed to, while
+/// on a small laptop it oversubscribed the same few cores. Where there is no SMT
+/// the two counts are equal and the cap binds, giving physical-minus-one — still
+/// the right answer, because the headroom is what the cap is for.
 fn default_asr_threads() -> u32 {
-    8
+    let logical = logical_cpus();
+    let desired = physical_cores().unwrap_or_else(|| logical.div_ceil(2));
+    clamp_decode_threads(desired, logical)
 }
 
 fn default_storage_audio_codec() -> String {
@@ -1077,5 +1130,74 @@ mod platform_tests {
             check_socket_path_len(&one_under, platform)
                 .expect("the last byte before the limit is usable");
         }
+    }
+}
+
+#[cfg(test)]
+mod decode_thread_policy_tests {
+    use super::{clamp_decode_threads, default_asr_threads, logical_cpus, physical_cores};
+
+    #[test]
+    fn decode_threads_never_saturate_every_logical_cpu() {
+        // Measured on a 24-core / 48-thread Zen 4: giving ggml one worker per
+        // LOGICAL cpu turns a ~3 s decode into >130 s — the workers spin, and
+        // with no cpu left over the kernel cannot schedule them against each
+        // other. Whatever is asked for, the pool must leave the machine
+        // headroom.
+        for logical in [2_u32, 4, 8, 16, 24, 48, 128] {
+            let threads = clamp_decode_threads(u32::MAX, logical);
+            assert!(
+                threads < logical,
+                "{threads} threads must stay under {logical} logical cpus",
+            );
+            assert!(threads >= 1, "must always schedule at least one thread");
+        }
+    }
+
+    #[test]
+    fn a_cpu_limited_daemon_is_sized_by_what_it_may_use_not_what_the_host_has() {
+        // The two inputs disagree under a restriction: `available_parallelism`
+        // honours sched_getaffinity and the cgroup cpu.max quota, while the
+        // sysfs topology always reports the whole host. So under `CPUQuota=200%`
+        // or `taskset -c 0-1` the physical figure is the host's, and the cap is
+        // the only thing keeping the pool sane. Measured on a 24/48 box:
+        // taskset -c 0-7 -> 7 threads, CPUQuota=200% -> 1. That is the point —
+        // the old fixed default put 8 busy-waiting workers on those 2 cpus.
+        assert_eq!(clamp_decode_threads(24, 2), 1);
+        assert_eq!(clamp_decode_threads(24, 8), 7);
+    }
+
+    #[test]
+    fn decode_threads_floor_at_one_cpu() {
+        // A single-cpu box still has to decode, and a zero-thread request is
+        // nonsense rather than a reason to hand whisper an empty pool.
+        assert_eq!(clamp_decode_threads(u32::MAX, 1), 1);
+        assert_eq!(clamp_decode_threads(0, 8), 1);
+        assert_eq!(clamp_decode_threads(4, 8), 4);
+    }
+
+    #[test]
+    fn default_asr_threads_sits_inside_the_safe_band() {
+        let logical = logical_cpus();
+        let threads = default_asr_threads();
+        assert!(threads >= 1);
+        assert!(
+            logical <= 1 || threads < logical,
+            "default {threads} must leave headroom under {logical} logical cpus",
+        );
+    }
+
+    #[test]
+    fn default_asr_threads_prefers_physical_cores_when_reported() {
+        // SMT siblings share execution units and cache, so a second worker on
+        // the same physical core buys no throughput on a compute-bound decode.
+        // Where the platform reports the real core count, that is the pool size.
+        let Some(physical) = physical_cores() else {
+            return;
+        };
+        assert_eq!(
+            default_asr_threads(),
+            clamp_decode_threads(physical, logical_cpus()),
+        );
     }
 }

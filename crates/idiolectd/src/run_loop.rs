@@ -34,9 +34,9 @@ use idiolect_common::languages::is_supported_language;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
-    CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
-    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECONCILE,
-    FEATURE_RECORDING_STATUS,
+    ActivityPhase, ActivityStatus, CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse,
+    HistoryReinsertResponse, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    FEATURE_ACTIVITY_STATUS, FEATURE_RECONCILE, FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -343,7 +343,7 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
             active_session: None,
             live_capture: None,
             live_stream: None,
-            status_tx: RecordingStatusTx::new(false),
+            status_tx: RecordingStatusTx::new(false, false),
             wants_reconcile: false,
         };
         match handle_connection(
@@ -829,8 +829,12 @@ fn handle_connection(
                     .accepted_features
                     .iter()
                     .any(|feature| feature == FEATURE_RECONCILE);
+                let wants_activity = response
+                    .accepted_features
+                    .iter()
+                    .any(|feature| feature == FEATURE_ACTIVITY_STATUS);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
-                live.status_tx = RecordingStatusTx::new(wants_status);
+                live.status_tx = RecordingStatusTx::new(wants_status, wants_activity);
                 live.status_tx.sync_initial(&mut stream)?;
             }
             IpcMessage::StartRecording | IpcMessage::ToggleRecording => {
@@ -1005,6 +1009,7 @@ fn handle_connection(
             }
             IpcMessage::ServerHello(_)
             | IpcMessage::RecordingStatus(_)
+            | IpcMessage::ActivityStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
             | IpcMessage::EditHistory(_)
@@ -1402,15 +1407,28 @@ fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
 struct RecordingStatusTx {
     /// Whether the connected client negotiated `recording_status` pushes.
     feature: bool,
-    /// The recording value last published to the tray (and, if `feature`, the client).
-    last: bool,
+    /// Whether the connected client negotiated `activity_status` pushes.
+    activity_feature: bool,
+    /// The phase last published to the tray (and, per feature, to the client).
+    last: ActivityPhase,
+}
+
+/// What one phase transition puts on the wire. Two channels, because they answer
+/// different questions: `recording` is the authoritative "is a take in flight"
+/// the engine's state machine runs on, `activity` is the finer phase the overlay
+/// shows the user. The decode moves the second without moving the first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StatusPush {
+    recording: Option<bool>,
+    activity: Option<ActivityPhase>,
 }
 
 impl RecordingStatusTx {
-    fn new(feature: bool) -> Self {
+    fn new(feature: bool, activity_feature: bool) -> Self {
         Self {
             feature,
-            last: false,
+            activity_feature,
+            last: ActivityPhase::Idle,
         }
     }
 
@@ -1421,25 +1439,39 @@ impl RecordingStatusTx {
             send_ipc_message(
                 stream,
                 &IpcMessage::RecordingStatus(RecordingStatus {
-                    recording: self.last,
+                    recording: self.last.take_in_flight(),
                 }),
+            )?;
+        }
+        if self.activity_feature {
+            send_ipc_message(
+                stream,
+                &IpcMessage::ActivityStatus(ActivityStatus { phase: self.last }),
             )?;
         }
         Ok(())
     }
 
-    /// Pure edge-trigger: record the transition and decide whether to push it over
-    /// IPC. Only a real change (and a negotiated client) pushes — a repeated value
-    /// (e.g. a commit after the stop already announced `false`) must not emit a
-    /// duplicate `RecordingStatus`.
-    fn should_push(&mut self, recording: bool) -> bool {
-        let changed = recording != self.last;
-        self.last = recording;
-        changed && self.feature
+    /// Pure edge-trigger: record the transition and decide what to push over IPC.
+    /// Only a real change (and a negotiated client) pushes — a repeated value
+    /// (e.g. a commit after the stop already announced idle) must not emit a
+    /// duplicate. `RecordingStatus` additionally only moves when the take actually
+    /// starts or ends, so the decode phase leaves it alone.
+    fn should_push(&mut self, phase: ActivityPhase) -> StatusPush {
+        let previous = std::mem::replace(&mut self.last, phase);
+        if phase == previous {
+            return StatusPush::default();
+        }
+        let in_flight = phase.take_in_flight();
+        StatusPush {
+            recording: (self.feature && in_flight != previous.take_in_flight())
+                .then_some(in_flight),
+            activity: self.activity_feature.then_some(phase),
+        }
     }
 
-    /// Publish a recording-state value: ALWAYS refresh the tray, and push
-    /// `RecordingStatus` over IPC only on a real transition.
+    /// Publish a recording-state value: ALWAYS refresh the tray, and push over IPC
+    /// only on a real transition.
     ///
     /// The tray refresh is deliberately not deduplicated on the recording value:
     /// the menu renders HISTORY, which changes on commit/correction/cancel even
@@ -1453,16 +1485,45 @@ impl RecordingStatusTx {
         config: &RunLoopConfig,
         recording: bool,
     ) -> Result<(), RunLoopError> {
-        let state = if recording {
+        let phase = if recording {
+            ActivityPhase::Recording
+        } else {
+            ActivityPhase::Idle
+        };
+        self.set_phase(stream, tray, store, config, phase)
+    }
+
+    /// As [`Self::set`], but naming the exact phase — used by the stop path to
+    /// announce the decode, which holds the take open without holding the
+    /// microphone open.
+    fn set_phase(
+        &mut self,
+        stream: &mut UnixStream,
+        tray: &mut KsniTray,
+        store: &SqliteMetadataStore,
+        config: &RunLoopConfig,
+        phase: ActivityPhase,
+    ) -> Result<(), RunLoopError> {
+        let state = if phase.take_in_flight() {
             RecordingState::Recording
         } else {
             RecordingState::Idle
         };
         update_tray_recording_state(tray, store, config, state)?;
-        if self.should_push(recording) {
+        let push = self.should_push(phase);
+        // Authoritative state first, presentation second: a client that mirrors
+        // `RecordingStatus` must never act on a phase for a take it has not been
+        // told about.
+        if let Some(recording) = push.recording {
             send_ipc_message(
                 stream,
                 &IpcMessage::RecordingStatus(RecordingStatus { recording }),
+            )?;
+        }
+        if let Some(phase) = push.activity {
+            send_ipc_message(
+                stream,
+                &IpcMessage::ActivityStatus(ActivityStatus { phase }),
             )?;
         }
         Ok(())
@@ -1477,12 +1538,23 @@ impl RecordingStatusTx {
         store: &SqliteMetadataStore,
         config: &RunLoopConfig,
     ) -> Result<(), RunLoopError> {
-        let state = if self.last {
+        let state = if self.last.take_in_flight() {
             RecordingState::Recording
         } else {
             RecordingState::Idle
         };
         update_tray_recording_state(tray, store, config, state)
+    }
+}
+
+/// Which decode phase to announce, given whether the speech model is already in
+/// memory. A cold start pays a multi-second model load before any decoding
+/// happens; calling that "transcribing" makes an ordinary wait look like a hang.
+fn decode_phase(model_is_resident: bool) -> ActivityPhase {
+    if model_is_resident {
+        ActivityPhase::Transcribing
+    } else {
+        ActivityPhase::LoadingModel
     }
 }
 
@@ -1793,6 +1865,22 @@ fn stop_live_and_transcribe(
     let Some(capture) = live_capture.take() else {
         return Ok(());
     };
+
+    // The microphone is now shut but the take is not finished: everything below
+    // decodes, which on CPU is seconds of apparent nothing. Announce the phase
+    // BEFORE that work so the caret overlay can stop showing a live-microphone
+    // badge and show progress instead — `recording` deliberately stays true, as
+    // the transcript is still to come and the engine only accepts one while its
+    // take is open.
+    status_tx.set_phase(
+        stream,
+        tray,
+        store,
+        config,
+        decode_phase(crate::adapters::asr_model_is_resident(
+            &config.adapter_profile,
+        )),
+    )?;
 
     if let Some(mut state) = live_stream.take() {
         // Streaming stop: drain the final capture chunk, flush the segmenter's
@@ -2406,9 +2494,10 @@ mod tests {
     use idiolect_ipc::messages::IpcMessage;
 
     use super::{
-        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix, send_ipc_message,
-        should_clear_clipboard, RecordingStatusTx, RunLoopError,
+        decode_phase, is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix,
+        send_ipc_message, should_clear_clipboard, RecordingStatusTx, RunLoopError, StatusPush,
     };
+    use idiolect_ipc::messages::ActivityPhase;
 
     #[test]
     fn clipboard_clears_only_when_unchanged() {
@@ -2434,21 +2523,126 @@ mod tests {
         // emit a duplicate RecordingStatus. (The tray menu refresh is deliberately
         // NOT deduplicated this way: history changes on commit/correction even when
         // the recording value does not — that lag was a real field bug.)
-        let mut tx = RecordingStatusTx::new(true);
-        assert!(!tx.should_push(false), "initial false is not a transition");
-        assert!(tx.should_push(true), "idle -> recording pushes");
-        assert!(
-            !tx.should_push(true),
+        let mut tx = RecordingStatusTx::new(true, false);
+        let recording = |push: StatusPush| push.recording;
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            None,
+            "initial idle is not a transition"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Recording)),
+            Some(true),
+            "idle -> recording pushes"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Recording)),
+            None,
             "repeated recording does not push again"
         );
-        assert!(tx.should_push(false), "recording -> idle pushes");
-        assert!(!tx.should_push(false), "commit after stop must not re-push");
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            Some(false),
+            "recording -> idle pushes"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            None,
+            "commit after stop must not re-push"
+        );
 
         // Without the negotiated feature nothing is ever pushed, but transitions
         // are still tracked so a mid-session upgrade cannot replay stale state.
-        let mut legacy = RecordingStatusTx::new(false);
-        assert!(!legacy.should_push(true));
-        assert!(!legacy.should_push(false));
+        let mut legacy = RecordingStatusTx::new(false, false);
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Recording),
+            StatusPush::default()
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Idle),
+            StatusPush::default()
+        );
+    }
+
+    #[test]
+    fn the_decode_phase_pushes_activity_without_disturbing_recording() {
+        // The crux of the caret indicator. At stop the microphone is shut but the
+        // decode has not run, so the take is still in flight: `recording` MUST
+        // stay true across it (the engine discards a transcript that arrives
+        // after `recording = false`), while the phase changes so the overlay can
+        // stop showing a live-microphone badge and show progress instead.
+        let mut tx = RecordingStatusTx::new(true, true);
+        assert_eq!(
+            tx.should_push(ActivityPhase::Recording),
+            StatusPush {
+                recording: Some(true),
+                activity: Some(ActivityPhase::Recording),
+            },
+        );
+        assert_eq!(
+            tx.should_push(ActivityPhase::Transcribing),
+            StatusPush {
+                recording: None,
+                activity: Some(ActivityPhase::Transcribing),
+            },
+            "the decode must not re-announce the recording state",
+        );
+        assert_eq!(
+            tx.should_push(ActivityPhase::Idle),
+            StatusPush {
+                recording: Some(false),
+                activity: Some(ActivityPhase::Idle),
+            },
+        );
+    }
+
+    #[test]
+    fn a_client_without_the_activity_feature_sees_the_old_byte_stream() {
+        // Strictly additive: an engine that predates the phase channel must get
+        // exactly the messages it always did, in the same places.
+        let mut legacy = RecordingStatusTx::new(true, false);
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Recording),
+            StatusPush {
+                recording: Some(true),
+                activity: None,
+            },
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Transcribing),
+            StatusPush::default(),
+            "the decode phase is invisible to a client that did not ask for it",
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Idle),
+            StatusPush {
+                recording: Some(false),
+                activity: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_repeated_phase_pushes_nothing() {
+        // Edge-triggered on the phase, so a re-publish of the same state (a
+        // commit after the stop already announced idle) stays silent.
+        let mut tx = RecordingStatusTx::new(true, true);
+        assert_eq!(tx.should_push(ActivityPhase::Idle), StatusPush::default());
+        assert!(tx.should_push(ActivityPhase::Recording).activity.is_some());
+        assert_eq!(
+            tx.should_push(ActivityPhase::Recording),
+            StatusPush::default(),
+        );
+    }
+
+    #[test]
+    fn a_cold_take_announces_the_model_load_rather_than_a_slow_decode() {
+        // The user's original complaint: the first take after an idle day takes
+        // many seconds because the model is being read off disk. Loading and
+        // decoding must be distinguishable, or the overlay can only say
+        // "transcribing" for twenty seconds and look hung.
+        assert_eq!(decode_phase(false), ActivityPhase::LoadingModel);
+        assert_eq!(decode_phase(true), ActivityPhase::Transcribing);
     }
 
     #[test]
@@ -2526,6 +2720,7 @@ mod tests {
         use idiolect_adapter_ksni::KsniTrayError;
         use idiolect_adapter_sqlite::SqliteMetadataStore;
         use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
+        use idiolect_ipc::messages::ActivityPhase;
         use idiolect_ports::storage::{
             MetadataStorePort, TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus,
         };
@@ -2686,7 +2881,8 @@ mod tests {
                 // As a start leaves it: `true` was the last published value.
                 status_tx: RecordingStatusTx {
                     feature: true,
-                    last: true,
+                    activity_feature: false,
+                    last: ActivityPhase::Recording,
                 },
                 wants_reconcile: false,
             };

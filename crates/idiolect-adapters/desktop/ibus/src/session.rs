@@ -18,6 +18,8 @@
 //! reports when the user actually changed existing dictated text — pure forward
 //! typing is treated as continuation, not a correction.
 
+use idiolect_ipc::messages::ActivityPhase;
+
 /// The idiolect daemon, as the session needs it. The daemon owns the microphone
 /// and is the single authority for recording state, so the session never decides
 /// start-vs-stop: it sends one direction-free [`toggle`](DaemonClient::toggle)
@@ -125,6 +127,16 @@ pub struct Session<D, S> {
     /// The daemon's authoritative mic state, mirrored independently of `state`
     /// (which may be `Reviewing` while the mic is still open in streaming mode).
     recording: bool,
+    /// The daemon's reported take phase, for display only. Purely additive to the
+    /// state machine above: it never gates a transition, so a daemon that does
+    /// not send it (the feature is opt-in) behaves exactly as before.
+    activity: ActivityPhase,
+    /// Whether the daemon can still tell us what phase the take is in. Cleared
+    /// while the engine's reader thread cannot listen — blocked on the review
+    /// dialog, or retrying a dropped socket — because the phase we hold is then
+    /// frozen, and a frozen decode phase drawn as a live spinner claims work
+    /// that may already be finished or abandoned.
+    phase_channel_live: bool,
     /// The cumulative live preview this take: the concatenation of every streamed
     /// partial, held in the IME-owned **preedit** (never committed to the app). At
     /// stop [`Session::on_reconcile`] clears the preedit and commits the verified
@@ -155,6 +167,8 @@ where
             state: State::Idle,
             review: None,
             recording: false,
+            activity: ActivityPhase::Idle,
+            phase_channel_live: true,
             preview: String::new(),
             reconcile_supported: false,
         }
@@ -162,6 +176,41 @@ where
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// The daemon reported a new take phase (display only). Recorded for
+    /// [`indicator_phase`](Self::indicator_phase); no state transition depends on
+    /// it, so a daemon that never sends one is indistinguishable from before.
+    pub fn on_activity(&mut self, phase: ActivityPhase) {
+        self.activity = phase;
+    }
+
+    /// Record whether the daemon's phase pushes can still reach us. The engine
+    /// clears this around the two places its reader thread stops reading — the
+    /// blocking review dialog and the reconnect loop — and restores it after.
+    pub fn set_phase_channel_live(&mut self, live: bool) {
+        self.phase_channel_live = live;
+    }
+
+    /// What the caret overlay should show, or `None` to hide it.
+    ///
+    /// Visibility follows the authoritative take state, so the phase channel can
+    /// never strand an overlay on screen; the phase only chooses WHICH badge an
+    /// open take shows. It also requires the channel to be LIVE: a phase nobody
+    /// can update is stale, and drawing it as a running spinner would assert
+    /// work that may have finished or died. In particular the decode phases keep the overlay up
+    /// after the microphone closes — that gap (seconds on CPU) used to show a
+    /// live-microphone badge and then nothing at all, with no way for the user to
+    /// tell working from hung.
+    #[must_use]
+    pub fn indicator_phase(&self) -> Option<ActivityPhase> {
+        if self.state != State::Recording || !self.phase_channel_live {
+            return None;
+        }
+        Some(match self.activity {
+            phase @ (ActivityPhase::Transcribing | ActivityPhase::LoadingModel) => phase,
+            ActivityPhase::Idle | ActivityPhase::Recording => ActivityPhase::Recording,
+        })
     }
 
     /// Record whether the daemon negotiated the stop-time reconcile final; the
@@ -388,6 +437,14 @@ where
     /// (a silent take) just returns to idle.
     pub fn on_recording_status(&mut self, recording: bool) {
         self.recording = recording;
+        // The authoritative signal also resets the display phase, so a phase push
+        // that was missed, dropped, or never sent (an older daemon) can never
+        // leave the overlay describing a take that has already ended.
+        self.activity = if recording {
+            ActivityPhase::Recording
+        } else {
+            ActivityPhase::Idle
+        };
         match self.state {
             State::Reviewing => {
                 if recording {
@@ -417,6 +474,7 @@ where
     pub fn reset_to_idle(&mut self) {
         self.review = None;
         self.clear_preview();
+        self.activity = ActivityPhase::Idle;
         self.state = State::Idle;
         self.recording = false;
     }
@@ -1134,5 +1192,131 @@ mod tests {
         // A late status push after reset is mirrored normally.
         s.on_recording_status(true);
         assert_eq!(s.state(), State::Recording);
+    }
+
+    #[test]
+    fn the_overlay_shows_the_microphone_while_recording() {
+        let mut s = session();
+        assert_eq!(s.indicator_phase(), None, "nothing to show when idle");
+        s.on_recording_status(true);
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::Recording));
+    }
+
+    #[test]
+    fn the_overlay_switches_to_the_decode_phase_at_stop() {
+        // The user's complaint: after they stop talking the machine decodes for
+        // seconds with the mic badge still showing, so it looks like it is still
+        // listening and then like it has died. The take is still open here — the
+        // transcript has not arrived — so the overlay stays up, but says what is
+        // actually happening.
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+        assert_eq!(s.state(), State::Recording, "the take is still open");
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::Transcribing));
+    }
+
+    #[test]
+    fn a_cold_start_is_shown_as_a_model_load() {
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::LoadingModel);
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::LoadingModel));
+    }
+
+    #[test]
+    fn the_transcript_still_lands_after_the_decode_phase() {
+        // The whole reason `recording` does not flip early: `on_transcript` only
+        // accepts text while a take is open. A phase push must not close it.
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+        s.on_transcript("restart traffic".to_owned());
+        assert_eq!(s.surface.committed, ["restart traffic"]);
+    }
+
+    #[test]
+    fn the_overlay_goes_away_once_the_take_ends() {
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+        dictate(&mut s, "restart traffic");
+        assert_eq!(
+            s.indicator_phase(),
+            None,
+            "a correction window is not a reason to keep the overlay up",
+        );
+    }
+
+    #[test]
+    fn an_authoritative_status_clears_a_stale_decode_phase() {
+        // The phase channel is presentation-only, so it must never outlive the
+        // take it described — a dropped or missed ActivityStatus(Idle) cannot be
+        // allowed to leave a spinner on screen forever.
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+        s.on_recording_status(false);
+        assert_eq!(s.indicator_phase(), None);
+        s.on_recording_status(true);
+        assert_eq!(
+            s.indicator_phase(),
+            Some(ActivityPhase::Recording),
+            "the next take starts on the microphone, not on the last take's decode",
+        );
+    }
+
+    #[test]
+    fn the_badge_goes_away_while_the_review_dialog_holds_the_reader() {
+        // In review mode the daemon sends Transcribing, then the transcript, and
+        // only then RecordingStatus(false). The engine's reader thread blocks
+        // inside the review dialog for as long as the user edits, so that final
+        // status is never read: the take stays open and the phase stays frozen
+        // at Transcribing. The badge would sit beside the caret counting
+        // "TRANSCRIBING · 43s" while the finished text is in the dialog in front
+        // of the user — a spinner asserting work that is already done.
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::Transcribing));
+
+        s.set_phase_channel_live(false);
+        assert_eq!(s.indicator_phase(), None, "a frozen phase is not shown");
+
+        s.set_phase_channel_live(true);
+        assert_eq!(
+            s.indicator_phase(),
+            Some(ActivityPhase::Transcribing),
+            "and it comes back when the reader can hear the daemon again",
+        );
+    }
+
+    #[test]
+    fn the_badge_goes_away_while_the_daemon_socket_is_down() {
+        // The daemon being OOM-killed mid-decode is a known failure mode here.
+        // The engine then retries the socket indefinitely, and until it succeeds
+        // nothing can move the take on — so every key event would re-show a
+        // decode spinner ticking up for a daemon that no longer exists. Hiding
+        // is the honest answer: we no longer know what is happening.
+        let mut s = session();
+        s.on_recording_status(true);
+        s.on_activity(ActivityPhase::Transcribing);
+
+        s.set_phase_channel_live(false);
+        assert_eq!(s.indicator_phase(), None);
+        // The take itself is deliberately untouched — the reconnect path still
+        // owns resetting it, and its preedit cleanup runs after the reconnect.
+        assert_eq!(s.state(), State::Recording);
+    }
+
+    #[test]
+    fn a_daemon_that_never_sends_a_phase_still_shows_the_microphone() {
+        // `activity_status` is opt-in and an older daemon never accepts it. The
+        // overlay must then behave exactly as it always did rather than vanish.
+        let mut s = session();
+        s.on_recording_status(true);
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::Recording));
+        s.on_partial_transcript("live words".to_owned());
+        assert_eq!(s.indicator_phase(), Some(ActivityPhase::Recording));
     }
 }
