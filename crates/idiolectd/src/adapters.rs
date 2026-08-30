@@ -1,12 +1,12 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use idiolect_adapter_cpal::{CpalAudioInput, CpalAudioInputError};
 use idiolect_adapter_translate::CommandTranslator;
 use idiolect_adapter_vad::VadAdapter;
-use idiolect_adapter_whisper::{WhisperAsr, WhisperDecodeTask, WhisperOptions};
+use idiolect_adapter_whisper::{ComputeMode, WhisperAsr, WhisperDecodeTask, WhisperOptions};
 use idiolect_common::config::TranslationConfig;
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::asr::{AdapterCapabilities, AsrPort, TranscriptDraft, TranscriptMetadata};
@@ -476,11 +476,8 @@ fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, Ru
             // for the small accuracy gain. The mobile facade opts into greedy instead.
             beam_size: WhisperOptions::default().beam_size,
         };
-        eprintln!(
-            "whisper: loading model {} (gpu={})",
-            profile.whisper_model_path.display(),
-            profile.asr_use_gpu
-        );
+        let mode = options.compute_mode();
+        eprintln!("{}", model_load_message(&profile.whisper_model_path, mode));
         return WhisperAsr::load(profile.whisper_model_path.clone(), options).map_err(|error| {
             RuntimeAdapterError::with_source(
                 "asr-unavailable",
@@ -504,6 +501,36 @@ fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, Ru
             error,
         )
     })
+}
+
+/// The model-load line, built from the mode Whisper will ACTUALLY run in.
+///
+/// It used to print `profile.asr_use_gpu` — the value the user asked for — so a
+/// binary compiled without the `cuda` feature announced `gpu=true` and then
+/// decoded on the CPU. That single misleading line is what made a config saying
+/// `use_gpu = true` look like a working GPU setup while every take took seconds.
+fn model_load_message(model_path: &Path, mode: ComputeMode) -> String {
+    format!("whisper: loading model {} ({mode})", model_path.display())
+}
+
+/// Whether this engine's speech model is already in memory on THIS thread.
+///
+/// The Whisper engine is built lazily into a thread-local on the run loop's
+/// thread, so the first take after a daemon start pays a model load (seconds, off
+/// disk) on top of its decode. Engines that load nothing are trivially resident.
+/// Lets the daemon tell the user "loading model" instead of a "transcribing" that
+/// runs several times longer than usual for no visible reason.
+///
+/// Answered at the moment it is asked, which is narrower than "the first take":
+/// a streaming take decodes each pause-completed snippet on this same thread as
+/// it goes, so a first take long enough to contain a pause has already loaded the
+/// model by the time its stop asks.
+pub(crate) fn asr_model_is_resident(profile: &RuntimeAdapterProfile) -> bool {
+    match profile.asr_engine.as_str() {
+        "whisper-rs" => WHISPER.with(|cell| cell.borrow().is_some()),
+        // Anything else decodes without a model to page in.
+        _ => true,
+    }
 }
 
 fn transcribe_with_whisper(
@@ -564,9 +591,11 @@ mod tests {
     use idiolect_common::config::TranslationConfig;
 
     use super::{
-        begin_capture, finish_capture, is_live_capture, transcribe_translated,
-        RuntimeAdapterProfile, RuntimeCapture,
+        asr_model_is_resident, begin_capture, finish_capture, is_live_capture, model_load_message,
+        transcribe_translated, RuntimeAdapterProfile, RuntimeCapture,
     };
+    use idiolect_adapter_whisper::ComputeMode;
+    use std::path::Path;
 
     fn fixture_profile() -> RuntimeAdapterProfile {
         RuntimeAdapterProfile {
@@ -762,5 +791,56 @@ mod tests {
             let chunk = vec![0.5_f32; 160];
             assert_eq!(resampler.push(&chunk), chunk);
         }
+    }
+
+    #[test]
+    fn the_load_line_reports_the_effective_mode_not_the_requested_one() {
+        // The original line printed `profile.asr_use_gpu`, so a CPU-only build
+        // announced "gpu=true" and then decoded on the CPU for seconds a take.
+        // The mode is now resolved by the adapter that actually does the offload.
+        let path = Path::new("/models/medium.bin");
+        assert_eq!(
+            model_load_message(path, ComputeMode::Gpu),
+            "whisper: loading model /models/medium.bin (gpu)",
+        );
+        assert_eq!(
+            model_load_message(path, ComputeMode::Cpu),
+            "whisper: loading model /models/medium.bin (cpu)",
+        );
+    }
+
+    #[test]
+    fn an_ignored_gpu_request_says_so_in_the_load_line() {
+        let message = model_load_message(
+            Path::new("/models/medium.bin"),
+            ComputeMode::CpuGpuNotCompiledIn,
+        );
+        assert!(
+            message.contains("asr.use_gpu = true ignored"),
+            "the line must name the contradiction, not just print 'cpu': {message}",
+        );
+        assert!(message.contains("no CUDA support"), "{message}");
+    }
+
+    #[test]
+    fn an_engine_with_no_model_to_load_is_always_resident() {
+        // The fixture engine decodes instantly and loads nothing, so a take on it
+        // must never be announced as "loading model".
+        assert!(asr_model_is_resident(&fixture_asr_profile()));
+    }
+
+    #[test]
+    fn whisper_is_not_resident_until_a_take_has_loaded_it() {
+        // Fresh thread ⇒ the engine's thread-local model slot is empty, which is
+        // exactly the cold-start the user waits on after an idle day. It is the
+        // difference between "transcribing" and "loading model" on the overlay.
+        let profile = RuntimeAdapterProfile {
+            asr_engine: "whisper-rs".to_owned(),
+            ..fixture_asr_profile()
+        };
+        let resident = std::thread::spawn(move || asr_model_is_resident(&profile))
+            .join()
+            .expect("probe thread");
+        assert!(!resident);
     }
 }

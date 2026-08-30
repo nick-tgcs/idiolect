@@ -607,6 +607,9 @@ mod tests {
         fn restore(&self, window: WindowId) {
             self.restored.lock().expect("restored mutex").push(window);
         }
+        fn window_anchor(&self, _window: WindowId) -> Option<(i32, i32)> {
+            None
+        }
     }
 
     fn focus_dialog(script: &str, focus: RecordingFocus) -> SubprocessReviewDialog {

@@ -16,12 +16,22 @@ pub const FEATURE_RECORDING_STATUS: &str = "recording_status";
 /// so an older client cannot mistake it for a batch transcript and append it
 /// after the preview.
 pub const FEATURE_RECONCILE: &str = "reconcile";
+/// Opt-in: a client that advertises this receives [`IpcMessage::ActivityStatus`]
+/// pushes describing WHICH PHASE of a take the daemon is in — in particular the
+/// decode, which happens after the microphone closes but before the transcript
+/// exists. [`RecordingStatus`] cannot carry it: its `recording` flag is what the
+/// engine's take state machine keys off, and flipping it early would make the
+/// engine discard the transcript that follows. This is a strictly additive,
+/// presentation-only channel, so a client that does not request it sees exactly
+/// the byte stream it always did.
+pub const FEATURE_ACTIVITY_STATUS: &str = "activity_status";
 
-const SUPPORTED_FEATURES: [&str; 4] = [
+const SUPPORTED_FEATURES: [&str; 5] = [
     FEATURE_PREEDIT,
     FEATURE_COMMIT,
     FEATURE_RECORDING_STATUS,
     FEATURE_RECONCILE,
+    FEATURE_ACTIVITY_STATUS,
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,6 +124,48 @@ pub struct RecordingStatus {
     pub recording: bool,
 }
 
+/// Which phase of a dictation take the daemon is in. Unlike [`RecordingStatus`]
+/// this is presentation-only: it tells the front-end what to SHOW the user, and
+/// no take state machine keys off it.
+///
+/// The distinction that matters is `Transcribing`: the microphone has closed but
+/// the decode has not finished, which on CPU is seconds of apparent silence. The
+/// engine keeps a take "in flight" (`recording = true`) across that window, so
+/// without this the user is shown a live-microphone badge while nothing is being
+/// recorded, then nothing at all while the machine works.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityPhase {
+    /// No take in progress.
+    #[default]
+    Idle,
+    /// The microphone is open and capturing.
+    Recording,
+    /// The microphone has closed; the captured audio is being decoded.
+    Transcribing,
+    /// As `Transcribing`, but the speech model still has to be read off disk
+    /// first — the cold-start case, which dominates the wait and deserves its own
+    /// wording rather than looking like an unusually slow decode.
+    LoadingModel,
+}
+
+impl ActivityPhase {
+    /// Whether a take is in flight in this phase — the value [`RecordingStatus`]
+    /// carries. `Transcribing`/`LoadingModel` count: the microphone is shut, but
+    /// the take is not finished and its transcript is still to come.
+    #[must_use]
+    pub fn take_in_flight(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+/// Server→client push of the current [`ActivityPhase`]. Sent only to clients that
+/// negotiated [`FEATURE_ACTIVITY_STATUS`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivityStatus {
+    pub phase: ActivityPhase,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ErrorMessage {
     pub code: String,
@@ -156,6 +208,8 @@ pub enum IpcMessage {
     ToggleRecording,
     /// Server→client push of the authoritative recording state (see [`RecordingStatus`]).
     RecordingStatus(RecordingStatus),
+    /// Server→client push of the take phase for display (see [`ActivityStatus`]).
+    ActivityStatus(ActivityStatus),
     PreeditUpdate(PreeditUpdate),
     CommitPreedit(CommitPreedit),
     CancelPreedit,
@@ -175,4 +229,34 @@ pub enum IpcMessage {
 #[must_use]
 pub fn supported_features() -> &'static [&'static str] {
     &SUPPORTED_FEATURES
+}
+
+#[cfg(test)]
+mod activity_phase_tests {
+    use super::{supported_features, ActivityPhase, FEATURE_ACTIVITY_STATUS};
+
+    #[test]
+    fn only_idle_means_no_take_is_in_flight() {
+        // The decode phases run with the microphone shut but the take unfinished,
+        // so they must still count as in-flight: the engine's take state machine
+        // is what receives the transcript that follows, and it only accepts one
+        // while a take is live.
+        assert!(!ActivityPhase::Idle.take_in_flight());
+        assert!(ActivityPhase::Recording.take_in_flight());
+        assert!(ActivityPhase::Transcribing.take_in_flight());
+        assert!(ActivityPhase::LoadingModel.take_in_flight());
+    }
+
+    #[test]
+    fn activity_status_is_a_negotiable_feature() {
+        // Opt-in: without it in the advertised set the daemon must not push
+        // ActivityStatus, so an older engine keeps its exact byte stream.
+        assert!(supported_features().contains(&FEATURE_ACTIVITY_STATUS));
+    }
+
+    #[test]
+    fn an_absent_phase_decodes_as_idle() {
+        // `phase` defaults so a peer that predates the field is readable.
+        assert_eq!(ActivityPhase::default(), ActivityPhase::Idle);
+    }
 }

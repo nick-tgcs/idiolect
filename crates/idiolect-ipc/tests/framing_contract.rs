@@ -1,6 +1,7 @@
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::messages::{
-    ClientHello, EditHistory, HistoryEdited, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    ActivityPhase, ActivityStatus, ClientHello, EditHistory, HistoryEdited, InsertText, IpcMessage,
+    PreeditUpdate, RecordingStatus,
 };
 
 #[test]
@@ -170,4 +171,27 @@ fn decoding_without_json_line_terminator_is_rejected() {
         .expect_err("missing newline should be rejected");
 
     assert_eq!(error, FramingError::MissingTerminator);
+}
+
+#[test]
+fn activity_status_round_trips_over_the_wire() {
+    // Daemon→client push of the fine-grained take phase. Separate from
+    // `RecordingStatus` (which stays byte-for-byte as it was) so a client that
+    // does not negotiate `activity_status` sees the exact stream it always did.
+    for (phase, tag) in [
+        (ActivityPhase::Idle, "idle"),
+        (ActivityPhase::Recording, "recording"),
+        (ActivityPhase::Transcribing, "transcribing"),
+        (ActivityPhase::LoadingModel, "loading_model"),
+    ] {
+        let message = IpcMessage::ActivityStatus(ActivityStatus { phase });
+
+        let line = encode_json_line(&message).expect("message should encode");
+        assert!(line.ends_with('\n'));
+        assert_eq!(
+            line.trim_end(),
+            format!(r#"{{"type":"ActivityStatus","payload":{{"phase":"{tag}"}}}}"#)
+        );
+        assert_eq!(decode_json_line(&line).expect("decode"), message);
+    }
 }

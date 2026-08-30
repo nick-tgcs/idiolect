@@ -63,6 +63,12 @@ todo = "deny"
 unimplemented = "deny"
 
 [workspace.dependencies]
+# Physical (non-SMT-sibling) core count, done per-platform: sysfs topology then
+# /proc/cpuinfo on Linux, hw.physicalcpu on macOS, GetLogicalProcessorInformation
+# on Windows. Adds no new crate to the supply chain — candle-core and liblzma
+# already build it. Replaces a hand-rolled sysfs reader that was Linux-only and
+# silently halved the logical count everywhere else, assuming two-way SMT.
+num_cpus = "1.17"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 thiserror = "=2.0.19"

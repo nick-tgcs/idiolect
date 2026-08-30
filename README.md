@@ -10,10 +10,13 @@ Dictate, then **review and fix** in a window Idiolect controls — so your corre
 
 <p align="center"><img src="docs/images/review-dialog.png" alt="Review-before-insert dialog: an editable box showing the dictated text" width="560"></p>
 
-A live microphone rides your **text caret** while you speak, and the tray icon shows state at a glance — idle, recording, or error:
+A badge rides your **text caret** and says what Idiolect is doing: a red mic while it
+listens, then a spinner while it decodes — so a slow transcription looks like work in
+progress rather than a dictation that vanished. The tray icon shows state at a glance —
+idle, recording, or error:
 
 <p align="center">
-  <img src="docs/images/recording-indicator.png" alt="A small live mic that follows the text caret while dictating" width="660">
+  <img src="docs/images/recording-indicator.png" alt="The caret badge in its three states: RECORDING, TRANSCRIBING and LOADING MODEL" width="660">
   <br><br>
   <img src="docs/images/tray-icons.png" alt="Tray icon states: idle, recording, error" width="430">
 </p>
@@ -107,7 +110,8 @@ engine = "webrtc"                 # the implemented VAD; "silero" is accepted bu
 [asr]
 engine = "whisper-rs"
 model = "medium-en"               # file at ~/.local/share/idiolect/models/whisper/medium-en.bin
-use_gpu = true
+use_gpu = true                    # needs a daemon built with --features cuda; a CPU build ignores it
+                                  # (the model-load line reports which one you actually get)
 [storage]
 data_dir = "~/.local/share/idiolect"   # expand to an absolute path
 ```
@@ -185,7 +189,21 @@ rm -f ~/.cache/ibus/bus/registry      # force a rescan
 ibus list-engine | grep idiolect
 ```
 
-Then run the daemon as above (`input_device = "default"`, `--features cuda` for GPU), select **Idiolect** as your input source, and dictate: press the toggle (default **Super+T**), speak, press **Super+T** again to stop. A small floating microphone appears next to the text caret while recording. What happens at commit depends on the mode (toggle it in the tray — see below):
+Then run the daemon as above (`input_device = "default"`, `--features cuda` for GPU), select **Idiolect** as your input source, and dictate: press the toggle (default **Super+T**), speak, press **Super+T** again to stop. A badge
+appears next to the text caret and tracks it, showing which phase the take is in:
+
+| badge | meaning |
+| --- | --- |
+| red mic, **RECORDING** | the microphone is open |
+| purple ring, **TRANSCRIBING · Ns** | mic closed, audio being decoded |
+| amber ring, **LOADING MODEL · Ns** | the speech model is being read off disk first — the cold start the daemon pays once, normally on the first take after it is started |
+
+The ring is deliberately indeterminate — Whisper reports no decode progress, so the
+elapsed seconds carry the "still working" signal instead of a percentage that would
+stall. On a GPU build the transcribing phase is usually only a few hundred
+milliseconds; it earns its keep on CPU decoding and on that first cold take.
+
+What happens at commit depends on the mode (toggle it in the tray — see below):
 
 - **Direct insert (default):** the recognized text is typed straight into the focused app.
 - **Review before insert:** a small editable dialog opens with the recognized text; you fix it there and press **Enter** (or **Esc** to cancel), then the final text is typed into the app. This is the robust capture path — because the edit happens in *our* window, the raw→corrected diff is captured **even in apps that don't expose their text** (notably Electron/VS Code). After the dialog closes, focus is returned to the exact window you were typing in, so you can hit Enter to send straight away.
@@ -699,8 +717,14 @@ auto_stop_silence_ms = 0
 engine   = "whisper-rs"
 model    = "whisper-medium-en"   # -> <data_dir>/models/whisper/whisper-medium-en.bin
 language = "en"
-use_gpu  = true
-threads  = 8
+use_gpu  = true              # ignored unless the daemon was built with --features cuda
+# CPU decode threads. Omit it: the default is one per PHYSICAL core, capped one
+# below the logical count (so on a machine without SMT you get logical-1). That
+# is ~3x faster than the old fixed 8 on a many-core desktop. If you DO set this,
+# never set it to the LOGICAL cpu count — an explicit value is used as written,
+# ggml's workers busy-wait, and with no cpu left to schedule them a 3 s decode
+# takes over two minutes.
+# threads = 8
 
 [storage]
 data_dir          = "…"      # default: $XDG_DATA_HOME/idiolect
@@ -1059,7 +1083,7 @@ idiolect/
 
     # --- out-of-process GUI helpers (pure-Rust egui/eframe, behind traits) ---
     idiolect-review-dialog/        # editable review window (idiolect-review-dialog)
-    idiolect-recording-indicator/  # floating "mic is live" overlay tracking the caret
+    idiolect-recording-indicator/  # caret badge: recording / transcribing / loading-model states
     idiolect-retention-dialog/     # custom training-retention input (idiolect-retention-dialog)
     idiolect-settings/             # full settings window: VAD, review mode, translation, history, training retention
 
@@ -1098,7 +1122,7 @@ idiolect-cli                  # operator CLI (installed also as `idiolect`)
 idiolect.so                   # fcitx5 input-method addon (built from fcitx5/idiolect-fcitx5)
 ibus-engine-idiolect          # IBus engine (built with `--features ibus-engine`)
 idiolect-review-dialog        # review-before-insert window (spawned by the engine)
-idiolect-recording-indicator  # floating caret mic overlay (spawned by the engine)
+idiolect-recording-indicator  # caret badge overlay (started once by the engine, shown/hidden per take)
 idiolect-retention-dialog     # custom training-retention input (spawned by the daemon)
 idiolect-settings             # full settings window: VAD, review mode, translation, history, training retention (spawned by the daemon)
 idiolect-trainerctl           # training CLI: revalidate (corpus cleaning) + train (LoRA -> merged .bin)

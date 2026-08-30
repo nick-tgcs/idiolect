@@ -1,0 +1,243 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>idiolect — caret progress indicator</title><style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  :root{
+    --accent:#7c83fd; --accent-bright:#a6abff; --live:#eb5757; --ok:#3ddc97; --warn:#e0a44a;
+    --bg:#16171e; --panel:#1b1e27; --surface:#1f212b; --field:#101117;
+    --text:#e5e7f0; --grey:#c7cad3; --muted:#8c90a1;
+  }
+  body{ background:#0d0e12; font-family:'Roboto','Segoe UI',sans-serif; padding:30px; color:var(--grey); }
+  h1{ font-size:18px; font-weight:600; color:var(--text); margin-bottom:6px; }
+  h2{ font-size:13px; font-weight:700; color:var(--accent-bright); margin:30px 0 4px; text-transform:uppercase; letter-spacing:.8px; }
+  .legend{ color:var(--muted); font-size:12.5px; margin-bottom:8px; line-height:1.75; max-width:1180px; }
+  .legend b{ color:var(--accent-bright); font-weight:600; }
+  .legend code{ background:#ffffff0f; padding:1px 5px; border-radius:4px; color:var(--grey); font-size:11.5px; }
+  .grid{ display:flex; flex-wrap:wrap; gap:30px 24px; align-items:flex-start; margin-top:20px; }
+  .panel{ width:340px; }
+  .cap{ font-size:13.5px; margin-bottom:11px; font-weight:600; color:var(--grey); }
+  .cap small{ display:block; color:var(--muted); font-weight:400; font-size:11.5px; margin-top:3px; line-height:1.55; }
+
+  /* editor surface the caret lives in */
+  .edit{ width:340px; height:150px; background:var(--field); border:1px solid #ffffff12; border-radius:10px;
+         padding:16px 18px; position:relative; overflow:hidden; }
+  .edit .line{ color:var(--grey); font-size:13.5px; line-height:1.9; font-family:'Roboto Mono',monospace; white-space:nowrap; }
+  .edit .line .dim{ color:var(--muted); }
+  .edit .line .pre{ color:var(--accent-bright); border-bottom:1px dotted var(--accent); }
+  .caret{ display:inline-block; width:2px; height:15px; background:var(--text); vertical-align:-2px; }
+
+  /* the overlay puck, anchored right of the caret */
+  .puck{ position:absolute; width:74px; height:74px; }
+  svg.p{ width:74px; height:74px; display:block; overflow:visible; }
+  .lbl{ position:absolute; left:50%; transform:translateX(-50%); top:60px; white-space:nowrap;
+        font-size:10.5px; font-weight:700; letter-spacing:.5px; padding:3px 9px; border-radius:11px;
+        background:#0d0e12e8; border:1px solid #ffffff1a; }
+  .lbl.rec{ color:var(--live); } .lbl.work{ color:var(--accent-bright); } .lbl.warn{ color:var(--warn); }
+  .lbl.ok{ color:var(--ok); }
+
+  table{ border-collapse:collapse; margin-top:14px; font-size:12.5px; width:100%; max-width:1180px; }
+  th{ text-align:left; color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.6px;
+      padding:8px 12px; border-bottom:1px solid #ffffff18; font-weight:700; }
+  td{ padding:9px 12px; border-bottom:1px solid #ffffff0d; color:var(--grey); vertical-align:top; }
+  td b{ color:var(--text); font-weight:600; }
+  td.n{ color:var(--muted); font-family:'Roboto Mono',monospace; font-size:11.5px; }
+  .sw{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; vertical-align:0px; }
+</style></head><body>
+
+<h1>idiolect — “what is it doing?” at the caret</h1>
+<div class="legend">
+  Today the overlay has <b>two</b> states: mic-visible (recording) and gone. The moment you stop speaking the
+  overlay is killed and the decode runs <b>silently</b> — on the current box that is <b>~8&nbsp;s of dead air</b> before
+  text lands. These mockups add the missing third state: <b>working</b>. Same 74&nbsp;px puck, same position
+  (right of the caret), so nothing new appears on screen and nothing steals focus — the ring around the mic
+  is the whole change.
+</div>
+
+<div class="legend" style="border-left:3px solid #7c83fd;padding-left:12px;margin:18px 0">
+  <b>Shipped:</b> option <b>B</b> (indeterminate spinner + elapsed seconds), with the recording
+  state given its own label and the live red from these mockups. Options A and C are NOT built —
+  A needs a decode-progress hook whisper does not expose, and C is the natural follow-on.
+  The measured numbers at the bottom are from CPU decoding; on a CUDA build the transcribing
+  phase is a few hundred milliseconds, so it mostly matters for CPU takes and cold model loads.
+</div>
+<h2>A — the state sequence (option 1: determinate ring)</h2>
+<div class="legend">A sweeping arc whose <b>length</b> encodes progress. Whisper reports decode progress, so this can be real, not fake.</div>
+<div class="grid">
+
+  <div class="panel">
+    <div class="cap">1 · Recording<small>Unchanged from today: red breathing dot, mic glyph.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#eb575733" stroke-width="3"/>
+          <circle cx="37" cy="37" r="9" fill="#eb5757"/>
+          <rect x="34.5" y="30" width="5" height="10" rx="2.5" fill="#f0f1fa"/>
+          <path d="M31 39.5a6 6 0 0 0 12 0" fill="none" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+          <line x1="37" y1="45.5" x2="37" y2="48" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl rec">RECORDING</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="cap">2 · Transcribing (37 %)<small>Mic dims to accent; ring fills clockwise with real decode progress.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#ffffff14" stroke-width="3"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#7c83fd" stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="163.4" stroke-dashoffset="103" transform="rotate(-90 37 37)"/>
+          <circle cx="37" cy="37" r="9" fill="#7c83fd"/>
+          <rect x="34.5" y="30" width="5" height="10" rx="2.5" fill="#f0f1fa"/>
+          <path d="M31 39.5a6 6 0 0 0 12 0" fill="none" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+          <line x1="37" y1="45.5" x2="37" y2="48" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl work">TRANSCRIBING 37%</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="cap">3 · Text lands<small>Puck fades out as the preedit is inserted.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="pre">jumps over</span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px; opacity:.18;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#3ddc97" stroke-width="3"/>
+          <circle cx="37" cy="37" r="9" fill="#3ddc97"/>
+        </svg>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>B — option 2: indeterminate spinner (no progress hook needed)</h2>
+<div class="legend">
+  A fixed-length arc that <b>rotates</b>. Cheapest to ship — needs only “busy / not busy”, no progress callback.
+  Honest when we cannot know the percentage (e.g. model still loading from disk).
+</div>
+<div class="grid">
+  <div class="panel">
+    <div class="cap">Spinner + elapsed time<small>Elapsed seconds reassure that it is alive, not hung.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#ffffff14" stroke-width="3"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#7c83fd" stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="41 122" transform="rotate(20 37 37)"/>
+          <circle cx="37" cy="37" r="9" fill="#7c83fd"/>
+          <rect x="34.5" y="30" width="5" height="10" rx="2.5" fill="#f0f1fa"/>
+          <path d="M31 39.5a6 6 0 0 0 12 0" fill="none" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+          <line x1="37" y1="45.5" x2="37" y2="48" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl work">TRANSCRIBING · 3s</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="cap">First-use model load<small>The “couple of days idle” case: distinct copy so a 20 s cold start is explained, not mysterious.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#ffffff14" stroke-width="3"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#e0a44a" stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="41 122" transform="rotate(140 37 37)"/>
+          <circle cx="37" cy="37" r="9" fill="#e0a44a"/>
+          <path d="M32 37h10M37 32v10" stroke="#0d0e12" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl warn">LOADING MODEL · 12s</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="cap">Slow-decode warning<small>Past a threshold, name the cause instead of spinning forever.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span class="caret"></span></div>
+      <div class="puck" style="left:150px; top:14px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#ffffff14" stroke-width="3"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#e0a44a" stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="41 122" transform="rotate(250 37 37)"/>
+          <circle cx="37" cy="37" r="9" fill="#e0a44a"/>
+          <rect x="34.5" y="30" width="5" height="10" rx="2.5" fill="#f0f1fa"/>
+          <path d="M31 39.5a6 6 0 0 0 12 0" fill="none" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl warn">SLOW · CPU MODE · 9s</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>C — option 3: ring + inline ghost preedit</h2>
+<div class="legend">
+  The ring covers <i>latency</i>; a greyed placeholder covers <i>location</i> — you can see <b>where</b> the text
+  will land while it is still decoding. Most reassuring, and it reuses the existing preedit channel.
+</div>
+<div class="grid">
+  <div class="panel">
+    <div class="cap">Ghost placeholder at the insertion point<small>Dimmed, italic, non-committal — replaced in place by the real transcript.</small></div>
+    <div class="edit">
+      <div class="line"><span class="dim">the quick brown fox </span><span style="color:#8c90a1; font-style:italic; border-bottom:1px dotted #454b5c;">▏transcribing…</span></div>
+      <div class="puck" style="left:236px; top:52px;">
+        <svg class="p" viewBox="0 0 74 74">
+          <circle cx="37" cy="37" r="26" fill="#0d0e12e8" stroke="#ffffff1a"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#ffffff14" stroke-width="3"/>
+          <circle cx="37" cy="37" r="26" fill="none" stroke="#7c83fd" stroke-width="3" stroke-linecap="round"
+                  stroke-dasharray="163.4" stroke-dashoffset="60" transform="rotate(-90 37 37)"/>
+          <circle cx="37" cy="37" r="9" fill="#7c83fd"/>
+          <rect x="34.5" y="30" width="5" height="10" rx="2.5" fill="#f0f1fa"/>
+          <path d="M31 39.5a6 6 0 0 0 12 0" fill="none" stroke="#f0f1fa" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="lbl work">TRANSCRIBING 63%</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>Measured — CPU decode, on 15 of your own real takes</h2>
+<div class="legend">
+  Every row is a real stored take re-decoded with the real <code>medium.bin</code>, spread across the actual
+  duration distribution (717 takes: median <b>11.5&nbsp;s</b>, 62&nbsp;% under 15&nbsp;s). <b>identical</b> = the
+  transcript came back word-for-word the same as the current config produced.
+</div>
+<table>
+  <tr><th>Configuration</th><th>15 takes, total</th><th>vs today</th><th>Identical output</th><th>Verdict</th></tr>
+  <tr><td class="n">4 threads · beam 5 &nbsp;<i>(today)</i></td><td class="n"><b>151 302 ms</b></td><td class="n">—</td><td class="n">—</td>
+      <td><span class="sw" style="background:#eb5757"></span>4 threads on a 24-core machine</td></tr>
+  <tr style="background:#11362a2e"><td class="n"><b>24 threads · beam 5</b></td><td class="n"><b>50 375 ms</b></td><td class="n"><b>3.00×</b></td><td class="n"><b>15 / 15</b></td>
+      <td><span class="sw" style="background:#3ddc97"></span><b>Shipped.</b> Free, lossless — one worker per physical core</td></tr>
+  <tr><td class="n">24 threads · greedy</td><td class="n">44 391 ms</td><td class="n">3.41×</td><td class="n">11 / 15</td>
+      <td><span class="sw" style="background:#eb5757"></span><b>Rejected.</b> +12&nbsp;% speed, but one take fell to 0.21 word-similarity</td></tr>
+  <tr><td class="n">reduced <code>audio_ctx</code></td><td class="n">—</td><td class="n">1.5–1.8×</td><td class="n">17 / 20</td>
+      <td><span class="sw" style="background:#e0a44a"></span><b>Rejected as a default.</b> Silently rewrites short takes; can be 2× <i>slower</i> when the bad decode triggers fallback retries</td></tr>
+  <tr><td class="n">48 threads (all logical cpus)</td><td class="n">—</td><td class="n"><b>0.02×</b></td><td class="n">—</td>
+      <td><span class="sw" style="background:#eb5757"></span><b>Landmine.</b> 138&nbsp;s for a 3&nbsp;s decode — the reason the pool is capped below the logical count</td></tr>
+</table>
+<div class="legend" style="margin-top:14px">
+  <b>Why every take felt slow, not just the first.</b> Whisper encodes a padded 30&nbsp;s window regardless of
+  utterance length, so on CPU a half-second “yes” cost the same ~3.2&nbsp;s as a ten-second sentence. The extra
+  first-use delay was the 1.5&nbsp;GB model paging in from disk.
+  <br><br>
+  <b>GPU remains the big one:</b> the same model on CUDA decodes 10&nbsp;s of speech in <b>290&nbsp;ms</b> vs
+  8&nbsp;370&nbsp;ms on the old CPU config — but a CUDA build can silently fall back to CPU when the GPU is
+  busy, which is exactly why the CPU path had to be fast too, and why the <b>CPU-mode warning</b> below matters.
+</div>
+<div class="legend" style="margin-top:14px">
+  <b>Note the 0.5 s column.</b> On CPU a one-word “yes” costs the <i>same</i> 3.2 s as a ten-second sentence —
+  Whisper always encodes a padded 30&nbsp;s window. That is why <b>every</b> transcription feels slow, not just the first.
+  The first-use delay you noticed on top of that is the 1.5&nbsp;GB model being read from disk into page cache.
+</div>
+
+</body></html>
