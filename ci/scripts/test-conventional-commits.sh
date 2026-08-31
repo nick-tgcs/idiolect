@@ -357,68 +357,107 @@ done
 
 # ------------------------------------------------- grandfathered commit SHAs
 # `develop` is force-push-proof (protect-develop: non_fast_forward, empty bypass
-# list), so 8cfc392 can never be reworded and would fail the develop -> main
-# release PR forever. It is skipped BY SHA. The alternative — skipping the whole
-# release range — would permanently stop judging the one place squash subjects
-# land, which is exactly where this gate was already blind.
-GRANDFATHERED=$WORK/grandfathered
-git init -q -b main "$GRANDFATHERED"
-git -C "$GRANDFATHERED" config user.email test@example.com
-git -C "$GRANDFATHERED" config user.name Test
-git -C "$GRANDFATHERED" commit -q --allow-empty -m 'feat: base'
-git -C "$GRANDFATHERED" checkout -q -b develop
-# The real SHA the script grandfathers cannot be reproduced in a fixture, so the
-# fixture asserts the MECHANISM: whatever the script lists is skipped by hash,
-# and nothing else is.
-LISTED="$(grep -oE '^[0-9a-f]{40}$' "$CHECK" | sed -n 1p)"
-if [ -z "$LISTED" ]; then
-    fail "the script lists no grandfathered SHA — the cases below would be vacuous"
-else
-    ok "the script names a grandfathered SHA to test against ($LISTED)"
-fi
+# list), so a subject already merged there can never be reworded and would fail
+# the develop -> main release PR forever. Such commits are skipped BY SHA.
+#
+# Everything below is HERMETIC: a fixture repository, and a COPY of the check
+# script with the fixture's own SHA inserted into the list. Nothing here reads
+# this repository's history or its configured entries.
+#
+# That is not fastidiousness, it is the fix for two P1s. This file runs as a
+# step in the conventional-commits job, which gates every PR, so any assertion
+# about live history fails unrelated PRs the moment that history changes —
+# whether by the release landing (the entry leaves `main..develop`) or by
+# anything non-conforming reaching `develop`. Either way it is the 2026-08-28
+# outage rebuilt inside the test written to guard the fix for it. Whether the
+# real release range passes is a question the release PR's own CI answers.
+#
+# Injecting into a COPY rather than reading an override keeps the production
+# script seamless: there is no environment variable or flag by which anyone
+# could add a SHA to the live gate.
+GF="$WORK/grandfather"
+git init -q -b main "$GF"
+git -C "$GF" config user.email test@example.com
+git -C "$GF" config user.name Test
+git -C "$GF" commit -q --allow-empty -m 'feat: base'
+git -C "$GF" checkout -q -b topic
+git -C "$GF" commit -q --allow-empty -m 'Surface helper process failures (#95)'
+FIXTURE_SHA="$(git -C "$GF" rev-parse HEAD)"
+# A second commit with the SAME subject and a different SHA, to prove the match
+# is on the hash.
+git -C "$GF" commit -q --allow-empty -m 'Surface helper process failures (#95)'
+TWIN_SHA="$(git -C "$GF" rev-parse HEAD)"
 
-# A commit carrying the grandfathered SUBJECT but a different SHA must still
-# fail: reusing the wording must not inherit the exemption.
-git -C "$GRANDFATHERED" commit -q --allow-empty -m 'Surface helper process failures (#95)'
-output="$(run_check "$GRANDFATHERED" main)"
+# Baseline: unmodified, neither commit is listed, so both are reported. Without
+# this the skip below could be the gate ignoring the fixture for some other
+# reason entirely.
+output="$(run_check "$GF" main)"
 status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "the grandfather list matches on SHA, not on subject"
+if [ $status -ne 0 ] && [ "$(printf '%s\n' "$output" | grep -c '::error::Commit message')" -eq 2 ]; then
+    ok "unlisted commits are reported — the fixture range is judged normally"
 else
-    fail "a fresh commit reusing the grandfathered subject must still fail (status=$status):
+    fail "the fixture must fail the unmodified gate, or the skip proves nothing (status=$status):
 $output"
 fi
 
-# The configured SHA really is skipped — asserted over the ONE-COMMIT range
-# `$LISTED~1..$LISTED`, which is immutable history, and never over
-# `origin/main..origin/develop`.
-#
-# That distinction is the whole point. This self-test runs as its own step in
-# the conventional-commits job, BEFORE the PR's own range is checked, so any
-# assertion about live `develop` fails every unrelated PR the moment anything
-# non-conforming reaches that branch — by a ruleset bypass, or by whatever gap
-# in this gate comes after the squash-subject one. That is precisely the
-# 2026-08-28 outage, rebuilt inside the test that guards the fix for it. The
-# release PR's own CI is what answers "does the release range pass"; this file
-# answers "does the grandfather mechanism work", and those must not be coupled.
-#
-# The range is non-trivial: it holds exactly that commit, whose subject the
-# pattern rejects, so it fails without the grandfather entry — which the
-# `list emptied` mutation confirms.
-if git rev-parse --verify --quiet "$LISTED^{commit}" >/dev/null 2>&1 &&
-    git rev-parse --verify --quiet "$LISTED~1^{commit}" >/dev/null 2>&1; then
-    output="$("$CHECK" "$LISTED~1" "$LISTED" 2>&1)"
+# The copy, with the fixture's SHA appended to the list. Inserted after the
+# opening line rather than substituted for an existing entry, so these cases
+# keep working when the production list is emptied — which is exactly what
+# happens once a release retires the last entry.
+COPY="$WORK/check-with-fixture.sh"
+awk -v sha="$FIXTURE_SHA" '{ print } /^GRANDFATHERED_SHAS="$/ { print sha }' "$CHECK" >"$COPY"
+chmod +x "$COPY"
+if ! grep -qx "$FIXTURE_SHA" "$COPY"; then
+    fail "the fixture SHA was not inserted into the copy — the anchor line changed?"
+elif ! bash -n "$COPY" 2>/dev/null; then
+    fail "the generated copy is not valid shell — the insertion landed in the wrong place"
+else
+    ok "a copy of the check script carries the fixture SHA"
+
+    output="$(cd "$GF" && "$COPY" main 2>&1)"
     status=$?
-    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q "skipping grandfathered commit $LISTED"; then
-        ok "the configured SHA is skipped over its own immutable range, and the skip is announced"
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q "skipping grandfathered commit $FIXTURE_SHA"; then
+        ok "a listed SHA is skipped, and the skip is announced"
     else
-        fail "$LISTED must be skipped and announced in $LISTED~1..$LISTED (status=$status):
+        fail "$FIXTURE_SHA is listed and must be skipped and announced (status=$status):
 $output"
     fi
+
+    # The twin carries the identical subject: it must still be reported, and it
+    # is also what keeps the case above from passing on a gate that skips
+    # everything.
+    if printf '%s' "$output" | grep -q '::error::Commit message'; then
+        ok "the twin with the same subject is still reported — matching is by SHA"
+    else
+        fail "only $FIXTURE_SHA is listed; $TWIN_SHA shares its subject and must still fail:
+$output"
+    fi
+
+    # And with BOTH listed the range is clean, which is the release case in
+    # miniature — with no dependence on when the real release happens.
+    COPY2="$WORK/check-with-both.sh"
+    awk -v a="$FIXTURE_SHA" -v b="$TWIN_SHA" '{ print } /^GRANDFATHERED_SHAS="$/ { print a; print b }' "$CHECK" >"$COPY2"
+    chmod +x "$COPY2"
+    output="$(cd "$GF" && "$COPY2" main 2>&1)"
+    status=$?
+    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q '2 grandfathered'; then
+        ok "a fully grandfathered range passes and counts what it skipped"
+    else
+        fail "with both SHAs listed the range must pass and say how many it skipped (status=$status):
+$output"
+    fi
+fi
+
+# The production list is never executed here, but a typo in it would be silent
+# until a release. Checked statically, without git: every entry is a full SHA.
+bad_entries="$(awk '/^GRANDFATHERED_SHAS="$/ { inlist = 1; next }
+                    inlist && /^"$/ { inlist = 0 }
+                    inlist && $0 !~ /^[0-9a-f]{40}$/ && NF { print }' "$CHECK")"
+if [ -z "$bad_entries" ]; then
+    ok "every configured grandfather entry is a full 40-character SHA"
 else
-    # Named rather than silent: in a shallow clone the commit may be absent, and
-    # a case that did not run must not read as a case that passed.
-    ok "SKIPPED: $LISTED not present in this checkout (shallow clone?)"
+    fail "malformed grandfather entries (a short SHA or stray text never matches anything):
+$bad_entries"
 fi
 
 # ------------------------------------------------------------ the summary count

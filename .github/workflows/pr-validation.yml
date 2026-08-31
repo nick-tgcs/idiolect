@@ -98,7 +98,44 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The self-test gates every PR through this job, so a bug in IT blocks
+      # everyone — which is how two P1s on PR #106 would have played out. The
+      # blast radius is cut to the PRs that can actually fix it: the self-test
+      # runs only when the gate scripts change. When they do not, they are
+      # byte-identical to what this same self-test already validated on the PR
+      # that last touched them — and it still runs nightly regardless, via
+      # `test-all.sh` in scheduled.yml, which is not a PR gate. So latent
+      # breakage is still found; it just stops taking every open PR down with
+      # it.
+      #
+      # A STEP, deliberately, not the job. `gate` reads
+      # `needs.conventional-commits.result != 'success'`, and a skipped job
+      # reports `skipped` — so skipping the job would fail every PR, which is
+      # the outcome this is meant to avoid. A skipped step does not.
+      - name: Did the commit-gate scripts change?
+        id: gate_scripts
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        # `...` here, and NOT the `..` the gate itself uses. `git diff A...B`
+        # compares B against the merge base — "what this PR changed" — whereas
+        # `git diff A..B` would also report files the BASE moved on, running the
+        # self-test for unrelated reasons. Different question, different operator.
+        run: |
+          if ! git rev-parse --verify --quiet "origin/$BASE_REF" >/dev/null; then
+            echo "base ref unavailable — running the self-test rather than assuming it is unnecessary"
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          elif git diff --quiet "origin/$BASE_REF...HEAD" -- \
+                 ci/scripts/check-conventional-commits.sh \
+                 ci/scripts/test-conventional-commits.sh; then
+            echo "gate scripts untouched by this PR — self-test not required"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "gate scripts changed by this PR — running the self-test"
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+
       - name: Self-test the commit check
+        if: steps.gate_scripts.outputs.changed == 'true'
         run: bash ci/scripts/test-conventional-commits.sh
 
       - name: Check commit messages
