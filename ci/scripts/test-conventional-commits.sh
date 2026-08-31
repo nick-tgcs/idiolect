@@ -389,36 +389,36 @@ else
 $output"
 fi
 
-# And the real range this exists for: develop -> main on the actual repository.
+# The configured SHA really is skipped — asserted over the ONE-COMMIT range
+# `$LISTED~1..$LISTED`, which is immutable history, and never over
+# `origin/main..origin/develop`.
 #
-# The notice is asserted ONLY while the grandfathered SHA is actually inside
-# that range. This is load-bearing: the moment the release lands, the commit is
-# on `main` too, `main..develop` stops containing it, and the check correctly
-# says nothing. Demanding the notice unconditionally would then fail this
-# self-test — which runs as its own step in the conventional-commits job — on
-# EVERY subsequent PR until someone deleted the entry, recreating the very
-# repo-wide red CI this change exists to prevent.
-if git rev-parse --verify --quiet origin/main >/dev/null 2>&1 &&
-    git rev-parse --verify --quiet origin/develop >/dev/null 2>&1; then
-    output="$("$CHECK" origin/main origin/develop 2>&1)"
+# That distinction is the whole point. This self-test runs as its own step in
+# the conventional-commits job, BEFORE the PR's own range is checked, so any
+# assertion about live `develop` fails every unrelated PR the moment anything
+# non-conforming reaches that branch — by a ruleset bypass, or by whatever gap
+# in this gate comes after the squash-subject one. That is precisely the
+# 2026-08-28 outage, rebuilt inside the test that guards the fix for it. The
+# release PR's own CI is what answers "does the release range pass"; this file
+# answers "does the grandfather mechanism work", and those must not be coupled.
+#
+# The range is non-trivial: it holds exactly that commit, whose subject the
+# pattern rejects, so it fails without the grandfather entry — which the
+# `list emptied` mutation confirms.
+if git rev-parse --verify --quiet "$LISTED^{commit}" >/dev/null 2>&1 &&
+    git rev-parse --verify --quiet "$LISTED~1^{commit}" >/dev/null 2>&1; then
+    output="$("$CHECK" "$LISTED~1" "$LISTED" 2>&1)"
     status=$?
-    if [ "$status" -ne 0 ]; then
-        fail "the release range must pass (status=$status):
-$output"
-    elif git rev-list origin/main..origin/develop 2>/dev/null | grep -qx "$LISTED"; then
-        if printf '%s' "$output" | grep -q 'skipping grandfathered commit'; then
-            ok "the release range passes while $LISTED is in it, and says what it skipped"
-        else
-            fail "$LISTED is in main..develop, so the skip must be announced:
-$output"
-        fi
+    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q "skipping grandfathered commit $LISTED"; then
+        ok "the configured SHA is skipped over its own immutable range, and the skip is announced"
     else
-        # Not a skip: the range genuinely no longer holds it, which is the
-        # retirement this list was designed for.
-        ok "the release range passes; $LISTED has landed on main and its entry can now be deleted"
+        fail "$LISTED must be skipped and announced in $LISTED~1..$LISTED (status=$status):
+$output"
     fi
 else
-    ok "SKIPPED: real develop -> main range (origin/main or origin/develop absent here)"
+    # Named rather than silent: in a shallow clone the commit may be absent, and
+    # a case that did not run must not read as a case that passed.
+    ok "SKIPPED: $LISTED not present in this checkout (shallow clone?)"
 fi
 
 # ------------------------------------------------------------ the summary count
