@@ -25,6 +25,20 @@
 # depends on the commit count. Between them the gate polices what survives
 # rather than what gets thrown away.
 #
+# This repo also allows merge commits and rebase merges (`allow_merge_commit`
+# and `allow_rebase_merge` are both true; `a88152e` is a real two-parent merge
+# of PR #104). Under either, the title never lands: `merge_commit_title` is
+# MERGE_MESSAGE, so the subject is "Merge pull request #N from ...", which is a
+# merge commit and skipped by --no-merges anyway, and a rebase merge replays the
+# commits themselves. A multi-commit PR's title is therefore gated on a merge
+# method that MIGHT be chosen — and deliberately so: the method is picked at
+# merge time by a human and is unknowable here, so the gate fails closed. The
+# cost of being strict is editing a title, with no rebase and no force-push. The
+# cost of being lax was 8cfc392: an unrewordable subject on a force-push-proof
+# branch, and a day of red CI on every open PR. To make the gate exact instead
+# of conservative, disable merge commits and rebase merges at the repository
+# level — a policy decision, not something this script should assume.
+#
 # The base ref is the PR's OWN base, not `main`. This repo is GitFlow: `develop`
 # runs ahead of `main`, so scanning `main...HEAD` made every feature PR inherit
 # every develop-only commit. On 2026-08-28 one non-conforming subject on develop
@@ -64,8 +78,11 @@ if [ "${1:-}" = "--title" ]; then
 
     if ! printf '%s' "$TITLE" | grep -qE "$CONVENTIONAL"; then
         echo "::error::PR title does not follow conventional commits format: $TITLE"
-        echo "This PR has more than one commit, so the squash subject on the base branch is"
-        echo "taken from its title. Reword the title; no rebase needed."
+        echo "This PR has more than one commit, so if it is SQUASH-merged the base-branch"
+        echo "subject is taken from this title. A merge commit or a rebase merge would not"
+        echo "use it — but the merge method is chosen at merge time and cannot be known"
+        echo "here, so the title has to conform either way. Reword the title; no rebase"
+        echo "needed, and nothing to force-push."
         exit 1
     fi
     echo "PR title follows conventional commits format."

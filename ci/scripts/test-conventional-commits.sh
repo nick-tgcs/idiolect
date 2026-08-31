@@ -317,6 +317,18 @@ else
 $output"
 fi
 
+# The rejection has to explain itself. A multi-commit PR's title is gated on a
+# merge method that might not be chosen — merge commits and rebase merges are
+# both enabled here and neither uses the title — so an author who hits this is
+# owed the reason, or the block reads as arbitrary.
+output="$(run_check "$REPO" --title 'WIP' 3)"
+if printf '%s' "$output" | grep -qi 'squash' && printf '%s' "$output" | grep -qi 'merge method'; then
+    ok "the title rejection says which merge method makes the title land"
+else
+    fail "a conservative block must say why it is conservative:
+$output"
+fi
+
 # Guard the guard: the skip above proves nothing unless that same title is
 # rejected when the count says the title IS what lands.
 for count in 2 3 12; do
