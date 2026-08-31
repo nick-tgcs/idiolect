@@ -107,20 +107,23 @@ jobs:
           # expression is substituted as shell CODE, and git ref names may carry
           # `;`, `$` and backticks; as an environment variable it is data.
           BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          THIS_REPO: ${{ github.repository }}
         # The PR's OWN base, not main: this repo is GitFlow, so scanning from
         # main made every feature PR inherit develop's commits and fail on
         # subjects it did not write.
-        #
-        # The head branch and repo are passed too, and are read only by the
-        # develop -> main release exemption — which needs all three because the
-        # merge ref names neither, and because a fork's branch can also be
-        # called `develop`. See the script for why the release PR is exempt.
-        run: |
-          bash ci/scripts/check-conventional-commits.sh \
-            "origin/$BASE_REF" HEAD "$HEAD_REF" "$HEAD_REPO" "$THIS_REPO"
+        run: bash ci/scripts/check-conventional-commits.sh "origin/$BASE_REF"
+
+      - name: Check the PR title
+        env:
+          # Same reasoning as BASE_REF above, and it matters more here: a PR
+          # title is free text from anyone who can open a PR, so it reaches the
+          # script as an environment variable rather than as `run:` code.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        # Merges here are squashes and `squash_merge_commit_title` is
+        # COMMIT_OR_PR_TITLE, so a multi-commit PR puts its TITLE on the base
+        # branch — text the step above never sees, synthesised after it ran.
+        # That is how `8cfc392 Surface helper process failures (#95)` reached
+        # develop and then blocked every PR for a day.
+        run: bash ci/scripts/check-conventional-commits.sh --title "$PR_TITLE"
 
   # =========================================================================
   # RUST: Quick validation (fmt, clippy, check, test)

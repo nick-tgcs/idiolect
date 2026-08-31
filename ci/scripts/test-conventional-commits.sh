@@ -250,121 +250,101 @@ fi
 # reword it — develop's protect-develop ruleset forbids the force-push, for
 # everyone, with an empty bypass list. So a PR whose base is `main` is not
 # scanned.
-OURS=nick-tgcs/idiolect
-
-# The exact shape CI passes for the release PR, with one part swapped per case.
-# Everything below varies ONE argument from this, so each `ok` names the reason
-# it was scanned rather than merely observing that it was.
-release_check() { # release_check <base> <head-branch> <head-repo> <this-repo>
-    run_check "$REPO" "$1" develop "$2" "$3" "$4"
-}
-
-output="$(release_check main develop "$OURS" "$OURS")"
-status=$?
-if [ $status -eq 0 ]; then
-    ok "a release PR into main is not re-scanned"
-else
-    fail "base=main head=develop from this repo must be exempt (status=$status):
-$output"
-fi
-
-# The workflow passes `origin/$BASE_REF`, never a bare branch name, so the
-# exemption has to survive that spelling or it never fires in CI at all.
-git -C "$REPO" update-ref refs/remotes/origin/main "$(git -C "$REPO" rev-parse main)"
-output="$(release_check origin/main develop "$OURS" "$OURS")"
-status=$?
-if [ $status -eq 0 ]; then
-    ok "the exemption recognises the origin/ prefixed spelling the workflow uses"
-else
-    fail "origin/main is the form CI passes and must be exempt too (status=$status):
-$output"
-fi
-
-# Guard the guard: every pass above proves nothing unless that range really does
-# contain a subject this gate would otherwise reject.
-git -C "$REPO" branch -f mainline main
-output="$(release_check mainline develop "$OURS" "$OURS")"
-status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "the exempted range is not empty — a non-main base still rejects it"
-else
-    fail "the release-PR cases would be vacuous: this range must contain an offender (status=$status):
-$output"
-fi
-
-# EVERY half is required. Keyed on the base alone this would fire on any PR into
-# main, leaving main-source-guard as the only thing between an arbitrary branch
-# and an unscanned merge to main.
-output="$(release_check main feature "$OURS" "$OURS")"
-status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "base=main with a head that is not develop is still scanned"
-else
-    fail "the exemption must need every half of the release shape (status=$status):
-$output"
-fi
-
-# A FORK's branch may also be called `develop` — the hole main-source-guard
-# documents and closes with a head-repo check. Without the same check here, a
-# fork could put unscanned commits behind the release exemption.
-output="$(release_check main develop attacker/idiolect "$OURS")"
-status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "a fork branch named develop is not the release PR"
-else
-    fail "the exemption must require OUR develop, not any repo's (status=$status):
-$output"
-fi
-
-# Defaulted to empty, `$HEAD_REPO = $THIS_REPO` is two blanks matching. Absent
-# repo identity must read as "not the release PR", not as "same repo".
-output="$(release_check main develop "" "")"
-status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "an absent repo identity is not a matching one"
-else
-    fail "empty == empty must not exempt (status=$status):
-$output"
-fi
-
-# ...and the whole thing is shut for the two-argument callers used everywhere
-# else in this file, which name no head branch at all.
-output="$(run_check "$REPO" main develop)"
-status=$?
-if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-    ok "with no head branch named, base=main is still scanned"
-else
-    fail "the exemption must be shut by default (status=$status):
-$output"
-fi
-
-# ...and the base half is an equality test, not a prefix or a substring one.
-git -C "$REPO" branch -f main-2 main
-git -C "$REPO" update-ref refs/remotes/upstream/main "$(git -C "$REPO" rev-parse main)"
-for base in mainline main-2 upstream/main; do
-    output="$(release_check "$base" develop "$OURS" "$OURS")"
+# --------------------------------------------------------- the PR TITLE is the
+# subject that actually lands. `squash_merge_commit_title` is COMMIT_OR_PR_TITLE
+# and merges here are squashes, so a multi-commit PR puts its TITLE on the base
+# branch — text no commit carried and the range mode never saw. That is how
+# `8cfc392 Surface helper process failures (#95)` reached develop. Judging only
+# the range polices text that is thrown away.
+for title in \
+    'Surface helper process failures (#95)' \
+    'WIP' \
+    'test(android)+docs: compound type' \
+    'feat(): empty scope' \
+    'feat:' \
+    ''; do
+    output="$(run_check "$REPO" --title "$title")"
     status=$?
-    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-        ok "base '$base' is not treated as main"
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "title rejected: '${title:-<empty>}'"
     else
-        fail "only an exact 'main' is exempt; '$base' must still be scanned (status=$status):
+        fail "PR title '$title' must be rejected (status=$status):
 $output"
     fi
 done
 
-# The same for the head half. `origin/develop` is in this list deliberately: the
-# base is `origin/`-stripped because the workflow adds that prefix, and applying
-# the same strip to the head would exempt a branch actually named that.
-for head in developer develop-2 upstream/develop origin/develop; do
-    output="$(release_check main "$head" "$OURS" "$OURS")"
+for title in 'fix(asr): halve nothing' 'chore(deps): bump uuid from 1.24.0 to 1.26.0' 'ci: gate the title too'; do
+    output="$(run_check "$REPO" --title "$title")"
     status=$?
-    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
-        ok "head '$head' is not treated as develop"
+    if [ $status -eq 0 ]; then
+        ok "title accepted: '$title'"
     else
-        fail "only an exact 'develop' head is exempt; '$head' must still be scanned (status=$status):
+        fail "PR title '$title' conforms and must pass (status=$status):
 $output"
     fi
 done
+
+# `--title` with no argument is a caller bug, not a clean title.
+output="$(run_check "$REPO" --title)"
+status=$?
+if [ $status -eq 2 ] && printf '%s' "$output" | grep -q 'usage:'; then
+    ok "--title with no subject is a usage error, not a pass"
+else
+    fail "a missing --title argument must not read as a conforming title (status=$status):
+$output"
+fi
+
+# ------------------------------------------------- grandfathered commit SHAs
+# `develop` is force-push-proof (protect-develop: non_fast_forward, empty bypass
+# list), so 8cfc392 can never be reworded and would fail the develop -> main
+# release PR forever. It is skipped BY SHA. The alternative — skipping the whole
+# release range — would permanently stop judging the one place squash subjects
+# land, which is exactly where this gate was already blind.
+GRANDFATHERED=$WORK/grandfathered
+git init -q -b main "$GRANDFATHERED"
+git -C "$GRANDFATHERED" config user.email test@example.com
+git -C "$GRANDFATHERED" config user.name Test
+git -C "$GRANDFATHERED" commit -q --allow-empty -m 'feat: base'
+git -C "$GRANDFATHERED" checkout -q -b develop
+# The real SHA the script grandfathers cannot be reproduced in a fixture, so the
+# fixture asserts the MECHANISM: whatever the script lists is skipped by hash,
+# and nothing else is.
+LISTED="$(grep -oE '^[0-9a-f]{40}$' "$CHECK" | sed -n 1p)"
+if [ -z "$LISTED" ]; then
+    fail "the script lists no grandfathered SHA — the cases below would be vacuous"
+else
+    ok "the script names a grandfathered SHA to test against ($LISTED)"
+fi
+
+# A commit carrying the grandfathered SUBJECT but a different SHA must still
+# fail: reusing the wording must not inherit the exemption.
+git -C "$GRANDFATHERED" commit -q --allow-empty -m 'Surface helper process failures (#95)'
+output="$(run_check "$GRANDFATHERED" main)"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "the grandfather list matches on SHA, not on subject"
+else
+    fail "a fresh commit reusing the grandfathered subject must still fail (status=$status):
+$output"
+fi
+
+# And the real range this exists for: develop -> main on the actual repository.
+# Skipped only if this test runs inside a clone that still has both refs and the
+# commit — stated rather than silently passing.
+if git rev-parse --verify --quiet 8cfc392de6d0842c740c65de768f5050dc74f343 >/dev/null 2>&1 &&
+    git rev-parse --verify --quiet origin/main >/dev/null 2>&1 &&
+    git rev-parse --verify --quiet origin/develop >/dev/null 2>&1; then
+    output="$("$CHECK" origin/main origin/develop 2>&1)"
+    status=$?
+    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q 'skipping grandfathered commit'; then
+        ok "the real develop -> main range passes, and says what it skipped"
+    else
+        fail "the release range must pass and announce the skip (status=$status):
+$output"
+    fi
+else
+    ok "SKIPPED: real develop -> main range (refs not present in this checkout)"
+fi
 
 # ------------------------------------------------------------ the summary count
 output="$(run_check "$REPO" develop)"
