@@ -2,7 +2,12 @@
 # Every non-merge commit a PR adds to its base must have a Conventional Commits
 # subject. Called by the `conventional-commits` job in pr-validation.yml.
 #
-#   usage: check-conventional-commits.sh <base-ref> [head-ref]
+#   usage: check-conventional-commits.sh <base-ref> [head-ref] \
+#              [head-branch] [head-repo] [this-repo]
+#
+# <head-ref> is the rev whose commits are scanned (`HEAD`, the PR merge ref, in
+# CI). The last three describe the PR itself — things the merge ref cannot
+# supply — and are read ONLY by the develop -> main release exemption below.
 #
 # The base ref is the PR's OWN base, not `main`. This repo is GitFlow: `develop`
 # runs ahead of `main`, so scanning `main...HEAD` made every feature PR inherit
@@ -16,9 +21,14 @@ set -uo pipefail
 
 BASE="${1:-}"
 HEAD_REF="${2:-HEAD}"
+# Absent by default: with no head branch named, no PR can match the release
+# shape, so the exemption stays shut for every caller that does not opt in.
+HEAD_BRANCH="${3:-}"
+HEAD_REPO="${4:-}"
+THIS_REPO="${5:-}"
 
 if [ -z "$BASE" ]; then
-    echo "usage: $(basename "$0") <base-ref> [head-ref]" >&2
+    echo "usage: $(basename "$0") <base-ref> [head-ref] [head-branch] [head-repo] [this-repo]" >&2
     exit 2
 fi
 
@@ -28,6 +38,48 @@ fi
 if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
     echo "::error::base ref '$BASE' does not resolve — the commit check could not run"
     exit 1
+fi
+
+# The develop -> main release PR is not re-scanned. Two facts make that safe,
+# and both are enforced elsewhere in this same workflow: `main` only ever
+# receives `develop` (the main-source-guard job fails any other head), and every
+# commit on develop was already judged by this gate on the PR that put it there.
+# Re-judging all of develop at release time only re-runs work already done — and
+# it is exactly the redundancy behind the 2026-08-28 outage. It is also
+# unfixable when it fires: `8cfc392 Surface helper process failures (#95)` is on
+# develop with a non-conforming subject, and the protect-develop ruleset forbids
+# the force-push that rewording it would need, for everyone, with an empty
+# bypass list. A gate whose only remedy is to disable a branch protection is not
+# a gate worth having.
+#
+# Every half of the shape is required, and the head halves are why this takes
+# arguments beyond the range at all. In CI the rev to scan is the merge ref,
+# `HEAD`, which names neither a branch nor a repository — so both are passed
+# separately, as data, from `github.head_ref` and the PR's head repo.
+#
+# Keying on the base alone would fire on ANY PR into main, leaving
+# main-source-guard as the only thing between an arbitrary branch and an
+# unscanned merge to main. And keying on the branch NAME alone repeats the hole
+# that job documents: a fork's branch may also be called `develop`. So the
+# exemption matches only OUR develop, exactly as main-source-guard does.
+#
+# Exact equality throughout. The `origin/` strip applies to the BASE alone,
+# because that prefix is something the workflow adds; `github.head_ref` never
+# carries it, and stripping it there would exempt a branch actually named
+# `origin/develop`. So `mainline`, `main-2` and `upstream/main` stay ordinary
+# bases, and `developer`, `develop-2` and `origin/develop` stay ordinary heads.
+#
+# The repo identity must be PRESENT, not merely equal: defaulted to empty,
+# `$HEAD_REPO = $THIS_REPO` is two blanks matching, which would exempt any
+# caller that named a develop head and no repository at all.
+RELEASE_BASE=main
+RELEASE_HEAD=develop
+if [ "${BASE#origin/}" = "$RELEASE_BASE" ] &&
+    [ "$HEAD_BRANCH" = "$RELEASE_HEAD" ] &&
+    [ -n "$THIS_REPO" ] && [ "$HEAD_REPO" = "$THIS_REPO" ]; then
+    echo "Base is '$BASE' and head is '$HEAD_BRANCH' — the release PR. Its commits were"
+    echo "each judged on the PR that merged them to $RELEASE_HEAD; not re-scanning here."
+    exit 0
 fi
 
 # `..` and NOT `...`, and this is load-bearing rather than stylistic. HEAD is the

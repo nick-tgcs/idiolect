@@ -241,6 +241,131 @@ else
 $output"
 fi
 
+# ------------------------------------------------- the develop -> main release PR
+# `main` only ever receives develop (enforced by the main-source-guard job), and
+# every commit on develop was already judged by this gate on the PR that put it
+# there. Re-judging the whole of develop at release time is the same redundancy
+# that caused the 2026-08-28 outage: `8cfc392 Surface helper process failures
+# (#95)` reached develop with a non-conforming subject, and no release PR can
+# reword it — develop's protect-develop ruleset forbids the force-push, for
+# everyone, with an empty bypass list. So a PR whose base is `main` is not
+# scanned.
+OURS=nick-tgcs/idiolect
+
+# The exact shape CI passes for the release PR, with one part swapped per case.
+# Everything below varies ONE argument from this, so each `ok` names the reason
+# it was scanned rather than merely observing that it was.
+release_check() { # release_check <base> <head-branch> <head-repo> <this-repo>
+    run_check "$REPO" "$1" develop "$2" "$3" "$4"
+}
+
+output="$(release_check main develop "$OURS" "$OURS")"
+status=$?
+if [ $status -eq 0 ]; then
+    ok "a release PR into main is not re-scanned"
+else
+    fail "base=main head=develop from this repo must be exempt (status=$status):
+$output"
+fi
+
+# The workflow passes `origin/$BASE_REF`, never a bare branch name, so the
+# exemption has to survive that spelling or it never fires in CI at all.
+git -C "$REPO" update-ref refs/remotes/origin/main "$(git -C "$REPO" rev-parse main)"
+output="$(release_check origin/main develop "$OURS" "$OURS")"
+status=$?
+if [ $status -eq 0 ]; then
+    ok "the exemption recognises the origin/ prefixed spelling the workflow uses"
+else
+    fail "origin/main is the form CI passes and must be exempt too (status=$status):
+$output"
+fi
+
+# Guard the guard: every pass above proves nothing unless that range really does
+# contain a subject this gate would otherwise reject.
+git -C "$REPO" branch -f mainline main
+output="$(release_check mainline develop "$OURS" "$OURS")"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "the exempted range is not empty — a non-main base still rejects it"
+else
+    fail "the release-PR cases would be vacuous: this range must contain an offender (status=$status):
+$output"
+fi
+
+# EVERY half is required. Keyed on the base alone this would fire on any PR into
+# main, leaving main-source-guard as the only thing between an arbitrary branch
+# and an unscanned merge to main.
+output="$(release_check main feature "$OURS" "$OURS")"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "base=main with a head that is not develop is still scanned"
+else
+    fail "the exemption must need every half of the release shape (status=$status):
+$output"
+fi
+
+# A FORK's branch may also be called `develop` — the hole main-source-guard
+# documents and closes with a head-repo check. Without the same check here, a
+# fork could put unscanned commits behind the release exemption.
+output="$(release_check main develop attacker/idiolect "$OURS")"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "a fork branch named develop is not the release PR"
+else
+    fail "the exemption must require OUR develop, not any repo's (status=$status):
+$output"
+fi
+
+# Defaulted to empty, `$HEAD_REPO = $THIS_REPO` is two blanks matching. Absent
+# repo identity must read as "not the release PR", not as "same repo".
+output="$(release_check main develop "" "")"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "an absent repo identity is not a matching one"
+else
+    fail "empty == empty must not exempt (status=$status):
+$output"
+fi
+
+# ...and the whole thing is shut for the two-argument callers used everywhere
+# else in this file, which name no head branch at all.
+output="$(run_check "$REPO" main develop)"
+status=$?
+if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+    ok "with no head branch named, base=main is still scanned"
+else
+    fail "the exemption must be shut by default (status=$status):
+$output"
+fi
+
+# ...and the base half is an equality test, not a prefix or a substring one.
+git -C "$REPO" branch -f main-2 main
+git -C "$REPO" update-ref refs/remotes/upstream/main "$(git -C "$REPO" rev-parse main)"
+for base in mainline main-2 upstream/main; do
+    output="$(release_check "$base" develop "$OURS" "$OURS")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+        ok "base '$base' is not treated as main"
+    else
+        fail "only an exact 'main' is exempt; '$base' must still be scanned (status=$status):
+$output"
+    fi
+done
+
+# The same for the head half. `origin/develop` is in this list deliberately: the
+# base is `origin/`-stripped because the workflow adds that prefix, and applying
+# the same strip to the head would exempt a branch actually named that.
+for head in developer develop-2 upstream/develop origin/develop; do
+    output="$(release_check main "$head" "$OURS" "$OURS")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'Surface helper process failures'; then
+        ok "head '$head' is not treated as develop"
+    else
+        fail "only an exact 'develop' head is exempt; '$head' must still be scanned (status=$status):
+$output"
+    fi
+done
+
 # ------------------------------------------------------------ the summary count
 output="$(run_check "$REPO" develop)"
 if printf '%s' "$output" | grep -q '^2 commit subject(s) above need rewording'; then

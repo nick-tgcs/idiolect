@@ -107,10 +107,20 @@ jobs:
           # expression is substituted as shell CODE, and git ref names may carry
           # `;`, `$` and backticks; as an environment variable it is data.
           BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
         # The PR's OWN base, not main: this repo is GitFlow, so scanning from
         # main made every feature PR inherit develop's commits and fail on
         # subjects it did not write.
-        run: bash ci/scripts/check-conventional-commits.sh "origin/$BASE_REF"
+        #
+        # The head branch and repo are passed too, and are read only by the
+        # develop -> main release exemption — which needs all three because the
+        # merge ref names neither, and because a fork's branch can also be
+        # called `develop`. See the script for why the release PR is exempt.
+        run: |
+          bash ci/scripts/check-conventional-commits.sh \
+            "origin/$BASE_REF" HEAD "$HEAD_REF" "$HEAD_REPO" "$THIS_REPO"
 
   # =========================================================================
   # RUST: Quick validation (fmt, clippy, check, test)
