@@ -390,21 +390,35 @@ $output"
 fi
 
 # And the real range this exists for: develop -> main on the actual repository.
-# Skipped only if this test runs inside a clone that still has both refs and the
-# commit — stated rather than silently passing.
-if git rev-parse --verify --quiet 8cfc392de6d0842c740c65de768f5050dc74f343 >/dev/null 2>&1 &&
-    git rev-parse --verify --quiet origin/main >/dev/null 2>&1 &&
+#
+# The notice is asserted ONLY while the grandfathered SHA is actually inside
+# that range. This is load-bearing: the moment the release lands, the commit is
+# on `main` too, `main..develop` stops containing it, and the check correctly
+# says nothing. Demanding the notice unconditionally would then fail this
+# self-test — which runs as its own step in the conventional-commits job — on
+# EVERY subsequent PR until someone deleted the entry, recreating the very
+# repo-wide red CI this change exists to prevent.
+if git rev-parse --verify --quiet origin/main >/dev/null 2>&1 &&
     git rev-parse --verify --quiet origin/develop >/dev/null 2>&1; then
     output="$("$CHECK" origin/main origin/develop 2>&1)"
     status=$?
-    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q 'skipping grandfathered commit'; then
-        ok "the real develop -> main range passes, and says what it skipped"
-    else
-        fail "the release range must pass and announce the skip (status=$status):
+    if [ "$status" -ne 0 ]; then
+        fail "the release range must pass (status=$status):
 $output"
+    elif git rev-list origin/main..origin/develop 2>/dev/null | grep -qx "$LISTED"; then
+        if printf '%s' "$output" | grep -q 'skipping grandfathered commit'; then
+            ok "the release range passes while $LISTED is in it, and says what it skipped"
+        else
+            fail "$LISTED is in main..develop, so the skip must be announced:
+$output"
+        fi
+    else
+        # Not a skip: the range genuinely no longer holds it, which is the
+        # retirement this list was designed for.
+        ok "the release range passes; $LISTED has landed on main and its entry can now be deleted"
     fi
 else
-    ok "SKIPPED: real develop -> main range (refs not present in this checkout)"
+    ok "SKIPPED: real develop -> main range (origin/main or origin/develop absent here)"
 fi
 
 # ------------------------------------------------------------ the summary count
