@@ -117,9 +117,20 @@ fi
 # these are already merged. Left unlisted they fail the develop -> main release
 # PR forever, whose base legitimately is `main`.
 #
-# This list retires itself. Once a release lands, the commit is on `main` too,
-# so `main..develop` no longer contains it and the entry is dead — delete it
-# then. It is deliberately NOT a blanket "skip the release PR": that would
+# Retiring an entry: delete it only once THIS SHA is an ancestor of `main`.
+#
+#     git merge-base --is-ancestor <sha> origin/main && echo "safe to delete"
+#
+# "after the next release" is NOT the condition, and the difference is not
+# academic. Only an ancestry-preserving merge puts this very commit on `main`; a
+# squash or rebase release creates new SHAs, leaves the original in
+# `main..develop`, and deleting the entry then fails every subsequent release PR.
+# Both methods are enabled on this repo, and main-source-guard constrains the
+# release PR's source branch, not how it is merged. Verified on fixtures: after
+# a merge-commit release `main..develop` holds the commit 0 times and it is an
+# ancestor of main; after a squash release it holds it once and is not.
+#
+# The list is deliberately NOT a blanket "skip the release PR": that would
 # permanently stop judging the range where squash subjects actually land, which
 # is the one place this gate has ever been blind.
 #
