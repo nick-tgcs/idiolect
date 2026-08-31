@@ -3,7 +3,7 @@
 # `conventional-commits` job in pr-validation.yml.
 #
 #   usage: check-conventional-commits.sh <base-ref> [head-ref]
-#          check-conventional-commits.sh --title <subject>
+#          check-conventional-commits.sh --title <subject> [pr-commit-count]
 #
 # The range mode judges every non-merge commit the PR ADDS to its base. The
 # title mode judges the PR title, and it exists because the range mode alone
@@ -11,14 +11,19 @@
 #
 #   `squash_merge_commit_title` on this repo is COMMIT_OR_PR_TITLE, and the
 #   dependabot workflow (and every human squash) merges with `--squash`. For a
-#   PR with more than one commit, GitHub therefore synthesises the base-branch
-#   subject from the PR TITLE, after this gate has run and from text no commit
-#   ever carried. `8cfc392 Surface helper process failures (#95)` is exactly
-#   that: a one-parent squash commit whose subject was never judged, on a PR
-#   whose own commits may well have conformed.
+#   PR with MORE THAN ONE commit, GitHub synthesises the base-branch subject
+#   from the PR TITLE, after this gate has run and from text no commit ever
+#   carried. `8cfc392 Surface helper process failures (#95)` is exactly that: a
+#   one-parent squash commit whose subject was never judged, on a PR whose own
+#   commits may well have conformed.
 #
-# So both are gated. Otherwise the gate polices text that gets thrown away and
-# ignores the text that survives.
+#   For a ONE-commit PR the same setting takes the subject from that commit
+#   instead, which the range mode has already judged. Gating the title there
+#   would block a PR over text that never reaches the branch.
+#
+# So exactly one of the two judges the subject that will land, and which one
+# depends on the commit count. Between them the gate polices what survives
+# rather than what gets thrown away.
 #
 # The base ref is the PR's OWN base, not `main`. This repo is GitFlow: `develop`
 # runs ahead of `main`, so scanning `main...HEAD` made every feature PR inherit
@@ -34,7 +39,7 @@ CONVENTIONAL='^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(
 
 usage() {
     echo "usage: $(basename "$0") <base-ref> [head-ref]" >&2
-    echo "       $(basename "$0") --title <subject>" >&2
+    echo "       $(basename "$0") --title <subject> [pr-commit-count]" >&2
 }
 
 # ----------------------------------------------------------------- title mode
@@ -44,10 +49,23 @@ if [ "${1:-}" = "--title" ]; then
         exit 2
     fi
     TITLE="${2-}"
+    PR_COMMITS="${3-}"
+
+    # Exactly one commit means GitHub takes the squash subject from that commit,
+    # not from this title — and the range mode has already judged it. Anything
+    # else, including a count that is missing or not a number, is checked: an
+    # unknown count must not buy a skip, since the whole point of this mode is
+    # the case the range mode cannot see.
+    if [ "$PR_COMMITS" = "1" ]; then
+        echo "Single-commit PR: the squash subject comes from that commit, which the"
+        echo "range check judges directly. PR title not gated."
+        exit 0
+    fi
+
     if ! printf '%s' "$TITLE" | grep -qE "$CONVENTIONAL"; then
         echo "::error::PR title does not follow conventional commits format: $TITLE"
-        echo "The PR title becomes the squash subject on the base branch, so it is judged"
-        echo "exactly like a commit subject. Reword the title; no rebase needed."
+        echo "This PR has more than one commit, so the squash subject on the base branch is"
+        echo "taken from its title. Reword the title; no rebase needed."
         exit 1
     fi
     echo "PR title follows conventional commits format."

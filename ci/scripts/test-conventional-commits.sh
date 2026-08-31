@@ -294,6 +294,55 @@ else
 $output"
 fi
 
+# --------------------------------- the count decides WHICH subject is judged
+# COMMIT_OR_PR_TITLE takes the squash subject from the single commit when a PR
+# has exactly one, and from the title only when it has more. Gating the title of
+# a one-commit PR would block it over text that never reaches the branch — while
+# the commit that DOES reach it was already judged by the range mode.
+output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' 1)"
+status=$?
+if [ $status -eq 0 ] && printf '%s' "$output" | grep -q 'Single-commit PR'; then
+    ok "a one-commit PR's title is not gated, and says why"
+else
+    fail "a one-commit PR takes its squash subject from the commit (status=$status):
+$output"
+fi
+
+output="$(run_check "$REPO" --title 'fix(asr): fine either way' 1)"
+status=$?
+if [ $status -eq 0 ]; then
+    ok "a one-commit PR with a conforming title also passes"
+else
+    fail "a conforming title must never fail (status=$status):
+$output"
+fi
+
+# Guard the guard: the skip above proves nothing unless that same title is
+# rejected when the count says the title IS what lands.
+for count in 2 3 12; do
+    output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' "$count")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "with $count commits the title is judged"
+    else
+        fail "a multi-commit PR's title becomes the squash subject and must be judged (status=$status):
+$output"
+    fi
+done
+
+# An unknown count must NOT buy a skip. The title mode exists for the case the
+# range mode cannot see, so anything it cannot read as exactly 1 is checked.
+for count in "" 0 abc " 1" "1x" -1; do
+    output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' "$count")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "count '${count:-<empty>}' is not a one-commit PR, so the title is judged"
+    else
+        fail "an unreadable commit count must fail closed (count='$count', status=$status):
+$output"
+    fi
+done
+
 # ------------------------------------------------- grandfathered commit SHAs
 # `develop` is force-push-proof (protect-develop: non_fast_forward, empty bypass
 # list), so 8cfc392 can never be reworded and would fail the develop -> main

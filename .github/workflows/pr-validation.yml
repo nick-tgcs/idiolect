@@ -118,12 +118,15 @@ jobs:
           # title is free text from anyone who can open a PR, so it reaches the
           # script as an environment variable rather than as `run:` code.
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
         # Merges here are squashes and `squash_merge_commit_title` is
-        # COMMIT_OR_PR_TITLE, so a multi-commit PR puts its TITLE on the base
+        # COMMIT_OR_PR_TITLE, so a MULTI-commit PR puts its TITLE on the base
         # branch — text the step above never sees, synthesised after it ran.
         # That is how `8cfc392 Surface helper process failures (#95)` reached
-        # develop and then blocked every PR for a day.
-        run: bash ci/scripts/check-conventional-commits.sh --title "$PR_TITLE"
+        # develop and then blocked every PR for a day. A one-commit PR takes
+        # that subject from the commit instead, which the step above already
+        # judged, so the count decides which of the two is authoritative.
+        run: bash ci/scripts/check-conventional-commits.sh --title "$PR_TITLE" "$PR_COMMITS"
 
   # =========================================================================
   # RUST: Quick validation (fmt, clippy, check, test)
