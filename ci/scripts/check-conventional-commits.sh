@@ -45,6 +45,19 @@
 # (that same 8cfc392) therefore failed every open feature PR, none of which
 # could do anything about it.
 #
+# LIMITATION, deliberate and unclosable from here: this gate judges the DEFAULT
+# squash subject, not the final one. Whoever merges can overwrite it — the merge
+# dialog has an editable subject field, and `gh pr merge --squash` documents
+# `-t, --subject text` — and doing so neither updates the PR nor re-runs
+# validation, so a non-conforming subject can still land with this job green.
+# Nothing that runs at PR time can prevent that; it needs enforcement where the
+# commit arrives. The options are a repository ruleset with a commit-message
+# pattern (metadata restrictions, which are org/plan gated and so may not be
+# available on this user-owned repo) or routing squash merges through automation
+# that sets the subject. Both are repository policy, not this script's to
+# assume. Recorded so nobody reads a green check here as proof that the subject
+# on the branch conforms — it is proof that the default one did.
+#
 # Lives in a script rather than inline in the workflow so it can be tested —
 # see test-conventional-commits.sh.
 set -uo pipefail
