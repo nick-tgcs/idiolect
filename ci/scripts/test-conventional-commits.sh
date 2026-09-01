@@ -241,6 +241,225 @@ else
 $output"
 fi
 
+# ------------------------------------------------- the develop -> main release PR
+# `main` only ever receives develop (enforced by the main-source-guard job), and
+# every commit on develop was already judged by this gate on the PR that put it
+# there. Re-judging the whole of develop at release time is the same redundancy
+# that caused the 2026-08-28 outage: `8cfc392 Surface helper process failures
+# (#95)` reached develop with a non-conforming subject, and no release PR can
+# reword it — develop's protect-develop ruleset forbids the force-push, for
+# everyone, with an empty bypass list. So a PR whose base is `main` is not
+# scanned.
+# --------------------------------------------------------- the PR TITLE is the
+# subject that actually lands. `squash_merge_commit_title` is COMMIT_OR_PR_TITLE
+# and merges here are squashes, so a multi-commit PR puts its TITLE on the base
+# branch — text no commit carried and the range mode never saw. That is how
+# `8cfc392 Surface helper process failures (#95)` reached develop. Judging only
+# the range polices text that is thrown away.
+for title in \
+    'Surface helper process failures (#95)' \
+    'WIP' \
+    'test(android)+docs: compound type' \
+    'feat(): empty scope' \
+    'feat:' \
+    ''; do
+    output="$(run_check "$REPO" --title "$title")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "title rejected: '${title:-<empty>}'"
+    else
+        fail "PR title '$title' must be rejected (status=$status):
+$output"
+    fi
+done
+
+for title in 'fix(asr): halve nothing' 'chore(deps): bump uuid from 1.24.0 to 1.26.0' 'ci: gate the title too'; do
+    output="$(run_check "$REPO" --title "$title")"
+    status=$?
+    if [ $status -eq 0 ]; then
+        ok "title accepted: '$title'"
+    else
+        fail "PR title '$title' conforms and must pass (status=$status):
+$output"
+    fi
+done
+
+# `--title` with no argument is a caller bug, not a clean title.
+output="$(run_check "$REPO" --title)"
+status=$?
+if [ $status -eq 2 ] && printf '%s' "$output" | grep -q 'usage:'; then
+    ok "--title with no subject is a usage error, not a pass"
+else
+    fail "a missing --title argument must not read as a conforming title (status=$status):
+$output"
+fi
+
+# --------------------------------- the count decides WHICH subject is judged
+# COMMIT_OR_PR_TITLE takes the squash subject from the single commit when a PR
+# has exactly one, and from the title only when it has more. Gating the title of
+# a one-commit PR would block it over text that never reaches the branch — while
+# the commit that DOES reach it was already judged by the range mode.
+output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' 1)"
+status=$?
+if [ $status -eq 0 ] && printf '%s' "$output" | grep -q 'Single-commit PR'; then
+    ok "a one-commit PR's title is not gated, and says why"
+else
+    fail "a one-commit PR takes its squash subject from the commit (status=$status):
+$output"
+fi
+
+output="$(run_check "$REPO" --title 'fix(asr): fine either way' 1)"
+status=$?
+if [ $status -eq 0 ]; then
+    ok "a one-commit PR with a conforming title also passes"
+else
+    fail "a conforming title must never fail (status=$status):
+$output"
+fi
+
+# The rejection has to explain itself. A multi-commit PR's title is gated on a
+# merge method that might not be chosen — merge commits and rebase merges are
+# both enabled here and neither uses the title — so an author who hits this is
+# owed the reason, or the block reads as arbitrary.
+output="$(run_check "$REPO" --title 'WIP' 3)"
+if printf '%s' "$output" | grep -qi 'squash' && printf '%s' "$output" | grep -qi 'merge method'; then
+    ok "the title rejection says which merge method makes the title land"
+else
+    fail "a conservative block must say why it is conservative:
+$output"
+fi
+
+# Guard the guard: the skip above proves nothing unless that same title is
+# rejected when the count says the title IS what lands.
+for count in 2 3 12; do
+    output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' "$count")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "with $count commits the title is judged"
+    else
+        fail "a multi-commit PR's title becomes the squash subject and must be judged (status=$status):
+$output"
+    fi
+done
+
+# An unknown count must NOT buy a skip. The title mode exists for the case the
+# range mode cannot see, so anything it cannot read as exactly 1 is checked.
+for count in "" 0 abc " 1" "1x" -1; do
+    output="$(run_check "$REPO" --title 'Surface helper process failures (#95)' "$count")"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q 'PR title does not follow'; then
+        ok "count '${count:-<empty>}' is not a one-commit PR, so the title is judged"
+    else
+        fail "an unreadable commit count must fail closed (count='$count', status=$status):
+$output"
+    fi
+done
+
+# ------------------------------------------------- grandfathered commit SHAs
+# `develop` is force-push-proof (protect-develop: non_fast_forward, empty bypass
+# list), so a subject already merged there can never be reworded and would fail
+# the develop -> main release PR forever. Such commits are skipped BY SHA.
+#
+# Everything below is HERMETIC: a fixture repository, and a COPY of the check
+# script with the fixture's own SHA inserted into the list. Nothing here reads
+# this repository's history or its configured entries.
+#
+# That is not fastidiousness, it is the fix for two P1s. This file runs as a
+# step in the conventional-commits job, which gates every PR, so any assertion
+# about live history fails unrelated PRs the moment that history changes —
+# whether by the release landing (the entry leaves `main..develop`) or by
+# anything non-conforming reaching `develop`. Either way it is the 2026-08-28
+# outage rebuilt inside the test written to guard the fix for it. Whether the
+# real release range passes is a question the release PR's own CI answers.
+#
+# Injecting into a COPY rather than reading an override keeps the production
+# script seamless: there is no environment variable or flag by which anyone
+# could add a SHA to the live gate.
+GF="$WORK/grandfather"
+git init -q -b main "$GF"
+git -C "$GF" config user.email test@example.com
+git -C "$GF" config user.name Test
+git -C "$GF" commit -q --allow-empty -m 'feat: base'
+git -C "$GF" checkout -q -b topic
+git -C "$GF" commit -q --allow-empty -m 'Surface helper process failures (#95)'
+FIXTURE_SHA="$(git -C "$GF" rev-parse HEAD)"
+# A second commit with the SAME subject and a different SHA, to prove the match
+# is on the hash.
+git -C "$GF" commit -q --allow-empty -m 'Surface helper process failures (#95)'
+TWIN_SHA="$(git -C "$GF" rev-parse HEAD)"
+
+# Baseline: unmodified, neither commit is listed, so both are reported. Without
+# this the skip below could be the gate ignoring the fixture for some other
+# reason entirely.
+output="$(run_check "$GF" main)"
+status=$?
+if [ $status -ne 0 ] && [ "$(printf '%s\n' "$output" | grep -c '::error::Commit message')" -eq 2 ]; then
+    ok "unlisted commits are reported — the fixture range is judged normally"
+else
+    fail "the fixture must fail the unmodified gate, or the skip proves nothing (status=$status):
+$output"
+fi
+
+# The copy, with the fixture's SHA appended to the list. Inserted after the
+# opening line rather than substituted for an existing entry, so these cases
+# keep working when the production list is emptied — which is exactly what
+# happens once a release retires the last entry.
+COPY="$WORK/check-with-fixture.sh"
+awk -v sha="$FIXTURE_SHA" '{ print } /^GRANDFATHERED_SHAS="$/ { print sha }' "$CHECK" >"$COPY"
+chmod +x "$COPY"
+if ! grep -qx "$FIXTURE_SHA" "$COPY"; then
+    fail "the fixture SHA was not inserted into the copy — the anchor line changed?"
+elif ! bash -n "$COPY" 2>/dev/null; then
+    fail "the generated copy is not valid shell — the insertion landed in the wrong place"
+else
+    ok "a copy of the check script carries the fixture SHA"
+
+    output="$(cd "$GF" && "$COPY" main 2>&1)"
+    status=$?
+    if [ $status -ne 0 ] && printf '%s' "$output" | grep -q "skipping grandfathered commit $FIXTURE_SHA"; then
+        ok "a listed SHA is skipped, and the skip is announced"
+    else
+        fail "$FIXTURE_SHA is listed and must be skipped and announced (status=$status):
+$output"
+    fi
+
+    # The twin carries the identical subject: it must still be reported, and it
+    # is also what keeps the case above from passing on a gate that skips
+    # everything.
+    if printf '%s' "$output" | grep -q '::error::Commit message'; then
+        ok "the twin with the same subject is still reported — matching is by SHA"
+    else
+        fail "only $FIXTURE_SHA is listed; $TWIN_SHA shares its subject and must still fail:
+$output"
+    fi
+
+    # And with BOTH listed the range is clean, which is the release case in
+    # miniature — with no dependence on when the real release happens.
+    COPY2="$WORK/check-with-both.sh"
+    awk -v a="$FIXTURE_SHA" -v b="$TWIN_SHA" '{ print } /^GRANDFATHERED_SHAS="$/ { print a; print b }' "$CHECK" >"$COPY2"
+    chmod +x "$COPY2"
+    output="$(cd "$GF" && "$COPY2" main 2>&1)"
+    status=$?
+    if [ $status -eq 0 ] && printf '%s' "$output" | grep -q '2 grandfathered'; then
+        ok "a fully grandfathered range passes and counts what it skipped"
+    else
+        fail "with both SHAs listed the range must pass and say how many it skipped (status=$status):
+$output"
+    fi
+fi
+
+# The production list is never executed here, but a typo in it would be silent
+# until a release. Checked statically, without git: every entry is a full SHA.
+bad_entries="$(awk '/^GRANDFATHERED_SHAS="$/ { inlist = 1; next }
+                    inlist && /^"$/ { inlist = 0 }
+                    inlist && $0 !~ /^[0-9a-f]{40}$/ && NF { print }' "$CHECK")"
+if [ -z "$bad_entries" ]; then
+    ok "every configured grandfather entry is a full 40-character SHA"
+else
+    fail "malformed grandfather entries (a short SHA or stray text never matches anything):
+$bad_entries"
+fi
+
 # ------------------------------------------------------------ the summary count
 output="$(run_check "$REPO" develop)"
 if printf '%s' "$output" | grep -q '^2 commit subject(s) above need rewording'; then
