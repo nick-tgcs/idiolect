@@ -31,8 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use idiolect_adapter_sqlite::SqliteMetadataStore;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    CommitPreedit, InsertText, PreeditUpdate, RecordingStatus, ServerHello, FEATURE_RECONCILE,
-    PROTOCOL_VERSION,
+    ActivityPhase, ActivityStatus, CommitPreedit, InsertText, PreeditUpdate, RecordingStatus,
+    ServerHello, FEATURE_RECONCILE, PROTOCOL_VERSION,
 };
 use idiolect_ipc::IpcMessage;
 use zbus::zvariant::{OwnedObjectPath, Value};
@@ -287,6 +287,68 @@ async fn direct_transcript_after_focus_in_commits_to_the_focused_context() {
         "a focused context receives the direct-mode transcript via CommitText"
     );
     // The engine also reports the commit back so the daemon records it.
+    expect_commit_preedit(&mut server_reader);
+
+    drop(engine);
+    drop(conn);
+}
+
+/// The decode-phase push must be inert to the take. The daemon announces
+/// `ActivityStatus{Transcribing}` in the gap between the microphone closing and
+/// the transcript existing — the whole point being that the take is STILL OPEN
+/// there. If the engine treated that phase as the end of the take (the tempting
+/// shortcut of flipping `recording` early instead of adding a channel), the
+/// transcript that follows would be discarded as unsolicited and the user's
+/// dictation would silently vanish. So: same flow as the direct-commit e2e above,
+/// with the phase push wedged into the gap, and the same text must land.
+#[tokio::test]
+async fn a_decode_phase_push_does_not_swallow_the_transcript_that_follows() {
+    let Some(bus) = PrivateBus::start() else {
+        panic!("dbus-daemon not found — install the 'dbus' package to run engine e2e tests");
+    };
+    let fixture = Fixture::new("e2e-activity-phase");
+    let listener = UnixListener::bind(fixture.socket_path()).expect("bind daemon socket");
+    let engine = fixture.spawn_engine_on_bus(bus.address());
+    let (mut server_writer, mut server_reader) = accept_and_handshake(&listener);
+
+    let conn = connect_private(&bus).await;
+    let engine_proxy = create_engine(&conn).await;
+    let mut commit_signals = engine_proxy
+        .receive_signal("CommitText")
+        .await
+        .expect("subscribe CommitText");
+
+    engine_proxy
+        .call::<_, _, ()>("FocusIn", &())
+        .await
+        .expect("FocusIn");
+
+    send_line(
+        &mut server_writer,
+        &IpcMessage::RecordingStatus(RecordingStatus { recording: true }),
+    );
+    // The microphone has closed; the decode has not finished.
+    send_line(
+        &mut server_writer,
+        &IpcMessage::ActivityStatus(ActivityStatus {
+            phase: ActivityPhase::Transcribing,
+        }),
+    );
+    send_line(
+        &mut server_writer,
+        &IpcMessage::PreeditUpdate(PreeditUpdate {
+            text: DRAFT.to_owned(),
+            review: false,
+            partial: false,
+            reconcile: false,
+        }),
+    );
+
+    let committed = next_commit(&mut commit_signals).await;
+    assert_eq!(
+        committed, DRAFT,
+        "the take survives the decode-phase announcement"
+    );
     expect_commit_preedit(&mut server_reader);
 
     drop(engine);

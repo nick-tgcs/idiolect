@@ -98,19 +98,72 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check commit messages
+      # The self-test gates every PR through this job, so a bug in IT blocks
+      # everyone — which is how two P1s on PR #106 would have played out. The
+      # blast radius is cut to the PRs that can actually fix it: the self-test
+      # runs only when the gate scripts change. When they do not, they are
+      # byte-identical to what this same self-test already validated on the PR
+      # that last touched them — and it still runs nightly regardless, via
+      # `test-all.sh` in scheduled.yml, which is not a PR gate. So latent
+      # breakage is still found; it just stops taking every open PR down with
+      # it.
+      #
+      # A STEP, deliberately, not the job. `gate` reads
+      # `needs.conventional-commits.result != 'success'`, and a skipped job
+      # reports `skipped` — so skipping the job would fail every PR, which is
+      # the outcome this is meant to avoid. A skipped step does not.
+      - name: Did the commit-gate scripts change?
+        id: gate_scripts
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        # `...` here, and NOT the `..` the gate itself uses. `git diff A...B`
+        # compares B against the merge base — "what this PR changed" — whereas
+        # `git diff A..B` would also report files the BASE moved on, running the
+        # self-test for unrelated reasons. Different question, different operator.
         run: |
-          # Check that all commits follow conventional commits format.
-          # --no-merges skips the merge commit GitHub synthesizes for the PR
-          # ref (subject "Merge <sha> into <sha>"), which isn't a real commit.
-          COMMITS=$(git log --no-merges --format="%s" origin/main...HEAD)
-          echo "$COMMITS" | while IFS= read -r commit; do
-            if ! echo "$commit" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(.+\))?: .+'; then
-              echo "::error::Commit message does not follow conventional commits format: $commit"
-              exit 1
-            fi
-          done
-          echo "All commit messages follow conventional commits format."
+          if ! git rev-parse --verify --quiet "origin/$BASE_REF" >/dev/null; then
+            echo "base ref unavailable — running the self-test rather than assuming it is unnecessary"
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          elif git diff --quiet "origin/$BASE_REF...HEAD" -- \
+                 ci/scripts/check-conventional-commits.sh \
+                 ci/scripts/test-conventional-commits.sh; then
+            echo "gate scripts untouched by this PR — self-test not required"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "gate scripts changed by this PR — running the self-test"
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-test the commit check
+        if: steps.gate_scripts.outputs.changed == 'true'
+        run: bash ci/scripts/test-conventional-commits.sh
+
+      - name: Check commit messages
+        env:
+          # Through the environment, never interpolated into `run:`. A ${{ }}
+          # expression is substituted as shell CODE, and git ref names may carry
+          # `;`, `$` and backticks; as an environment variable it is data.
+          BASE_REF: ${{ github.base_ref }}
+        # The PR's OWN base, not main: this repo is GitFlow, so scanning from
+        # main made every feature PR inherit develop's commits and fail on
+        # subjects it did not write.
+        run: bash ci/scripts/check-conventional-commits.sh "origin/$BASE_REF"
+
+      - name: Check the PR title
+        env:
+          # Same reasoning as BASE_REF above, and it matters more here: a PR
+          # title is free text from anyone who can open a PR, so it reaches the
+          # script as an environment variable rather than as `run:` code.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+        # Merges here are squashes and `squash_merge_commit_title` is
+        # COMMIT_OR_PR_TITLE, so a MULTI-commit PR puts its TITLE on the base
+        # branch — text the step above never sees, synthesised after it ran.
+        # That is how `8cfc392 Surface helper process failures (#95)` reached
+        # develop and then blocked every PR for a day. A one-commit PR takes
+        # that subject from the commit instead, which the step above already
+        # judged, so the count decides which of the two is authoritative.
+        run: bash ci/scripts/check-conventional-commits.sh --title "$PR_TITLE" "$PR_COMMITS"
 
   # =========================================================================
   # RUST: Quick validation (fmt, clippy, check, test)
@@ -320,7 +373,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

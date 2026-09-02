@@ -5,7 +5,14 @@
 //! Protocol (so the toolkit stays swappable behind the daemon's `RetentionDialog`):
 //!   args[1] : optional current retention, in days, used to prefill the field.
 //!   stdout  : on save, the chosen retention as a whole number of DAYS; exits 0.
-//!   exit 1  : the user cancelled (nothing written).
+//!   exit 1  : the user cancelled — `dialog::CANCELLED_MARKER` on stdout first.
+//!   exit 2  : the dialog could not start at all; reason on stderr.
+//!
+//! The MARKER, not the exit code, is what proves a cancel. libX11's default
+//! I/O-error handler calls `exit(1)` itself when the X connection drops, so on
+//! the commonest runtime GUI death `main` never runs at all and cannot pick a
+//! different code. Only something written on the way out distinguishes "the
+//! user cancelled" from "the dialog died holding the answer".
 //!
 //! This is one interchangeable implementation; the daemon only knows the
 //! args/stdout contract, never egui.
@@ -13,6 +20,7 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED, EXIT_UNAVAILABLE};
 
 /// Months are approximated as 30 days — matching the tray presets (1 month = 30).
 const DAYS_PER_MONTH: u32 = 30;
@@ -40,7 +48,7 @@ struct Outcome {
     confirmed: bool,
 }
 
-fn main() -> eframe::Result<()> {
+fn main() {
     let prefill_days: u32 = std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse().ok())
@@ -60,22 +68,26 @@ fn main() -> eframe::Result<()> {
     };
 
     let app_outcome = Arc::clone(&outcome);
-    eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "idiolect-retention",
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx);
             Ok(Box::new(RetentionApp::new(prefill_days, app_outcome)))
         }),
-    )?;
+    ) {
+        eprintln!("retention dialog could not start: {error}");
+        std::process::exit(EXIT_UNAVAILABLE);
+    }
 
     let outcome = outcome.lock().expect("outcome mutex");
-    if outcome.confirmed {
-        print!("{}", outcome.days);
-        Ok(())
-    } else {
-        std::process::exit(1);
+    if !outcome.confirmed {
+        print!("{CANCELLED_MARKER}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(EXIT_CANCELLED);
     }
+    print!("{}", outcome.days);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);
@@ -226,7 +238,7 @@ impl RetentionApp {
                 top: 16,
                 bottom: 6,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new("Keep training data for")
@@ -251,7 +263,7 @@ impl RetentionApp {
                 top: 8,
                 bottom: 16,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let hint = match resolved {
                         Some(days) => format!("≈ {days} days"),
@@ -281,7 +293,7 @@ impl RetentionApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(22, 8)))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.amount)
@@ -336,7 +348,11 @@ mod tests {
     fn run(app: &mut RetentionApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
-        let _ = ctx.run_ui(input, |ui| app.draw(ui));
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        // epaint 0.36 added a `Drop` guard that debug-asserts a `TexturesDelta`
+        // was applied. There is no renderer here to apply one to, so discard it
+        // explicitly — the escape hatch the assertion message itself names.
+        output.textures_delta.clear();
     }
 
     #[test]

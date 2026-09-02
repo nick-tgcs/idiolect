@@ -17,7 +17,14 @@ path = "src/main.rs"
 # becomes a normal, focus-stealing, dock-listed window. See `viewport()` in main.rs.
 # `wayland` is intentionally omitted: these run as X11/Xwayland clients, so it adds
 # the smithay-clipboard/wayland stack for no benefit here.
-eframe = { version = "0.34", default-features = false, features = ["glow", "x11"] }
+# `default_fonts` is REQUIRED, not decorative: with `default-features = false`
+# egui embeds no font data at all, so every string lays out to zero size and the
+# overlay's elapsed-time caption renders as an empty pill. Silent — nothing warns.
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "x11",
+    "default_fonts",
+] }
 
 [lints]
 workspace = true

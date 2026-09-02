@@ -20,6 +20,11 @@ pub trait WindowFocus: Send + Sync {
     fn active_window(&self) -> Option<WindowId>;
     /// Re-assert focus on a previously captured window.
     fn restore(&self, window: WindowId);
+    /// A screen position on `window` to anchor the recording badge to when the
+    /// application has not told us where its text caret is. Near the window's
+    /// bottom-left, because the apps that never report a caret rect (terminals,
+    /// chat boxes, some browsers) overwhelmingly take input at the bottom.
+    fn window_anchor(&self, window: WindowId) -> Option<(i32, i32)>;
 }
 
 /// No-op manager: capturing returns `None` (so `restore` is never called). Used
@@ -31,6 +36,9 @@ impl WindowFocus for NoopWindowFocus {
         None
     }
     fn restore(&self, _window: WindowId) {}
+    fn window_anchor(&self, _window: WindowId) -> Option<(i32, i32)> {
+        None
+    }
 }
 
 /// The default focus manager for the running engine: X11 when it can connect,
@@ -60,6 +68,10 @@ mod x11 {
     use x11rb::protocol::xproto::{
         Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, Window,
     };
+
+    /// Inset from the window's bottom-left corner for the fallback anchor, so the
+    /// badge sits just inside the frame rather than straddling its edge.
+    const ANCHOR_INSET: i32 = 28;
     use x11rb::rust_connection::RustConnection;
 
     /// Activates the user's window via the EWMH `_NET_ACTIVE_WINDOW` request,
@@ -106,6 +118,21 @@ mod x11 {
                 .ok()?;
             let window = reply.value32()?.next()?;
             (window != 0).then_some(window)
+        }
+
+        fn window_anchor(&self, window: WindowId) -> Option<(i32, i32)> {
+            let geometry = self.conn.get_geometry(window).ok()?.reply().ok()?;
+            // get_geometry is parent-relative; translate to root coordinates so
+            // the overlay (which positions in screen space) lands on the window.
+            let origin = self
+                .conn
+                .translate_coordinates(window, self.root, 0, 0)
+                .ok()?
+                .reply()
+                .ok()?;
+            let x = i32::from(origin.dst_x) + ANCHOR_INSET;
+            let y = i32::from(origin.dst_y) + i32::from(geometry.height) - ANCHOR_INSET;
+            Some((x.max(0), y.max(0)))
         }
 
         fn restore(&self, window: WindowId) {

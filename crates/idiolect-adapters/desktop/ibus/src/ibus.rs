@@ -88,11 +88,14 @@ struct Shared {
     /// trait so the GUI toolkit is swappable; runs out-of-process so it never
     /// blocks the IME.
     dialog: Box<dyn crate::review::ReviewDialog>,
-    /// "Voice is live" overlay shown next to the caret while recording.
+    /// Caret badge naming the phase of the open take — the microphone, then the
+    /// decode that follows it. Runs continuously from `warm_up`, not per take.
     indicator: Box<dyn crate::indicator::RecordingIndicator>,
-    /// Latest known caret position (screen pixels) from `set_cursor_location`,
-    /// so the indicator can appear right where the user is dictating.
-    caret: Mutex<(i32, i32)>,
+    /// Latest caret position (screen pixels) from `set_cursor_location`, or
+    /// `None` while no application has reported one. Deliberately NOT seeded with
+    /// a plausible-looking default: a made-up position puts the badge somewhere
+    /// the user is not looking, which is indistinguishable from it never showing.
+    caret: Mutex<Option<(i32, i32)>>,
     connection: Connection,
     /// Restores X11 focus to the app the user was dictating into before a direct
     /// (no-dialog) commit, mirroring what the review dialog already does — the WM
@@ -113,7 +116,19 @@ type SharedRef = Arc<Shared>;
 
 impl Shared {
     fn set_active(&self, path: &OwnedObjectPath) {
-        *self.active_path.lock().expect("active_path mutex") = Some(path.clone());
+        let mut active = self.active_path.lock().expect("active_path mutex");
+        // A different input context is a different window or application, so
+        // whatever caret the last one reported is now meaningless. Dropping it
+        // makes the badge fall back to the newly focused window until that app
+        // says where its cursor is; keeping it put the badge at the PREVIOUS
+        // window's cursor, which reads as the indicator not showing at all.
+        if !crate::indicator::caret_survives_context_change(
+            active.as_ref().map(|p| p.as_str()),
+            path.as_str(),
+        ) {
+            *self.caret.lock().expect("caret mutex") = None;
+        }
+        *active = Some(path.clone());
     }
 
     /// Forget the active target if it is this (now-gone) context, so a destroyed
@@ -123,6 +138,14 @@ impl Shared {
         if active.as_ref() == Some(path) {
             *active = None;
         }
+    }
+
+    /// Where on the focused window to put the badge when the app has not said
+    /// where its caret is.
+    fn focused_window_anchor(&self) -> Option<(i32, i32)> {
+        self.focus
+            .active_window()
+            .and_then(|window| self.focus.window_anchor(window))
     }
 
     /// Run a session operation and return the resulting surface ops (lock held
@@ -136,16 +159,44 @@ impl Shared {
         session.surface_mut().take_ops()
     }
 
+    /// Record whether the daemon's phase pushes can still reach the session.
+    /// Separate from [`Self::run_session`] because this emits no surface ops by
+    /// construction, so there is nothing for the caller to forward.
+    ///
+    /// THE RULE: every blocking call made on the reader thread must bracket
+    /// itself with `false` … `true` and a [`Self::sync_indicator`] on each side.
+    /// While that thread is blocked the daemon's phase pushes queue up unread,
+    /// so the phase the session holds is frozen — and a frozen decode phase
+    /// drawn as a live spinner claims work that may already be over. There are
+    /// two such calls, both `ReviewDialog::review`: the stop-of-take review, and
+    /// the retroactive history edit.
+    fn set_phase_channel_live(&self, live: bool) {
+        self.session
+            .lock()
+            .expect("session mutex")
+            .set_phase_channel_live(live);
+    }
+
     /// Show or hide the recording indicator to match the session state — call
-    /// after any state-changing session operation.
+    /// after any state-changing session operation. The session also decides WHICH
+    /// phase the overlay shows, so the decode reads as progress rather than as a
+    /// microphone that is still listening.
     fn sync_indicator(&self) {
-        let recording = matches!(
-            self.session.lock().expect("session mutex").state(),
-            crate::session::State::Recording
-        );
-        if recording {
-            let (x, y) = *self.caret.lock().expect("caret mutex");
-            self.indicator.show(x, y);
+        let phase = self
+            .session
+            .lock()
+            .expect("session mutex")
+            .indicator_phase();
+        if let Some(phase) = phase {
+            let caret = *self.caret.lock().expect("caret mutex");
+            // No caret reported yet (a fresh engine, or an app that never sends
+            // one) — anchor to the focused window rather than inventing a spot.
+            let window = caret
+                .is_none()
+                .then(|| self.focused_window_anchor())
+                .flatten();
+            let (x, y) = crate::indicator::resolve_anchor(caret, window);
+            self.indicator.show(x, y, phase);
         } else {
             self.indicator.hide();
         }
@@ -381,7 +432,7 @@ impl IbusEngine {
         // 0,0) with the real caret rect; only trust those with a real line
         // height, and anchor on the caret's vertical centre.
         if h > 0 {
-            *self.shared.caret.lock().expect("caret mutex") = (x, y + h / 2);
+            *self.shared.caret.lock().expect("caret mutex") = Some((x, y + h / 2));
             // While recording, stream the moved caret so the indicator follows.
             self.shared.sync_indicator();
         }
@@ -516,7 +567,18 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     // fine on this dedicated reader thread), then commit the
                     // user's final text into the app and record raw→edited,
                     // or cancel.
-                    match shared.dialog.review(&update.text) {
+                    //
+                    // Blocking here means the daemon's RecordingStatus(false)
+                    // is not read until the user is done, so the take stays
+                    // open with its phase frozen at the decode. Say so, and
+                    // take the badge down: a spinner counting up beside the
+                    // caret while the finished text sits in the dialog is the
+                    // overlay asserting work that is already over.
+                    shared.set_phase_channel_live(false);
+                    shared.sync_indicator();
+                    let reviewed = shared.dialog.review(&update.text);
+                    shared.set_phase_channel_live(true);
+                    match reviewed {
                         Some(edited) => {
                             dbg_edit(&format!("dialog -> insert {edited:?}"));
                             shared.run_session(|s| s.commit_reviewed(&edited))
@@ -590,6 +652,14 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 }
                 shared.run_session(|s| s.on_recording_status(status.recording))
             }
+            Ok(IpcMessage::ActivityStatus(status)) => {
+                // Display-only: which phase of the open take the caret overlay
+                // shows (recording vs decoding vs loading the model). It moves no
+                // session state and emits no surface ops — `sync_indicator` below
+                // is the whole effect.
+                dbg_edit(&format!("activity_status <- daemon: {:?}", status.phase));
+                shared.run_session(|s| s.on_activity(status.phase))
+            }
             Ok(IpcMessage::Error(_)) => {
                 shared.dialog.close();
                 shared.run_session(|s| s.on_error())
@@ -603,7 +673,16 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                     "edit_history <- daemon: id={} text={:?}",
                     edit.id, edit.text
                 ));
+                // Blocks this reader thread for as long as the user edits, in
+                // exactly the way the stop-of-take review above does — and a
+                // history edit can be opened while a take is still running, so
+                // the badge would sit there showing whatever phase the take was
+                // in when the dialog opened, however long that is.
+                shared.set_phase_channel_live(false);
+                shared.sync_indicator();
                 handle_edit_history(&*shared.dialog, &mut sender, edit);
+                shared.set_phase_channel_live(true);
+                shared.sync_indicator();
                 continue;
             }
             Ok(_) => continue,
@@ -613,6 +692,13 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 // engine stuck), reconnect and resync from the daemon's authoritative
                 // state push. We retry until the daemon returns, so even a long outage
                 // (an update, a slow restart) self-heals.
+                // The retry below runs until the daemon comes back, which can be
+                // a long outage (an update, an OOM kill mid-decode). Nothing can
+                // advance the take until it does, so the phase we are holding is
+                // stale — drop the badge now rather than leaving a decode spinner
+                // ticking for a daemon that is gone.
+                shared.set_phase_channel_live(false);
+                shared.sync_indicator();
                 let (new_reader, reconcile_supported) = reconnect_reader(&socket, &sender);
                 reader = new_reader;
                 shared.dialog.close();
@@ -623,6 +709,7 @@ fn spawn_reader(shared: SharedRef, mut reader: DaemonReader, mut sender: DaemonS
                 let ops = shared.run_session(|s| {
                     s.reset_to_idle();
                     s.set_reconcile_supported(reconcile_supported);
+                    s.set_phase_channel_live(true);
                 });
                 let target = shared
                     .active_path
@@ -797,6 +884,9 @@ pub async fn run() -> zbus::Result<()> {
     // Only keep the live preview in uncommitted preedit if the daemon negotiated
     // the stop-time reconcile; otherwise a stop arrives as a bare
     // RecordingStatus(false) and the session commits partials instead.
+    // The engine launches GUI helpers of its own; when one dies it has to be
+    // able to tell the user, using the notifier from the user's config.
+    let helpers = crate::helpers::EngineHelpers::discover();
     let mut session = Session::new(sender, PendingSurface::default());
     session.set_reconcile_supported(reconcile_supported);
 
@@ -806,12 +896,17 @@ pub async fn run() -> zbus::Result<()> {
     };
     let connection = builder.build().await?;
 
+    // Build the caret overlay now, hidden. Creating its GL window takes about a
+    // third of a second; doing it here means the badge is on screen the moment
+    // the user hits the toggle, instead of a third of a second into the take.
+    helpers.indicator.warm_up();
+
     let shared = Arc::new(Shared {
         session: Mutex::new(session),
         active_path: Mutex::new(None),
-        dialog: Box::new(crate::review::SubprocessReviewDialog::discover()),
-        indicator: Box::new(crate::indicator::SubprocessIndicator::discover()),
-        caret: Mutex::new((400, 400)),
+        dialog: Box::new(helpers.dialog),
+        indicator: Box::new(helpers.indicator),
+        caret: Mutex::new(None),
         connection: connection.clone(),
         focus: crate::focus::default_window_focus(),
         dictation_target: Mutex::new(None),
@@ -901,6 +996,9 @@ mod tests {
         }
         fn restore(&self, window: WindowId) {
             self.restored.lock().expect("restored mutex").push(window);
+        }
+        fn window_anchor(&self, _window: WindowId) -> Option<(i32, i32)> {
+            None
         }
     }
 

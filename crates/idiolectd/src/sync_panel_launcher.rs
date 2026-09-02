@@ -29,6 +29,9 @@ use std::sync::{mpsc, Arc};
 
 use idiolect_adapter_ksni::TrayCallback;
 use idiolect_common::config::dashboard_store_env;
+use idiolect_process::{ExpectedExit, FailureReporter, ObservedChild};
+
+use crate::DAEMON_UNIT;
 
 /// The daemon-resolved store the dashboard must operate on, passed through the
 /// child's environment ([`dashboard_store_env`] — the same constants
@@ -54,43 +57,69 @@ pub(crate) struct SyncPanelLauncher {
     binary: PathBuf,
     args: Vec<String>,
     store: Option<DashboardStore>,
+    reporter: FailureReporter,
     window_open: Arc<AtomicBool>,
 }
 
 impl SyncPanelLauncher {
+    #[cfg(test)]
     pub(crate) fn with_command(binary: impl Into<PathBuf>, args: Vec<String>) -> Self {
-        Self {
-            binary: binary.into(),
-            args,
-            store: None,
-            window_open: Arc::new(AtomicBool::new(false)),
-        }
+        Self::configured(binary, args, None, String::new())
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_command_and_notifier(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        notify_command: impl Into<String>,
+    ) -> Self {
+        Self::configured(binary, args, None, notify_command)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_command_and_store(
         binary: impl Into<PathBuf>,
         args: Vec<String>,
         store: DashboardStore,
     ) -> Self {
+        Self::configured(binary, args, Some(store), String::new())
+    }
+
+    fn configured(
+        binary: impl Into<PathBuf>,
+        args: Vec<String>,
+        store: Option<DashboardStore>,
+        notify_command: impl Into<String>,
+    ) -> Self {
         Self {
-            store: Some(store),
-            ..Self::with_command(binary, args)
+            binary: binary.into(),
+            args,
+            store,
+            reporter: FailureReporter::new(notify_command).with_journal_unit(DAEMON_UNIT),
+            window_open: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The notify command this launcher reports failures through.
+    #[cfg(test)]
+    pub(crate) fn notify_command(&self) -> &str {
+        self.reporter.notify_command()
     }
 
     /// Find the dashboard binary next to the running daemon binary, falling
     /// back to its plain name (resolved via `PATH`); every launch carries the
     /// daemon's [`DashboardStore`].
-    pub(crate) fn discover(store: DashboardStore) -> Self {
+    pub(crate) fn discover(store: DashboardStore, notify_command: &str) -> Self {
         const NAME: &str = "idiolect-app";
         let beside_daemon = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join(NAME)))
             .filter(|path| path.exists());
-        Self::with_command_and_store(
+        Self::configured(
             beside_daemon.unwrap_or_else(|| PathBuf::from(NAME)),
             Vec::new(),
-            store,
+            Some(store),
+            notify_command,
         )
     }
 
@@ -106,8 +135,7 @@ impl SyncPanelLauncher {
             .args(&self.args)
             .arg("--standalone")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped());
         if let Some(store) = &self.store {
             command
                 .env(dashboard_store_env::DATA_DIR, &store.data_dir)
@@ -124,12 +152,13 @@ impl SyncPanelLauncher {
                 command.env(dashboard_store_env::HISTORY_KEY, history_key);
             }
         }
-        let spawned = command.spawn();
-        let Ok(mut child) = spawned else {
+        let Some(mut child) =
+            ObservedChild::spawn(&mut command, "Corrections Dashboard", self.reporter.clone())
+        else {
             self.window_open.store(false, Ordering::SeqCst);
             return;
         };
-        let stdout = child.stdout.take();
+        let stdout = child.child_mut().stdout.take();
         let window_open = Arc::clone(&self.window_open);
         std::thread::spawn(move || {
             if let Some(stdout) = stdout {
@@ -143,7 +172,7 @@ impl SyncPanelLauncher {
                     }
                 }
             }
-            let _ = child.wait();
+            let _ = child.wait(ExpectedExit::shares_our_lifecycle(&[0]));
             window_open.store(false, Ordering::SeqCst);
         });
     }
@@ -152,10 +181,79 @@ impl SyncPanelLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use idiolect_test_support::notifications::NotificationRecorder;
+    use std::time::{Duration, Instant};
 
     fn script_launcher(script: &str) -> SyncPanelLauncher {
         SyncPanelLauncher::with_command("sh", vec!["-c".to_owned(), script.to_owned()])
+    }
+
+    fn notifying_launcher(script: &str, notify_command: &str) -> SyncPanelLauncher {
+        SyncPanelLauncher::with_command_and_notifier(
+            "sh",
+            vec!["-c".to_owned(), script.to_owned()],
+            notify_command.to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_crashing_dashboard_alerts_the_user_with_its_exit_and_stderr() {
+        let recorder = NotificationRecorder::new();
+        let launcher = notifying_launcher(
+            "printf 'no GPU adapter found\n' >&2; exit 23",
+            recorder.command(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let alert = recorder.wait();
+        assert!(
+            alert.contains("Idiolect Corrections Dashboard failed"),
+            "{alert}"
+        );
+        assert!(alert.contains("status 23"), "{alert}");
+        assert!(alert.contains("no GPU adapter found"), "{alert}");
+    }
+
+    #[test]
+    fn a_dashboard_that_cannot_start_alerts_the_user() {
+        let recorder = NotificationRecorder::new();
+        let launcher = SyncPanelLauncher::with_command_and_notifier(
+            "/nonexistent/idiolect-app-xyz",
+            Vec::new(),
+            recorder.command().to_owned(),
+        );
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let alert = recorder.wait();
+        assert!(alert.contains("could not start"), "{alert}");
+        assert!(alert.contains("No such file or directory"), "{alert}");
+    }
+
+    #[test]
+    fn closing_the_dashboard_normally_does_not_alert() {
+        let recorder = NotificationRecorder::new();
+        let launcher = notifying_launcher("exit 0", recorder.command());
+        let (tx, _rx) = mpsc::channel();
+
+        launcher.open(tx);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while launcher.window_open.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "dashboard did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // The recorder proved it can record when constructed, so an empty log
+        // means nothing was notified rather than a broken recorder.
+        assert!(
+            recorder.records().is_empty(),
+            "a clean close alerted the user: {:?}",
+            recorder.records()
+        );
     }
 
     #[test]

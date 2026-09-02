@@ -1,12 +1,12 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use idiolect_adapter_cpal::{CpalAudioInput, CpalAudioInputError};
 use idiolect_adapter_translate::CommandTranslator;
 use idiolect_adapter_vad::VadAdapter;
-use idiolect_adapter_whisper::{WhisperAsr, WhisperDecodeTask, WhisperOptions};
+use idiolect_adapter_whisper::{ComputeMode, WhisperAsr, WhisperDecodeTask, WhisperOptions};
 use idiolect_common::config::TranslationConfig;
 use idiolect_common::ids::ImeSessionId;
 use idiolect_ports::asr::{AdapterCapabilities, AsrPort, TranscriptDraft, TranscriptMetadata};
@@ -395,28 +395,7 @@ fn unsupported_asr_engine(engine: &str) -> RuntimeAdapterError {
     )
 }
 
-/// Surface a daemon-side problem to the USER as a desktop notification, via the
-/// configured command (`<command> <summary> <body>`; notify-send by default,
-/// empty = disabled). Dictation must never fail because telling the user about
-/// a failure failed: spawn errors are swallowed, and the child is reaped on a
-/// detached thread so a slow notifier can't stall the run-loop tick.
-pub(crate) fn notify_user(command: &str, summary: &str, body: &str) {
-    if command.is_empty() {
-        return;
-    }
-    let spawned = std::process::Command::new(command)
-        .arg(summary)
-        .arg(body)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
-}
+pub(crate) use idiolect_process::notify_user;
 
 /// Extract the spoken audio for transcription. Recording runs from the user's
 /// Super+T (start) to Super+T (stop); VAD is used only to drop leading/trailing
@@ -497,11 +476,8 @@ fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, Ru
             // for the small accuracy gain. The mobile facade opts into greedy instead.
             beam_size: WhisperOptions::default().beam_size,
         };
-        eprintln!(
-            "whisper: loading model {} (gpu={})",
-            profile.whisper_model_path.display(),
-            profile.asr_use_gpu
-        );
+        let mode = options.compute_mode();
+        eprintln!("{}", model_load_message(&profile.whisper_model_path, mode));
         return WhisperAsr::load(profile.whisper_model_path.clone(), options).map_err(|error| {
             RuntimeAdapterError::with_source(
                 "asr-unavailable",
@@ -525,6 +501,36 @@ fn load_whisper_engine(profile: &RuntimeAdapterProfile) -> Result<WhisperAsr, Ru
             error,
         )
     })
+}
+
+/// The model-load line, built from the mode Whisper will ACTUALLY run in.
+///
+/// It used to print `profile.asr_use_gpu` — the value the user asked for — so a
+/// binary compiled without the `cuda` feature announced `gpu=true` and then
+/// decoded on the CPU. That single misleading line is what made a config saying
+/// `use_gpu = true` look like a working GPU setup while every take took seconds.
+fn model_load_message(model_path: &Path, mode: ComputeMode) -> String {
+    format!("whisper: loading model {} ({mode})", model_path.display())
+}
+
+/// Whether this engine's speech model is already in memory on THIS thread.
+///
+/// The Whisper engine is built lazily into a thread-local on the run loop's
+/// thread, so the first take after a daemon start pays a model load (seconds, off
+/// disk) on top of its decode. Engines that load nothing are trivially resident.
+/// Lets the daemon tell the user "loading model" instead of a "transcribing" that
+/// runs several times longer than usual for no visible reason.
+///
+/// Answered at the moment it is asked, which is narrower than "the first take":
+/// a streaming take decodes each pause-completed snippet on this same thread as
+/// it goes, so a first take long enough to contain a pause has already loaded the
+/// model by the time its stop asks.
+pub(crate) fn asr_model_is_resident(profile: &RuntimeAdapterProfile) -> bool {
+    match profile.asr_engine.as_str() {
+        "whisper-rs" => WHISPER.with(|cell| cell.borrow().is_some()),
+        // Anything else decodes without a model to page in.
+        _ => true,
+    }
 }
 
 fn transcribe_with_whisper(
@@ -585,9 +591,11 @@ mod tests {
     use idiolect_common::config::TranslationConfig;
 
     use super::{
-        begin_capture, finish_capture, is_live_capture, notify_user, transcribe_translated,
-        RuntimeAdapterProfile, RuntimeCapture,
+        asr_model_is_resident, begin_capture, finish_capture, is_live_capture, model_load_message,
+        transcribe_translated, RuntimeAdapterProfile, RuntimeCapture,
     };
+    use idiolect_adapter_whisper::ComputeMode;
+    use std::path::Path;
 
     fn fixture_profile() -> RuntimeAdapterProfile {
         RuntimeAdapterProfile {
@@ -785,58 +793,54 @@ mod tests {
         }
     }
 
-    mod notify_user_contract {
-        use super::notify_user;
-        use std::time::{Duration, Instant};
+    #[test]
+    fn the_load_line_reports_the_effective_mode_not_the_requested_one() {
+        // The original line printed `profile.asr_use_gpu`, so a CPU-only build
+        // announced "gpu=true" and then decoded on the CPU for seconds a take.
+        // The mode is now resolved by the adapter that actually does the offload.
+        let path = Path::new("/models/medium.bin");
+        assert_eq!(
+            model_load_message(path, ComputeMode::Gpu),
+            "whisper: loading model /models/medium.bin (gpu)",
+        );
+        assert_eq!(
+            model_load_message(path, ComputeMode::Cpu),
+            "whisper: loading model /models/medium.bin (cpu)",
+        );
+    }
 
-        /// Writes a recorder honouring the notify contract: appends
-        /// "<summary>|<body>" to a log file next to the script.
-        fn recorder(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = std::env::temp_dir();
-            let log = dir.join(format!("idiolectd-notify-log-{tag}-{}", std::process::id()));
-            let script = dir.join(format!("idiolectd-notify-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_file(&log);
-            std::fs::write(
-                &script,
-                format!(
-                    "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> \"{}\"\n",
-                    log.display()
-                ),
-            )
-            .expect("write recorder");
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod recorder");
-            (script, log)
-        }
+    #[test]
+    fn an_ignored_gpu_request_says_so_in_the_load_line() {
+        let message = model_load_message(
+            Path::new("/models/medium.bin"),
+            ComputeMode::CpuGpuNotCompiledIn,
+        );
+        assert!(
+            message.contains("asr.use_gpu = true ignored"),
+            "the line must name the contradiction, not just print 'cpu': {message}",
+        );
+        assert!(message.contains("no CUDA support"), "{message}");
+    }
 
-        #[test]
-        fn invokes_the_command_with_summary_and_body() {
-            let (script, log) = recorder("ok");
-            let command = script.to_string_lossy().into_owned();
-            // The spawn is fire-and-forget (reaped off-thread) and can lose a
-            // rare ETXTBSY to a sibling test's fork — retry until the log lands.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                notify_user(&command, "Idiolect", "translation unavailable");
-                std::thread::sleep(Duration::from_millis(50));
-                if log.exists() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "recorder never invoked");
-            }
-            let line = std::fs::read_to_string(&log).expect("log readable");
-            assert_eq!(
-                line.lines().next(),
-                Some("Idiolect|translation unavailable"),
-                "summary and body arrive as the two positional args"
-            );
-        }
+    #[test]
+    fn an_engine_with_no_model_to_load_is_always_resident() {
+        // The fixture engine decodes instantly and loads nothing, so a take on it
+        // must never be announced as "loading model".
+        assert!(asr_model_is_resident(&fixture_asr_profile()));
+    }
 
-        #[test]
-        fn missing_binary_and_empty_command_are_silent_noops() {
-            notify_user("/nonexistent/idiolect-notifier-xyz", "s", "b"); // must not panic
-            notify_user("", "s", "b"); // disabled — must not panic or spawn
-        }
+    #[test]
+    fn whisper_is_not_resident_until_a_take_has_loaded_it() {
+        // Fresh thread ⇒ the engine's thread-local model slot is empty, which is
+        // exactly the cold-start the user waits on after an idle day. It is the
+        // difference between "transcribing" and "loading model" on the overlay.
+        let profile = RuntimeAdapterProfile {
+            asr_engine: "whisper-rs".to_owned(),
+            ..fixture_asr_profile()
+        };
+        let resident = std::thread::spawn(move || asr_model_is_resident(&profile))
+            .join()
+            .expect("probe thread");
+        assert!(!resident);
     }
 }

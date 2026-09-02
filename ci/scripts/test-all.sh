@@ -14,5 +14,6 @@ bash ci/scripts/test-gui-crates-build-standalone.sh
 bash ci/scripts/test-packaging.sh
 bash ci/scripts/test-package-smoke.sh
 bash ci/scripts/test-package-lifecycle.sh
+bash ci/scripts/test-conventional-commits.sh
 bash ci/scripts/test-coverage-map.sh
 bash ci/scripts/test-coverage.sh

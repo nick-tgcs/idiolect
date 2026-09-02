@@ -17,12 +17,22 @@
 //!            Payloads escape backslash as `\\` and newline as `\n`.
 //!            EOF before any `final` means the take was cancelled: close.
 //!   stdout : on confirm, the final edited text; process exits 0.
-//!   exit 1 : the user cancelled (nothing written).
+//!   exit 1 : the user cancelled — `dialog::CANCELLED_MARKER` on stdout first.
+//!   exit 2 : the dialog could not start at all; reason on stderr.
+//!
+//! The MARKER, not the exit code, is what proves a cancel. libX11's default
+//! I/O-error handler calls `exit(1)` itself when the X connection drops, so on
+//! the commonest runtime GUI death `main` never runs at all and cannot pick a
+//! different code. Without something written on the way out, a dialog that
+//! died holding the user's take was indistinguishable from Cancel — and the
+//! engine discarded every word of it without saying so.
 //!
 //! This is one interchangeable implementation; the engine only knows the
 //! stdin/stdout contract, never egui.
 
 use std::io::BufRead;
+
+use idiolect_process::dialog::{CANCELLED_MARKER, EXIT_CANCELLED, EXIT_UNAVAILABLE};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -61,7 +71,7 @@ fn unescape_payload(payload: &str) -> String {
     output
 }
 
-fn main() -> eframe::Result<()> {
+fn main() {
     let feed = Arc::new(Mutex::new(Feed::default()));
     let reader_feed = Arc::clone(&feed);
     std::thread::spawn(move || {
@@ -91,22 +101,26 @@ fn main() -> eframe::Result<()> {
     };
 
     let app_outcome = Arc::clone(&outcome);
-    eframe::run_native(
+    if let Err(error) = eframe::run_native(
         "idiolect-review",
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx);
             Ok(Box::new(ReviewApp::new(feed, app_outcome)))
         }),
-    )?;
+    ) {
+        eprintln!("review dialog could not start: {error}");
+        std::process::exit(EXIT_UNAVAILABLE);
+    }
 
     let outcome = outcome.lock().expect("outcome mutex");
-    if outcome.confirmed {
-        print!("{}", outcome.text);
-        Ok(())
-    } else {
-        std::process::exit(1);
+    if !outcome.confirmed {
+        print!("{CANCELLED_MARKER}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(EXIT_CANCELLED);
     }
+    print!("{}", outcome.text);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 131, 253);
@@ -314,7 +328,7 @@ impl ReviewApp {
                 top: 16,
                 bottom: 6,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.listening {
                         // A *painted* round recording dot. The header used to
@@ -370,7 +384,7 @@ impl ReviewApp {
                 top: 12,
                 bottom: 16,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let insert = egui::Button::new(
                         egui::RichText::new("Insert")
@@ -401,7 +415,7 @@ impl ReviewApp {
                 top: 2,
                 bottom: 2,
             }))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let blurb = if self.listening {
                     "Each pause adds a phrase. Nothing is typed until you finish."
                 } else {
@@ -455,10 +469,14 @@ mod tests {
     }
 
     fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
-        let mut input = egui::RawInput {
-            modifiers,
-            ..Default::default()
-        };
+        let mut input = egui::RawInput::default();
+        // egui 0.36 removed `RawInput::modifiers`. `InputState::modifiers` —
+        // what the Ctrl+Enter path reads — is now driven ONLY by
+        // `Event::ModifiersChanged`; the `modifiers` on `Event::Key` is not
+        // folded into it. A real winit backend sends the change ahead of the
+        // key, so send it here too, or `i.modifiers.command` stays false and
+        // the accept path under test never fires.
+        input.events.push(egui::Event::ModifiersChanged(modifiers));
         input.events.push(egui::Event::Key {
             key,
             physical_key: None,
@@ -483,7 +501,11 @@ mod tests {
     fn run(app: &mut ReviewApp, input: egui::RawInput) {
         let ctx = egui::Context::default();
         install_theme(&ctx);
-        let _ = ctx.run_ui(input, |ui| app.draw(ui));
+        let mut output = ctx.run_ui(input, |ui| app.draw(ui));
+        // epaint 0.36 added a `Drop` guard that debug-asserts a `TexturesDelta`
+        // was applied. There is no renderer here to apply one to, so discard it
+        // explicitly — the escape hatch the assertion message itself names.
+        output.textures_delta.clear();
     }
 
     #[test]

@@ -28,7 +28,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    ClientHello, CommitPreedit, IpcMessage, RecordingStatus, ReportCorrection,
+    ActivityPhase, ActivityStatus, ClientHello, CommitPreedit, IpcMessage, RecordingStatus,
+    ReportCorrection,
 };
 
 #[test]
@@ -147,6 +148,62 @@ fn client_without_feature_sees_no_recording_status() {
     client.send(IpcMessage::CommitPreedit(CommitPreedit {
         text: "restart Traefik".to_owned(),
     }));
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+}
+
+#[test]
+fn the_decode_phase_is_announced_before_the_transcript_and_without_closing_the_take() {
+    // The caret overlay's whole reason to exist. Between the microphone closing
+    // and the transcript arriving the daemon decodes, which is where the user was
+    // left staring at a badge that still said "listening". Two things are pinned
+    // here: the phase IS announced in that gap, and `recording` does NOT move
+    // with it — the engine only accepts a transcript while its take is open, so
+    // flipping it early would silently drop the dictation.
+    let fixture = DaemonFixture::new("activity", "fixture-live");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_activity();
+    client.expect_recording_status(false); // initial sync
+    client.expect_activity_status(ActivityPhase::Idle);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.expect_activity_status(ActivityPhase::Recording);
+
+    // The stop: the decode phase lands FIRST, before any transcript, and carries
+    // no RecordingStatus with it.
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_activity_status(ActivityPhase::Transcribing);
+    client.expect_preedit("restart traffic"); // the live preview snippet
+    client.expect_preedit("restart traffic"); // the stop-time reconcile (verified text)
+    client.expect_recording_status(false);
+    client.expect_activity_status(ActivityPhase::Idle);
+
+    drop(client);
+    assert_daemon_exits_successfully(daemon);
+}
+
+#[test]
+fn client_without_the_activity_feature_sees_no_activity_status() {
+    // Strictly additive: an engine that predates the phase channel must get the
+    // byte stream it always did, including through the decode gap.
+    let fixture = DaemonFixture::new("noactivity", "fixture-live");
+    let daemon = fixture.spawn_daemon();
+    let mut client = DaemonClient::connect(&fixture.socket_path());
+
+    client.send_hello_with_status();
+    client.expect_recording_status(false);
+
+    client.send(IpcMessage::ToggleRecording);
+    client.expect_recording_status(true);
+    client.send(IpcMessage::ToggleRecording);
+    // No ActivityStatus anywhere: the next message is the transcript, as before.
+    client.expect_preedit("restart traffic");
+    client.expect_preedit("restart traffic");
+    client.expect_recording_status(false);
 
     drop(client);
     assert_daemon_exits_successfully(daemon);
@@ -316,6 +373,16 @@ impl DaemonClient {
         ]);
     }
 
+    fn send_hello_with_activity(&mut self) {
+        self.handshake(vec![
+            "preedit".to_owned(),
+            "commit".to_owned(),
+            "recording_status".to_owned(),
+            "reconcile".to_owned(),
+            "activity_status".to_owned(),
+        ]);
+    }
+
     fn send_hello_legacy(&mut self) {
         self.handshake(vec!["preedit".to_owned(), "commit".to_owned()]);
     }
@@ -356,6 +423,15 @@ impl DaemonClient {
                 assert_eq!(recording, expected, "unexpected recording state");
             }
             other => panic!("expected RecordingStatus({expected}), got {other:?}"),
+        }
+    }
+
+    fn expect_activity_status(&mut self, expected: ActivityPhase) {
+        match self.read() {
+            IpcMessage::ActivityStatus(ActivityStatus { phase }) => {
+                assert_eq!(phase, expected, "unexpected take phase");
+            }
+            other => panic!("expected ActivityStatus({expected:?}), got {other:?}"),
         }
     }
 

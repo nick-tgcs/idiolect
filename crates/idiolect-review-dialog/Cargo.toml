@@ -10,7 +10,10 @@ name = "idiolect-review-dialog"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts"] }
+# Zero-dependency crate holding the exit-code/marker contract this binary
+# shares with whatever launched it, so the two ends cannot drift apart.
+idiolect-process = { path = "../idiolect-process" }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 
 # X11 windowing backend. eframe with default-features off pulls in NO platform
 # backend, so winit fails to build (and the binary cannot open a window) unless
@@ -24,7 +27,7 @@ eframe = { version = "0.34", default-features = false, features = ["glow", "defa
 # Linux build would silently drop the glow-only config above and could exit
 # instead of opening where wgpu can't init but OpenGL would.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.34", default-features = false, features = ["x11"] }
+eframe = { version = "0.36", default-features = false, features = ["x11"] }
 
 [lints]
 workspace = true

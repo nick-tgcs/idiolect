@@ -18,7 +18,9 @@ ibus-engine = ["dep:zbus", "dep:tokio", "dep:x11rb"]
 trace = []
 
 [dependencies]
+idiolect-common = { path = "../../../idiolect-common" }
 idiolect-ipc = { path = "../../../idiolect-ipc" }
+idiolect-process = { path = "../../../idiolect-process" }
 zbus = { version = "5", optional = true, features = ["tokio"] }
 tokio = { workspace = true, optional = true }
 # X11 focus capture/restore around the review dialog (only with the real engine).
@@ -30,6 +32,8 @@ path = "src/main.rs"
 required-features = ["ibus-engine"]
 
 [dev-dependencies]
+idiolect-test-support = { path = "../../../idiolect-test-support" }
+tempfile = { workspace = true }
 idiolectd = { path = "../../../idiolectd" }
 idiolect-adapter-sqlite = { path = "../../../idiolect-adapter-sqlite" }
 idiolect-ports = { path = "../../../idiolect-ports" }

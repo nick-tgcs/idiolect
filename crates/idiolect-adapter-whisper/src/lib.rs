@@ -14,6 +14,49 @@ const PRIMARY_FIXTURE_MODEL_FILE: &str = "ggml-tiny.en.bin";
 /// `cuda` cargo feature on this crate.
 const GPU_ENABLED: bool = cfg!(feature = "cuda");
 
+/// Where Whisper inference will actually run, once the build's capabilities and
+/// the runtime request have both been taken into account.
+///
+/// Exists because those two can disagree silently: `asr.use_gpu = true` in the
+/// config is discarded by a binary compiled without the `cuda` feature, and
+/// nothing said so. The model-load line now does, via the `Display` impl below;
+/// the tray and settings window still show only what was configured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputeMode {
+    /// GPU offload: asked for, and this build can do it.
+    Gpu,
+    /// CPU because the CPU is what was asked for.
+    Cpu,
+    /// CPU *despite* `use_gpu = true` — this build has no CUDA support, so the
+    /// request cannot be honoured. Distinct from [`Self::Cpu`] because the user
+    /// configured one thing and is getting another.
+    CpuGpuNotCompiledIn,
+}
+
+impl std::fmt::Display for ComputeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gpu => f.write_str("gpu"),
+            Self::Cpu => f.write_str("cpu"),
+            Self::CpuGpuNotCompiledIn => {
+                f.write_str("cpu (asr.use_gpu = true ignored: this build has no CUDA support)")
+            }
+        }
+    }
+}
+
+/// Resolve the effective compute mode from the runtime request and whether the
+/// build has CUDA compiled in. Pure, so the policy is testable on any machine —
+/// including one with no GPU at all.
+#[must_use]
+pub fn compute_mode(use_gpu: bool, gpu_compiled_in: bool) -> ComputeMode {
+    match (use_gpu, gpu_compiled_in) {
+        (true, true) => ComputeMode::Gpu,
+        (true, false) => ComputeMode::CpuGpuNotCompiledIn,
+        (false, _) => ComputeMode::Cpu,
+    }
+}
+
 pub struct WhisperAsr {
     backend: backend::WhisperBackend,
 }
@@ -34,6 +77,15 @@ pub struct WhisperOptions {
     /// the right default for live, on-device dictation; larger values use beam search
     /// (a small accuracy gain) and suit the GPU-backed desktop, which can afford it.
     pub beam_size: u32,
+}
+
+impl WhisperOptions {
+    /// The compute mode these options will actually produce in THIS build — the
+    /// value to report to the user, rather than the `use_gpu` they asked for.
+    #[must_use]
+    pub fn compute_mode(&self) -> ComputeMode {
+        compute_mode(self.use_gpu, GPU_ENABLED)
+    }
 }
 
 impl Default for WhisperOptions {
@@ -484,5 +536,52 @@ mod tests {
         assert_eq!(capabilities.supports_gpu, cfg!(feature = "cuda"));
         assert!(!capabilities.supports_incremental_updates);
         assert!(!std::any::type_name::<WhisperAsr>().contains("whisper_rs"));
+    }
+}
+
+#[cfg(test)]
+mod compute_mode_tests {
+    use super::{compute_mode, ComputeMode, WhisperOptions, GPU_ENABLED};
+
+    #[test]
+    fn requesting_the_gpu_on_a_build_without_cuda_is_reported_as_ignored() {
+        // The bug this exists to stop: `use_gpu = true` is silently dropped by a
+        // build compiled without the `cuda` feature, and the daemon went on
+        // announcing "gpu=true" from the config value while whisper.cpp decoded
+        // on the CPU. The request being unhonourable is its own distinct state,
+        // never a plain "cpu".
+        assert_eq!(compute_mode(true, false), ComputeMode::CpuGpuNotCompiledIn,);
+        assert_eq!(compute_mode(true, true), ComputeMode::Gpu);
+        assert_eq!(compute_mode(false, true), ComputeMode::Cpu);
+        assert_eq!(compute_mode(false, false), ComputeMode::Cpu);
+    }
+
+    #[test]
+    fn options_report_the_mode_this_build_will_actually_use() {
+        // Ties the pure mapping to the real build flag, so the value the daemon
+        // logs is derived from the same `cfg!` that gates the offload itself and
+        // the two cannot drift apart.
+        let options = WhisperOptions {
+            use_gpu: true,
+            ..WhisperOptions::default()
+        };
+        assert_eq!(options.compute_mode(), compute_mode(true, GPU_ENABLED));
+        assert_eq!(
+            options.compute_mode() == ComputeMode::Gpu,
+            GPU_ENABLED,
+            "a GPU request resolves to GPU exactly when this build has CUDA",
+        );
+    }
+
+    #[test]
+    fn every_mode_describes_itself_for_the_daemon_log() {
+        assert_eq!(ComputeMode::Gpu.to_string(), "gpu");
+        assert_eq!(ComputeMode::Cpu.to_string(), "cpu");
+        // Says WHY, because "cpu" alone next to `use_gpu = true` in the config is
+        // what made this take a full root-cause analysis to find.
+        assert_eq!(
+            ComputeMode::CpuGpuNotCompiledIn.to_string(),
+            "cpu (asr.use_gpu = true ignored: this build has no CUDA support)",
+        );
     }
 }

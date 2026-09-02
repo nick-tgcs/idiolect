@@ -34,9 +34,9 @@ use idiolect_common::languages::is_supported_language;
 use idiolect_ipc::framing::{decode_json_line, encode_json_line, FramingError};
 use idiolect_ipc::handshake::{negotiate_protocol, HandshakeError};
 use idiolect_ipc::messages::{
-    CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse, HistoryReinsertResponse,
-    InsertText, IpcMessage, PreeditUpdate, RecordingStatus, FEATURE_RECONCILE,
-    FEATURE_RECORDING_STATUS,
+    ActivityPhase, ActivityStatus, CommitPreedit, EditHistory, ErrorMessage, HistoryCopyResponse,
+    HistoryReinsertResponse, InsertText, IpcMessage, PreeditUpdate, RecordingStatus,
+    FEATURE_ACTIVITY_STATUS, FEATURE_RECONCILE, FEATURE_RECORDING_STATUS,
 };
 use idiolect_ports::audio::AudioSegment;
 use idiolect_ports::codec::AudioCodecPort;
@@ -180,6 +180,38 @@ fn build_history_cipher(
     Ok(Some(Box::new(ChaCha20Poly1305Cipher::new(key))))
 }
 
+/// The three out-of-process helpers the tray can open, discovered together.
+///
+/// Grouped so the daemon's notify command reaches all of them from ONE place.
+/// Wired per-call-site, it is invisible when one of them silently loses the
+/// ability to tell the user anything — the whole feature can be disabled by
+/// three characters with every test still green.
+pub(crate) struct HelperLaunchers {
+    /// Backs the "Custom…" retention entry.
+    pub(crate) retention_dialog: SubprocessRetentionDialog,
+    /// Backs "Settings…".
+    pub(crate) settings_window: crate::settings_launcher::SettingsLauncher,
+    /// Backs "Corrections Dashboard…", handed the daemon's resolved store so
+    /// pairing and training act on the database this daemon writes — not a
+    /// second, default-path store.
+    pub(crate) sync_panel: crate::sync_panel_launcher::SyncPanelLauncher,
+}
+
+impl HelperLaunchers {
+    pub(crate) fn discover(config: &RunLoopConfig) -> Self {
+        Self {
+            retention_dialog: SubprocessRetentionDialog::discover(&config.notify_command),
+            settings_window: crate::settings_launcher::SettingsLauncher::discover(
+                &config.notify_command,
+            ),
+            sync_panel: crate::sync_panel_launcher::SyncPanelLauncher::discover(
+                dashboard_store(config),
+                &config.notify_command,
+            ),
+        }
+    }
+}
+
 /// The store the tray hands to the dashboard subprocess: the daemon's resolved
 /// paths, plus the history key exactly when this daemon ciphers with one
 /// (`encrypt_at_rest` is config-file-only — `effective_history_config` never
@@ -311,7 +343,7 @@ pub(crate) fn run(config: RunLoopConfig) -> Result<(), RunLoopError> {
             active_session: None,
             live_capture: None,
             live_stream: None,
-            status_tx: RecordingStatusTx::new(false),
+            status_tx: RecordingStatusTx::new(false, false),
             wants_reconcile: false,
         };
         match handle_connection(
@@ -700,15 +732,7 @@ fn handle_connection(
     let audio_store =
         FileAudioStore::new(config.audio_root.clone(), config.decoded_cache_root.clone());
     let codec = OpusCodec::new();
-    // Out-of-process dialog for the "Custom…" retention entry; discovered once.
-    let retention_dialog = SubprocessRetentionDialog::discover();
-    // Out-of-process Settings window ("Settings…" in the tray); discovered once.
-    let settings_window = crate::settings_launcher::SettingsLauncher::discover();
-    // Out-of-process Corrections Dashboard ("Corrections Dashboard…" in the tray),
-    // handed the daemon's resolved store so pairing and training act on the
-    // database this daemon writes — not a second, default-path store.
-    let sync_panel =
-        crate::sync_panel_launcher::SyncPanelLauncher::discover(dashboard_store(config));
+    let helpers = HelperLaunchers::discover(config);
     let mut line = String::new();
 
     loop {
@@ -727,9 +751,9 @@ fn handle_connection(
                 },
                 live,
                 &ConfigSurfaces {
-                    retention_dialog: &retention_dialog,
-                    settings_window: &settings_window,
-                    sync_panel: &sync_panel,
+                    retention_dialog: &helpers.retention_dialog,
+                    settings_window: &helpers.settings_window,
+                    sync_panel: &helpers.sync_panel,
                     settings_forward_tx: tray_channel.forward_tx,
                 },
             )?;
@@ -805,8 +829,12 @@ fn handle_connection(
                     .accepted_features
                     .iter()
                     .any(|feature| feature == FEATURE_RECONCILE);
+                let wants_activity = response
+                    .accepted_features
+                    .iter()
+                    .any(|feature| feature == FEATURE_ACTIVITY_STATUS);
                 send_ipc_message(&mut stream, &IpcMessage::ServerHello(response))?;
-                live.status_tx = RecordingStatusTx::new(wants_status);
+                live.status_tx = RecordingStatusTx::new(wants_status, wants_activity);
                 live.status_tx.sync_initial(&mut stream)?;
             }
             IpcMessage::StartRecording | IpcMessage::ToggleRecording => {
@@ -905,7 +933,7 @@ fn handle_connection(
                             if active.tail_text.is_some() {
                                 active.tail_text = Some(correction.corrected_text.clone());
                             }
-                            live.status_tx.refresh_tray(tray, store, config)?;
+                            live.status_tx.refresh_tray(tray, store, config);
                         }
                     }
                 }
@@ -955,7 +983,7 @@ fn handle_connection(
                                         active.current_text = edited.corrected_text.clone();
                                     }
                                 }
-                                live.status_tx.refresh_tray(tray, store, config)?;
+                                live.status_tx.refresh_tray(tray, store, config);
                             }
                             Err(error) => {
                                 eprintln!("history edit: amend failed: {error}");
@@ -981,6 +1009,7 @@ fn handle_connection(
             }
             IpcMessage::ServerHello(_)
             | IpcMessage::RecordingStatus(_)
+            | IpcMessage::ActivityStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
             | IpcMessage::EditHistory(_)
@@ -1351,7 +1380,9 @@ fn drop_live_capture(live_capture: &mut Option<crate::adapters::RuntimeCapture>)
 /// The tray render must not be skipped: the client may have died after
 /// `start_live_capture` rendered Recording, and nothing else repaints the tray
 /// before the next take. It also must not touch the dead stream, so it goes
-/// through [`update_tray_recording_state`] directly, never `status_tx.set`.
+/// through [`repaint_tray`] directly, never `status_tx.set` — and best-effort,
+/// because a failed repaint here would hand the accept loop a fatal error and
+/// turn a routine client disconnect into a daemon exit.
 fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
     tray: &mut T,
     store: &mut SqliteMetadataStore,
@@ -1360,7 +1391,8 @@ fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
 ) -> Result<(), RunLoopError> {
     drop_live_capture(&mut live.live_capture);
     cancel_uncommitted_active_session(store, &mut live.active_session, "daemon-disconnect")?;
-    update_tray_recording_state(tray, store, config, RecordingState::Idle)
+    repaint_tray(tray, store, config, RecordingState::Idle);
+    Ok(())
 }
 
 /// The single place recording-state changes are published TO A LIVE CLIENT. The
@@ -1378,15 +1410,28 @@ fn cleanup_disconnected_client<T: TrayPort<Error = KsniTrayError>>(
 struct RecordingStatusTx {
     /// Whether the connected client negotiated `recording_status` pushes.
     feature: bool,
-    /// The recording value last published to the tray (and, if `feature`, the client).
-    last: bool,
+    /// Whether the connected client negotiated `activity_status` pushes.
+    activity_feature: bool,
+    /// The phase last published to the tray (and, per feature, to the client).
+    last: ActivityPhase,
+}
+
+/// What one phase transition puts on the wire. Two channels, because they answer
+/// different questions: `recording` is the authoritative "is a take in flight"
+/// the engine's state machine runs on, `activity` is the finer phase the overlay
+/// shows the user. The decode moves the second without moving the first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StatusPush {
+    recording: Option<bool>,
+    activity: Option<ActivityPhase>,
 }
 
 impl RecordingStatusTx {
-    fn new(feature: bool) -> Self {
+    fn new(feature: bool, activity_feature: bool) -> Self {
         Self {
             feature,
-            last: false,
+            activity_feature,
+            last: ActivityPhase::Idle,
         }
     }
 
@@ -1397,48 +1442,91 @@ impl RecordingStatusTx {
             send_ipc_message(
                 stream,
                 &IpcMessage::RecordingStatus(RecordingStatus {
-                    recording: self.last,
+                    recording: self.last.take_in_flight(),
                 }),
+            )?;
+        }
+        if self.activity_feature {
+            send_ipc_message(
+                stream,
+                &IpcMessage::ActivityStatus(ActivityStatus { phase: self.last }),
             )?;
         }
         Ok(())
     }
 
-    /// Pure edge-trigger: record the transition and decide whether to push it over
-    /// IPC. Only a real change (and a negotiated client) pushes — a repeated value
-    /// (e.g. a commit after the stop already announced `false`) must not emit a
-    /// duplicate `RecordingStatus`.
-    fn should_push(&mut self, recording: bool) -> bool {
-        let changed = recording != self.last;
-        self.last = recording;
-        changed && self.feature
+    /// Pure edge-trigger: record the transition and decide what to push over IPC.
+    /// Only a real change (and a negotiated client) pushes — a repeated value
+    /// (e.g. a commit after the stop already announced idle) must not emit a
+    /// duplicate. `RecordingStatus` additionally only moves when the take actually
+    /// starts or ends, so the decode phase leaves it alone.
+    fn should_push(&mut self, phase: ActivityPhase) -> StatusPush {
+        let previous = std::mem::replace(&mut self.last, phase);
+        if phase == previous {
+            return StatusPush::default();
+        }
+        let in_flight = phase.take_in_flight();
+        StatusPush {
+            recording: (self.feature && in_flight != previous.take_in_flight())
+                .then_some(in_flight),
+            activity: self.activity_feature.then_some(phase),
+        }
     }
 
-    /// Publish a recording-state value: ALWAYS refresh the tray, and push
-    /// `RecordingStatus` over IPC only on a real transition.
+    /// Publish a recording-state value: ALWAYS refresh the tray, and push over IPC
+    /// only on a real transition.
     ///
     /// The tray refresh is deliberately not deduplicated on the recording value:
     /// the menu renders HISTORY, which changes on commit/correction/cancel even
     /// when the recording value does not. Skipping the refresh in that case made
     /// the tray history lag a full take behind (a real field bug).
-    fn set(
+    fn set<T: TrayPort<Error = KsniTrayError>>(
         &mut self,
         stream: &mut UnixStream,
-        tray: &mut KsniTray,
+        tray: &mut T,
         store: &SqliteMetadataStore,
         config: &RunLoopConfig,
         recording: bool,
     ) -> Result<(), RunLoopError> {
-        let state = if recording {
+        let phase = if recording {
+            ActivityPhase::Recording
+        } else {
+            ActivityPhase::Idle
+        };
+        self.set_phase(stream, tray, store, config, phase)
+    }
+
+    /// As [`Self::set`], but naming the exact phase — used by the stop path to
+    /// announce the decode, which holds the take open without holding the
+    /// microphone open.
+    fn set_phase<T: TrayPort<Error = KsniTrayError>>(
+        &mut self,
+        stream: &mut UnixStream,
+        tray: &mut T,
+        store: &SqliteMetadataStore,
+        config: &RunLoopConfig,
+        phase: ActivityPhase,
+    ) -> Result<(), RunLoopError> {
+        let state = if phase.take_in_flight() {
             RecordingState::Recording
         } else {
             RecordingState::Idle
         };
-        update_tray_recording_state(tray, store, config, state)?;
-        if self.should_push(recording) {
+        repaint_tray(tray, store, config, state);
+        let push = self.should_push(phase);
+        // Authoritative state first, presentation second: a client that mirrors
+        // `RecordingStatus` must never act on a phase for a take it has not been
+        // told about.
+        if let Some(recording) = push.recording {
             send_ipc_message(
                 stream,
                 &IpcMessage::RecordingStatus(RecordingStatus { recording }),
+            )?;
+        }
+        if let Some(phase) = push.activity {
+            send_ipc_message(
+                stream,
+                &IpcMessage::ActivityStatus(ActivityStatus { phase }),
             )?;
         }
         Ok(())
@@ -1447,18 +1535,45 @@ impl RecordingStatusTx {
     /// Re-render the tray (menu + icon) with the current recording value, pushing
     /// nothing. For history-only mutations (e.g. an in-place correction) that must
     /// show up in the menu immediately.
-    fn refresh_tray(
+    fn refresh_tray<T: TrayPort<Error = KsniTrayError>>(
         &self,
-        tray: &mut KsniTray,
+        tray: &mut T,
         store: &SqliteMetadataStore,
         config: &RunLoopConfig,
-    ) -> Result<(), RunLoopError> {
-        let state = if self.last {
+    ) {
+        let state = if self.last.take_in_flight() {
             RecordingState::Recording
         } else {
             RecordingState::Idle
         };
-        update_tray_recording_state(tray, store, config, state)
+        repaint_tray(tray, store, config, state);
+    }
+}
+
+/// Tell the client which decode phase the take has entered. Call only once the
+/// microphone has been stopped AND drained, so the badge never claims the mic is
+/// shut while it is still collecting samples.
+fn announce_decode_phase(
+    stream: &mut UnixStream,
+    tray: &mut KsniTray,
+    store: &SqliteMetadataStore,
+    config: &RunLoopConfig,
+    status_tx: &mut RecordingStatusTx,
+) -> Result<(), RunLoopError> {
+    let phase = decode_phase(crate::adapters::asr_model_is_resident(
+        &config.adapter_profile,
+    ));
+    status_tx.set_phase(stream, tray, store, config, phase)
+}
+
+/// Which decode phase to announce, given whether the speech model is already in
+/// memory. A cold start pays a multi-second model load before any decoding
+/// happens; calling that "transcribing" makes an ordinary wait look like a hang.
+fn decode_phase(model_is_resident: bool) -> ActivityPhase {
+    if model_is_resident {
+        ActivityPhase::Transcribing
+    } else {
+        ActivityPhase::LoadingModel
     }
 }
 
@@ -1770,12 +1885,23 @@ fn stop_live_and_transcribe(
         return Ok(());
     };
 
+    // NOTE: the microphone is still OPEN here. `live_capture.take()` only moves
+    // the capture out of `Live`; the stream keeps collecting until
+    // `finish_capture` stops and drains it. So the decode phase is announced
+    // below, once per branch, immediately after that call — announcing it here
+    // would tell the user the mic had closed while it was still recording them,
+    // and fold whatever they said during the tray/IPC round-trip into the take.
     if let Some(mut state) = live_stream.take() {
         // Streaming stop: drain the final capture chunk, flush the segmenter's
         // tail, fold the remaining utterances into the take, then finalize the
         // WHOLE take as one session — there is no batch transcription.
         match crate::adapters::finish_capture(capture) {
             Ok(tail) => {
+                // Microphone now stopped and drained; everything below decodes,
+                // which on CPU is seconds of apparent nothing. `recording`
+                // deliberately stays true — the transcript is still to come and
+                // the engine only accepts one while its take is open.
+                announce_decode_phase(stream, tray, store, config, status_tx)?;
                 let mut snippets = state.ingest(&tail);
                 snippets.extend(state.flush());
                 for snippet in snippets {
@@ -1829,6 +1955,9 @@ fn stop_live_and_transcribe(
             return Ok(());
         }
     };
+
+    // As above: only now is the microphone actually stopped and drained.
+    announce_decode_phase(stream, tray, store, config, status_tx)?;
 
     match materialize_session(store, audio_store, codec, config, segment)? {
         StartSessionOutcome::Started(session) => {
@@ -2329,6 +2458,32 @@ fn parse_index_suffix(action: &str, prefix: &str) -> Option<usize> {
         .and_then(|rest| rest.parse().ok())
 }
 
+/// Repaint the tray for `state`, reporting a failure instead of propagating it.
+///
+/// Every caller is publishing PRESENTATION, and two of them do it while a take
+/// exists only in memory: [`announce_decode_phase`] runs after `finish_capture`
+/// has drained the microphone but before the audio is folded or finalized. The
+/// menu renders `recent_history`, so this touches SQLite, which fails
+/// transiently whenever another process (the trainer, the sync server,
+/// trainerctl) has the database busy. Propagating that error there skipped the
+/// finalize AND — the accept loop treating any non-disconnect error as fatal —
+/// stopped the daemon, so a momentarily busy database destroyed the take the
+/// user had just spoken. A repaint is never worth a take.
+///
+/// Deliberately NOT applied at startup (`run`) or to the tray-callback handlers:
+/// no take is in flight there, so failing fast still surfaces a broken tray
+/// without costing anything.
+fn repaint_tray<T: TrayPort<Error = KsniTrayError>>(
+    tray: &mut T,
+    store: &SqliteMetadataStore,
+    config: &RunLoopConfig,
+    state: RecordingState,
+) {
+    if let Err(error) = update_tray_recording_state(tray, store, config, state) {
+        eprintln!("tray: repaint failed, continuing: {error}");
+    }
+}
+
 fn update_tray_recording_state<T: TrayPort<Error = KsniTrayError>>(
     tray: &mut T,
     store: &SqliteMetadataStore,
@@ -2382,9 +2537,10 @@ mod tests {
     use idiolect_ipc::messages::IpcMessage;
 
     use super::{
-        is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix, send_ipc_message,
-        should_clear_clipboard, RecordingStatusTx, RunLoopError,
+        decode_phase, is_disconnect, is_read_timeout, parse_id_suffix, parse_index_suffix,
+        send_ipc_message, should_clear_clipboard, RecordingStatusTx, RunLoopError, StatusPush,
     };
+    use idiolect_ipc::messages::ActivityPhase;
 
     #[test]
     fn clipboard_clears_only_when_unchanged() {
@@ -2410,21 +2566,126 @@ mod tests {
         // emit a duplicate RecordingStatus. (The tray menu refresh is deliberately
         // NOT deduplicated this way: history changes on commit/correction even when
         // the recording value does not — that lag was a real field bug.)
-        let mut tx = RecordingStatusTx::new(true);
-        assert!(!tx.should_push(false), "initial false is not a transition");
-        assert!(tx.should_push(true), "idle -> recording pushes");
-        assert!(
-            !tx.should_push(true),
+        let mut tx = RecordingStatusTx::new(true, false);
+        let recording = |push: StatusPush| push.recording;
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            None,
+            "initial idle is not a transition"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Recording)),
+            Some(true),
+            "idle -> recording pushes"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Recording)),
+            None,
             "repeated recording does not push again"
         );
-        assert!(tx.should_push(false), "recording -> idle pushes");
-        assert!(!tx.should_push(false), "commit after stop must not re-push");
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            Some(false),
+            "recording -> idle pushes"
+        );
+        assert_eq!(
+            recording(tx.should_push(ActivityPhase::Idle)),
+            None,
+            "commit after stop must not re-push"
+        );
 
         // Without the negotiated feature nothing is ever pushed, but transitions
         // are still tracked so a mid-session upgrade cannot replay stale state.
-        let mut legacy = RecordingStatusTx::new(false);
-        assert!(!legacy.should_push(true));
-        assert!(!legacy.should_push(false));
+        let mut legacy = RecordingStatusTx::new(false, false);
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Recording),
+            StatusPush::default()
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Idle),
+            StatusPush::default()
+        );
+    }
+
+    #[test]
+    fn the_decode_phase_pushes_activity_without_disturbing_recording() {
+        // The crux of the caret indicator. At stop the microphone is shut but the
+        // decode has not run, so the take is still in flight: `recording` MUST
+        // stay true across it (the engine discards a transcript that arrives
+        // after `recording = false`), while the phase changes so the overlay can
+        // stop showing a live-microphone badge and show progress instead.
+        let mut tx = RecordingStatusTx::new(true, true);
+        assert_eq!(
+            tx.should_push(ActivityPhase::Recording),
+            StatusPush {
+                recording: Some(true),
+                activity: Some(ActivityPhase::Recording),
+            },
+        );
+        assert_eq!(
+            tx.should_push(ActivityPhase::Transcribing),
+            StatusPush {
+                recording: None,
+                activity: Some(ActivityPhase::Transcribing),
+            },
+            "the decode must not re-announce the recording state",
+        );
+        assert_eq!(
+            tx.should_push(ActivityPhase::Idle),
+            StatusPush {
+                recording: Some(false),
+                activity: Some(ActivityPhase::Idle),
+            },
+        );
+    }
+
+    #[test]
+    fn a_client_without_the_activity_feature_sees_the_old_byte_stream() {
+        // Strictly additive: an engine that predates the phase channel must get
+        // exactly the messages it always did, in the same places.
+        let mut legacy = RecordingStatusTx::new(true, false);
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Recording),
+            StatusPush {
+                recording: Some(true),
+                activity: None,
+            },
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Transcribing),
+            StatusPush::default(),
+            "the decode phase is invisible to a client that did not ask for it",
+        );
+        assert_eq!(
+            legacy.should_push(ActivityPhase::Idle),
+            StatusPush {
+                recording: Some(false),
+                activity: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_repeated_phase_pushes_nothing() {
+        // Edge-triggered on the phase, so a re-publish of the same state (a
+        // commit after the stop already announced idle) stays silent.
+        let mut tx = RecordingStatusTx::new(true, true);
+        assert_eq!(tx.should_push(ActivityPhase::Idle), StatusPush::default());
+        assert!(tx.should_push(ActivityPhase::Recording).activity.is_some());
+        assert_eq!(
+            tx.should_push(ActivityPhase::Recording),
+            StatusPush::default(),
+        );
+    }
+
+    #[test]
+    fn a_cold_take_announces_the_model_load_rather_than_a_slow_decode() {
+        // The user's original complaint: the first take after an idle day takes
+        // many seconds because the model is being read off disk. Loading and
+        // decoding must be distinguishable, or the overlay can only say
+        // "transcribing" for twenty seconds and look hung.
+        assert_eq!(decode_phase(false), ActivityPhase::LoadingModel);
+        assert_eq!(decode_phase(true), ActivityPhase::Transcribing);
     }
 
     #[test]
@@ -2502,6 +2763,7 @@ mod tests {
         use idiolect_adapter_ksni::KsniTrayError;
         use idiolect_adapter_sqlite::SqliteMetadataStore;
         use idiolect_common::config::{HistoryConfig, TranslationConfig, VadConfig};
+        use idiolect_ipc::messages::ActivityPhase;
         use idiolect_ports::storage::{
             MetadataStorePort, TrayIcon, TrayMenuItem, TrayMenuItemKind, TrayPort, TrayStatus,
         };
@@ -2548,7 +2810,7 @@ mod tests {
             }
         }
 
-        fn test_config() -> RunLoopConfig {
+        pub(super) fn test_config() -> RunLoopConfig {
             RunLoopConfig {
                 socket_path: PathBuf::new(),
                 data_dir: PathBuf::new(),
@@ -2571,6 +2833,30 @@ mod tests {
                 vad_config: VadConfig::default(),
                 notify_command: String::new(),
             }
+        }
+
+        #[test]
+        fn every_helper_launcher_reports_through_the_configured_notify_command() {
+            // This is the ONLY line joining the supervision code to a real
+            // desktop. Nothing downstream of it can tell a misdirected notifier
+            // from a working one: replacing these arguments with "" disables
+            // every helper-failure alert in production, and `notify_user`
+            // treats an empty command as "notifications off", so the whole
+            // feature goes quiet with the suite still green.
+            let mut config = test_config();
+            config.notify_command = "/opt/custom-notifier".to_owned();
+
+            let helpers = crate::run_loop::HelperLaunchers::discover(&config);
+
+            assert_eq!(
+                helpers.retention_dialog.notify_command(),
+                "/opt/custom-notifier"
+            );
+            assert_eq!(
+                helpers.settings_window.notify_command(),
+                "/opt/custom-notifier"
+            );
+            assert_eq!(helpers.sync_panel.notify_command(), "/opt/custom-notifier");
         }
 
         #[test]
@@ -2638,7 +2924,8 @@ mod tests {
                 // As a start leaves it: `true` was the last published value.
                 status_tx: RecordingStatusTx {
                     feature: true,
-                    last: true,
+                    activity_feature: false,
+                    last: ActivityPhase::Recording,
                 },
                 wants_reconcile: false,
             };
@@ -2662,6 +2949,132 @@ mod tests {
                     .is_some_and(|menu| contains_history_item(menu)),
                 "the re-rendered menu must already show the just-cancelled take: \
                  the repaint has to happen after the session cancel"
+            );
+        }
+    }
+
+    /// Pinned at the unit level only, and deliberately.
+    ///
+    /// The defect is a store read failing for ONE call — the tray menu's
+    /// `recent_history` — while the surrounding take keeps working. Integration
+    /// and e2e both drive a real `SqliteMetadataStore`, which the daemon holds
+    /// concretely from `run` all the way down, so the only way to break that one
+    /// read is to break the database for every other statement too: the finalize
+    /// then fails on its own account and the run proves nothing about this
+    /// ordering. A fault-injecting store would need `MetadataStorePort`
+    /// threaded through the whole stop path, which is a refactor of the daemon,
+    /// not a test. The seam used here is the same `TrayPort`/store boundary the
+    /// disconnect-cleanup contract is already pinned at.
+    mod presentation_never_aborts_a_take {
+        use idiolect_adapter_ksni::KsniTrayError;
+        use idiolect_adapter_sqlite::SqliteMetadataStore;
+        use idiolect_ipc::messages::ActivityPhase;
+        use idiolect_ports::storage::{
+            MetadataStorePort, TrayIcon, TrayMenuItem, TrayPort, TrayStatus,
+        };
+
+        use super::disconnect_cleanup::test_config;
+        use crate::run_loop::{cleanup_disconnected_client, Live, RecordingStatusTx};
+
+        /// Renders nothing and fails nothing, so the only failure in play comes
+        /// from the STORE — the tray menu's `recent_history` read.
+        struct SilentTray;
+
+        impl TrayPort for SilentTray {
+            type Error = KsniTrayError;
+
+            fn set_icon(&mut self, _icon: TrayIcon) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn set_tooltip(&mut self, _tooltip: &str) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn set_menu(&mut self, _items: Vec<TrayMenuItem>) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn set_status(&mut self, _status: TrayStatus) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn a_failed_tray_repaint_never_takes_the_daemon_down_with_the_client() {
+            // The disconnect cleanup exists so one client going away cannot kill
+            // the daemon ("crashing instead would let any engine restart take
+            // the whole daemon down"). Its last act is a tray repaint, which
+            // reads history out of SQLite — so a database that is briefly busy
+            // hands the accept loop a non-disconnect error, and that IS fatal.
+            // Every client disconnect would then be a coin flip on the daemon
+            // surviving: precisely what this path was written to prevent.
+            let mut tray = SilentTray;
+            // Unmigrated, and with no session to cancel the repaint is the only
+            // thing here that touches the store.
+            let mut store = SqliteMetadataStore::open_in_memory().expect("store");
+            let config = test_config();
+            let mut live = Live {
+                active_session: None,
+                live_capture: None,
+                live_stream: None,
+                status_tx: RecordingStatusTx::new(true, true),
+                wants_reconcile: false,
+            };
+
+            cleanup_disconnected_client(&mut tray, &mut store, &config, &mut live)
+                .expect("a failed repaint must not turn a disconnect into a daemon exit");
+        }
+
+        #[test]
+        fn a_failed_tray_repaint_never_aborts_the_take_that_is_still_in_memory() {
+            // The decode announcement runs at the one moment a take exists ONLY
+            // in memory: `finish_capture` has drained the microphone, and
+            // nothing has been folded or finalized yet. `set_phase` repaints the
+            // tray, whose menu renders `recent_history` — a SQLite read that can
+            // fail transiently while another process (trainer, sync-server,
+            // trainerctl) writes the database. Propagating that error skips the
+            // fold/finalize, and because the accept loop treats a non-disconnect
+            // error as fatal it also stops the daemon: the audio the user just
+            // spoke is gone. A repaint is presentation and must never be able to
+            // do that.
+            let mut tray = SilentTray;
+            // Unmigrated on purpose: `recent_history` hits a missing table,
+            // which is the same Err path a briefly unreadable database takes.
+            let store = SqliteMetadataStore::open_in_memory().expect("store");
+            assert!(
+                store.recent_history(5).is_err(),
+                "fixture must actually fail, or this test proves nothing",
+            );
+            let config = test_config();
+            let (mut daemon_side, client_side) =
+                std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let mut tx = RecordingStatusTx::new(true, true);
+
+            tx.set_phase(
+                &mut daemon_side,
+                &mut tray,
+                &store,
+                &config,
+                ActivityPhase::Transcribing,
+            )
+            .expect("a failed tray repaint must not fail the take");
+
+            // And the pushes still reach the client: degrading the presentation
+            // must not also silence the state the engine mirrors. Authoritative
+            // `RecordingStatus` first, then the phase — the documented order.
+            let mut reader = std::io::BufReader::new(client_side);
+            let mut recording = String::new();
+            let mut activity = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut recording).expect("read status");
+            std::io::BufRead::read_line(&mut reader, &mut activity).expect("read phase");
+            assert!(
+                recording.contains(r#""recording":true"#),
+                "the take must still be published as in flight: {recording}",
+            );
+            assert!(
+                activity.contains("transcribing"),
+                "the phase must still be published: {activity}",
             );
         }
     }

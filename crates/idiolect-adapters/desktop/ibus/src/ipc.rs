@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use idiolect_ipc::framing::{decode_json_line, encode_json_line};
 use idiolect_ipc::messages::{
-    FEATURE_COMMIT, FEATURE_PREEDIT, FEATURE_RECONCILE, FEATURE_RECORDING_STATUS, PROTOCOL_VERSION,
+    FEATURE_ACTIVITY_STATUS, FEATURE_COMMIT, FEATURE_PREEDIT, FEATURE_RECONCILE,
+    FEATURE_RECORDING_STATUS, PROTOCOL_VERSION,
 };
 use idiolect_ipc::{ClientHello, CommitPreedit, IpcMessage, ReportCorrection};
 
@@ -70,6 +71,9 @@ fn client_hello() -> IpcMessage {
             // This engine replaces its live preview with the verified text at stop,
             // so opt into the daemon's stop-time reconcile final.
             FEATURE_RECONCILE.to_owned(),
+            // The caret overlay distinguishes recording from decoding, so ask for
+            // the daemon's take-phase pushes.
+            FEATURE_ACTIVITY_STATUS.to_owned(),
         ],
     })
 }
@@ -258,5 +262,18 @@ mod tests {
     fn handshake_reports_no_reconcile_when_the_daemon_omits_it() {
         assert!(!negotiated_reconcile(vec![FEATURE_PREEDIT.to_owned()]));
         assert!(!negotiated_reconcile(vec![]));
+    }
+
+    #[test]
+    fn the_engine_asks_for_take_phase_pushes() {
+        // Without this in the hello the daemon stays silent about the decode and
+        // the caret overlay keeps showing a live microphone through it.
+        let IpcMessage::ClientHello(hello) = client_hello() else {
+            panic!("client_hello must be a ClientHello");
+        };
+        assert!(hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_ACTIVITY_STATUS));
     }
 }

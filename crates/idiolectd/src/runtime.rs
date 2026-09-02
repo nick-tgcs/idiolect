@@ -561,6 +561,7 @@ fn handle_fixture_connection(
             }
             IpcMessage::ServerHello(_)
             | IpcMessage::RecordingStatus(_)
+            | IpcMessage::ActivityStatus(_)
             | IpcMessage::PreeditUpdate(_)
             | IpcMessage::InsertText(_)
             | IpcMessage::EditHistory(_)

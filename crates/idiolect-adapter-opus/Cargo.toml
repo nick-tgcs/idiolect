@@ -7,7 +7,7 @@ rust-version = "1.96"
 
 [dependencies]
 idiolect-ports = { path = "../idiolect-ports" }
-opus = "=0.3.1"
+opus = "=0.4.0"
 
 [dev-dependencies]
 idiolect-test-support = { path = "../idiolect-test-support" }
