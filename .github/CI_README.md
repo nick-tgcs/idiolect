@@ -149,8 +149,7 @@ cargo install cargo-llvm-cov
 # System dependencies (Ubuntu/Debian)
 sudo apt-get install -y \
   cmake g++ \
-  libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev \
-  libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev \
+  libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev \
   libasound2-dev libpulse-dev \
   dpkg-dev time
 
@@ -238,7 +237,7 @@ bash ci/scripts/test-coverage-map.sh
 ### FCITX5 Build Fails
 ```bash
 # Ensure all dependencies installed
-sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev
+sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev
 
 # Clean rebuild
 rm -rf fcitx5/idiolect-fcitx5/build
