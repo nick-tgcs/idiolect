@@ -127,14 +127,12 @@ while IFS= read -r workflow; do
         esac
         pending=""
 
+        # Cheap pre-filter: a line that never says "apt" cannot hold an install
+        # command, and this skips almost every line in the repository.
         case "$line" in
-        *"apt-get install"* | *"apt install"*) ;;
+        *apt*) ;;
         *) continue ;;
         esac
-
-        # Everything before `install` is the invocation (sudo, apt-get, flags);
-        # everything after is the package list, up to the first shell operator.
-        args="${line#*install}"
 
         # `${{ matrix.pkg }}` is ONE package name, and splitting on whitespace
         # makes it three tokens — of which the middle one carries no `$` and is
@@ -142,42 +140,89 @@ while IFS= read -r workflow; do
         # workflow. Squeezing the spaces out of each expression first keeps it a
         # single token for the interpolation check below. A false red here would
         # block every PR, which is how a gate gets switched off.
-        args="$(printf '%s' "$args" | sed ':a;s/\(\${{[^}]*\) \([^}]*}}\)/\1\2/;ta')"
+        line="$(printf '%s' "$line" | sed ':a;s/\(\${{[^}]*\) \([^}]*}}\)/\1\2/;ta')"
 
-        # A shell operator ends the package list, but not necessarily the line:
-        # `apt-get install -y a && apt-get install -y b` holds two of them, and
-        # stopping at the operator would drop the second without saying so.
-        # Resuming at the next bare `install` picks it up, while `&& echo
-        # installed` stays off, since `installed` is not `install`.
-        in_packages=true
-        for token in $args; do
-            if [ "$in_packages" = false ]; then
-                [ "$token" = "install" ] && in_packages=true
-                continue
-            fi
+        # Walked as a state machine over the whole line rather than by matching
+        # the string "apt-get install", because that string is not the only way
+        # to write it and not the only way it appears:
+        #
+        #   - `apt-get [options] install pkg1 ...` is the documented syntax, so
+        #     `apt-get --no-install-recommends install -y bad-pkg` holds no such
+        #     substring and walked straight past the invalid package;
+        #   - a `#` comment runs to end of line, so `install -y cmake # for the
+        #     addon` had `#`, `for`, `the` and `addon` looked up as packages and
+        #     failed a correct workflow;
+        #   - CI_README.md is prose, where "the apt install step" is a sentence
+        #     and not a command, so an install starts only in COMMAND POSITION.
+        state=idle
+        prev=""
+        for token in $line; do
             case "$token" in
+            "#"*)
+                # A comment runs to the end of the line. Continuations were
+                # joined above, so nothing after this is a command either.
+                break
+                ;;
             '&&' | '||' | ';' | '|' | '>' | '>>')
-                in_packages=false
-                continue
-                ;;
-            -*)
-                continue
-                ;;
-            *'$'* | *'{{'*)
-                # Announced, never silent: a package name assembled at runtime
-                # cannot be resolved here, and a skip nobody can see is a skip
-                # nobody can audit.
-                echo "notice: $workflow:$pending_line names a package through a variable, not checked: $token"
-                unresolvable=$((unresolvable + 1))
+                state=idle
+                prev="$token"
                 continue
                 ;;
             esac
 
-            checked=$((checked + 1))
-            if [ -z "$(candidate_of "$token")" ]; then
-                echo "::error::$workflow:$pending_line installs a package apt cannot resolve: $token"
-                missing=$((missing + 1))
-            fi
+            case "$state" in
+            idle)
+                case "$token" in
+                apt | apt-get)
+                    # Command position: line start, or straight after sudo/env,
+                    # a `VAR=value` prefix, a shell operator, or the YAML `run:`
+                    # key. Anything else is a word in a sentence. The operators
+                    # are load-bearing: `... && apt-get install -y bad` has no
+                    # `sudo` to key on, and requiring one lets it through.
+                    case "$prev" in
+                    '' | sudo | env | 'run:' | '-' | \
+                        '&&' | '||' | ';' | '|' | *=*) state=options ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            options)
+                # Everything between `apt-get` and its subcommand is an option;
+                # only `install` opens a package list.
+                [ "$token" = "install" ] && state=packages
+                ;;
+            packages)
+                # Shell quoting and a trailing separator are punctuation, not
+                # part of the name — `"cmake"` and `cmake;` install `cmake`.
+                # Reading them literally rejects a command that works, which is
+                # the same class as the comment and option cases above.
+                token="${token%[;,]}"
+                token="${token#[\"\']}"
+                token="${token%[\"\']}"
+                [ -n "$token" ] || continue
+
+                case "$token" in
+                -*) ;;
+                *'$'* | *'{{'* | *'('* | *')'*)
+                    # Announced, never silent: a package name assembled at
+                    # runtime cannot be resolved here, and a skip nobody can see
+                    # is a skip nobody can audit. The parentheses matter on their
+                    # own: `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`,
+                    # and only the first carries a `$`.
+                    echo "notice: $workflow:$pending_line names a package through a variable, not checked: $token"
+                    unresolvable=$((unresolvable + 1))
+                    ;;
+                *)
+                    checked=$((checked + 1))
+                    if [ -z "$(candidate_of "$token")" ]; then
+                        echo "::error::$workflow:$pending_line installs a package apt cannot resolve: $token"
+                        missing=$((missing + 1))
+                    fi
+                    ;;
+                esac
+                ;;
+            esac
+            prev="$token"
         done
     done <"$workflow"
 

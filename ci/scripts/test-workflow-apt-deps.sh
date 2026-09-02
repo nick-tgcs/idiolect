@@ -119,6 +119,46 @@ YAML
 expect "a second install command on the same line is checked" 1 chained \
     "libfcitx5-dev"
 
+# The same line without the second `sudo`. A shell operator is a command
+# position in its own right, and requiring `sudo` to recognise one would let
+# this form through unexamined.
+write_workflow chained-nosudo ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake && apt-get install -y libfcitx5-dev
+YAML
+expect "an operator is a command position on its own" 1 chained-nosudo \
+    "libfcitx5-dev"
+
+# A `#` starts a comment that runs to the end of the line. Reading its words as
+# packages fails a perfectly good workflow, and this gate blocks PRs.
+write_workflow commented ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake # needed for the fcitx5 addon
+YAML
+expect "an inline shell comment is not a package list" 0 commented \
+    "All 1 apt package(s)"
+
+# `apt-get [options] install pkg` is documented apt syntax, so matching the
+# literal string "apt-get install" walks straight past an invalid package in the
+# one form the gate exists to catch.
+write_workflow global-opts ci.yml <<'YAML'
+        run: sudo apt-get --no-install-recommends install -y libfcitx5-dev
+YAML
+expect "options between apt-get and install are recognised" 1 global-opts \
+    "libfcitx5-dev"
+
+# Scanning prose (CI_README.md) means the words "apt install" can occur in a
+# sentence. Only a command position starts a package list — otherwise the next
+# sentence becomes a list of packages that do not exist.
+mkdir -p "$WORK/prose"
+cat >"$WORK/prose/CI_README.md" <<'MD'
+If the apt install step fails, check your mirrors first.
+
+```bash
+sudo apt-get install -y cmake
+```
+MD
+expect "prose mentioning apt install is not a package list" 0 prose/CI_README.md \
+    "All 1 apt package(s)"
+
 # A name assembled at runtime cannot be resolved here. It must be announced and
 # skipped, not guessed at in either direction.
 write_workflow interpolated ci.yml <<'YAML'
@@ -127,6 +167,23 @@ YAML
 expect "an interpolated package name is announced, not judged" 0 interpolated \
     "not checked: \${{matrix.extra_package}}" "not checked: \$EXTRA" \
     "1 apt package(s)" "2 not checkable"
+
+# The rest of the punctuation class Codex found in the comment and option cases:
+# shell quoting and a trailing separator are not part of the package name, and
+# reading them as one rejects a command that works.
+write_workflow punctuation ci.yml <<'YAML'
+        run: sudo apt-get install -y "cmake" 'g++' libglib2.0-dev;
+YAML
+expect "quotes and a trailing separator are not part of the name" 0 punctuation \
+    "All 3 apt package(s)"
+
+# `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`. Only the first carries a
+# `$`; judging the second as a package name fails a correct workflow.
+write_workflow substitution ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $(cat extra-packages.txt)
+YAML
+expect "a command substitution is announced, not judged" 0 substitution \
+    "not checked" "1 apt package(s)" "2 not checkable"
 
 # --------------------------------------------------------------- continuations
 # A package on a continuation line is still installed by the job, so it is still
