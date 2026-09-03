@@ -157,7 +157,7 @@ sudo apt-get install -y cmake
 ```
 MD
 expect "prose mentioning apt install is not a package list" 0 prose/CI_README.md \
-    "All 1 apt package(s)"
+    "All 1 apt package(s)" "looks like an apt install command but was not parsed"
 
 # A name assembled at runtime cannot be resolved here. It must be announced and
 # skipped, not guessed at in either direction.
@@ -185,6 +185,44 @@ write_workflow punctuation ci.yml <<'YAML'
 YAML
 expect "quotes and a trailing separator are not part of the name" 0 punctuation \
     "All 3 apt package(s)"
+
+# An attached `;` ends the command as surely as a spaced one. Stripping it off
+# the package name while staying in the package list reads `echo done` as two
+# packages and rejects a correct workflow.
+write_workflow semicolon ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake; echo done
+YAML
+expect "an attached semicolon ends the command" 0 semicolon \
+    "All 1 apt package(s)"
+
+# A comma is NOT shell punctuation: the shell passes it through and apt rejects
+# the name. Verified with `apt-get -s install cmake,` -> exit 100, "Unable to
+# locate package cmake,". Stripping it would hide exactly the kind of typo this
+# gate exists to catch.
+write_workflow comma ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake, g++
+YAML
+expect "a comma-suffixed name is rejected, because apt rejects it" 1 comma \
+    "cmake,"
+
+# `sudo [options] command` is documented sudo syntax, so `apt-get` does not
+# always follow `sudo` directly.
+write_workflow sudo-opts ci.yml <<'YAML'
+        run: sudo -E apt-get install -y libfcitx5-dev
+YAML
+expect "sudo options before apt-get are consumed" 1 sudo-opts \
+    "libfcitx5-dev"
+
+# The general safety net for this whole class. `sudo -u root apt-get ...` puts an
+# option ARGUMENT before the command, which cannot be recognised without knowing
+# which options take arguments. Not parsing it is acceptable; not SAYING SO is
+# not, because a silent skip reads exactly like a clean result.
+write_workflow unparsed ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake
+        run: sudo -u root apt-get install -y libfcitx5-dev
+YAML
+expect "an install form the parser cannot read is announced" 0 unparsed \
+    "looks like an apt install command but was not parsed" "1 not checkable"
 
 # `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`. Only the first carries a
 # `$`; judging the second as a package name fails a correct workflow.

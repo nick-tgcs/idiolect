@@ -161,7 +161,20 @@ while IFS= read -r workflow; do
         #   - CI_README.md is prose, where "the apt install step" is a sentence
         #     and not a command, so an install starts only in COMMAND POSITION.
         state=idle
-        prev=""
+        # A command position: the start of the line, and again after every shell
+        # operator. It survives the prefix material an invocation may carry —
+        # sudo/env, their options, and `VAR=value` assignments — and dies on the
+        # first token that is none of those, which is what stops "the apt install
+        # step" in prose from being read as a command.
+        cmd_prefix=true
+        # If a line names apt and names `install` but never reaches the package
+        # list, the parser did not understand the form. Not parsing it is
+        # acceptable; not saying so is not, because a silent skip reads exactly
+        # like a clean result. `sudo -u root apt-get install` is the case that
+        # cannot be recognised without knowing which options take arguments.
+        saw_apt=false
+        saw_install=false
+        parsed_install=false
         for token in $line; do
             case "$token" in
             *'$'* | *'{{'*)
@@ -178,41 +191,62 @@ while IFS= read -r workflow; do
                 # and `2>&1` arrive as one token and match none of the bare
                 # operator patterns. A package name never contains `>` or `<`.
                 state=idle
-                prev="$token"
+                cmd_prefix=true
                 continue
                 ;;
             esac
 
+            case "$token" in
+            apt | apt-get) saw_apt=true ;;
+            install) saw_install=true ;;
+            esac
+
             case "$state" in
             idle)
+                [ "$cmd_prefix" = true ] || continue
                 case "$token" in
                 apt | apt-get)
-                    # Command position: line start, or straight after sudo/env,
-                    # a `VAR=value` prefix, a shell operator, or the YAML `run:`
-                    # key. Anything else is a word in a sentence. The operators
-                    # are load-bearing: `... && apt-get install -y bad` has no
-                    # `sudo` to key on, and requiring one lets it through.
-                    case "$prev" in
-                    '' | sudo | env | 'run:' | '-' | \
-                        '&&' | '||' | ';' | '|' | *=*) state=options ;;
-                    esac
+                    state=options
                     ;;
+                # Still an invocation prefix, so the command is yet to come.
+                # `sudo -E apt-get ...` is documented sudo syntax and put an
+                # option between the two.
+                sudo | env | 'run:' | '-' | -* | *=*) ;;
+                # Any other word is the command itself, or prose.
+                *) cmd_prefix=false ;;
                 esac
                 ;;
             options)
                 # Everything between `apt-get` and its subcommand is an option;
                 # only `install` opens a package list.
-                [ "$token" = "install" ] && state=packages
+                if [ "$token" = "install" ]; then
+                    state=packages
+                    parsed_install=true
+                fi
                 ;;
             packages)
-                # Shell quoting and a trailing separator are punctuation, not
-                # part of the name — `"cmake"` and `cmake;` install `cmake`.
-                # Reading them literally rejects a command that works, which is
-                # the same class as the comment and option cases above.
-                token="${token%[;,]}"
+                # Shell quoting is not part of the name — `"cmake"` installs
+                # `cmake`. An attached `;` is not either, but it also ENDS the
+                # command, so `cmake; echo done` must not read `echo` and `done`
+                # as two more packages.
+                #
+                # A comma is deliberately NOT stripped. The shell passes it
+                # straight to apt, which rejects it: `apt-get -s install cmake,`
+                # exits 100 with "Unable to locate package cmake,". Removing it
+                # here would hide exactly the typo this gate exists to catch.
+                ends_command=false
+                case "$token" in
+                *';')
+                    token="${token%;}"
+                    ends_command=true
+                    ;;
+                esac
                 token="${token#[\"\']}"
                 token="${token%[\"\']}"
-                [ -n "$token" ] || continue
+                if [ -z "$token" ]; then
+                    [ "$ends_command" = true ] && { state=idle; cmd_prefix=true; }
+                    continue
+                fi
 
                 case "$token" in
                 -*) ;;
@@ -233,10 +267,26 @@ while IFS= read -r workflow; do
                     fi
                     ;;
                 esac
+
+                # Judged first, then the `;` takes effect: `cmake;` installs
+                # cmake AND ends the command.
+                if [ "$ends_command" = true ]; then
+                    state=idle
+                    cmd_prefix=true
+                fi
                 ;;
             esac
-            prev="$token"
         done
+
+        # A line that names apt and names `install` but never reached a package
+        # list is a form this parser does not understand. Saying so turns a
+        # silent skip into a visible one — `sudo -u root apt-get install` puts an
+        # option ARGUMENT before the command, which cannot be recognised without
+        # knowing which options take arguments.
+        if [ "$saw_apt" = true ] && [ "$saw_install" = true ] && [ "$parsed_install" = false ]; then
+            echo "notice: $workflow:$pending_line looks like an apt install command but was not parsed as one — its packages were not checked"
+            unresolvable=$((unresolvable + 1))
+        fi
     done <"$workflow"
 
     if [ -n "$pending" ]; then
