@@ -228,6 +228,10 @@ scan_line() {
     # as unknowable and it was looked up as a package. Depth is tracked across
     # tokens so every word of the substitution is announced instead.
     local subst_depth=0 opens closes parens
+    # Quoting that spans a space makes one argument: `"cmake g++"` asks apt for a
+    # package of that name, and apt says no. Stripping the quotes off each
+    # whitespace token would report two good packages for a command that fails.
+    local quote_char="" quote_buf="" quoted_rest
     local i=0 next
     while [ "$i" -lt "${#tokens[@]}" ]; do
         token="${tokens[$i]}"
@@ -289,6 +293,32 @@ scan_line() {
             fi
             ;;
         packages)
+            if [ -n "$quote_char" ]; then
+                quote_buf="$quote_buf $token"
+                case "$token" in
+                *"$quote_char")
+                    judge_package "$workflow" "$pending_line" "$quote_buf"
+                    quote_char=""
+                    quote_buf=""
+                    ;;
+                esac
+                continue
+            fi
+
+            case "$token" in
+            '"'?* | "'"?*)
+                quoted_rest="${token#?}"
+                case "$quoted_rest" in
+                *"${token%"$quoted_rest"}") ;;
+                *)
+                    quote_char="${token%"$quoted_rest"}"
+                    quote_buf="$token"
+                    continue
+                    ;;
+                esac
+                ;;
+            esac
+
             # Options that take a SEPARATE argument, so the token after them is
             # not a package. Only the ones apt actually accepts on `install`,
             # each verified against apt 2.8.3 — listing one that does NOT take
@@ -318,6 +348,12 @@ scan_line() {
         esac
     done
 
+    if [ -n "$quote_char" ]; then
+        # A quote with no closing partner cannot be resolved into a name.
+        echo "notice: $workflow:$pending_line has an unterminated quote, not checked: $quote_buf"
+        unresolvable=$((unresolvable + 1))
+    fi
+
     if [ "$saw_apt" = true ] && [ "$saw_install" = true ] && [ "$parsed_install" = false ]; then
         echo "notice: $workflow:$pending_line looks like an apt install command but was not parsed as one — its packages were not checked"
         unresolvable=$((unresolvable + 1))
@@ -341,12 +377,32 @@ while IFS= read -r workflow; do
     fold_content_indent=-1
     fold_line=0
     fold_buf=""
+    # A heredoc body is DATA: bash writes those lines somewhere and runs none of
+    # them, so reading them as commands rejects a workflow that merely generates
+    # an install script.
+    heredoc_delim=""
 
     while IFS= read -r raw; do
         lineno=$((lineno + 1))
 
         indent="${raw%%[! ]*}"
         trimmed="${raw#"$indent"}"
+
+        if [ -n "$heredoc_delim" ]; then
+            if [ "$trimmed" = "$heredoc_delim" ]; then
+                heredoc_delim=""
+            else
+                # Announced rather than dropped: if the delimiter was misread,
+                # the install that went unchecked is still visible.
+                case "$trimmed" in
+                *apt*install*)
+                    echo "notice: $workflow:$lineno is inside a heredoc, so it is data and not a command — not checked: $trimmed"
+                    unresolvable=$((unresolvable + 1))
+                    ;;
+                esac
+            fi
+            continue
+        fi
 
         if [ "$fold_indent" -ge 0 ]; then
             if [ -n "$trimmed" ] && [ "${#indent}" -gt "$fold_indent" ]; then
@@ -386,10 +442,15 @@ while IFS= read -r workflow; do
         # key may be `run:` or `- run:`. The dash counts as indentation for the
         # block beneath it either way.
         keyed="$trimmed"
+        key_indent="${#indent}"
         case "$keyed" in
         '- '*)
-            keyed="${keyed#- }"
-            keyed="${keyed#"${keyed%%[! ]*}"}"
+            stripped="${keyed#- }"
+            stripped="${stripped#"${stripped%%[! ]*}"}"
+            # The parent node of the block is the mapping, which starts where the
+            # KEY does — past the dash, not at it.
+            key_indent=$((key_indent + ${#keyed} - ${#stripped}))
+            keyed="$stripped"
             ;;
         esac
 
@@ -419,8 +480,17 @@ while IFS= read -r workflow; do
                 ;;
             esac
             if [ "$scalar_is_fold" = true ]; then
-                fold_indent="${#indent}"
-                fold_content_indent=-1
+                fold_indent="$key_indent"
+                # An explicit indentation indicator sets the baseline itself, and
+                # it is relative to the parent node. Without one the baseline is
+                # taken from the block's first content line.
+                fold_digits="${scalar#>}"
+                fold_digits="${fold_digits//[!0-9]/}"
+                if [ -n "$fold_digits" ]; then
+                    fold_content_indent=$((key_indent + fold_digits))
+                else
+                    fold_content_indent=-1
+                fi
                 fold_line=$lineno
                 fold_buf=""
                 continue
@@ -447,6 +517,15 @@ while IFS= read -r workflow; do
         pending=""
 
         scan_line "$workflow" "$pending_line" "$line"
+
+        # `<<WORD`, `<< 'WORD'`, `<<-"WORD"`: everything until a line holding
+        # WORD alone is data. Detected after the line is scanned, because the
+        # line that opens a heredoc is itself a command.
+        opener="$(printf '%s' "$line" |
+            sed -n 's/.*<<-\{0,1\}[[:space:]]*["'"'"']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)["'"'"']\{0,1\}.*/\1/p')"
+        if [ -n "$opener" ]; then
+            heredoc_delim="$opener"
+        fi
     done <"$workflow"
 
     if [ "$fold_indent" -ge 0 ] && [ -n "$fold_buf" ]; then

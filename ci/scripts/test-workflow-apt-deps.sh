@@ -224,6 +224,24 @@ YAML
 expect "an install form the parser cannot read is announced" 0 unparsed \
     "looks like an apt install command but was not parsed" "1 not checkable"
 
+# Quoting that spans a space makes ONE argument, so `"cmake g++"` asks apt for a
+# package of that name and gets nothing: `apt-get -s install "cmake g++"` exits
+# 100. Stripping the quotes off each whitespace token independently reports two
+# good packages for a command that cannot work.
+write_workflow quoted-multiword ci.yml <<'YAML'
+        run: sudo apt-get install -y "cmake g++"
+YAML
+expect "a quoted multiword argument is one package name" 1 quoted-multiword \
+    "cmake g++"
+
+# A quote with no closing partner cannot be resolved into a name at all, so it is
+# announced rather than guessed at in either direction.
+write_workflow quote-unclosed ci.yml <<'YAML'
+        run: sudo apt-get install -y g++ "cmake
+YAML
+expect "an unterminated quote is announced" 0 quote-unclosed \
+    "All 1 apt package(s)" "1 not checkable"
+
 # Some apt options take a SEPARATE argument, and that argument is not a package.
 # Verified against apt 2.8.3: `apt-get -s install -o Debug::NoLocking=1 cmake`
 # exits 0.
@@ -341,6 +359,20 @@ YAML
 expect "a command attached to a separator is parsed" 1 attached-next \
     "bad-package"
 
+# ------------------------------------------------------------------- heredocs
+# A heredoc body is DATA, not commands: bash writes those lines to a file and
+# runs none of them. Reading them as commands rejects a workflow that generates
+# an install script, which is a false red on a gate that blocks PRs.
+write_workflow heredoc ci.yml <<'YAML'
+        run: |
+          cat > install-example.sh <<'EOF'
+          sudo apt-get install -y codex-no-such-package
+          EOF
+          sudo apt-get install -y cmake
+YAML
+expect "a heredoc body is not a command" 0 heredoc \
+    "All 1 apt package(s)" "inside a heredoc"
+
 # ------------------------------------------------------ YAML folded run blocks
 # `run: >` folds the following more-indented lines into ONE command, so the
 # package can sit on a line that names no command at all.
@@ -392,6 +424,36 @@ write_workflow folded-comment ci.yml <<'YAML'
 YAML
 expect "a comment on a folded header still folds" 1 folded-comment \
     "libfcitx5-dev"
+
+# An explicit indentation indicator sets the folding baseline, so lines deeper
+# than IT are more-indented and keep their newlines — even though they all share
+# one indentation with each other. Confirmed against PyYAML, which preserves the
+# newline between them.
+write_workflow folded-indicator-baseline ci.yml <<'YAML'
+      - name: ok
+        run: sudo apt-get install -y cmake
+      - run: >2
+            echo first
+            sudo apt-get install -y libfcitx5-dev
+YAML
+expect "an explicit indentation indicator sets the fold baseline" 1 folded-indicator-baseline \
+    "libfcitx5-dev"
+
+# The indicator counts from the PARENT NODE, which starts where the key does —
+# past the dash, not at it. With the key at column 8 and `>2`, content at column
+# 10 is exactly at the baseline, so both lines fold into one command and the
+# `apt-get` in the second is an argument to `echo`, not an install. PyYAML agrees:
+# 'echo first sudo apt-get install -y libfcitx5-dev\n'. Measuring the dash column
+# instead would make these two more-indented lines and invent an install.
+write_workflow folded-indicator-exact ci.yml <<'YAML'
+      - name: ok
+        run: sudo apt-get install -y cmake
+      - run: >2
+          echo first
+          sudo apt-get install -y libfcitx5-dev
+YAML
+expect "content at the indicator baseline folds into one command" 0 folded-indicator-exact \
+    "All 1 apt package(s)" "looks like an apt install command but was not parsed"
 
 # YAML puts the first key of a sequence item on the dash line, so `- run: >` is
 # the same fold with the key one step to the right.
