@@ -899,6 +899,94 @@ else
     fail "the documented local-development dependencies include PyYAML"
 fi
 
+
+# `<< -EOF` is NOT the `<<-` operator. The dash is separated from `<<` by
+# whitespace, so it belongs to the delimiter WORD: bash ends this body on a line
+# saying `-EOF` and strips no tabs. Stripping the dash off every delimiter that
+# starts with one — the shape of the `<<-EOF` fix — misses that terminator and
+# swallows the rest of the block as data. shlex tokenises both forms
+# identically, so the adjacency has to come from the lexer's reading position.
+write_workflow heredoc-spaced-dash-delimiter ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          cat << -EOF > /tmp/generated
+          body text
+          -EOF
+          sudo apt-get install -y codex-no-such-package
+YAML
+expect "a space before a dashed delimiter keeps the dash" 1 heredoc-spaced-dash-delimiter \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ---------------------------------------------- substitutions inside a word
+# A command substitution need not be the whole argument: `c$(printf make)` is
+# one word that expands to `cmake`, and apt installs it. shlex hands back `c$`,
+# `(`, `printf`, `make`, `)` — reporting those four as package names rejects a
+# workflow that works, which is the failure that gets a gate switched off.
+write_workflow substitution-embedded ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake c$(printf make)
+YAML
+expect "a substitution inside a word is one unresolvable argument" 0 substitution-embedded \
+    "All 1 apt package(s)" "not checked"
+
+# shlex groups a RUN of punctuation into one token, so the `)` closing a
+# substitution arrives welded to whatever follows it — `);`, `)>`, `)&&`. Read
+# as one word it closes nothing, the walk runs to the end of the line, and the
+# command after the separator is swallowed without a word being said about it.
+# That is silent under-coverage, which reads exactly like a clean result.
+write_workflow substitution-then-command ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y $(printf make);sudo apt-get install -y libfcitx5-dev
+YAML
+# The valid package on the first line is load-bearing: without it the swallowed
+# case exits 1 through the "nothing to check" guard, with the swallowed name
+# quoted in the notice, and this would pass while the command was being lost.
+expect "a command after a substitution is not swallowed" 1 substitution-then-command \
+    "libfcitx5-dev" "installs a package apt cannot resolve"
+
+# ...and the other direction: absorbing the separator INTO the substitution
+# leaves the words after it being read as a package list, so a workflow that
+# installs one package and then echoes is rejected for installing `echo`.
+write_workflow substitution-then-separator ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $(printf make);echo done
+YAML
+expect "a separator after a substitution ends the package list" 0 substitution-then-separator \
+    "All 1 apt package(s)"
+
+# `;;` is a welded run too, and it is neither a package nor an operator this
+# scanner knows. Split into two separators it does what it does — end the
+# command — where kept whole it is looked up as a package name and rejects a
+# workflow containing a `case` statement.
+write_workflow double-semicolon ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake;;echo x
+YAML
+expect "a doubled separator is separators, not a package" 0 double-semicolon \
+    "All 1 apt package(s)"
+
+# Same weld, redirection instead of a separator: the target of the redirect is
+# not part of the package argument either.
+write_workflow substitution-then-redirect ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y c$(printf make)>/dev/null
+YAML
+expect "a redirection after a substitution is not part of it" 0 substitution-then-redirect \
+    "All 1 apt package(s)" "c\$(printf make)"
+
+# ------------------------------------------------ continuations join nothing
+# A backslash-newline is REMOVED, not replaced by a space: `cma\` followed by
+# `ke` is the single word `cmake`. Joining with a space asks apt for `cma` and
+# `ke`, neither of which exists, and blocks a workflow that installs correctly.
+# The conventional layout is unaffected — its separator is the whitespace
+# already sitting before the backslash, or the next line's indentation.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cma\' \
+    '          ke' \
+    | write_workflow continuation-midword ci.yml
+expect "a continuation inside a word joins it up" 0 continuation-midword \
+    "All 1 apt package(s)"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

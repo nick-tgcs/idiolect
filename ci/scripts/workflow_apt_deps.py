@@ -66,6 +66,40 @@ SEPARATORS = {";", "|", "&&", "||", "&", "\n"}
 
 REDIRECTIONS = {">", "<", ">>", "<<<", ">&", "<&", "&>", "&>>", "<>"}
 
+# shlex groups a RUN of punctuation into one token, so `);` and `)>` arrive
+# welded together and match neither the parenthesis nor the operator. Longest
+# first, because `<<<` must not be read as `<<` and then `<`. `;;` is absent on
+# purpose: split into two separators it ends a command list, which is what it
+# does, where kept whole it is neither operator nor package.
+OPERATORS = (
+    "&>>", "<<<", ">>", "<<", ">&", "<&", "&>", "<>", "&&", "||",
+    ";", "|", "&", "<", ">", "(", ")",
+)
+
+# Taken from shlex rather than restated, so the two cannot drift apart.
+PUNCTUATION = set(shlex.shlex("", punctuation_chars=True).punctuation_chars)
+
+
+def split_operators(token):
+    """Split a welded run of punctuation into the operators it is made of."""
+    if not token or not set(token) <= PUNCTUATION:
+        return [token]
+    parts = []
+    index = 0
+    while index < len(token):
+        for operator in OPERATORS:
+            if token.startswith(operator, index):
+                parts.append(operator)
+                index += len(operator)
+                break
+        else:
+            # Unreachable while every punctuation character is a one-character
+            # operator above, and load-bearing if that ever stops being true:
+            # without it the loop would not advance.
+            parts.append(token[index])
+            index += 1
+    return parts
+
 
 EXPRESSION_PREFIX = "__GITHUB_EXPRESSION_"
 EXPRESSION_SENTINEL = EXPRESSION_PREFIX + "{}__"
@@ -108,16 +142,24 @@ class Word:
     expand — inside single quotes, or backslash-escaped. That word reaches apt
     with the dollar sign in it, so it is a package name to resolve and not a
     variable to excuse.
+
+    `space_before` is false when no whitespace separates this word from the one
+    before it. shlex splits `<<-EOF` and `<< -EOF` into the same three tokens,
+    and `c$(printf make)` into five, so adjacency is the only thing that says
+    whether a dash belongs to the operator or to the delimiter, and whether a
+    fragment belongs to the word beside it.
     """
 
-    __slots__ = ("value", "literal_dollar")
+    __slots__ = ("value", "literal_dollar", "space_before")
 
-    def __init__(self, value, literal_dollar=False):
+    def __init__(self, value, literal_dollar=False, space_before=True):
         self.value = value
         self.literal_dollar = literal_dollar
+        self.space_before = space_before
 
     def __repr__(self):
-        return f"Word({self.value!r}, literal_dollar={self.literal_dollar})"
+        return (f"Word({self.value!r}, literal_dollar={self.literal_dollar}, "
+                f"space_before={self.space_before})")
 
 
 class _QuoteWatchingStream(io.StringIO):
@@ -137,11 +179,14 @@ class _QuoteWatchingStream(io.StringIO):
         super().__init__(text)
         self.lexer = None
         self.literal_dollar = False
+        self.last_char = None
 
     def read(self, size=-1):
         char = super().read(size)
-        if char == "$" and self.lexer.state in ("'", self.lexer.escape):
-            self.literal_dollar = True
+        if char:
+            if char == "$" and self.lexer.state in ("'", self.lexer.escape):
+                self.literal_dollar = True
+            self.last_char = char
         return char
 
 
@@ -158,10 +203,17 @@ def lex_words(text):
         # this token's, since shlex consumes the whitespace that ends a word
         # before returning it and pushes punctuation back unread.
         stream.literal_dollar = False
+        # The character last read is either the whitespace that ended the word
+        # before, or — when shlex pushed one back — the first character of this
+        # word. Either way, whitespace here means the two words are separated.
+        space_before = stream.last_char is None or stream.last_char.isspace()
         token = lexer.get_token()
         if token is lexer.eof:
             return words
-        words.append(Word(token, stream.literal_dollar))
+        for position, part in enumerate(split_operators(token)):
+            # Only the first part can have had whitespace before it; the rest
+            # were welded to their predecessor by definition.
+            words.append(Word(part, stream.literal_dollar, space_before and position == 0))
 
 
 def scan_command(path, line, words, expressions):
@@ -204,12 +256,23 @@ def scan_command(path, line, words, expressions):
             continue
 
         if state == "packages":
-            if token == "$" and index < len(words) and words[index].value == "(":
+            if (
+                token.endswith("$")
+                and not word.literal_dollar
+                and index < len(words)
+                and words[index].value == "("
+                and not words[index].space_before
+            ):
                 # `$( ... )` arrives as `$`, `(`, its words, `)`. It is one
                 # expansion and none of it can be resolved here, so it is
                 # announced once rather than word by word. Quoted, it would not
                 # be an expansion at all and would arrive as a single word —
                 # which is why this branch cannot be reached by `'$(x)'`.
+                #
+                # The substitution need not be the whole argument, either:
+                # `c$(printf make)` is one word that expands to `cmake`, and
+                # apt installs it. Reporting the fragments around it as package
+                # names rejects a workflow that works.
                 parts = []
                 index += 1
                 depth = 1
@@ -223,7 +286,18 @@ def scan_command(path, line, words, expressions):
                         if not depth:
                             break
                     parts.append(inner)
-                rendered = "$(" + " ".join(parts) + ")"
+                rendered = token[:-1] + "$(" + " ".join(parts) + ")"
+                # Whatever is written hard against the closing `)` is part of
+                # the same word — but a separator or a redirection is not, and
+                # absorbing one would discard the command after it.
+                while (
+                    index < len(words)
+                    and not words[index].space_before
+                    and words[index].value not in SEPARATORS
+                    and words[index].value not in REDIRECTIONS
+                ):
+                    rendered += words[index].value
+                    index += 1
                 emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
                 continue
             if token.startswith(EXPRESSION_PREFIX) and token.endswith("__"):
@@ -294,12 +368,16 @@ def heredocs_opened(words):
         if words[index].value != "<<" or index + 1 >= len(words):
             index += 1
             continue
-        delimiter = words[index + 1].value
-        if not delimiter.startswith("-"):
-            opened.append((delimiter, False))
+        word = words[index + 1]
+        if not word.value.startswith("-") or word.space_before:
+            # A dash SEPARATED from `<<` is part of the delimiter word, not the
+            # operator: `cat << -EOF` ends on a line saying `-EOF` and strips no
+            # tabs. shlex tokenises it identically to `<<-EOF`, so only the
+            # adjacency tells them apart.
+            opened.append((word.value, False))
             index += 2
-        elif delimiter != "-":
-            opened.append((delimiter[1:], True))
+        elif word.value != "-":
+            opened.append((word.value[1:], True))
             index += 2
         elif index + 2 < len(words):
             # `<<- EOF`: bash allows whitespace between the operator and the
@@ -366,7 +444,12 @@ def scan_shell(path, text, first_line, exact_lines):
             pending_offset = offset
             pending = raw
         else:
-            pending = f"{pending} {raw}"
+            # Joined with NOTHING: the shell removes a backslash-newline pair
+            # entirely, so `cma\` followed by `ke` is the one word `cmake`. The
+            # conventional layout keeps its separator either way — it is the
+            # whitespace already sitting before the backslash, or the next
+            # line's indentation.
+            pending = f"{pending}{raw}"
 
         if pending.endswith("\\"):
             pending = pending[:-1]
