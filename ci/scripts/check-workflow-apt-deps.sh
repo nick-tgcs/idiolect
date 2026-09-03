@@ -103,6 +103,163 @@ missing=0
 checked=0
 unresolvable=0
 
+# `judge_package <workflow> <line> <token>` — one candidate package name.
+judge_package() {
+    local workflow="$1" lineno="$2" token="$3"
+
+    # Shell quoting is not part of the name: `"cmake"` installs `cmake`.
+    token="${token#[\"\']}"
+    token="${token%[\"\']}"
+    [ -n "$token" ] || return
+
+    case "$token" in
+    -*) return ;;
+    *'$'* | *'{{'* | *'('* | *')'*)
+        # Announced, never silent: a package name assembled at runtime cannot be
+        # resolved here, and a skip nobody can see is a skip nobody can audit.
+        # The parentheses matter on their own: `$(cat pkgs.txt)` splits into
+        # `$(cat` and `pkgs.txt)`, and only the first carries a `$`.
+        echo "notice: $workflow:$lineno names a package through a variable, not checked: $token"
+        unresolvable=$((unresolvable + 1))
+        return
+        ;;
+    esac
+
+    # A comma is deliberately NOT stripped. The shell passes it straight to apt,
+    # which rejects it: `apt-get -s install cmake,` exits 100 with "Unable to
+    # locate package cmake,". Removing it would hide exactly that typo.
+    checked=$((checked + 1))
+    if [ -z "$(candidate_of "$token")" ]; then
+        echo "::error::$workflow:$lineno installs a package apt cannot resolve: $token"
+        missing=$((missing + 1))
+    fi
+}
+
+# `scan_line <workflow> <line-number> <text>` — judges one LOGICAL line: a single
+# shell command line, already assembled from whatever YAML and shell spread it
+# across several physical ones.
+scan_line() {
+    local workflow="$1" pending_line="$2" line="$3"
+    local state cmd_prefix saw_apt saw_install parsed_install token word sep
+
+    # Cheap pre-filter: a line that never says "apt" cannot hold an install
+    # command, and this skips almost every line in the repository.
+    case "$line" in
+    *apt*) ;;
+    *) return ;;
+    esac
+
+    # `${{ matrix.pkg }}` is ONE package name, and splitting on whitespace makes
+    # it three tokens — of which the middle one carries no `$` and is duly looked
+    # up as a package, does not resolve, and fails a correct workflow. Squeezing
+    # the spaces out of each expression first keeps it a single token. A false
+    # red here would block every PR, which is how a gate gets switched off.
+    line="$(printf '%s' "$line" | sed ':a;s/\(\${{[^}]*\) \([^}]*}}\)/\1\2/;ta')"
+
+    # Walked as a state machine rather than by matching the string "apt-get
+    # install", because that string is not the only way to write it and not the
+    # only way it appears:
+    #
+    #   - `apt-get [options] install pkg1 ...` is the documented syntax, so
+    #     `apt-get --no-install-recommends install -y bad-pkg` holds no such
+    #     substring and walked straight past the invalid package;
+    #   - a `#` comment runs to end of line, so `install -y cmake # for the
+    #     addon` had `#`, `for`, `the` and `addon` looked up as packages;
+    #   - CI_README.md is prose, where "the apt install step" is a sentence and
+    #     not a command, so an install starts only in COMMAND POSITION.
+    state=idle
+    # Command position: the start of the line, and again after every shell
+    # operator. It survives the prefix material an invocation may carry —
+    # sudo/env, their options, and `VAR=value` assignments — and dies on the
+    # first token that is none of those.
+    cmd_prefix=true
+    # If a line names apt and names `install` but never reaches the package
+    # list, the parser did not understand the form. Not parsing it is
+    # acceptable; not saying so is not.
+    saw_apt=false
+    saw_install=false
+    parsed_install=false
+
+    case "$line" in
+    *apt-get* | *' apt '*) saw_apt=true ;;
+    esac
+    case "$line" in
+    *install*) saw_install=true ;;
+    esac
+
+    for token in $line; do
+        case "$token" in
+        *'$'* | *'{{'*)
+            # An interpolated value may contain any of the characters below. It
+            # is judged by state further down, never as punctuation.
+            ;;
+        "#"*)
+            # A comment runs to the end of the line. Continuations were joined
+            # above, so nothing after this is a command either.
+            break
+            ;;
+        *[';&|<>']*)
+            # Shell metacharacters need no whitespace around them, so ONE
+            # whitespace-delimited token can hold the end of a word and the
+            # operator that ends it: `bad-package>/dev/null`, `cmake&&`,
+            # `cmake;`. What precedes the first metacharacter is still a word
+            # the shell passes to apt; what follows belongs to the next command.
+            word="${token%%[;&|<>]*}"
+            sep="${token#"$word"}"
+            if [ "$state" = packages ] && [ -n "$word" ]; then
+                case "$word" in
+                *[!0-9]*)
+                    judge_package "$workflow" "$pending_line" "$word"
+                    ;;
+                *)
+                    # All digits in front of a redirection is a file descriptor
+                    # (`2>&1`), not a package.
+                    case "$sep" in
+                    [\<\>]*) ;;
+                    *) judge_package "$workflow" "$pending_line" "$word" ;;
+                    esac
+                    ;;
+                esac
+            fi
+            state=idle
+            cmd_prefix=true
+            continue
+            ;;
+        esac
+
+        case "$state" in
+        idle)
+            [ "$cmd_prefix" = true ] || continue
+            case "$token" in
+            apt | apt-get) state=options ;;
+            # Still an invocation prefix, so the command is yet to come.
+            # `sudo -E apt-get ...` is documented sudo syntax and put an option
+            # between the two.
+            sudo | env | 'run:' | '-' | -* | *=*) ;;
+            # Any other word is the command itself, or prose.
+            *) cmd_prefix=false ;;
+            esac
+            ;;
+        options)
+            # Everything between `apt-get` and its subcommand is an option; only
+            # `install` opens a package list.
+            if [ "$token" = "install" ]; then
+                state=packages
+                parsed_install=true
+            fi
+            ;;
+        packages)
+            judge_package "$workflow" "$pending_line" "$token"
+            ;;
+        esac
+    done
+
+    if [ "$saw_apt" = true ] && [ "$saw_install" = true ] && [ "$parsed_install" = false ]; then
+        echo "notice: $workflow:$pending_line looks like an apt install command but was not parsed as one — its packages were not checked"
+        unresolvable=$((unresolvable + 1))
+    fi
+}
+
 while IFS= read -r workflow; do
     # The list above is newline-terminated, so the here-string yields a final
     # empty line that is not a path.
@@ -111,14 +268,54 @@ while IFS= read -r workflow; do
     lineno=0
     pending=""
     pending_line=0
+    # `run: >` is a FOLDED scalar: GitHub joins the more-indented lines beneath
+    # it into ONE command, so a package can sit on a line that names no command.
+    # -1 means no fold is open; otherwise it holds the indentation of the `run:`
+    # key, and the fold ends at the first blank line or the first line indented
+    # no further than that key.
+    fold_indent=-1
+    fold_line=0
+    fold_buf=""
 
     while IFS= read -r raw; do
         lineno=$((lineno + 1))
 
-        # A `run:` block may split one command across lines with a trailing
-        # backslash. Joining them first is what stops the packages on the
-        # continuation lines from going unexamined — silent under-coverage
-        # reads exactly like a clean result.
+        indent="${raw%%[! ]*}"
+        trimmed="${raw#"$indent"}"
+
+        if [ "$fold_indent" -ge 0 ]; then
+            if [ -n "$trimmed" ] && [ "${#indent}" -gt "$fold_indent" ]; then
+                fold_buf="$fold_buf $trimmed"
+                continue
+            fi
+            # The fold closed. Judge what it collected, then fall through and
+            # handle THIS line as an ordinary one.
+            scan_line "$workflow" "$fold_line" "$fold_buf"
+            fold_indent=-1
+            fold_buf=""
+        fi
+
+        # Only a `>` standing alone as the scalar indicator opens a fold;
+        # `run: echo a > b` is a command that happens to redirect.
+        case "$trimmed" in
+        run:*)
+            scalar="${trimmed#run:}"
+            scalar="${scalar#"${scalar%%[! ]*}"}"
+            case "$scalar" in
+            '>' | '>-' | '>+')
+                fold_indent="${#indent}"
+                fold_line=$lineno
+                fold_buf=""
+                continue
+                ;;
+            esac
+            ;;
+        esac
+
+        # A `run:` block may also split one command across lines with a trailing
+        # backslash. Joining them is what stops the packages on the continuation
+        # lines from going unexamined — silent under-coverage reads exactly like
+        # a clean result.
         line="$raw"
         if [ -n "$pending" ]; then
             line="$pending $line"
@@ -133,161 +330,13 @@ while IFS= read -r workflow; do
         esac
         pending=""
 
-        # Cheap pre-filter: a line that never says "apt" cannot hold an install
-        # command, and this skips almost every line in the repository.
-        case "$line" in
-        *apt*) ;;
-        *) continue ;;
-        esac
-
-        # `${{ matrix.pkg }}` is ONE package name, and splitting on whitespace
-        # makes it three tokens — of which the middle one carries no `$` and is
-        # duly looked up as a package, does not resolve, and fails a correct
-        # workflow. Squeezing the spaces out of each expression first keeps it a
-        # single token for the interpolation check below. A false red here would
-        # block every PR, which is how a gate gets switched off.
-        line="$(printf '%s' "$line" | sed ':a;s/\(\${{[^}]*\) \([^}]*}}\)/\1\2/;ta')"
-
-        # Walked as a state machine over the whole line rather than by matching
-        # the string "apt-get install", because that string is not the only way
-        # to write it and not the only way it appears:
-        #
-        #   - `apt-get [options] install pkg1 ...` is the documented syntax, so
-        #     `apt-get --no-install-recommends install -y bad-pkg` holds no such
-        #     substring and walked straight past the invalid package;
-        #   - a `#` comment runs to end of line, so `install -y cmake # for the
-        #     addon` had `#`, `for`, `the` and `addon` looked up as packages and
-        #     failed a correct workflow;
-        #   - CI_README.md is prose, where "the apt install step" is a sentence
-        #     and not a command, so an install starts only in COMMAND POSITION.
-        state=idle
-        # A command position: the start of the line, and again after every shell
-        # operator. It survives the prefix material an invocation may carry —
-        # sudo/env, their options, and `VAR=value` assignments — and dies on the
-        # first token that is none of those, which is what stops "the apt install
-        # step" in prose from being read as a command.
-        cmd_prefix=true
-        # If a line names apt and names `install` but never reaches the package
-        # list, the parser did not understand the form. Not parsing it is
-        # acceptable; not saying so is not, because a silent skip reads exactly
-        # like a clean result. `sudo -u root apt-get install` is the case that
-        # cannot be recognised without knowing which options take arguments.
-        saw_apt=false
-        saw_install=false
-        parsed_install=false
-        for token in $line; do
-            case "$token" in
-            *'$'* | *'{{'*)
-                # An interpolated value may contain any of the characters below.
-                # It is judged by state further down, never as punctuation.
-                ;;
-            "#"*)
-                # A comment runs to the end of the line. Continuations were
-                # joined above, so nothing after this is a command either.
-                break
-                ;;
-            '&&' | '||' | ';' | '|' | *'>'* | *'<'*)
-                # A redirection needs no space before its target, so `>/dev/null`
-                # and `2>&1` arrive as one token and match none of the bare
-                # operator patterns. A package name never contains `>` or `<`.
-                state=idle
-                cmd_prefix=true
-                continue
-                ;;
-            esac
-
-            case "$token" in
-            apt | apt-get) saw_apt=true ;;
-            install) saw_install=true ;;
-            esac
-
-            case "$state" in
-            idle)
-                [ "$cmd_prefix" = true ] || continue
-                case "$token" in
-                apt | apt-get)
-                    state=options
-                    ;;
-                # Still an invocation prefix, so the command is yet to come.
-                # `sudo -E apt-get ...` is documented sudo syntax and put an
-                # option between the two.
-                sudo | env | 'run:' | '-' | -* | *=*) ;;
-                # Any other word is the command itself, or prose.
-                *) cmd_prefix=false ;;
-                esac
-                ;;
-            options)
-                # Everything between `apt-get` and its subcommand is an option;
-                # only `install` opens a package list.
-                if [ "$token" = "install" ]; then
-                    state=packages
-                    parsed_install=true
-                fi
-                ;;
-            packages)
-                # Shell quoting is not part of the name — `"cmake"` installs
-                # `cmake`. An attached `;` is not either, but it also ENDS the
-                # command, so `cmake; echo done` must not read `echo` and `done`
-                # as two more packages.
-                #
-                # A comma is deliberately NOT stripped. The shell passes it
-                # straight to apt, which rejects it: `apt-get -s install cmake,`
-                # exits 100 with "Unable to locate package cmake,". Removing it
-                # here would hide exactly the typo this gate exists to catch.
-                ends_command=false
-                case "$token" in
-                *';')
-                    token="${token%;}"
-                    ends_command=true
-                    ;;
-                esac
-                token="${token#[\"\']}"
-                token="${token%[\"\']}"
-                if [ -z "$token" ]; then
-                    [ "$ends_command" = true ] && { state=idle; cmd_prefix=true; }
-                    continue
-                fi
-
-                case "$token" in
-                -*) ;;
-                *'$'* | *'{{'* | *'('* | *')'*)
-                    # Announced, never silent: a package name assembled at
-                    # runtime cannot be resolved here, and a skip nobody can see
-                    # is a skip nobody can audit. The parentheses matter on their
-                    # own: `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`,
-                    # and only the first carries a `$`.
-                    echo "notice: $workflow:$pending_line names a package through a variable, not checked: $token"
-                    unresolvable=$((unresolvable + 1))
-                    ;;
-                *)
-                    checked=$((checked + 1))
-                    if [ -z "$(candidate_of "$token")" ]; then
-                        echo "::error::$workflow:$pending_line installs a package apt cannot resolve: $token"
-                        missing=$((missing + 1))
-                    fi
-                    ;;
-                esac
-
-                # Judged first, then the `;` takes effect: `cmake;` installs
-                # cmake AND ends the command.
-                if [ "$ends_command" = true ]; then
-                    state=idle
-                    cmd_prefix=true
-                fi
-                ;;
-            esac
-        done
-
-        # A line that names apt and names `install` but never reached a package
-        # list is a form this parser does not understand. Saying so turns a
-        # silent skip into a visible one — `sudo -u root apt-get install` puts an
-        # option ARGUMENT before the command, which cannot be recognised without
-        # knowing which options take arguments.
-        if [ "$saw_apt" = true ] && [ "$saw_install" = true ] && [ "$parsed_install" = false ]; then
-            echo "notice: $workflow:$pending_line looks like an apt install command but was not parsed as one — its packages were not checked"
-            unresolvable=$((unresolvable + 1))
-        fi
+        scan_line "$workflow" "$pending_line" "$line"
     done <"$workflow"
+
+    if [ "$fold_indent" -ge 0 ]; then
+        # A fold that runs to the end of the file still holds a command.
+        scan_line "$workflow" "$fold_line" "$fold_buf"
+    fi
 
     if [ -n "$pending" ]; then
         # A `run:` block whose last line ends in a backslash. The join above

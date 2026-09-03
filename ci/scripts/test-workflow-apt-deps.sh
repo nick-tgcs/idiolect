@@ -254,6 +254,77 @@ YAML
 expect "a file ending inside a continuation is announced" 0 dangling \
     "ends inside a line continuation"
 
+# ------------------------------------------- metacharacters need no whitespace
+# The shell ends a word at `>` without a space, so `bad-package>/dev/null` still
+# installs `bad-package`. Discarding the whole whitespace token throws the
+# package away with the redirection.
+write_workflow attached-redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake bad-package>/dev/null
+YAML
+expect "a package attached to a redirection is still checked" 1 attached-redirect \
+    "bad-package"
+
+# ...but a leading FILE DESCRIPTOR is not a package: `2>&1` is a redirection
+# whose word is the digit 2.
+write_workflow fd-redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake 2>&1
+YAML
+expect "a file descriptor before a redirection is not a package" 0 fd-redirect \
+    "All 1 apt package(s)"
+
+# Same for the boolean operators: the shell ends the word before `&&` whether or
+# not a space is written, so `cmake&&` installs `cmake` and starts a new command.
+write_workflow attached-and ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake&& echo done
+YAML
+expect "an attached && ends the word and the command" 0 attached-and \
+    "All 1 apt package(s)"
+
+# ------------------------------------------------------ YAML folded run blocks
+# `run: >` folds the following more-indented lines into ONE command, so the
+# package can sit on a line that names no command at all.
+write_workflow folded ci.yml <<'YAML'
+      - name: ok
+        run: sudo apt-get install -y cmake
+      - name: folded
+        run: >
+          sudo apt-get install -y
+          libfcitx5-dev
+YAML
+expect "a folded run block is one command" 1 folded \
+    "libfcitx5-dev" "ci.yml:4"
+
+# The fold ends where the indentation drops, or the next step would be glued to
+# the previous command and its words read as packages.
+write_workflow folded-end ci.yml <<'YAML'
+      - name: folded
+        run: >
+          sudo apt-get install -y
+          cmake
+      - name: after
+        run: cargo test --workspace
+YAML
+expect "a folded block ends when the indentation drops" 0 folded-end \
+    "All 1 apt package(s)"
+
+# `run: |` is LITERAL: newlines are kept, so each line is its own command and
+# must not be folded together.
+write_workflow literal-block ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          echo done
+YAML
+expect "a literal run block keeps its lines separate" 0 literal-block \
+    "All 1 apt package(s)"
+
+# `run: echo a > b` is a command containing a redirection, not a folded scalar.
+write_workflow not-folded ci.yml <<'YAML'
+        run: echo hello > /tmp/x
+        run: sudo apt-get install -y cmake
+YAML
+expect "a redirection in a run command is not a folded scalar" 0 not-folded \
+    "All 1 apt package(s)"
+
 # ------------------------------------------------- a gate that cannot run says so
 # Each of these yields an empty finding set, which is indistinguishable from a
 # clean pass unless it is reported as a failure to run.
