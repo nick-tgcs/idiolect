@@ -177,7 +177,7 @@ scan_line() {
     #
     # Longest alternative first, so `&&` is not read as two `&` and `>>` not as
     # two `>`. A lone `&` is deliberately left alone: it belongs to `2>&1`.
-    line="$(printf '%s' "$line" | sed 's/\(&&\|||\|>>\|<<\|[;|<>]\)/ \1 /g')"
+    line="$(printf '%s' "$line" | sed 's/\(&&\|||\|&>>\|&>\|>>\|<<\|[;|<>]\)/ \1 /g')"
 
     # AFTER that spacing and never before: `${{ matrix.pkg }}` is ONE package
     # name, and any whitespace inside it — including whitespace the line above
@@ -247,7 +247,7 @@ scan_line() {
             cmd_prefix=true
             continue
             ;;
-        '<' | '>' | '<<' | '>>')
+        '<' | '>' | '<<' | '>>' | '&>' | '&>>')
             # A redirection does NOT end the argument list — `cmd a >log b`
             # passes both a and b to cmd — so consume its target and carry on
             # in the same state.
@@ -262,7 +262,7 @@ scan_line() {
         *[!0-9]* | '') ;;
         *)
             case "$next" in
-            '<' | '>' | '<<' | '>>') continue ;;
+            '<' | '>' | '<<' | '>>' | '&>' | '&>>') continue ;;
             esac
             ;;
         esac
@@ -289,6 +289,18 @@ scan_line() {
             fi
             ;;
         packages)
+            # Options that take a SEPARATE argument, so the token after them is
+            # not a package. Only the ones apt actually accepts on `install`,
+            # each verified against apt 2.8.3 — listing one that does NOT take
+            # an argument would swallow a real package, which is the false green
+            # this check exists to prevent.
+            case "$token" in
+            -o | -c | -t | --option | --config-file | --target-release | --default-release)
+                i=$((i + 1))
+                continue
+                ;;
+            esac
+
             if [ "$subst_depth" -gt 0 ]; then
                 echo "notice: $workflow:$pending_line names a package through a variable, not checked: $token"
                 unresolvable=$((unresolvable + 1))
@@ -326,6 +338,7 @@ while IFS= read -r workflow; do
     # key, and the fold ends at the first blank line or the first line indented
     # no further than that key.
     fold_indent=-1
+    fold_content_indent=-1
     fold_line=0
     fold_buf=""
 
@@ -337,13 +350,33 @@ while IFS= read -r workflow; do
 
         if [ "$fold_indent" -ge 0 ]; then
             if [ -n "$trimmed" ] && [ "${#indent}" -gt "$fold_indent" ]; then
+                # The block's content indentation is set by its first line.
+                if [ "$fold_content_indent" -lt 0 ]; then
+                    fold_content_indent="${#indent}"
+                fi
+
+                if [ "${#indent}" -gt "$fold_content_indent" ]; then
+                    # YAML does NOT fold a more-indented line into the one above
+                    # it — the newline is kept — so it is a command of its own,
+                    # and joining it with a space would hide what it runs.
+                    if [ -n "$fold_buf" ]; then
+                        scan_line "$workflow" "$fold_line" "$fold_buf"
+                        fold_buf=""
+                    fi
+                    scan_line "$workflow" "$lineno" "$trimmed"
+                    continue
+                fi
+
                 fold_buf="$fold_buf $trimmed"
                 continue
             fi
             # The fold closed. Judge what it collected, then fall through and
             # handle THIS line as an ordinary one.
-            scan_line "$workflow" "$fold_line" "$fold_buf"
+            if [ -n "$fold_buf" ]; then
+                scan_line "$workflow" "$fold_line" "$fold_buf"
+            fi
             fold_indent=-1
+            fold_content_indent=-1
             fold_buf=""
         fi
 
@@ -387,6 +420,7 @@ while IFS= read -r workflow; do
             esac
             if [ "$scalar_is_fold" = true ]; then
                 fold_indent="${#indent}"
+                fold_content_indent=-1
                 fold_line=$lineno
                 fold_buf=""
                 continue
@@ -415,7 +449,7 @@ while IFS= read -r workflow; do
         scan_line "$workflow" "$pending_line" "$line"
     done <"$workflow"
 
-    if [ "$fold_indent" -ge 0 ]; then
+    if [ "$fold_indent" -ge 0 ] && [ -n "$fold_buf" ]; then
         # A fold that runs to the end of the file still holds a command.
         scan_line "$workflow" "$fold_line" "$fold_buf"
     fi

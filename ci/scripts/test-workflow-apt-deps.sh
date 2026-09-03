@@ -224,6 +224,32 @@ YAML
 expect "an install form the parser cannot read is announced" 0 unparsed \
     "looks like an apt install command but was not parsed" "1 not checkable"
 
+# Some apt options take a SEPARATE argument, and that argument is not a package.
+# Verified against apt 2.8.3: `apt-get -s install -o Debug::NoLocking=1 cmake`
+# exits 0.
+write_workflow option-arg ci.yml <<'YAML'
+        run: sudo apt-get install -o Debug::NoLocking=1 cmake
+YAML
+expect "an apt option argument is not a package" 0 option-arg \
+    "All 1 apt package(s)"
+
+# ...but only the options that actually take one. `--no-install-recommends` does
+# not, so consuming the token after it would swallow a real package — the false
+# green this gate exists to prevent.
+write_workflow option-noarg ci.yml <<'YAML'
+        run: sudo apt-get install --no-install-recommends libfcitx5-dev
+YAML
+expect "an option that takes no argument does not swallow a package" 1 option-noarg \
+    "libfcitx5-dev"
+
+# Bash `&>` and `&>>` redirect both streams and are single operators; spacing
+# only the `>` leaves a bare `&` to be looked up as a package.
+write_workflow combined-redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake &>/dev/null
+YAML
+expect "a combined output redirection is one operator" 0 combined-redirect \
+    "All 1 apt package(s)"
+
 # A MULTIWORD substitution has middle tokens carrying neither `$` nor a
 # parenthesis, so nothing marks them as uncheckable and `%s` gets looked up as a
 # package. The whole substitution is one expansion and none of it is knowable
@@ -328,6 +354,20 @@ write_workflow folded ci.yml <<'YAML'
 YAML
 expect "a folded run block is one command" 1 folded \
     "libfcitx5-dev" "ci.yml:4"
+
+# YAML does not fold a MORE-indented line into the line above it: the newline is
+# kept, so it is its own command. Joining it with a space hides the command it
+# holds.
+write_workflow folded-more-indented ci.yml <<'YAML'
+      - name: ok
+        run: sudo apt-get install -y cmake
+      - name: folded
+        run: >
+          echo first
+            sudo apt-get install -y libfcitx5-dev
+YAML
+expect "a more-indented folded line is its own command" 1 folded-more-indented \
+    "libfcitx5-dev" "ci.yml:6"
 
 # The fold ends where the indentation drops, or the next step would be glued to
 # the previous command and its words read as packages.
