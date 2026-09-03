@@ -51,10 +51,28 @@ if ! command -v apt-cache >/dev/null 2>&1; then
     exit 1
 fi
 
-candidate_of() { # candidate_of <package> -> prints the candidate version, if any
-    apt-cache policy "$1" 2>/dev/null |
+# One `apt-cache` process per DISTINCT package rather than per occurrence: the
+# workflows name 149 packages between them but only 14 different ones, and a
+# candidate cannot change within a single run.
+declare -A APT_CANDIDATE
+
+# `resolve_candidate <package>` sets CANDIDATE to the candidate version, or to
+# the empty string if apt cannot resolve the name. It assigns to a global rather
+# than printing, because a `$(...)` call would run — and discard — the cache in a
+# subshell, leaving one process per occurrence after all.
+CANDIDATE=""
+resolve_candidate() {
+    local package="$1"
+
+    if [ -n "${APT_CANDIDATE[$package]+set}" ]; then
+        CANDIDATE="${APT_CANDIDATE[$package]}"
+        return
+    fi
+
+    CANDIDATE="$(apt-cache policy "$package" 2>/dev/null |
         sed -n 's/^  Candidate: //p' |
-        grep -v '^(none)$'
+        grep -v '^(none)$')"
+    APT_CANDIDATE["$package"]="$CANDIDATE"
 }
 
 # The control has to be the ARCHIVE INDEXES, not a package. `apt-cache policy`
@@ -129,7 +147,8 @@ judge_package() {
     # which rejects it: `apt-get -s install cmake,` exits 100 with "Unable to
     # locate package cmake,". Removing it would hide exactly that typo.
     checked=$((checked + 1))
-    if [ -z "$(candidate_of "$token")" ]; then
+    resolve_candidate "$token"
+    if [ -z "$CANDIDATE" ]; then
         echo "::error::$workflow:$lineno installs a package apt cannot resolve: $token"
         missing=$((missing + 1))
     fi
@@ -140,7 +159,7 @@ judge_package() {
 # across several physical ones.
 scan_line() {
     local workflow="$1" pending_line="$2" line="$3"
-    local state cmd_prefix saw_apt saw_install parsed_install token word sep
+    local state cmd_prefix saw_apt saw_install parsed_install token
 
     # Cheap pre-filter: a line that never says "apt" cannot hold an install
     # command, and this skips almost every line in the repository.
@@ -149,12 +168,29 @@ scan_line() {
     *) return ;;
     esac
 
-    # `${{ matrix.pkg }}` is ONE package name, and splitting on whitespace makes
-    # it three tokens — of which the middle one carries no `$` and is duly looked
-    # up as a package, does not resolve, and fails a correct workflow. Squeezing
-    # the spaces out of each expression first keeps it a single token. A false
-    # red here would block every PR, which is how a gate gets switched off.
+    # Shell metacharacters need no whitespace around them, so one
+    # whitespace-delimited word can hold a package AND the punctuation after it:
+    # `cmake&&`, `bad-package>/dev/null`, `cmake;apt-get`. Spacing them out first
+    # means the loop below only ever sees a word or an operator, never a blend —
+    # and the command AFTER an attached separator survives instead of being
+    # discarded along with the separator.
+    #
+    # Longest alternative first, so `&&` is not read as two `&` and `>>` not as
+    # two `>`. A lone `&` is deliberately left alone: it belongs to `2>&1`.
+    line="$(printf '%s' "$line" | sed 's/\(&&\|||\|>>\|<<\|[;|<>]\)/ \1 /g')"
+
+    # AFTER that spacing and never before: `${{ matrix.pkg }}` is ONE package
+    # name, and any whitespace inside it — including whitespace the line above
+    # just introduced around a `>` — would make it several tokens, of which the
+    # middle ones carry no `$` and are duly looked up as packages. Squeezing the
+    # expression back together repairs both. A false red here would block every
+    # PR, which is how a gate gets switched off.
     line="$(printf '%s' "$line" | sed ':a;s/\(\${{[^}]*\) \([^}]*}}\)/\1\2/;ta')"
+
+    # `read -a` rather than `for token in $line`, which would glob-expand a token
+    # like `*` against the working directory.
+    local -a tokens=()
+    read -r -a tokens <<<"$line"
 
     # Walked as a state machine rather than by matching the string "apt-get
     # install", because that string is not the only way to write it and not the
@@ -168,8 +204,8 @@ scan_line() {
     #   - CI_README.md is prose, where "the apt install step" is a sentence and
     #     not a command, so an install starts only in COMMAND POSITION.
     state=idle
-    # Command position: the start of the line, and again after every shell
-    # operator. It survives the prefix material an invocation may carry —
+    # Command position: the start of the line, and again after every command
+    # separator. It survives the prefix material an invocation may carry —
     # sudo/env, their options, and `VAR=value` assignments — and dies on the
     # first token that is none of those.
     cmd_prefix=true
@@ -187,43 +223,42 @@ scan_line() {
     *install*) saw_install=true ;;
     esac
 
-    for token in $line; do
+    local i=0 next
+    while [ "$i" -lt "${#tokens[@]}" ]; do
+        token="${tokens[$i]}"
+        next="${tokens[$((i + 1))]:-}"
+        i=$((i + 1))
+
         case "$token" in
-        *'$'* | *'{{'*)
-            # An interpolated value may contain any of the characters below. It
-            # is judged by state further down, never as punctuation.
-            ;;
         "#"*)
-            # A comment runs to the end of the line. Continuations were joined
-            # above, so nothing after this is a command either.
+            # A comment runs to the end of the line. Continuations and folds
+            # were assembled above, so nothing after this is a command either.
             break
             ;;
-        *[';&|<>']*)
-            # Shell metacharacters need no whitespace around them, so ONE
-            # whitespace-delimited token can hold the end of a word and the
-            # operator that ends it: `bad-package>/dev/null`, `cmake&&`,
-            # `cmake;`. What precedes the first metacharacter is still a word
-            # the shell passes to apt; what follows belongs to the next command.
-            word="${token%%[;&|<>]*}"
-            sep="${token#"$word"}"
-            if [ "$state" = packages ] && [ -n "$word" ]; then
-                case "$word" in
-                *[!0-9]*)
-                    judge_package "$workflow" "$pending_line" "$word"
-                    ;;
-                *)
-                    # All digits in front of a redirection is a file descriptor
-                    # (`2>&1`), not a package.
-                    case "$sep" in
-                    [\<\>]*) ;;
-                    *) judge_package "$workflow" "$pending_line" "$word" ;;
-                    esac
-                    ;;
-                esac
-            fi
+        '&&' | '||' | ';' | '|')
+            # A command separator: what follows is a new command, in command
+            # position.
             state=idle
             cmd_prefix=true
             continue
+            ;;
+        '<' | '>' | '<<' | '>>')
+            # A redirection does NOT end the argument list — `cmd a >log b`
+            # passes both a and b to cmd — so consume its target and carry on
+            # in the same state.
+            i=$((i + 1))
+            continue
+            ;;
+        esac
+
+        # `2>&1`: an all-digit word immediately in front of a redirection is a
+        # file descriptor, not a package.
+        case "$token" in
+        *[!0-9]* | '') ;;
+        *)
+            case "$next" in
+            '<' | '>' | '<<' | '>>') continue ;;
+            esac
             ;;
         esac
 
@@ -300,7 +335,12 @@ while IFS= read -r workflow; do
         case "$trimmed" in
         run:*)
             scalar="${trimmed#run:}"
+            # YAML allows a comment after the scalar indicator: `run: > # why`.
+            case "$scalar" in
+            *'#'*) scalar="${scalar%%#*}" ;;
+            esac
             scalar="${scalar#"${scalar%%[! ]*}"}"
+            scalar="${scalar%"${scalar##*[! ]}"}"
             case "$scalar" in
             '>' | '>-' | '>+')
                 fold_indent="${#indent}"

@@ -280,6 +280,31 @@ YAML
 expect "an attached && ends the word and the command" 0 attached-and \
     "All 1 apt package(s)"
 
+# A redirection does not end the argument list: `cmd a 2>/dev/null b` passes
+# BOTH a and b. Resetting the parser at the redirection loses everything after
+# it.
+write_workflow after-redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake 2>/dev/null bad-package
+YAML
+expect "packages after a redirection are still checked" 1 after-redirect \
+    "bad-package"
+
+# `>>` is a redirection too, and the two-character form must not be read as two
+# separate `>` (which would consume a package as the second one's target).
+write_workflow append-redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake >>build.log g++
+YAML
+expect "an append redirection consumes only its target" 0 append-redirect \
+    "All 2 apt package(s)"
+
+# ...and a separator with no space after it still starts a real command, whose
+# packages are as much the gate's business as the first command's.
+write_workflow attached-next ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake;apt-get install -y bad-package
+YAML
+expect "a command attached to a separator is parsed" 1 attached-next \
+    "bad-package"
+
 # ------------------------------------------------------ YAML folded run blocks
 # `run: >` folds the following more-indented lines into ONE command, so the
 # package can sit on a line that names no command at all.
@@ -306,6 +331,17 @@ write_workflow folded-end ci.yml <<'YAML'
 YAML
 expect "a folded block ends when the indentation drops" 0 folded-end \
     "All 1 apt package(s)"
+
+# YAML allows a comment after the scalar indicator, and it does not stop the
+# block from being a folded scalar.
+write_workflow folded-comment ci.yml <<'YAML'
+      - name: folded
+        run: > # install the addon dependencies
+          sudo apt-get install -y
+          libfcitx5-dev
+YAML
+expect "a comment on a folded header still folds" 1 folded-comment \
+    "libfcitx5-dev"
 
 # `run: |` is LITERAL: newlines are kept, so each line is its own command and
 # must not be folded together.
@@ -440,6 +476,35 @@ write_workflow update-only ci.yml <<'YAML'
 YAML
 expect "apt-get update is not parsed as an install" 0 update-only \
     "All 1 apt package(s)"
+
+# ------------------------------------------------------------- one call per name
+# 149 occurrences of 14 distinct names meant 149 `apt-cache` processes. Nothing
+# about a package's candidate changes within a run, so the answers are cached —
+# pinned by counting the processes rather than by timing them, which would be a
+# flaky assertion about whatever machine is running the suite.
+write_workflow repeated ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake cmake cmake g++ cmake g++
+YAML
+CALL_LOG="$WORK/apt-calls"
+COUNTING_BIN="$WORK/counting-bin"
+mkdir -p "$COUNTING_BIN"
+cat >"$COUNTING_BIN/apt-cache" <<EOF
+#!/bin/sh
+echo "\$*" >>"$CALL_LOG"
+exec "$(command -v apt-cache)" "\$@"
+EOF
+chmod +x "$COUNTING_BIN/apt-cache"
+: >"$CALL_LOG"
+if PATH="$COUNTING_BIN:$PATH" bash "$CHECK" "$WORK/repeated" >/dev/null 2>&1; then
+    lookups="$(grep -c '^policy .' "$CALL_LOG" || true)"
+    if [ "$lookups" -eq 2 ]; then
+        ok "each distinct package is looked up exactly once"
+    else
+        fail "each distinct package is looked up exactly once: 6 occurrences of 2 names caused $lookups lookups"
+    fi
+else
+    fail "each distinct package is looked up exactly once: the check did not pass on a valid fixture"
+fi
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
