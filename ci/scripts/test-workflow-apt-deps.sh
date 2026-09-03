@@ -224,6 +224,16 @@ YAML
 expect "an install form the parser cannot read is announced" 0 unparsed \
     "looks like an apt install command but was not parsed" "1 not checkable"
 
+# A MULTIWORD substitution has middle tokens carrying neither `$` nor a
+# parenthesis, so nothing marks them as uncheckable and `%s` gets looked up as a
+# package. The whole substitution is one expansion and none of it is knowable
+# here.
+write_workflow substitution-multiword ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $(printf '%s' g++)
+YAML
+expect "every word of a command substitution is announced" 0 substitution-multiword \
+    "All 1 apt package(s)" "3 not checkable"
+
 # `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`. Only the first carries a
 # `$`; judging the second as a package name fails a correct workflow.
 write_workflow substitution ci.yml <<'YAML'
@@ -341,6 +351,36 @@ write_workflow folded-comment ci.yml <<'YAML'
           libfcitx5-dev
 YAML
 expect "a comment on a folded header still folds" 1 folded-comment \
+    "libfcitx5-dev"
+
+# YAML puts the first key of a sequence item on the dash line, so `- run: >` is
+# the same fold with the key one step to the right.
+write_workflow folded-dash ci.yml <<'YAML'
+      - run: >
+          sudo apt-get install -y
+          libfcitx5-dev
+YAML
+expect "a fold opened on the sequence-dash line is recognised" 1 folded-dash \
+    "libfcitx5-dev"
+
+# YAML allows an explicit indentation indicator on a block scalar, alone or
+# combined with a chomping indicator: `>2`, `>2-`, `>-2`.
+write_workflow folded-indent ci.yml <<'YAML'
+      - name: folded
+        run: >2
+          sudo apt-get install -y
+          libfcitx5-dev
+YAML
+expect "a folded header with an indentation indicator still folds" 1 folded-indent \
+    "libfcitx5-dev"
+
+write_workflow folded-indent-chomp ci.yml <<'YAML'
+      - name: folded
+        run: >2-
+          sudo apt-get install -y
+          libfcitx5-dev
+YAML
+expect "an indentation and chomping indicator together still fold" 1 folded-indent-chomp \
     "libfcitx5-dev"
 
 # `run: |` is LITERAL: newlines are kept, so each line is its own command and

@@ -223,6 +223,11 @@ scan_line() {
     *install*) saw_install=true ;;
     esac
 
+    # `$(printf '%s' g++)` is ONE expansion spread over three tokens, and the
+    # middle one carries neither `$` nor a parenthesis — so nothing marked `%s`
+    # as unknowable and it was looked up as a package. Depth is tracked across
+    # tokens so every word of the substitution is announced instead.
+    local subst_depth=0 opens closes parens
     local i=0 next
     while [ "$i" -lt "${#tokens[@]}" ]; do
         token="${tokens[$i]}"
@@ -284,7 +289,19 @@ scan_line() {
             fi
             ;;
         packages)
-            judge_package "$workflow" "$pending_line" "$token"
+            if [ "$subst_depth" -gt 0 ]; then
+                echo "notice: $workflow:$pending_line names a package through a variable, not checked: $token"
+                unresolvable=$((unresolvable + 1))
+            else
+                judge_package "$workflow" "$pending_line" "$token"
+            fi
+
+            parens="${token//[!(]/}"
+            opens=${#parens}
+            parens="${token//[!)]/}"
+            closes=${#parens}
+            subst_depth=$((subst_depth + opens - closes))
+            [ "$subst_depth" -lt 0 ] && subst_depth=0
             ;;
         esac
     done
@@ -332,23 +349,48 @@ while IFS= read -r workflow; do
 
         # Only a `>` standing alone as the scalar indicator opens a fold;
         # `run: echo a > b` is a command that happens to redirect.
-        case "$trimmed" in
+        # YAML puts the first key of a sequence item on the dash line, so the
+        # key may be `run:` or `- run:`. The dash counts as indentation for the
+        # block beneath it either way.
+        keyed="$trimmed"
+        case "$keyed" in
+        '- '*)
+            keyed="${keyed#- }"
+            keyed="${keyed#"${keyed%%[! ]*}"}"
+            ;;
+        esac
+
+        case "$keyed" in
         run:*)
-            scalar="${trimmed#run:}"
+            scalar="${keyed#run:}"
             # YAML allows a comment after the scalar indicator: `run: > # why`.
             case "$scalar" in
             *'#'*) scalar="${scalar%%#*}" ;;
             esac
             scalar="${scalar#"${scalar%%[! ]*}"}"
             scalar="${scalar%"${scalar##*[! ]}"}"
+            # `>`, plus YAML's optional indentation and chomping indicators in
+            # either order: `>-`, `>+`, `>2`, `>2-`, `>-2`.
             case "$scalar" in
-            '>' | '>-' | '>+')
+            '>')
+                scalar_is_fold=true
+                ;;
+            '>'*)
+                case "${scalar#>}" in
+                *[!0-9+-]*) scalar_is_fold=false ;;
+                *) scalar_is_fold=true ;;
+                esac
+                ;;
+            *)
+                scalar_is_fold=false
+                ;;
+            esac
+            if [ "$scalar_is_fold" = true ]; then
                 fold_indent="${#indent}"
                 fold_line=$lineno
                 fold_buf=""
                 continue
-                ;;
-            esac
+            fi
             ;;
         esac
 
