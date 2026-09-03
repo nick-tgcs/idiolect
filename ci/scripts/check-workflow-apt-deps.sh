@@ -44,12 +44,6 @@ if [ "$#" -eq 0 ]; then
     set -- ".github/workflows" ".github/CI_README.md"
 fi
 
-# Resolves on any Ubuntu or Debian with usable package lists, and is entirely
-# independent of the input. If THIS cannot be found, the lists are missing or
-# empty and every lookup below would report "unavailable" — an empty answer
-# dressed up as a unanimous verdict.
-CONTROL_PACKAGE="coreutils"
-
 if ! command -v apt-cache >/dev/null 2>&1; then
     echo "::error::apt-cache not found — the workflow dependency check could not run"
     echo "The workflows target ubuntu-latest, so this check needs a Debian-family"
@@ -63,10 +57,22 @@ candidate_of() { # candidate_of <package> -> prints the candidate version, if an
         grep -v '^(none)$'
 }
 
-if [ -z "$(candidate_of "$CONTROL_PACKAGE")" ]; then
-    echo "::error::control package '$CONTROL_PACKAGE' does not resolve — the workflow dependency check could not run"
-    echo "apt package lists are missing or empty. Run 'sudo apt-get update' first;"
-    echo "without them every package below would look unavailable."
+# The control has to be the ARCHIVE INDEXES, not a package. `apt-cache policy`
+# with no arguments lists the package files apt is working from; with nothing
+# fetched that is `/var/lib/dpkg/status` alone. A control PACKAGE cannot see
+# that condition, because an INSTALLED package still reports a candidate out of
+# the local dpkg database and the guard concludes all is well — while every
+# dependency that is merely declared, not installed, is then reported as
+# nonexistent. An empty answer dressed up as a unanimous verdict.
+repository_indexes="$(apt-cache policy 2>/dev/null |
+    grep -E '^[[:space:]]+[0-9]+[[:space:]]' |
+    grep -vF '/var/lib/dpkg/status')"
+
+if [ -z "$repository_indexes" ]; then
+    echo "::error::apt has no repository indexes — the workflow dependency check could not run"
+    echo "Only /var/lib/dpkg/status is available, so apt-cache is answering from the"
+    echo "local package database and anything not already installed would look"
+    echo "nonexistent. Run 'sudo apt-get update' first."
     exit 1
 fi
 
@@ -158,12 +164,19 @@ while IFS= read -r workflow; do
         prev=""
         for token in $line; do
             case "$token" in
+            *'$'* | *'{{'*)
+                # An interpolated value may contain any of the characters below.
+                # It is judged by state further down, never as punctuation.
+                ;;
             "#"*)
                 # A comment runs to the end of the line. Continuations were
                 # joined above, so nothing after this is a command either.
                 break
                 ;;
-            '&&' | '||' | ';' | '|' | '>' | '>>')
+            '&&' | '||' | ';' | '|' | *'>'* | *'<'*)
+                # A redirection needs no space before its target, so `>/dev/null`
+                # and `2>&1` arrive as one token and match none of the bare
+                # operator patterns. A package name never contains `>` or `<`.
                 state=idle
                 prev="$token"
                 continue

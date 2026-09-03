@@ -168,6 +168,15 @@ expect "an interpolated package name is announced, not judged" 0 interpolated \
     "not checked: \${{matrix.extra_package}}" "not checked: \$EXTRA" \
     "1 apt package(s)" "2 not checkable"
 
+# A redirection needs no space in front of its target, so `>/dev/null` arrives as
+# a single token that none of the bare operator patterns match. A package name
+# never contains `>` or `<`.
+write_workflow redirect ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake >/dev/null 2>&1
+YAML
+expect "an attached redirection is not a package" 0 redirect \
+    "All 1 apt package(s)"
+
 # The rest of the punctuation class Codex found in the comment and option cases:
 # shell quoting and a trailing separator are not part of the package name, and
 # reading them as one rejects a command that works.
@@ -255,9 +264,28 @@ STUB_BIN="$WORK/stub-bin"
 mkdir -p "$STUB_BIN"
 printf '#!/bin/sh\nexit 0\n' >"$STUB_BIN/apt-cache"
 chmod +x "$STUB_BIN/apt-cache"
-expect_path "empty apt lists are a failure, not every package being broken" \
+expect_path "an apt-cache that answers nothing is a failure, not a pass" \
     "$STUB_BIN:$PATH" 1 fixed \
-    "control package" "could not run"
+    "no repository indexes" "could not run"
+
+# apt-cache present and answering, but from /var/lib/dpkg/status alone because no
+# lists have been fetched. This is the case a control PACKAGE cannot see: an
+# installed package still reports a candidate, so the guard concludes the lists
+# are fine and every uninstalled dependency is then reported as nonexistent.
+# Real apt against an empty lists directory, not a mock, so the reproduction is
+# the actual condition.
+EMPTY_LISTS="$WORK/empty-lists"
+mkdir -p "$EMPTY_LISTS"
+UNFETCHED_BIN="$WORK/unfetched-bin"
+mkdir -p "$UNFETCHED_BIN"
+cat >"$UNFETCHED_BIN/apt-cache" <<EOF
+#!/bin/sh
+exec "$(command -v apt-cache)" -o Dir::State::Lists="$EMPTY_LISTS" "\$@"
+EOF
+chmod +x "$UNFETCHED_BIN/apt-cache"
+expect_path "unfetched apt lists are a failure, though installed packages resolve" \
+    "$UNFETCHED_BIN:$PATH" 1 fixed \
+    "could not run"
 
 # apt-cache absent entirely, as on a non-Debian machine. The stub directory
 # carries only bash and what the script itself shells out to.
