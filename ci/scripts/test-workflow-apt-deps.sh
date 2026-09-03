@@ -733,6 +733,172 @@ else
     fail "each distinct package is looked up exactly once: the check did not pass on a valid fixture"
 fi
 
+# ------------------------------------------- heredocs the shell does not open
+# `echo example # <<EOF` opens no heredoc, because everything after `#` is a
+# comment. A scanner that searches the raw line for `<<` opens one anyway and
+# then swallows every command after it as data — silently under-checking a file
+# that looks clean. shlex drops the comment for us; this pins that it stays
+# dropped.
+write_workflow heredoc-commented ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          echo example # <<EOF
+          sudo apt-get install -y codex-no-such-package
+YAML
+# The valid package is load-bearing: with none, the gate exits 1 through its
+# "nothing to check" guard and the case would pass without reading the comment
+# correctly at all.
+expect "a commented-out heredoc marker opens no heredoc" 1 heredoc-commented \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# `<<-EOF` is a heredoc whose terminator may be indented with tabs, and bash
+# resumes executing at the line after it. The dash belongs to the OPERATOR, not
+# to the delimiter word: read as `-EOF` the terminator never matches, the
+# heredoc never closes, and every install after it is announced as data instead
+# of checked.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    '          cat <<-EOF > /tmp/generated' \
+    '          body text' \
+    '          	EOF' \
+    '          sudo apt-get install -y codex-no-such-package' \
+    | write_workflow heredoc-dash ci.yml
+expect "a <<- heredoc closes on its tab-indented terminator" 1 heredoc-dash \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# bash allows whitespace between the redirection operator and its word, so
+# `<<- EOF` is the same heredoc. The dash then arrives on its own: taken as the
+# delimiter it yields an empty one, which closes the body on the first blank
+# line and reads the rest of the data as commands.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    '          cat <<- EOF > /tmp/generated' \
+    '' \
+    '          sudo apt-get install -y codex-no-such-package' \
+    '          	EOF' \
+    | write_workflow heredoc-dash-spaced ci.yml
+expect "a <<- heredoc with a spaced delimiter still has a delimiter" 0 heredoc-dash-spaced \
+    "inside a heredoc" "All 1 apt package(s)"
+
+# The shell joins no line continuations inside a heredoc body: the body is
+# data, and `line one \` does not swallow the `EOF` beneath it. Joining them
+# first leaves the heredoc open forever, and every command after it is
+# announced as data instead of checked.
+write_workflow heredoc-body-continuation ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          cat > x.sh <<'EOF'
+          line one \
+          EOF
+          sudo apt-get install -y codex-no-such-package
+YAML
+expect "a continuation inside a heredoc body does not swallow the terminator" 1 heredoc-body-continuation \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and the terminator is the line, not the word on it. A `<<` heredoc ends on
+# a line that is EXACTLY the delimiter; an indented one is body text, which is
+# why the whole line is compared and not a trimmed copy of it.
+write_workflow heredoc-indented-terminator ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          cat > x.sh <<'EOF'
+            EOF
+          sudo apt-get install -y codex-no-such-package
+          EOF
+YAML
+expect "an indented terminator does not close a plain heredoc" 0 heredoc-indented-terminator \
+    "inside a heredoc" "All 1 apt package(s)"
+
+# One command may open more than one heredoc, and the shell reads their bodies
+# in order: `cat <<A <<B` reads all of A, then all of B. Keeping only the first
+# resumes reading commands while the shell is still reading data.
+write_workflow heredoc-two ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          cat <<A <<B > /tmp/generated
+          body of a
+          A
+          sudo apt-get install -y codex-no-such-package
+          B
+YAML
+expect "a second heredoc on the same command is still a heredoc" 0 heredoc-two \
+    "inside a heredoc" "All 1 apt package(s)"
+
+# ------------------------------------------------------- literal dollar signs
+# `'$MISSING'` is not a variable reference. The shell performs no expansion
+# inside single quotes, so apt receives the eight characters `$MISSING`, fails
+# to find them and exits 100. Announcing it as an unresolvable variable lets the
+# broken install through the gate.
+write_workflow dollar-single ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '$MISSING'
+YAML
+expect "a single-quoted dollar is a literal package name" 1 dollar-single \
+    '$MISSING'
+
+# Same for a backslash-escaped `$`, for the same reason.
+write_workflow dollar-escaped ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake \$ESCAPED
+YAML
+expect "a backslash-escaped dollar is a literal package name" 1 dollar-escaped \
+    '$ESCAPED'
+
+# The other direction, and the reason this cannot be settled by looking for a
+# `$`: double quotes DO expand. Judging `"$DQ"` as a package name would be a
+# false red on a workflow that is perfectly correct.
+write_workflow dollar-double ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake "$DQ"
+YAML
+expect "a double-quoted dollar is still a runtime variable" 0 dollar-double \
+    "not checked" "All 1 apt package(s)"
+
+# Unquoted, likewise.
+write_workflow dollar-bare ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $BARE
+YAML
+expect "an unquoted dollar is still a runtime variable" 0 dollar-bare \
+    "not checked" "All 1 apt package(s)"
+
+# The quoting is read out of the lexer's own state rather than reconstructed
+# here, so this pins the four states it reports. If a future Python changes
+# them, this fails loudly instead of the gate quietly reclassifying every
+# literal `$` as a variable again — the direction that lets a broken install
+# through.
+if SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PYPIN'
+import os
+import sys
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+from workflow_apt_deps import lex_words
+
+for text, want in [
+    ("a '$X'", [False, True]),
+    ("a \\$X", [False, True]),
+    ("a $X", [False, False]),
+    ('a "$X"', [False, False]),
+]:
+    got = [word.literal_dollar for word in lex_words(text)]
+    if got != want:
+        print(f"{text!r}: expected {want}, got {got}")
+        raise SystemExit(1)
+PYPIN
+then
+    ok "the lexer reports which dollar signs the shell would not expand"
+else
+    fail "the lexer reports which dollar signs the shell would not expand"
+fi
+
+# ------------------------------------------------ the documented prerequisites
+# CI_README.md tells a contributor what to install before running test-all.sh,
+# and test-all.sh now runs this gate, which needs PyYAML. The workflows were
+# updated; a fresh machine following the README alone was not, and fails on its
+# first run with an error about a package nobody told it to install.
+if grep -q 'python3-yaml' "$SCRIPT_DIR/../../.github/CI_README.md"; then
+    ok "the documented local-development dependencies include PyYAML"
+else
+    fail "the documented local-development dependencies include PyYAML"
+fi
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

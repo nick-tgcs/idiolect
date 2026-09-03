@@ -38,6 +38,8 @@ and ends. Keep it that way — if something in this file starts to look like
 lexing or parsing, the library is being worked around rather than used.
 """
 
+import io
+import shlex
 import sys
 
 import yaml
@@ -99,16 +101,70 @@ def emit(kind, path, line, value):
     print(f"{kind}\t{path}\t{line}\t{value}")
 
 
-def lex(text):
+class Word:
+    """One shell word: what apt would receive, and how it was quoted.
+
+    `literal_dollar` is true when the word holds a `$` the shell does NOT
+    expand — inside single quotes, or backslash-escaped. That word reaches apt
+    with the dollar sign in it, so it is a package name to resolve and not a
+    variable to excuse.
+    """
+
+    __slots__ = ("value", "literal_dollar")
+
+    def __init__(self, value, literal_dollar=False):
+        self.value = value
+        self.literal_dollar = literal_dollar
+
+    def __repr__(self):
+        return f"Word({self.value!r}, literal_dollar={self.literal_dollar})"
+
+
+class _QuoteWatchingStream(io.StringIO):
+    """Feeds shlex, and notes the quoting in force as each character is read.
+
+    shlex removes quotes and escapes, so by the time a token exists `'$X'`,
+    `\\$X` and `$X` are the same three characters and the distinction that
+    decides whether apt sees a literal dollar is gone. Rather than reconstruct
+    it — re-deriving quoting by hand is exactly what this file exists not to do
+    — the answer is taken from the lexer while it still has it: `shlex.state`
+    holds the quote character it is inside, or the escape character it has just
+    consumed. Which state means what is pinned by a test, so a change in a
+    future Python fails loudly instead of silently reopening the hole.
+    """
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.lexer = None
+        self.literal_dollar = False
+
+    def read(self, size=-1):
+        char = super().read(size)
+        if char == "$" and self.lexer.state in ("'", self.lexer.escape):
+            self.literal_dollar = True
+        return char
+
+
+def lex_words(text):
     """Tokenise one shell command line. Raises ValueError on an unclosed quote."""
-    import shlex
-
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    stream = _QuoteWatchingStream(text)
+    lexer = shlex.shlex(stream, posix=True, punctuation_chars=True)
+    stream.lexer = lexer
     lexer.whitespace_split = True
-    return list(lexer)
+
+    words = []
+    while True:
+        # Reset per word: the characters read while producing this token are
+        # this token's, since shlex consumes the whitespace that ends a word
+        # before returning it and pushes punctuation back unread.
+        stream.literal_dollar = False
+        token = lexer.get_token()
+        if token is lexer.eof:
+            return words
+        words.append(Word(token, stream.literal_dollar))
 
 
-def scan_command(path, line, tokens, expressions):
+def scan_command(path, line, words, expressions):
     """Report the packages installed by one already-tokenised command line."""
     state = "idle"
     # A command position: the start of the line, and again after every
@@ -121,8 +177,9 @@ def scan_command(path, line, tokens, expressions):
     parsed_install = False
 
     index = 0
-    while index < len(tokens):
-        token = tokens[index]
+    while index < len(words):
+        word = words[index]
+        token = word.value
         index += 1
 
         if token in ("apt", "apt-get"):
@@ -143,23 +200,21 @@ def scan_command(path, line, tokens, expressions):
 
         # `2>&1`: an all-digit word in front of a redirection is a file
         # descriptor, not a package.
-        if token.isdigit() and index < len(tokens) and tokens[index] in REDIRECTIONS:
+        if token.isdigit() and index < len(words) and words[index].value in REDIRECTIONS:
             continue
 
         if state == "packages":
-            # `$(...)` arrives as `$`, `(`, the words inside, then `)`. None of
-            # it can be resolved here, and a skip nobody can see is a skip
-            # nobody can audit.
-            if token == "$" and index < len(tokens) and tokens[index] == "(":
+            if token == "$" and index < len(words) and words[index].value == "(":
                 # `$( ... )` arrives as `$`, `(`, its words, `)`. It is one
                 # expansion and none of it can be resolved here, so it is
-                # announced once rather than word by word.
-                depth = 0
-                parts = ["$("]
+                # announced once rather than word by word. Quoted, it would not
+                # be an expansion at all and would arrive as a single word —
+                # which is why this branch cannot be reached by `'$(x)'`.
+                parts = []
                 index += 1
                 depth = 1
-                while index < len(tokens) and depth:
-                    inner = tokens[index]
+                while index < len(words) and depth:
+                    inner = words[index].value
                     index += 1
                     if inner == "(":
                         depth += 1
@@ -168,7 +223,7 @@ def scan_command(path, line, tokens, expressions):
                         if not depth:
                             break
                     parts.append(inner)
-                rendered = "$(" + " ".join(parts[1:]) + ")"
+                rendered = "$(" + " ".join(parts) + ")"
                 emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
                 continue
             if token.startswith(EXPRESSION_PREFIX) and token.endswith("__"):
@@ -176,7 +231,7 @@ def scan_command(path, line, tokens, expressions):
                 original = expressions[int(position)] if position.isdigit() else token
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {original}")
                 continue
-            if "$" in token:
+            if "$" in token and not word.literal_dollar:
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
                 continue
             if token in OPTIONS_WITH_ARGUMENT:
@@ -184,6 +239,10 @@ def scan_command(path, line, tokens, expressions):
                 continue
             if token.startswith("-"):
                 continue
+            # A literal `$` falls through to here on purpose: the shell expands
+            # nothing inside single quotes or after a backslash, so apt is
+            # handed the dollar sign and rejects the name. That is a broken
+            # install, not an unresolvable one.
             emit("PKG", path, line, token)
             continue
 
@@ -216,32 +275,42 @@ def scan_command(path, line, tokens, expressions):
         )
 
 
-def join_continuations(lines):
-    """Join `\\`-continued lines, keeping each result's first line number."""
-    joined = []
-    pending = None
-    pending_index = 0
-    for index, text in enumerate(lines):
-        if pending is None:
-            pending = ""
-            pending_index = index
-        pending = f"{pending} {text}" if pending else text
-        if text.endswith("\\"):
-            pending = pending[:-1]
+def heredocs_opened(words):
+    """Every heredoc a command opens, in order, as (delimiter, tabs_stripped).
+
+    In order, and all of them: `cat <<A <<B` reads A's body and then B's, so a
+    scanner that keeps only the first resumes reading commands while the shell
+    is still reading data.
+
+    The dash in `<<-EOF` belongs to the OPERATOR, not to the delimiter word, but
+    shlex splits on `<<` and hands back `-EOF`. Read literally that terminator
+    never matches, the body never ends, and every command after it is treated as
+    data — under-checking a whole file from one heredoc. The dash also changes
+    the terminator: bash strips leading TABS from it before comparing.
+    """
+    opened = []
+    index = 0
+    while index < len(words):
+        if words[index].value != "<<" or index + 1 >= len(words):
+            index += 1
             continue
-        joined.append((pending_index, pending))
-        pending = None
-    if pending is not None:
-        joined.append((pending_index, pending))
-    return joined
-
-
-def heredoc_delimiter(tokens):
-    """The delimiter word of a heredoc opened on this line, if any."""
-    for index, token in enumerate(tokens):
-        if token in ("<<", "<<-") and index + 1 < len(tokens):
-            return tokens[index + 1]
-    return None
+        delimiter = words[index + 1].value
+        if not delimiter.startswith("-"):
+            opened.append((delimiter, False))
+            index += 2
+        elif delimiter != "-":
+            opened.append((delimiter[1:], True))
+            index += 2
+        elif index + 2 < len(words):
+            # `<<- EOF`: bash allows whitespace between the operator and the
+            # word, so the dash arrives on its own and the delimiter is the word
+            # after it. Taking the dash as the delimiter yields an empty one,
+            # which closes the body on the first blank line.
+            opened.append((words[index + 2].value, True))
+            index += 3
+        else:
+            index += 2
+    return opened
 
 
 def scan_shell(path, text, first_line, exact_lines):
@@ -251,40 +320,65 @@ def scan_shell(path, text, first_line, exact_lines):
     true for a literal block or a plain scalar, false once YAML has folded the
     block, where every finding is reported against the line the block starts on.
     """
-    heredoc = None
-    for offset, command in join_continuations(text.splitlines()):
+    heredocs = []
+    pending = None
+    pending_offset = 0
+
+    def scan_one(command, offset):
+        """Scan one complete command; returns the heredocs it opens."""
         line = first_line + offset if exact_lines else first_line
-
-        if heredoc is not None:
-            if command.strip() == heredoc:
-                heredoc = None
-            elif "apt" in command and "install" in command:
-                # A heredoc body is data, not commands. Announced anyway, so a
-                # misread delimiter cannot hide an install silently.
-                emit(
-                    "NOTICE",
-                    path,
-                    line,
-                    f"is inside a heredoc, so it is data and not a command — not checked: {command.strip()}",
-                )
-            continue
-
         masked, expressions = mask_expressions(command)
         try:
-            tokens = lex(masked)
+            words = lex_words(masked)
         except ValueError as error:
             # Only worth reporting for a line that could hold an install; every
             # other unbalanced quote in a workflow is somebody else's business.
             if "apt" in command and "install" in command:
                 emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
+            return []
+        if "apt" in command:
+            scan_command(path, line, words, expressions)
+        # Looked for on EVERY command, not only the ones naming apt: the line
+        # that opens a heredoc is usually `cat > file <<EOF`, which names
+        # nothing. The body starts after the command's LAST physical line.
+        return heredocs_opened(words)
+
+    for offset, raw in enumerate(text.splitlines()):
+        if heredocs:
+            # A heredoc body is matched against PHYSICAL lines: the shell joins
+            # no continuations inside one, so a body line ending in `\` must not
+            # swallow the terminator on the next.
+            delimiter, tabs_stripped = heredocs[0]
+            if (raw.lstrip("\t") if tabs_stripped else raw) == delimiter:
+                heredocs.pop(0)
+            elif "apt" in raw and "install" in raw:
+                # A heredoc body is data, not commands. Announced anyway, so a
+                # misread delimiter cannot hide an install silently.
+                emit(
+                    "NOTICE",
+                    path,
+                    first_line + offset if exact_lines else first_line,
+                    f"is inside a heredoc, so it is data and not a command — not checked: {raw.strip()}",
+                )
             continue
 
-        # Detected for EVERY line, not only the ones naming apt: the line that
-        # opens a heredoc is usually `cat > file <<EOF`, which names nothing.
-        heredoc = heredoc_delimiter(tokens)
+        if pending is None:
+            pending_offset = offset
+            pending = raw
+        else:
+            pending = f"{pending} {raw}"
 
-        if "apt" in command:
-            scan_command(path, line, tokens, expressions)
+        if pending.endswith("\\"):
+            pending = pending[:-1]
+            continue
+
+        command, pending = pending, None
+        heredocs = scan_one(command, pending_offset)
+
+    if pending is not None:
+        # A trailing `\` at the end of the block: still a command, and the last
+        # one, so whatever heredoc it opens has no body to open.
+        scan_one(pending, pending_offset)
 
 
 def shell_scalars(node):

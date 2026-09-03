@@ -151,7 +151,8 @@ sudo apt-get install -y \
   cmake g++ \
   libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev \
   libasound2-dev libpulse-dev \
-  dpkg-dev time
+  dpkg-dev time \
+  python3-yaml
 
 # Optional: for scheduled checks
 cargo install cargo-audit cargo-outdated cargo-machete cargo-deny cargo-cyclonedx
