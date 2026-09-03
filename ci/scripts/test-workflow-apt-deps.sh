@@ -165,7 +165,7 @@ write_workflow interpolated ci.yml <<'YAML'
         run: sudo apt-get install -y cmake ${{ matrix.extra_package }} $EXTRA
 YAML
 expect "an interpolated package name is announced, not judged" 0 interpolated \
-    "not checked: \${{matrix.extra_package}}" "not checked: \$EXTRA" \
+    "not checked: \${{ matrix.extra_package }}" "not checked: \$EXTRA" \
     "1 apt package(s)" "2 not checkable"
 
 # A redirection needs no space in front of its target, so `>/dev/null` arrives as
@@ -237,10 +237,12 @@ expect "a quoted multiword argument is one package name" 1 quoted-multiword \
 # A quote with no closing partner cannot be resolved into a name at all, so it is
 # announced rather than guessed at in either direction.
 write_workflow quote-unclosed ci.yml <<'YAML'
-        run: sudo apt-get install -y g++ "cmake
+        run: |
+          sudo apt-get install -y g++
+          sudo apt-get install -y "cmake
 YAML
 expect "an unterminated quote is announced" 0 quote-unclosed \
-    "All 1 apt package(s)" "1 not checkable"
+    "All 1 apt package(s)" "could not be tokenised" "1 not checkable"
 
 # Some apt options take a SEPARATE argument, and that argument is not a package.
 # Verified against apt 2.8.3: `apt-get -s install -o Debug::NoLocking=1 cmake`
@@ -276,7 +278,8 @@ write_workflow substitution-multiword ci.yml <<'YAML'
         run: sudo apt-get install -y cmake $(printf '%s' g++)
 YAML
 expect "every word of a command substitution is announced" 0 substitution-multiword \
-    "All 1 apt package(s)" "3 not checkable"
+    "All 1 apt package(s)" "1 not checkable" \
+    "not checked: \$(printf %s g++)"
 
 # `$(cat pkgs.txt)` splits into `$(cat` and `pkgs.txt)`. Only the first carries a
 # `$`; judging the second as a package name fails a correct workflow.
@@ -284,7 +287,7 @@ write_workflow substitution ci.yml <<'YAML'
         run: sudo apt-get install -y cmake $(cat extra-packages.txt)
 YAML
 expect "a command substitution is announced, not judged" 0 substitution \
-    "not checked" "1 apt package(s)" "2 not checkable"
+    "not checked" "1 apt package(s)" "1 not checkable"
 
 # --------------------------------------------------------------- continuations
 # A package on a continuation line is still installed by the job, so it is still
@@ -298,15 +301,16 @@ YAML
 expect "packages after a line continuation are checked" 1 continuation \
     "libfcitx5-dev" "ci.yml:2"
 
-# A file that ends mid-continuation swallowed its packages into the join. Say so
-# rather than counting them as examined.
+# A trailing backslash with nothing after it continues into nothing, so the
+# command is complete and its packages are still checked. The bash reader used to
+# swallow this line and announce it unexamined; assembling the logical line makes
+# the announcement unnecessary.
 write_workflow dangling ci.yml <<'YAML'
         run: sudo apt-get install -y cmake
-        # the next line ends the file inside a continuation
         run: sudo apt-get install -y libglib2.0-dev \
 YAML
-expect "a file ending inside a continuation is announced" 0 dangling \
-    "ends inside a line continuation"
+expect "a trailing continuation still has its packages checked" 0 dangling \
+    "All 2 apt package(s)"
 
 # ------------------------------------------- metacharacters need no whitespace
 # The shell ends a word at `>` without a space, so `bad-package>/dev/null` still
@@ -412,7 +416,7 @@ write_workflow folded-more-indented ci.yml <<'YAML'
             sudo apt-get install -y libfcitx5-dev
 YAML
 expect "a more-indented folded line is its own command" 1 folded-more-indented \
-    "libfcitx5-dev" "ci.yml:6"
+    "libfcitx5-dev" "ci.yml:4"
 
 # A blank line inside a folded block is a paragraph break, NOT the end of the
 # block: YAML keeps folding the lines after it. Confirmed against PyYAML:
@@ -531,6 +535,37 @@ YAML
 expect "a redirection in a run command is not a folded scalar" 0 not-folded \
     "All 1 apt package(s)"
 
+# ------------------------------------------------ what the libraries buy us
+# A metacharacter INSIDE quotes is a literal character, not an operator, so
+# `"codex;no-such-package"` is one package name and apt rejects it (exit 100).
+# The hand-written tokeniser split it and passed the workflow; shlex does not.
+write_workflow quoted-metachar ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake "codex;no-such-package"
+YAML
+expect "a metacharacter inside quotes is part of the name" 1 quoted-metachar \
+    "codex;no-such-package"
+
+# Shell does not only live under `run:`. desktop-app-release.yml keeps an install
+# in a matrix entry and executes it later through `run: ${{ matrix.extra_deps }}`,
+# so a scan that trusts the key name misses it — which is exactly what the first
+# version of the library-based scanner did, caught by comparing package counts
+# against the implementation it replaced.
+write_workflow matrix-value ci.yml <<'YAML'
+      - os: linux
+        extra_deps: |
+          sudo apt-get update
+          sudo apt-get install -y libfcitx5-dev
+        run: ${{ matrix.extra_deps }}
+YAML
+expect "a package named in a matrix value is checked" 1 matrix-value \
+    "libfcitx5-dev"
+
+# A file that does not parse is not a file with no packages.
+mkdir -p "$WORK/broken-yaml"
+printf 'steps:\n  - run: "unterminated\n   bad: [\n' >"$WORK/broken-yaml/ci.yml"
+expect "a workflow that is not valid YAML is a failure, not a pass" 1 broken-yaml \
+    "could not run"
+
 # ------------------------------------------------- a gate that cannot run says so
 # Each of these yields an empty finding set, which is indistinguishable from a
 # clean pass unless it is reported as a failure to run.
@@ -646,6 +681,28 @@ write_workflow update-only ci.yml <<'YAML'
 YAML
 expect "apt-get update is not parsed as an install" 0 update-only \
     "All 1 apt package(s)"
+
+# A missing path alongside VALID ones. Without this the missing-path guard is
+# covered only by a case where nothing else is scanned either, and skipping the
+# bad path would still fail on "found nothing to check" — a different guard
+# catching it, which is not the same as this one working.
+expect "a missing path among valid ones is still a failure" 1 "fixed does-not-exist" \
+    "does not exist" "could not run"
+
+# PyYAML missing is its own condition, and without the guard the scanner merely
+# crashes — still non-zero, but reported as an unexplained failure. A shim that
+# shadows the real module reproduces it exactly.
+NO_YAML="$WORK/no-yaml"
+mkdir -p "$NO_YAML"
+printf 'raise ImportError("not available in this test")\n' >"$NO_YAML/yaml.py"
+out="$(PYTHONPATH="$NO_YAML" "$CHECK" "$WORK/fixed" 2>&1)"
+got=$?
+if [ "$got" -eq 1 ] && printf '%s' "$out" | grep -qF "PyYAML not available"; then
+    ok "a missing PyYAML is named, not left as an unexplained crash"
+else
+    fail "a missing PyYAML is named, not left as an unexplained crash: exit $got"
+    printf '%s\n' "$out" | sed 's/^/    | /' >&2
+fi
 
 # ------------------------------------------------------------- one call per name
 # 149 occurrences of 14 distinct names meant 149 `apt-cache` processes. Nothing
