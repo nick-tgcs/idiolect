@@ -405,7 +405,21 @@ while IFS= read -r workflow; do
         fi
 
         if [ "$fold_indent" -ge 0 ]; then
-            if [ -n "$trimmed" ] && [ "${#indent}" -gt "$fold_indent" ]; then
+            if [ -z "$trimmed" ]; then
+                # A blank line is a PARAGRAPH BREAK inside the block, not its
+                # end: YAML keeps folding the lines that follow. Confirmed
+                # against PyYAML. So the buffer is judged and emptied, and the
+                # block stays open, with the next content line starting the next
+                # logical command.
+                if [ -n "$fold_buf" ]; then
+                    scan_line "$workflow" "$fold_line" "$fold_buf"
+                    fold_buf=""
+                fi
+                fold_line=$((lineno + 1))
+                continue
+            fi
+
+            if [ "${#indent}" -gt "$fold_indent" ]; then
                 # The block's content indentation is set by its first line.
                 if [ "$fold_content_indent" -lt 0 ]; then
                     fold_content_indent="${#indent}"
@@ -521,8 +535,17 @@ while IFS= read -r workflow; do
         # `<<WORD`, `<< 'WORD'`, `<<-"WORD"`: everything until a line holding
         # WORD alone is data. Detected after the line is scanned, because the
         # line that opens a heredoc is itself a command.
-        opener="$(printf '%s' "$line" |
-            sed -n 's/.*<<-\{0,1\}[[:space:]]*["'"'"']\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)["'"'"']\{0,1\}.*/\1/p')"
+        # The delimiter is a shell WORD and may hold punctuation:
+        # `<<'END-MARKER'`. Reading it as an identifier captured `END`, so the
+        # real terminator never matched and every later command was swallowed.
+        opener="$(printf '%s' "$line" | sed -n "s/.*<<-\{0,1\}[[:space:]]*'\([^']*\)'.*/\1/p")"
+        if [ -z "$opener" ]; then
+            opener="$(printf '%s' "$line" | sed -n 's/.*<<-\{0,1\}[[:space:]]*"\([^"]*\)".*/\1/p')"
+        fi
+        if [ -z "$opener" ]; then
+            opener="$(printf '%s' "$line" |
+                sed -n 's/.*<<-\{0,1\}[[:space:]]*\([^[:space:];&|<>"'"'"']\{1,\}\).*/\1/p')"
+        fi
         if [ -n "$opener" ]; then
             heredoc_delim="$opener"
         fi

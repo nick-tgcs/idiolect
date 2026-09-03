@@ -373,6 +373,19 @@ YAML
 expect "a heredoc body is not a command" 0 heredoc \
     "All 1 apt package(s)" "inside a heredoc"
 
+# A heredoc delimiter is a shell WORD, not an identifier: `<<'END-MARKER'` ends
+# at a line saying END-MARKER. Capturing only `END` means the terminator never
+# matches and every command after it is swallowed as heredoc data.
+write_workflow heredoc-punct ci.yml <<'YAML'
+        run: |
+          cat > x.sh <<'END-MARKER'
+          sudo apt-get install -y codex-no-such-package
+          END-MARKER
+          sudo apt-get install -y cmake
+YAML
+expect "a punctuated heredoc delimiter still closes the body" 0 heredoc-punct \
+    "All 1 apt package(s)" "inside a heredoc"
+
 # ------------------------------------------------------ YAML folded run blocks
 # `run: >` folds the following more-indented lines into ONE command, so the
 # package can sit on a line that names no command at all.
@@ -400,6 +413,21 @@ write_workflow folded-more-indented ci.yml <<'YAML'
 YAML
 expect "a more-indented folded line is its own command" 1 folded-more-indented \
     "libfcitx5-dev" "ci.yml:6"
+
+# A blank line inside a folded block is a paragraph break, NOT the end of the
+# block: YAML keeps folding the lines after it. Confirmed against PyYAML:
+# 'echo first\nsudo apt-get install -y codex-no-such-package\n'.
+write_workflow folded-blank ci.yml <<'YAML'
+      - name: ok
+        run: sudo apt-get install -y cmake
+      - run: >
+          echo first
+
+          sudo apt-get install -y
+          codex-no-such-package
+YAML
+expect "a blank line does not close a folded block" 1 folded-blank \
+    "codex-no-such-package"
 
 # The fold ends where the indentation drops, or the next step would be glued to
 # the previous command and its words read as packages.
