@@ -82,6 +82,24 @@ APT_COMMANDS = {"apt", "apt-get"}
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
 
 
+def hands_over_a_script(word):
+    """Whether this option makes the word after it a script rather than a file.
+
+    `-c`, and the clustered short forms bash accepts for it: `bash -ec '…'`,
+    `-ce` and `-euxc` all run the script. A LONG option is not a cluster —
+    `--config` is one word, not six flags — and a cluster with no `c` in it
+    hands over nothing, `bash -e file` naming a file to run.
+    """
+    token = word.value
+    return (
+        not word.quoted
+        and len(token) > 1
+        and token[0] == "-"
+        and token[1] != "-"
+        and "c" in token[1:]
+    )
+
+
 def runs_a_script(words):
     """Whether these words hand a script to a shell, as `bash -c '…'` does.
 
@@ -91,13 +109,19 @@ def runs_a_script(words):
     return any(
         word.value.rsplit("/", 1)[-1] in SHELL_COMMANDS and not word.quoted
         for word in words
-    ) and any(word.value == "-c" and not word.quoted for word in words)
+    ) and any(hands_over_a_script(word) for word in words)
 
 
 # The forms a bare shell variable takes when it supplies a command: `$NAME` and
 # `${NAME}`, and nothing more — an index, a default or a substring makes the
 # value something other than what the workflow wrote down.
-SHELL_VARIABLE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+#
+# The braces are written as two alternatives rather than one optional pair,
+# because independently optional braces match `$NAME}` — which bash expands and
+# then appends the `}` to, asking apt for a package that does not exist.
+SHELL_VARIABLE = re.compile(
+    r"^\$([A-Za-z_][A-Za-z0-9_]*)$|^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$"
+)
 
 
 def is_an_assignment(word):
@@ -707,7 +731,7 @@ def scan_command(path, line, words, expressions):
             end_of_options = False
             continue
 
-        if saw_shell and token == "-c" and not word.quoted and index < len(words):
+        if saw_shell and hands_over_a_script(word) and index < len(words):
             # `bash -c '…'` runs its argument as a SCRIPT, and apt inside one
             # installs for real. Scanned rather than announced: it is shell,
             # and this file already knows how to read shell.
@@ -1538,9 +1562,8 @@ def follow_references(path, value, run_path, values, scanned, followed):
             if word is not None and not word.quoted:
                 variable = SHELL_VARIABLE.match(word.value)
                 if variable:
-                    for referenced in resolve_reference(
-                        run_path, "env", (variable.group(1),), values
-                    ):
+                    name = variable.group(1) or variable.group(2)
+                    for referenced in resolve_reference(run_path, "env", (name,), values):
                         visit_reference(path, referenced, run_path, values, scanned, followed)
 
             if not expressions:

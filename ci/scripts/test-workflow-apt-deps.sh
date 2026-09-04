@@ -3008,6 +3008,77 @@ YAML
 expect "env names the block containing the run" 0 env-vs-matrix \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------------------------------ `-c` may arrive inside a CLUSTER
+# `bash -ec '…'` runs the script exactly as `bash -c` does — bash accepts the
+# short options clustered, and `-ce` and `-euxc` run it too. An exact match on
+# `-c` left the script unread and unannounced.
+write_workflow shell-clustered-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -ec 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a clustered -c still hands over a script" 1 shell-clustered-c \
+    "codex-no-such-package"
+
+# ...but a cluster without a `c` hands over nothing: `bash -e file` names a
+# FILE to run, not a script to read, and scanning its word would invent a
+# command out of an operand.
+write_workflow shell-cluster-without-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -e 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a cluster without c hands over nothing" 0 shell-cluster-without-c \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and a LONG option is not a cluster of short ones, however it is spelled:
+# `bash --norc -c '…'` has a `c` in `--norc`, and reading that as the handover
+# consumes the real `-c` as the script and leaves the script itself unread.
+write_workflow shell-long-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash --norc -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a long option is not a short cluster" 1 shell-long-option \
+    "codex-no-such-package"
+
+# ---------------------------------------- a variable's braces have to BALANCE
+# `$COMMAND}` is not the variable `COMMAND`: bash expands it and appends the
+# `}`, so apt is asked for `cmake}` and the install fails. Reading it as the
+# bare name followed the env value and reported the workflow clean.
+write_workflow shell-variable-unbalanced ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: apt-get install -y cmake
+        run: |
+          $COMMAND}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an unbalanced brace is not a variable reference" 0 shell-variable-unbalanced \
+    "All 1 apt package(s)"
+
+# ...while the fully braced form is one, and is followed like the bare name.
+write_workflow shell-variable-braced ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: apt-get install -y codex-no-such-package
+        run: |
+          ${COMMAND}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a fully braced variable is followed" 1 shell-variable-braced \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
