@@ -144,10 +144,14 @@ SHELL_VARIABLE = re.compile(
 def is_an_assignment(word):
     """Whether this word sets a variable rather than naming a command.
 
-    `NAME=value` and `NAME+=value`, unquoted: the `=` has to be part of the
-    word bash reads, and a word that STARTS with one assigns nothing.
+    `NAME=value` and `NAME+=value`; a word that STARTS with `=` assigns
+    nothing. Quoting is not asked about, because it is per WORD here and an
+    assignment is routinely written `OUT="…"` — only the characters before the
+    `=` would have to be unquoted for bash, and a fully quoted `"OUT=x"` names
+    a command rather than assigning. That form appears in no workflow, and
+    reading it as an assignment costs a command name rather than a package.
     """
-    return "=" in word.value and not word.value.startswith("=") and not word.quoted
+    return "=" in word.value and not word.value.startswith("=")
 
 
 def is_apt(token):
@@ -724,11 +728,12 @@ def case_pattern_end(words):
     return None
 
 
-def scan_command(path, line, words, expressions, arrays=None):
+def scan_command(path, line, words, expressions, defined=None):
     """Report the packages installed by one already-tokenised command line.
 
-    `arrays` carries the arrays assigned earlier in the same block, since
-    `deps=( … )` and the `"${deps[@]}"` that runs it are two commands apart.
+    `defined` carries what earlier commands in the same block have DEFINED —
+    arrays, variables and functions — because a definition and the command
+    that runs it are two commands apart, and declaring one runs none of it.
     """
     state = "idle"
     # A command position: the start of the line, and again after every
@@ -739,6 +744,7 @@ def scan_command(path, line, words, expressions, arrays=None):
     saw_apt = False
     saw_install = False
     parsed_install = False
+    pending = []
     end_of_options = False
 
     index = 0
@@ -753,6 +759,8 @@ def scan_command(path, line, words, expressions, arrays=None):
             saw_install = True
 
         if token in SEPARATORS and not word.quoted:
+            remember(pending if at_command else [], defined, expressions)
+            pending = []
             state = "idle"
             at_command = True
             end_of_options = False
@@ -784,8 +792,8 @@ def scan_command(path, line, words, expressions, arrays=None):
             # initializer says what the words are, not that they will ever be
             # run, and `printf '%s\n' "${deps[@]}"` only prints them.
             name, inside, index = assignment
-            if arrays is not None:
-                arrays[name] = (inside, expressions)
+            if defined is not None:
+                defined[("array", name)] = (inside, expressions)
             continue
 
         if (
@@ -944,10 +952,13 @@ def scan_command(path, line, words, expressions, arrays=None):
 
         if is_apt(token):
             state = "options"
-        elif token in INVOCATION_PREFIXES or token.startswith("-") or "=" in token:
+        elif is_an_assignment(word):
             # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
             # names no command, and announcing those flagged two lines of this
-            # repository's own workflows.
+            # repository's own workflows. Remembered only if nothing runs after
+            # it in this command: `FLAG=1 cmd` sets it for cmd alone.
+            pending.append(word)
+        elif token in INVOCATION_PREFIXES or token.startswith("-"):
             pass
         elif token in CONTROL_PREFIXES and not word.quoted:
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
@@ -956,16 +967,24 @@ def scan_command(path, line, words, expressions, arrays=None):
             # a notice, which nothing fails on. Quoted it is no longer reserved:
             # bash looks for a command called `if` and never runs what follows.
             pass
-        elif arrays is not None and ARRAY_EXPANSION.match(token) and \
-                ARRAY_EXPANSION.match(token).group(1) in arrays:
-            # `"${deps[@]}"` puts the array's words HERE, at a command
-            # position, with whatever follows as their arguments.
-            name = ARRAY_EXPANSION.match(token).group(1)
-            end = command_ends(words, index)
-            elsewhere = {key: value for key, value in arrays.items() if key != name}
-            elements = rebased(*arrays[name], expressions)
-            scan_command(path, line, elements + words[index:end], expressions, elsewhere)
-            index = end
+        elif defined is not None and defined_function(words, index - 1) is not None:
+            # Declaring a function runs none of it: the body is remembered and
+            # read where the name is CALLED.
+            name, body, index = defined_function(words, index - 1)
+            defined[("function", name)] = (body, expressions)
+            at_command = True
+        elif defined is not None and remembered(token, defined) is not None:
+            # `"${deps[@]}"`, `$COMMAND` and a function's name each put what
+            # was remembered HERE, at a command position. A function takes its
+            # arguments as `$1`; the other two are words in this command, so
+            # whatever follows belongs to them.
+            key = remembered(token, defined)
+            end = len(words) if key[0] == "function" else command_ends(words, index)
+            after = [] if key[0] == "function" else words[index:end]
+            elsewhere = {other: held for other, held in defined.items() if other != key}
+            scan_command(path, line, rebased(*defined[key], expressions) + after,
+                         expressions, elsewhere)
+            index = end if key[0] != "function" else index
             at_command = False
         elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS or token.rsplit("/", 1)[-1] == "eval":
             # `bash -c '…'` and `eval '…'` run their argument as a SCRIPT, and
@@ -989,6 +1008,8 @@ def scan_command(path, line, words, expressions, arrays=None):
             at_command = False
         else:
             at_command = False
+
+    remember(pending if at_command else [], defined, expressions)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -1150,7 +1171,7 @@ def scan_shell(path, text, first_line, exact_lines):
     true for a literal block or a plain scalar, false once YAML has folded the
     block, where every finding is reported against the line the block starts on.
     """
-    arrays = {}
+    defined = {}
     for offset, command, in_heredoc in shell_commands(text):
         line = first_line + offset if exact_lines else first_line
 
@@ -1183,14 +1204,14 @@ def scan_shell(path, text, first_line, exact_lines):
         if (
             any(is_apt(word.value) or is_partly_assembled(word.value) for word in words)
             or runs_a_script(words)
-            or touches_an_array(words, arrays)
+            or touches_a_definition(words, defined)
         ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
             # skips it without checking a package or saying a word. A word part
             # literal and part expression may be an apt invocation too, and is
             # announced rather than passed over.
-            scan_command(path, line, words, expressions, arrays)
+            scan_command(path, line, words, expressions, defined)
 
 
 def scalar_values(node, path=()):
@@ -1422,17 +1443,26 @@ def command_segments(line):
     """The line's WORDS, split at its unquoted separators.
 
     Words rather than strings: rebuilding a segment by joining values throws
-    away the quoting, and `"${{ github.ref }}"` then reads as a bare expression
-    supplying the command rather than as the literal argument of a `[[ ]]`
-    test. Built on the lexer so a `;` inside quotes stays part of its word.
+    away the quoting, and a name holding a `;` would split the segment that
+    holds it. Built on the lexer so a `;` inside quotes stays part of its word.
+
+    A `[[ … ]]` test is ONE command however many `&&` it holds: those are the
+    conditional's operators, not the shell's separators, and splitting there
+    left `"${{ github.ref }}" == refs/tags/*` looking like a command of its
+    own with the expression at the front of it.
     """
     try:
         words = lex_words(line)
     except ValueError:
         return []
     segments = [[]]
+    conditional = False
     for word in words:
-        if word.value in SEPARATORS and not word.quoted:
+        if not word.quoted and word.value in ("[[", "(("):
+            conditional = True
+        elif not word.quoted and word.value in ("]]", "))"):
+            conditional = False
+        if word.value in SEPARATORS and not word.quoted and not conditional:
             segments.append([])
         else:
             segments[-1].append(word)
@@ -1541,10 +1571,11 @@ def written_before_the_command(words):
         # sets a variable and runs nothing else — so the segment is written
         # here.
         return True
-    # A QUOTED expression is a literal argument rather than a command being
-    # substituted: `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test, not a
-    # command the expression supplies.
-    return not (WHOLE_EXPRESSION.match(word.value) and not word.quoted)
+    # Quoting does not decide this, POSITION does. GitHub substitutes inside
+    # the quotes, so `"${{ env.COMMAND }}" install -y x` runs what the value
+    # names; and `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test because
+    # `[[` is the command there, not because the expression is quoted.
+    return not WHOLE_EXPRESSION.match(word.value)
 
 
 def scalar_line(value, offset=0):
@@ -1631,18 +1662,91 @@ def rebased(words, expressions, into):
     ]
 
 
-def touches_an_array(words, arrays):
-    """Whether these words assign an array, or run one already assigned.
+def remembered(token, defined):
+    """The key `defined` holds for this word, or None: an array, a variable or
+    a function, whichever way the word names one."""
+    expansion = ARRAY_EXPANSION.match(token)
+    if expansion and ("array", expansion.group(1)) in defined:
+        return "array", expansion.group(1)
+    variable = SHELL_VARIABLE.match(token)
+    if variable:
+        name = variable.group(1) or variable.group(2)
+        if ("variable", name) in defined:
+            return "variable", name
+    if ("function", token) in defined:
+        return "function", token
+    return None
 
-    Asked because the two are separate commands and neither need hold apt: the
-    assignment has to be remembered when it does not, and `"${deps[@]}"` names
-    no command of its own for the line to be read for.
+
+def remember(assignments, defined, expressions):
+    """Remember what a command's assignments set, when nothing follows them.
+
+    `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
+    of the script; `FLAG=1 cmd` sets it for cmd alone and is gone after. The
+    value becomes WORDS, because that is what `$COMMAND` expands to.
+    """
+    if defined is None:
+        return
+    for word in assignments:
+        name, _, value = word.value.partition("=")
+        defined[("variable", name.rstrip("+"))] = (
+            [Word(part, quoted=True, literal_dollar=True, literal_backtick=True,
+                  literal_brace=True)
+             for part in value.split()],
+            expressions,
+        )
+
+
+def defined_function(words, index):
+    """The function `NAME () { … }` beginning at `index`, or None.
+
+    Returns the name, the words of its body, and the index after it. Declaring
+    a function RUNS none of it, so the body is remembered rather than read
+    where it is written — the same rule an array's elements follow.
+
+    The brackets have to be next to each other: `foo (cmd)` is the command foo
+    followed by a subshell, while `foo ()`, `foo()` and `foo ( )` all declare.
+    """
+    if index + 3 >= len(words):
+        return None
+    opener, closer, body = words[index + 1], words[index + 2], words[index + 3]
+    if (
+        opener.value != "(" or closer.value != ")" or body.value != "{"
+        or opener.quoted or closer.quoted or body.quoted
+    ):
+        return None
+    depth = 0
+    for position in range(index + 3, len(words)):
+        if words[position].quoted:
+            continue
+        if words[position].value == "{":
+            depth += 1
+        elif words[position].value == "}":
+            depth -= 1
+            if not depth:
+                return words[index].value, words[index + 4:position], position + 1
+    return words[index].value, words[index + 4:], len(words)
+
+
+def touches_a_definition(words, defined):
+    """Whether these words define something, or run something already defined.
+
+    Asked because a definition and its use are separate commands and neither
+    need hold apt: `deps=( … )` has to be remembered when it does not, and
+    `"${deps[@]}"` names no command of its own for the line to be read for.
     """
     for index, word in enumerate(words):
-        if assigned_array(words, index) is not None:
+        if assigned_array(words, index) is not None or defined_function(words, index):
             return True
-        match = ARRAY_EXPANSION.match(word.value)
-        if match and match.group(1) in arrays:
+        if is_an_assignment(word):
+            return True
+        expansion = ARRAY_EXPANSION.match(word.value)
+        variable = SHELL_VARIABLE.match(word.value)
+        if expansion and ("array", expansion.group(1)) in defined:
+            return True
+        if variable and ("variable", variable.group(1) or variable.group(2)) in defined:
+            return True
+        if ("function", word.value) in defined:
             return True
     return False
 
@@ -1826,20 +1930,25 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
                 if not WHOLE_EXPRESSION.match(script.value):
                     continue
                 supplying = [
-                    (all_expressions[int(number)], [])
+                    (all_expressions[int(number)], [], False)
                     for number in re.findall(EXPRESSION_PREFIX + r"(\d+)__", script.value)
                 ]
             else:
-                supplying = [(expression, segment[position + 1:])
+                supplying = [(expression, segment[position + 1:], segment[position].quoted)
                              for position, expression in found]
 
-            for expression, suffix in supplying:
+            for expression, suffix, was_quoted in supplying:
                 resolved = 0
                 written = " ".join(as_written(word, all_expressions) for word in suffix)
                 carried = " ".join(part for part in (written, arguments) if part)
                 for context, chain in referenced_values(expression):
                     for referenced in resolve_reference(run_path, context, chain, values):
                         resolved += 1
+                        if was_quoted and len(referenced.value.split()) != 1:
+                            # Quoted, the whole value is ONE word: bash looks
+                            # for a command with that name and finds none, so
+                            # nothing runs and its packages are not installed.
+                            continue
                         visit_reference(path, referenced, run_path, values, scanned,
                                         followed, scalar_line(value, offset), carried)
                 if not is_a_plain_reference(expression):

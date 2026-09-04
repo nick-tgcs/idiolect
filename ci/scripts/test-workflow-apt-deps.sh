@@ -2833,22 +2833,10 @@ YAML
 expect "a case arm's own command is checked" 1 case-arm-literal \
     "codex-no-such-package" '!looks like an apt install command but was not parsed'
 
-# ...and a function BODY is checked as well. The bracket of a definition closes
-# the same way an arm's does, and one rule for both is worth more than the
-# distinction: a workflow that defines `install_deps` calls it, and a name apt
-# cannot resolve inside one is a defect whether or not this scanner can see the
-# call. The cost is a red on a broken function nobody invokes, which is not a
-# workflow that works either.
-write_workflow function-definition-literal ci.yml <<'YAML'
-jobs:
-  build:
-    steps:
-      - run: |
-          install_deps() { apt-get install -y codex-no-such-package; }
-          sudo apt-get install -y cmake
-YAML
-expect "a function body is checked too" 1 function-definition-literal \
-    "codex-no-such-package" '!looks like an apt install command but was not parsed'
+# ...and the bracket of a function DEFINITION closes one the same way, so it
+# opens a command position too — but nothing there RUNS. What a declaration
+# holds is remembered and read where the name is called; the pair of cases for
+# that is with the other definitions, below.
 
 # ------------------------------------- `name=(...)` is an ARRAY, not a subshell
 # Reading the parenthesis as a command position — which is what made `( apt-get
@@ -3534,6 +3522,125 @@ jobs:
           sudo "${deps[@]}" ${{ env.extra }}
 YAML
 expect "a remembered array keeps its own expressions" 1 array-expansion-renumbered \
+    "codex-no-such-package"
+
+# ----------------------- a QUOTED expression can still be the command's name
+# GitHub substitutes inside the quotes, so `"${{ env.COMMAND }}" install -y x`
+# becomes `"apt-get" install -y x` and runs apt. Position decides this, not
+# quoting: an expression that is not where a command begins is an argument
+# whether it is quoted or not.
+write_workflow quoted-command-expression ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: apt-get
+    steps:
+      - run: |
+          "${{ env.COMMAND }}" install -y codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted expression can name the command" 1 quoted-command-expression \
+    "codex-no-such-package"
+
+# ...but only when the value is ONE word: quoted, `apt-get install -y` is a
+# single word bash looks for and never finds, so nothing is installed and
+# reporting its packages would be a red on a command that cannot run.
+write_workflow quoted-multiword-expression ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: apt-get install -y
+    steps:
+      - run: |
+          "${{ env.COMMAND }}" codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted multi-word value runs nothing" 0 quoted-multiword-expression \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------ a variable assigned in the SCRIPT is followed
+# `COMMAND='apt-get …'` then `$COMMAND` runs it: the value is in the script
+# rather than in `env:`, and looking only at the YAML missed it entirely.
+write_workflow script-assigned-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a variable assigned in the script is followed" 1 script-assigned-variable \
+    "codex-no-such-package"
+
+# ...and it splits into words like any other variable, so the metacharacters
+# inside it are ordinary characters.
+write_workflow script-variable-not-reparsed ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='echo ok ; apt-get install -y codex-no-such-package'
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a script variable is words, not shell source" 0 script-variable-not-reparsed \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and an assignment written BEFORE a command sets it for that command only:
+# `COMMAND=… echo hi` leaves nothing behind, so a later `$COMMAND` runs nothing
+# and remembering it would red a workflow for a command that never happens.
+write_workflow assignment-prefix-not-remembered ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' echo hi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an assignment before a command is not remembered" 0 assignment-prefix-not-remembered \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the same where the command ends at a SEPARATOR rather than at the end
+# of the line, which is the other place an assignment could be committed.
+write_workflow assignment-prefix-before-separator ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' echo hi; $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an assignment prefix before a separator is not remembered" 0 assignment-prefix-before-separator \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ----------------------------- a function body runs when the function is CALLED
+# Declaring `unused() { apt-get … ; }` executes nothing. Reading the body where
+# it is written rejected a workflow that only defines a helper.
+write_workflow function-never-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          unused() { apt-get install -y codex-no-such-package; }
+          echo ok
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an uncalled function installs nothing" 0 function-never-called \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...while a function that IS called installs what its body says.
+write_workflow function-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() { apt-get install -y codex-no-such-package; }
+          install_deps
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a called function installs its body" 1 function-called \
     "codex-no-such-package"
 
 # ------------------------------------------------------------------------ done
