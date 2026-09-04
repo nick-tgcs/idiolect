@@ -4211,6 +4211,19 @@ YAML
 expect "a function's arguments arrive together" 1 function-all-arguments \
     "codex-no-such-package"
 
+# ...and `"$@"` keeps them SEPARATE, which is the exception bash makes to
+# quoting: two operands, not one name with a space in it.
+write_workflow function-all-arguments-two ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() { apt-get install -y "$@"; }
+          install_deps cmake codex-no-such-package
+YAML
+expect "quoted \$@ stays one word per argument" 1 function-all-arguments-two \
+    "cannot resolve: codex-no-such-package"
+
 # -------------------- a QUOTED parenthesis inside a substitution is data
 # `"$(printf ')' ; apt-get …)"` runs both commands: the bracket in quotes is a
 # character, not the end of the substitution. Counting every bracket cut the
@@ -4299,6 +4312,108 @@ jobs:
 YAML
 expect "an option other than -x exports nothing" 0 declare-other-option \
     "All 1 apt package(s)" '!codex-no-such-package'
+
+# --------------------- a QUOTED variable is one operand, whatever it holds
+# `PKG='cmake g++'` expanded as `"$PKG"` hands apt ONE name with a space in it,
+# which apt rejects. Reading its words separately validated two packages that
+# apt is never asked for and called a broken workflow clean.
+write_workflow quoted-variable-one-operand ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          PKG='cmake g++'
+          apt-get install -y "$PKG"
+YAML
+expect "a quoted variable is one package name" 1 quoted-variable-one-operand \
+    "cmake g++"
+
+# ...while unquoted it splits, and both names are checked.
+write_workflow unquoted-variable-splits ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          PKG='cmake g++'
+          apt-get install -y $PKG
+YAML
+expect "an unquoted variable splits into names" 0 unquoted-variable-splits \
+    "All 2 apt package(s)"
+
+# ------------------------------- a child shell inherits no FUNCTIONS at all
+# `bash -c f` looks for an external `f` and finds none: functions are not in
+# the environment unless exported, and this one is not.
+write_workflow child-shell-function ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          bash -c f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a child shell does not inherit a function" 0 child-shell-function \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ---------------------------------------- a SUBSHELL keeps its state to itself
+# `( COMMAND=… )` sets the variable in a shell that ends at the bracket, so the
+# `$COMMAND` after it runs nothing.
+write_workflow subshell-assignment-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          ( COMMAND='apt-get install -y codex-no-such-package' )
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a subshell's assignment does not escape" 0 subshell-assignment-isolated \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and its forgetting does not escape either: the parent still holds what it
+# assigned, and still runs it.
+write_workflow subshell-unset-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          ( unset COMMAND )
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a subshell's unset does not escape" 1 subshell-unset-isolated \
+    "codex-no-such-package"
+
+# ------------------------------------- `command` runs no shell FUNCTION
+# The builtin exists to bypass them: `command f` looks for an external `f`,
+# finds none, and the function body never runs.
+write_workflow command-bypasses-function ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          command f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "command bypasses a function" 0 command-bypasses-function \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------------------------- `local -x` exports too
+# The options of `local` are `declare`'s, so `-x` puts the value in the child's
+# environment for as long as the function runs.
+write_workflow local-export ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          g() { local -x COMMAND='apt-get install -y codex-no-such-package'; bash -c '$COMMAND'; }
+          g
+      - run: sudo apt-get install -y cmake
+YAML
+expect "local -x exports" 1 local-export \
+    "codex-no-such-package"
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

@@ -770,6 +770,7 @@ def scan_command(path, line, words, expressions, defined=None):
     pending = []
     declaring = None
     namespace = None
+    bypassing = False
     end_of_options = False
 
     index = 0
@@ -789,6 +790,7 @@ def scan_command(path, line, words, expressions, defined=None):
             pending = []
             declaring = None
             namespace = None
+            bypassing = False
             state = "idle"
             at_command = True
             end_of_options = False
@@ -806,6 +808,25 @@ def scan_command(path, line, words, expressions, defined=None):
             state = "idle"
             at_command = True
             end_of_options = False
+            continue
+
+        if (
+            token == "("
+            and not word.quoted
+            and at_command
+            and assigned_array(words, index - 1) is None
+            and not (index < len(words) and words[index].value == "("
+                     and not words[index].space_before)
+        ):
+            # A SUBSHELL keeps its state to itself: `( COMMAND=… )` sets the
+            # variable in a shell that ends at the bracket, and `( unset X )`
+            # forgets nothing out here. Read in a copy, which is thrown away.
+            #
+            # `((` is arithmetic rather than a subshell, and an array's bracket
+            # was answered above.
+            inside, index = walk_to_closing_paren(words, index - 1)
+            scan_command(path, line, inside, expressions,
+                         dict(defined) if defined is not None else None)
             continue
 
         assignment = assigned_array(words, index - 1)
@@ -966,7 +987,15 @@ def scan_command(path, line, words, expressions, defined=None):
                     # packages that are written down after all.
                     key = remembered(token, defined)
                     elsewhere = {other: what for other, what in defined.items() if other != key}
-                    for package in rebased(*defined[key], expressions):
+                    held_words = rebased(*defined[key], expressions)
+                    if word.quoted and key[1] not in ("@", "*"):
+                        # Quoted, the whole value is ONE operand: `PKG='cmake
+                        # g++'` written `"$PKG"` asks apt for a single name
+                        # with a space in it, which apt rejects. `"$@"` is the
+                        # exception bash makes, and expands to one word each.
+                        held_words = [Word(" ".join(one.value for one in held_words),
+                                           quoted=True)]
+                    for package in held_words:
                         scan_command(path, line,
                                      [Word("apt-get"), Word("install"), package],
                                      expressions, elsewhere)
@@ -1068,7 +1097,9 @@ def scan_command(path, line, words, expressions, defined=None):
             # it in this command: `FLAG=1 cmd` sets it for cmd alone.
             pending.append(word)
         elif token in INVOCATION_PREFIXES or token.startswith("-"):
-            pass
+            # `command` exists to bypass shell functions: `command f` looks for
+            # an external `f` and never reads the body of one declared here.
+            bypassing = bypassing or token == "command"
         elif token in CONTROL_PREFIXES and not word.quoted:
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
             # then` installs x, and so does `( apt-get ... )`. Ending the
@@ -1082,7 +1113,11 @@ def scan_command(path, line, words, expressions, defined=None):
             name, body, index = defined_function(words, index - 1)
             defined[("function", name)] = (body, expressions)
             at_command = True
-        elif defined is not None and remembered(token, defined) is not None:
+        elif (
+            defined is not None
+            and remembered(token, defined) is not None
+            and not (bypassing and remembered(token, defined)[0] == "function")
+        ):
             # `"${deps[@]}"`, `$COMMAND` and a function's name each put what
             # was remembered HERE, at a command position. A function takes its
             # arguments as `$1`; the other two are words in this command, so
@@ -1131,8 +1166,23 @@ def scan_command(path, line, words, expressions, defined=None):
                 environment = dict(defined) if defined is not None else None
                 if environment is not None:
                     remember(pending, environment, expressions, "export")
-                scan_shell(path, script.value, line, exact_lines=False,
-                           defined=child_scope(environment, script,
+                # What the PARENT expanded is part of the script's text:
+                # `-c "$SCRIPT"` hands over the value, while `-c '$SCRIPT'`
+                # hands over the reference for the child to expand — or not,
+                # if nothing exported it.
+                text = script.value
+                if not script.literal_dollar and environment is not None:
+                    # A VARIABLE reference and nothing else: a bare `f` is a
+                    # name the CHILD looks up, not something the parent
+                    # substitutes, so `bash -c f` hands over the letter f.
+                    variable = SHELL_VARIABLE.match(script.value)
+                    if variable:
+                        name = variable.group(1) or variable.group(2)
+                        if ("variable", name) in environment:
+                            text = " ".join(one.value
+                                            for one in environment[("variable", name)][0])
+                scan_shell(path, text, line, exact_lines=False,
+                           defined=child_scope(environment,
                                                token.rsplit("/", 1)[-1]))
             at_command = False
         elif is_partly_assembled(token):
@@ -1922,19 +1972,19 @@ def substitution_bodies(token):
     return bodies
 
 
-def child_scope(defined, script, keyword):
+def child_scope(defined, keyword):
     """What the script being handed over can see.
 
     `eval` runs in THIS shell, so everything is visible. A shell run as a CHILD
-    inherits only what was EXPORTED: `bash -c '$COMMAND'` hands over the
-    reference, and an unexported variable does not exist over there.
+    inherits only EXPORTED VARIABLES — not functions, not arrays, not anything
+    the parent merely holds: `bash -c f` looks for an external `f` and finds
+    none.
 
-    When the parent expanded the argument itself — `-c "$SCRIPT"` — the value
-    is already in the text, and it is the parent's scope that read it. The
-    quoting says which happened: a `$` under single quotes reached the child
-    unexpanded, and that is what `literal_dollar` records.
+    What the parent expanded INTO the script text is a separate question,
+    answered before this one: the text is read in the parent's scope, and only
+    the reading of it happens over here.
     """
-    if defined is None or keyword == "eval" or not script.literal_dollar:
+    if defined is None or keyword == "eval":
         return defined
     return {
         key: value for key, value in defined.items()
@@ -1974,13 +2024,14 @@ def remember_array(prefix, inside, defined, expressions):
 def exports(declaring, namespace):
     """Whether this declaration puts its names in the child's environment.
 
-    `export` does by name; `declare -x` and `typeset -x` do by ATTRIBUTE, which
-    is the same fact spelled with an option. `readonly` and `local` set a
-    variable and leave the environment alone.
+    `export` does by name; `declare -x`, `typeset -x` and `local -x` do by
+    ATTRIBUTE, which is the same fact spelled with an option — `local` takes
+    whatever options `declare` takes. Without the attribute they set a variable
+    and leave the environment alone, and so does `readonly`.
     """
     if declaring == "export":
         return True
-    return declaring in ("declare", "typeset") and namespace is not None \
+    return declaring in ("declare", "typeset", "local") and namespace is not None \
         and namespace.startswith("-") and "x" in namespace[1:]
 
 
