@@ -87,6 +87,13 @@ CONTROL_PREFIXES = {
 REGION_OPENERS = {"if", "while", "until", "for", "select", "case"}
 REGION_CLOSERS = {"fi", "done", "esac"}
 
+# ...and the words that end one BRANCH of a region and begin the next. The
+# branches of an `if` are alternatives to each other, not to nothing: exactly
+# one of them runs, so each is a state the runner may end in. A case arm ends
+# with `;;` instead of a keyword, which is handled where separators are read.
+# A loop body has no branches, so nothing here belongs to one.
+REGION_BRANCHES = {"then", "elif", "else"}
+
 APT_COMMANDS = {"apt", "apt-get"}
 
 # What an array's bracket is written against: `deps=(` or `deps+=(`. A word
@@ -831,6 +838,25 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # than dropped.
             if token == "|" and starting is not None and defined is not None:
                 displaced(starting, defined)
+            # `;;` ends a case ARM. It arrives as two separators rather than
+            # one token, because the lexer splits a run of punctuation — so it
+            # is the SECOND `;` that names it, and a lone `;` between two
+            # commands of the same arm is left alone: they run in order and the
+            # first value is overwritten, not kept.
+            #
+            # `;&` is deliberately not one. It falls THROUGH to the next arm's
+            # body without testing it, so the two run in sequence and are not
+            # alternatives at all. `;;&` is (`;` `;` `&`), and its arms are.
+            # The one other place two `;` land side by side is `for ((;;))`,
+            # where the boundary fires against a state nothing has changed yet
+            # and records nothing.
+            if (
+                token == ";"
+                and index < len(words)
+                and words[index].value == ";"
+                and not words[index].quoted
+            ):
+                branched(regions, defined)
             conditional = dict(defined) if token in ("&&", "||") and defined is not None \
                 else None
             starting = dict(defined) if defined is not None else None
@@ -865,6 +891,8 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         if at_command and not word.quoted and defined is not None:
             if token in REGION_OPENERS:
                 regions.append(dict(defined))
+            elif token in REGION_BRANCHES:
+                branched(regions, defined)
             elif token in REGION_CLOSERS and regions:
                 displaced(regions.pop(), defined)
 
@@ -2189,15 +2217,21 @@ def held(name, kind, defined, expressions):
 
 
 def bounds_a_region(words):
-    """Whether these words open or close a region bash may skip.
+    """Whether these words open, close, or divide a region bash may skip.
 
     A FILTER, and deliberately permissive: `scan_shell` reads only the lines
     that could matter, and a bare `fi` matters even though it names no package
     and touches no definition. Whether the word is really a keyword — at a
     command position, unquoted — is asked in `scan_command`, where the answer
     is known.
+
+    All THREE sets, not just the two that bound a region: a bare `else` divides
+    one, and leaving it out here left the boundary keywords unreachable for the
+    reader that acts on them, so a multi-line `if`/`else` lost a branch while
+    the one-line form did not.
     """
     return any(word.value in REGION_OPENERS or word.value in REGION_CLOSERS
+               or word.value in REGION_BRANCHES
                for word in words if not word.quoted)
 
 
@@ -2214,6 +2248,20 @@ def alternatives(key, defined, expressions):
     """
     return [rebased(*what, expressions)
             for what in defined.get(("alternative", key[1], key[0]), [])]
+
+
+def branched(regions, defined):
+    """One branch of the region in progress has ended.
+
+    What that branch changed becomes one of the possibilities rather than the
+    only one, and the branch after it starts from here — so a `case` of three
+    arms ends with all three values scannable instead of the last. Called from
+    the two places a branch can end, a keyword and a `;;`, so the two cannot
+    answer it differently.
+    """
+    if regions and defined is not None:
+        displaced(regions[-1], defined)
+        regions[-1] = dict(defined)
 
 
 def displaced(before, defined):

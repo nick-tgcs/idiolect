@@ -5229,6 +5229,108 @@ YAML
 expect "the builtin's own operand is still exported" 1 export-operand-still-exported \
     "codex-no-such-package"
 
+# ------------------ the branches of a region are alternatives to EACH OTHER
+# A `case` runs ONE arm, and an `if` runs ONE branch. Read in file order they
+# overwrite one another, so keeping only the state before the region and the
+# state after the last branch loses every branch in between. Each is a state
+# the runner may end up in.
+write_workflow case-two-arms ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          case a in
+            a) COMMAND='apt-get install -y codex-no-such-package' ;;
+            b) COMMAND=true ;;
+          esac
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an earlier case arm's value survives a later one" 1 case-two-arms \
+    "codex-no-such-package"
+
+write_workflow case-two-arms-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          case a in a) COMMAND='apt-get install -y codex-no-such-package';; b) COMMAND=true;; esac
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the same where the arms share a line" 1 case-two-arms-one-line \
+    "codex-no-such-package"
+
+write_workflow if-else-branches ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          if true; then
+            COMMAND='apt-get install -y codex-no-such-package'
+          else
+            COMMAND=true
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a then branch's value survives its else" 1 if-else-branches \
+    "codex-no-such-package"
+
+write_workflow if-elif-branches ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          if false; then
+            COMMAND=true
+          elif true; then
+            COMMAND='apt-get install -y codex-no-such-package'
+          else
+            COMMAND=true
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an elif branch's value survives what follows it" 1 if-elif-branches \
+    "codex-no-such-package"
+
+write_workflow if-else-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          if true; then COMMAND='apt-get install -y codex-no-such-package'; else COMMAND=true; fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the same where the branches share a line" 1 if-else-one-line \
+    "codex-no-such-package"
+
+# ...and a LONE `;` inside an arm is not a boundary. Two commands of the same
+# arm run in order, so the first value is overwritten and gone — verified
+# against bash. Reading every `;` as an arm end would keep it, and fail a
+# workflow that works.
+write_workflow case-lone-semicolon ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          case a in
+            a) COMMAND='apt-get install -y codex-no-such-package'; COMMAND=true ;;
+          esac
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a lone semicolon inside an arm is not a boundary" 0 case-lone-semicolon \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
