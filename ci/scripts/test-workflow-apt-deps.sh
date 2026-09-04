@@ -3236,6 +3236,93 @@ YAML
 expect "a quoted invocation prefix is still one" 1 quoted-invocation-prefix \
     "codex-no-such-package"
 
+# ------------------------- the gate above the scanner sees a quoted shell too
+# `'bash' -c 'apt-get install -y bad'` runs bash, and the script is one quoted
+# word, so the "does this line hold apt?" gate decides whether the line is read
+# at all. It carried the same wrong quoting guard the walker had.
+write_workflow quoted-shell-literal-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          'bash' -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted shell name reaches the scanner" 1 quoted-shell-literal-script \
+    "codex-no-such-package"
+
+# ------------------------- a shell variable takes arguments like anything else
+# `env.COMMAND: apt-get install -y` with `run: $COMMAND pkg` installs pkg: bash
+# splits the variable and passes the rest along. Reading the value alone found
+# no package, and the call site holds no apt.
+write_workflow shell-variable-with-arguments ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: apt-get install -y
+        run: |
+          $COMMAND codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a shell variable is read with its arguments" 1 shell-variable-with-arguments \
+    "codex-no-such-package"
+
+# --------------------------- and the arguments survive the whole chain of hops
+# `run: ${{ env.COMMAND }} pkg` where `env.COMMAND` is itself `${{ matrix.base
+# }}`: the words after the reference belong to whatever the chain ends at, so
+# they have to travel with it.
+write_workflow chained-reference-with-arguments ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        base:
+          - apt-get install -y
+    env:
+      COMMAND: ${{ matrix.base }}
+    steps:
+      - run: ${{ env.COMMAND }} codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "arguments travel with a chain of references" 1 chained-reference-with-arguments \
+    "codex-no-such-package"
+
+# ...and one value used twice with DIFFERENT arguments is followed for each of
+# them. Remembering only that a value had been followed once stopped the second
+# call site's arguments from ever reaching the end of the chain.
+write_workflow reference-used-twice ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        base:
+          - apt-get install -y
+    env:
+      COMMAND: ${{ matrix.base }}
+    steps:
+      - run: |
+          ${{ env.COMMAND }} cmake
+          ${{ env.COMMAND }} codex-no-such-package
+YAML
+expect "a value followed once is followed again for other arguments" 1 reference-used-twice \
+    "codex-no-such-package"
+
+# ...and a shell variable carries them the same way a reference does, so a hop
+# through one does not lose the call site's words.
+write_workflow shell-variable-chain ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      A: $B
+      B: apt-get install -y
+    steps:
+      - run: ${{ env.A }} codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a hop through a shell variable keeps the arguments" 1 shell-variable-chain \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

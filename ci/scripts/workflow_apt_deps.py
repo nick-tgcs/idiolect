@@ -107,7 +107,9 @@ def runs_a_script(words):
     as apt and the line would otherwise never be looked at.
     """
     return any(
-        word.value.rsplit("/", 1)[-1] in SHELL_COMMANDS and not word.quoted
+        # No quoting guard on the NAME: `'bash' -c '…'` runs bash. Quotes take
+        # a reserved word's meaning away and leave a command name as it was.
+        word.value.rsplit("/", 1)[-1] in SHELL_COMMANDS
         for word in words
     ) and any(hands_over_a_script(word) for word in words)
 
@@ -1577,12 +1579,16 @@ def visit_reference(path, referenced, run_path, values, scanned, followed,
     elif id(referenced) not in scanned:
         scanned.add(id(referenced))
         scan_scalar(path, referenced)
-    if id(referenced) not in followed:
-        followed.add(id(referenced))
-        follow_references(path, referenced, run_path, values, scanned, followed)
+    if (id(referenced), arguments) not in followed:
+        followed.add((id(referenced), arguments))
+        # The arguments travel WITH the chain: `${{ env.COMMAND }} pkg` where
+        # `env.COMMAND` is itself `${{ matrix.base }}` installs pkg, so the
+        # words written at the call site belong to whatever the chain ends at.
+        follow_references(path, referenced, run_path, values, scanned, followed,
+                          arguments)
 
 
-def follow_references(path, value, run_path, values, scanned, followed):
+def follow_references(path, value, run_path, values, scanned, followed, arguments=""):
     """Scan the values this scalar's expressions name, and the values THOSE name.
 
     A `run:` may reach its command through more than one hop — a step writing
@@ -1618,8 +1624,15 @@ def follow_references(path, value, run_path, values, scanned, followed):
                 variable = SHELL_VARIABLE.match(word.value)
                 if variable:
                     name = variable.group(1) or variable.group(2)
+                    # With the words after it, for the same reason an
+                    # expression is read with them: `$COMMAND pkg` splits the
+                    # variable and passes the rest along.
+                    suffix = segment[segment.index(word) + 1:]
+                    written = " ".join(as_written(after, all_expressions) for after in suffix)
+                    carried = " ".join(part for part in (written, arguments) if part)
                     for referenced in resolve_reference(run_path, "env", (name,), values):
-                        visit_reference(path, referenced, run_path, values, scanned, followed)
+                        visit_reference(path, referenced, run_path, values, scanned,
+                                        followed, scalar_line(value, offset), carried)
 
             # Whether anything of the command is written HERE.
             # `echo ${{ github.ref }}` is an ordinary command with a value
@@ -1643,12 +1656,13 @@ def follow_references(path, value, run_path, values, scanned, followed):
 
             for expression, suffix in supplying:
                 resolved = 0
-                arguments = " ".join(as_written(word, all_expressions) for word in suffix)
+                written = " ".join(as_written(word, all_expressions) for word in suffix)
+                carried = " ".join(part for part in (written, arguments) if part)
                 for context, chain in referenced_values(expression):
                     for referenced in resolve_reference(run_path, context, chain, values):
                         resolved += 1
                         visit_reference(path, referenced, run_path, values, scanned,
-                                        followed, scalar_line(value, offset), arguments)
+                                        followed, scalar_line(value, offset), carried)
                 if not is_a_plain_reference(expression):
                     # The whole command is built by the expression, so it
                     # exists nowhere in the file to be checked. Announced,
@@ -1693,9 +1707,9 @@ def scan_workflow(path, text):
         if id(value) not in scanned:
             scanned.add(id(value))
             scan_scalar(path, value)
-        # The `run:` itself counts as followed, so a value that names it back
-        # cannot start the walk over.
-        follow_references(path, value, run_path, values, scanned, {id(value)})
+        # Seeded with the `run:` itself — keyed the way `visit_reference`
+        # keys it — so a value that names it back cannot start the walk over.
+        follow_references(path, value, run_path, values, scanned, {(id(value), "")})
 
 
 def main(argv):
