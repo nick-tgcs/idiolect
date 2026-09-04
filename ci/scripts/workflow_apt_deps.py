@@ -76,6 +76,17 @@ CONTROL_PREFIXES = {
     "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "(",
 }
 
+# A region bash may SKIP ENTIRELY, and the words that end one. Taken from the
+# manual's list of compound commands rather than from the ones a review
+# happened to raise: an `if` whose condition is false runs no branch, a
+# `while`/`until` body may iterate zero times, `for x in ;` and `select` may
+# have nothing to iterate, and a `case` runs at most one arm and possibly
+# none. All four were checked against bash. `{ … }` and `( … )` are absent
+# because they always run — the subshell's own copy is a separate question,
+# answered where its bracket is read.
+REGION_OPENERS = {"if", "while", "until", "for", "select", "case"}
+REGION_CLOSERS = {"fi", "done", "esac"}
+
 APT_COMMANDS = {"apt", "apt-get"}
 
 # What an array's bracket is written against: `deps=(` or `deps+=(`. A word
@@ -751,7 +762,8 @@ def case_pattern_end(words):
     return None
 
 
-def scan_command(path, line, words, expressions, defined=None, in_function=False):
+def scan_command(path, line, words, expressions, defined=None, in_function=False,
+                 regions=None):
     """Report the packages installed by one already-tokenised command line.
 
     `defined` carries what earlier commands in the same block have DEFINED —
@@ -777,6 +789,15 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
     # What was remembered before a `&&` or `||`, since the command after one
     # may not run at all.
     conditional = None
+    # ...and what was remembered before THIS command, since a pipeline runs
+    # every one of its elements in a subshell and only finds out afterwards.
+    starting = dict(defined) if defined is not None else None
+    # Only `scan_shell` passes one in, because only IT reads a region that
+    # spans lines. Every other caller hands over a self-contained word list —
+    # a function's body, a value expanded at a command position — and gets its
+    # own stack, so a branch inside one skips exactly as it does out here.
+    if regions is None:
+        regions = []
     end_of_options = False
 
     index = 0
@@ -801,8 +822,18 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # install.
             if conditional is not None and defined is not None:
                 displaced(conditional, defined)
+            # Bash runs EVERY element of a pipeline in a subshell, not just the
+            # ones before the last: `unset COMMAND | cat` leaves COMMAND set,
+            # and so does `echo x | { COMMAND=y; }`. So what the element just
+            # ended changed is not this shell's — except under `shopt -s
+            # lastpipe`, which a script may set and this scanner cannot see, so
+            # the element's own values are kept as the other possibility rather
+            # than dropped.
+            if token == "|" and starting is not None and defined is not None:
+                displaced(starting, defined)
             conditional = dict(defined) if token in ("&&", "||") and defined is not None \
                 else None
+            starting = dict(defined) if defined is not None else None
             pending = []
             declaring = None
             namespace = []
@@ -825,6 +856,17 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             at_command = True
             end_of_options = False
             continue
+
+        # A region bash may skip leaves what was remembered before it still
+        # possible afterwards — the `&&` rule again, over a block rather than
+        # over one command. Read at a command position only, so `echo done` is
+        # a word and not a closer, and only for an unquoted token, since
+        # `'fi'` is a command bash goes looking for.
+        if at_command and not word.quoted and defined is not None:
+            if token in REGION_OPENERS:
+                regions.append(dict(defined))
+            elif token in REGION_CLOSERS and regions:
+                displaced(regions.pop(), defined)
 
         if (
             token == "("
@@ -1188,6 +1230,13 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                     elsewhere[("variable", str(position))] = ([argument], expressions)
                 for every in ("@", "*"):
                     elsewhere[("variable", every)] = (arguments, expressions)
+                # `COMMAND=… f` runs f with COMMAND set, exported for anything
+                # f starts, and unset again the moment f returns — even if f
+                # assigned to it, and even under `set -o posix`. All three were
+                # checked against bash. That is exactly a `local -x`, so it is
+                # spelled as one rather than as a fourth kind of scope, and the
+                # markers already hold it back at the merge below.
+                remember(pending, elsewhere, expressions, "local", ("-x",))
             for other in alternatives(key, defined, expressions):
                 # A value a conditional command replaced may still be the one
                 # that runs. It is scanned against a COPY, because only one of
@@ -1508,6 +1557,10 @@ def scan_shell(path, text, first_line, exact_lines, defined=None):
     """
     if defined is None:
         defined = {}
+    # Kept out here because a region spans COMMANDS: `if false; then` and its
+    # `fi` are separate lines and so separate calls below, and a stack local to
+    # one of them would be lost between the two.
+    regions = []
     for offset, command, in_heredoc in shell_commands(text):
         line = first_line + offset if exact_lines else first_line
 
@@ -1543,13 +1596,14 @@ def scan_shell(path, text, first_line, exact_lines, defined=None):
             or touches_a_definition(words, defined)
             or any("`" in word.value and not word.literal_backtick for word in words)
             or any("$(" in word.value and not word.literal_dollar for word in words)
+            or bounds_a_region(words)
         ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
             # skips it without checking a package or saying a word. A word part
             # literal and part expression may be an apt invocation too, and is
             # announced rather than passed over.
-            scan_command(path, line, words, expressions, defined)
+            scan_command(path, line, words, expressions, defined, regions=regions)
 
 
 def scalar_values(node, path=()):
@@ -2119,6 +2173,19 @@ def held(name, kind, defined, expressions):
     """What is remembered under this name, renumbered into `expressions`."""
     remembered_words = defined.get((kind, name))
     return rebased(*remembered_words, expressions) if remembered_words else []
+
+
+def bounds_a_region(words):
+    """Whether these words open or close a region bash may skip.
+
+    A FILTER, and deliberately permissive: `scan_shell` reads only the lines
+    that could matter, and a bare `fi` matters even though it names no package
+    and touches no definition. Whether the word is really a keyword — at a
+    command position, unquoted — is asked in `scan_command`, where the answer
+    is known.
+    """
+    return any(word.value in REGION_OPENERS or word.value in REGION_CLOSERS
+               for word in words if not word.quoted)
 
 
 def alternatives(key, defined, expressions):

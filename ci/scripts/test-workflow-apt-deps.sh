@@ -4882,6 +4882,282 @@ YAML
 expect "a local export does not follow the value out" 0 local-export-not-inherited \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ---------------------- every element of a pipeline runs in its own subshell
+# Verified against bash: `COMMAND=x; unset COMMAND | cat; $COMMAND` still runs
+# x, because the `unset` happened in a child. Bash puts the LAST element in a
+# subshell too, unlike ksh — `echo x | { COMMAND=y; }` leaves COMMAND alone —
+# so no element of a pipeline is trusted to have changed this shell.
+write_workflow pipeline-unset ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          unset COMMAND | cat
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a pipeline element's unset does not escape it" 1 pipeline-unset \
+    "codex-no-such-package"
+
+# The value a pipeline element assigns is kept as the OTHER possibility rather
+# than dropped: `shopt -s lastpipe` makes the last element run in this shell
+# after all, and a script may set it.
+write_workflow pipeline-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          COMMAND='apt-get install -y codex-no-such-package' | cat
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a pipeline element's assignment is still a possible value" 1 pipeline-assignment \
+    "codex-no-such-package"
+
+# ...and the pipeline itself still installs, which is the thing all of this
+# must not break.
+write_workflow pipeline-installs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: apt-get install -y codex-no-such-package | tee log
+YAML
+expect "an install inside a pipeline is still found" 1 pipeline-installs \
+    "codex-no-such-package"
+
+# ------------------------- a branch that may not run leaves its value behind
+# `if false; then COMMAND=true; fi` runs nothing, so COMMAND is what it was.
+# The same holds for every construct bash can skip: a loop body that iterates
+# zero times, and a case arm whose pattern does not match. All verified
+# against bash before being pinned here.
+write_workflow branch-if ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          if false; then
+            COMMAND=true
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an if branch that may not run keeps the earlier value" 1 branch-if \
+    "codex-no-such-package"
+
+write_workflow branch-if-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          if false; then COMMAND=true; fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an if branch written on one line does the same" 1 branch-if-one-line \
+    "codex-no-such-package"
+
+write_workflow branch-while ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          while false; do
+            COMMAND=true
+          done
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a while body that may not run keeps the earlier value" 1 branch-while \
+    "codex-no-such-package"
+
+write_workflow branch-for ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          for item in $NOTHING; do
+            COMMAND=true
+          done
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a for body that may not run keeps the earlier value" 1 branch-for \
+    "codex-no-such-package"
+
+write_workflow branch-case ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          case x in
+            y) COMMAND=true ;;
+          esac
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a case arm that may not run keeps the earlier value" 1 branch-case \
+    "codex-no-such-package"
+
+# ...and the branch's OWN value is checked too, since it may equally have run.
+write_workflow branch-if-taken ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          if true; then
+            COMMAND='apt-get install -y codex-no-such-package'
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an if branch's own value is checked" 1 branch-if-taken \
+    "codex-no-such-package"
+
+# ...and an install written INSIDE a branch is still an install.
+write_workflow branch-installs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          if [ -n "$CI" ]; then
+            apt-get install -y codex-no-such-package
+          fi
+YAML
+expect "an install inside a branch is still found" 1 branch-installs \
+    "codex-no-such-package"
+
+# ------------------ a prefix assignment is visible to the function it prefixes
+# `COMMAND=x f` runs f with COMMAND set, and bash unsets it again when f
+# returns — including under `set -o posix`, which was checked because POSIX
+# keeps such an assignment for a special builtin.
+write_workflow function-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { $COMMAND; }
+          COMMAND='apt-get install -y codex-no-such-package' f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment reaches the function it prefixes" 1 function-prefix \
+    "codex-no-such-package"
+
+write_workflow function-prefix-gone ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          f() { :; }
+          COMMAND='apt-get install -y codex-no-such-package' f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment does not outlive the call" 0 function-prefix-gone \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and on ONE line, where the snapshot has to be retaken at each separator
+# rather than once for the line.
+write_workflow pipeline-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: COMMAND='apt-get install -y codex-no-such-package'; unset COMMAND | cat; $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a pipeline element on a shared line does the same" 1 pipeline-one-line \
+    "codex-no-such-package"
+
+# `done` as an ARGUMENT is a word, not the end of a loop. Read anywhere but a
+# command position it would close a region early and commit what the branch
+# assigned.
+write_workflow region-word-not-keyword ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          if false; then
+            echo done
+            COMMAND=true
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a closer read as an argument is only a word" 1 region-word-not-keyword \
+    "codex-no-such-package"
+
+# A prefix assignment is EXPORTED for the command it prefixes, so a shell the
+# function starts sees it too — checked against bash.
+write_workflow function-prefix-child ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { bash -c '$COMMAND'; }
+          COMMAND='apt-get install -y codex-no-such-package' f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment reaches a shell the function starts" 1 function-prefix-child \
+    "codex-no-such-package"
+
+# A function BODY is read by the same reader, so a branch inside one skips the
+# same way — verified against bash, where the caller's COMMAND survives.
+write_workflow region-in-function ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { if false; then COMMAND=true; fi; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a branch inside a function skips the same way" 1 region-in-function \
+    "codex-no-such-package"
+
+# The two loop forms with no test above: `until`, and `select`, which is the
+# member of the opener list a workflow is least likely to hold and so the one
+# most likely to be wrong without anybody noticing.
+write_workflow branch-until ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          until true; do
+            COMMAND=true
+          done
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an until body that may not run keeps the earlier value" 1 branch-until \
+    "codex-no-such-package"
+
+write_workflow branch-select ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          select item in ; do
+            COMMAND=true
+          done
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a select body that may not run keeps the earlier value" 1 branch-select \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
