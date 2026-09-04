@@ -230,20 +230,23 @@ class Word:
     fragment belongs to the word beside it.
     """
 
-    __slots__ = ("value", "literal_dollar", "space_before", "literal_backtick", "quoted")
+    __slots__ = ("value", "literal_dollar", "space_before", "literal_backtick",
+                 "quoted", "literal_brace")
 
     def __init__(self, value, literal_dollar=False, space_before=True,
-                 literal_backtick=False, quoted=False):
+                 literal_backtick=False, quoted=False, literal_brace=False):
         self.value = value
         self.literal_dollar = literal_dollar
         self.space_before = space_before
         self.literal_backtick = literal_backtick
         self.quoted = quoted
+        self.literal_brace = literal_brace
 
     def __repr__(self):
         return (f"Word({self.value!r}, literal_dollar={self.literal_dollar}, "
                 f"space_before={self.space_before}, "
-                f"literal_backtick={self.literal_backtick}, quoted={self.quoted})")
+                f"literal_backtick={self.literal_backtick}, quoted={self.quoted}, "
+                f"literal_brace={self.literal_brace})")
 
 
 class _QuoteWatchingStream(io.StringIO):
@@ -265,13 +268,35 @@ class _QuoteWatchingStream(io.StringIO):
         self.literal_dollar = False
         self.literal_backtick = False
         self.quoted = False
+        self.literal_brace = False
         self.last_char = None
+        self.last_was_escaped = False
+        self.position = 0
+        self.dollar_quotes = []
 
     def read(self, size=-1):
         char = super().read(size)
         if char:
-            if self.lexer.state in ("'", '"', self.lexer.escape):
+            state = self.lexer.state
+            if (
+                char in "'\""
+                and self.last_char == "$"
+                and not self.last_was_escaped
+                and state not in ("'", '"')
+            ):
+                # `$'...'` and `$"..."` are bash's own QUOTING forms, not
+                # expansions: the contents are passed WITHOUT the dollar. shlex
+                # removes the quotes and leaves the `$` welded to the text,
+                # where it reads exactly like a parameter expansion — so the
+                # offset is recorded and the dollar removed before lexing again.
+                self.dollar_quotes.append(self.position - 1)
+            if state in ("'", '"', self.lexer.escape):
                 self.quoted = True
+                if char in "{},":
+                    # Quoting the braces or the comma suppresses the expansion;
+                    # quoting one ALTERNATIVE does not, so a word-level flag
+                    # says the wrong thing about `lib{asound2,"pulse"}-dev`.
+                    self.literal_brace = True
             if char in "$`" and self.lexer.state in ("'", self.lexer.escape):
                 # Single quotes and a backslash suppress BOTH forms of
                 # expansion; double quotes suppress neither.
@@ -279,7 +304,9 @@ class _QuoteWatchingStream(io.StringIO):
                     self.literal_dollar = True
                 else:
                     self.literal_backtick = True
+            self.last_was_escaped = state == self.lexer.escape
             self.last_char = char
+            self.position += 1
         return char
 
 
@@ -297,7 +324,7 @@ class Unlexable(ValueError):
         self.state = state
 
 
-def _lex(text, commenters):
+def _lex(text, commenters, dollar_quotes=None):
     """Tokenise, with shlex's own comment handling set to `commenters`.
 
     Raises Unlexable on an unbalanced quote, carrying the words already read —
@@ -318,6 +345,7 @@ def _lex(text, commenters):
         stream.literal_dollar = False
         stream.literal_backtick = False
         stream.quoted = False
+        stream.literal_brace = False
         # The character last read is either the whitespace that ended the word
         # before, or — when shlex pushed one back — the first character of this
         # word. Either way, whitespace here means the two words are separated.
@@ -327,18 +355,21 @@ def _lex(text, commenters):
         except ValueError as error:
             raise Unlexable(error, words, lexer.state) from error
         if token is lexer.eof:
+            if dollar_quotes is not None:
+                dollar_quotes.extend(stream.dollar_quotes)
             return words
         if stream.quoted:
             # A quoted run of punctuation is an argument, not a sequence of
             # operators, so it is not taken apart.
             words.append(Word(token, stream.literal_dollar, space_before,
-                              stream.literal_backtick, True))
+                              stream.literal_backtick, True, stream.literal_brace))
             continue
         for position, part in enumerate(split_operators(token)):
             # Only the first part can have had whitespace before it; the rest
             # were welded to their predecessor by definition.
             words.append(Word(part, stream.literal_dollar,
-                              space_before and position == 0, stream.literal_backtick))
+                              space_before and position == 0, stream.literal_backtick,
+                              False, stream.literal_brace))
 
 
 # Where a new word can begin without any whitespace: after an operator.
@@ -368,8 +399,9 @@ def lex_words(text):
     Comments are applied by bash's rule rather than shlex's, which treats every
     unquoted `#` as one wherever it appears.
     """
+    dollar_quotes = []
     try:
-        words = _lex(text, commenters="")
+        words = _lex(text, commenters="", dollar_quotes=dollar_quotes)
     except Unlexable as error:
         # A comment may hold an apostrophe — `# don't` is an ordinary line — and
         # no lexer can read that as shell. But everything after a `#` is comment
@@ -382,6 +414,12 @@ def lex_words(text):
         words = error.words
         if not any(starts_a_comment(words, index) for index in range(len(words))):
             raise
+    else:
+        if dollar_quotes:
+            removed = set(dollar_quotes)
+            return lex_words("".join(
+                character for position, character in enumerate(text) if position not in removed
+            ))
     for index in range(len(words)):
         if starts_a_comment(words, index):
             return words[:index]
@@ -511,7 +549,10 @@ def scan_command(path, line, words, expressions):
             and index < len(words)
             and words[index].value in REDIRECTIONS
             and not words[index].quoted
+            and not words[index].space_before
         ):
+            # Attached only: `2>out` redirects, while `2 >out` passes `2` as an
+            # argument and apt is asked for a package called `2`.
             continue
 
         if state == "packages":
@@ -594,7 +635,7 @@ def scan_command(path, line, words, expressions):
                 emit("NOTICE", path, line,
                      f"names packages through a pattern, not checked: {token}")
                 continue
-            if expands_a_brace(token) and not word.quoted:
+            if expands_a_brace(token) and not word.literal_brace:
                 # Announced rather than expanded. Expanding would check more —
                 # both halves of `lib{asound2,pulse}-dev` exist — but brace
                 # expansion is a grammar of its own, with ranges and nesting,

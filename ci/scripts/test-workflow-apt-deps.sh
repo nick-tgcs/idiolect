@@ -1368,6 +1368,77 @@ YAML
 expect "a process substitution is not a package list" 0 process-substitution \
     "All 1 apt package(s)" "not checked"
 
+
+# ------------------------------------ a number is a descriptor only when attached
+# `2>out` redirects; `2 >out` passes `2` as an argument and apt is asked for a
+# package called `2`. The descriptor rule has to require adjacency, exactly as
+# the `<<-` one does.
+write_workflow fd-spaced ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake 2 >out
+YAML
+expect "a spaced number is an argument, not a descriptor" 1 fd-spaced \
+    "installs a package apt cannot resolve"
+
+# ------------------------------------------------- bash's own quoting forms
+# `$'...'` is ANSI-C quoting, not an expansion: bash passes the contents
+# WITHOUT the dollar. shlex removes the quotes and leaves the `$` welded to the
+# text, which then reads exactly like a parameter expansion.
+write_workflow dollar-quote ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $'codex-no-such-package'
+YAML
+expect "ANSI-C quoting is not an expansion" 1 dollar-quote \
+    "installs a package apt cannot resolve"
+
+# ...and the dollar has to actually go, not merely stop being excused: the
+# contents may be a perfectly good package name, and reporting `$cmake` would
+# be a false red on a working workflow.
+write_workflow dollar-quote-valid ci.yml <<'YAML'
+        run: sudo apt-get install -y $'cmake'
+YAML
+expect "ANSI-C quoting keeps the name inside it" 0 dollar-quote-valid \
+    "All 1 apt package(s)"
+
+# ...and an ESCAPED dollar before a quote is not that form at all: bash passes
+# a literal `$` followed by the quoted text, so apt is handed `$cmake` and
+# rejects it. Stripping the dollar here would turn a broken install into a
+# valid one and let it through.
+printf '%s\n' \
+    '        run: |' \
+    "          sudo apt-get install -y \\\$'cmake'" \
+    | write_workflow dollar-quote-escaped ci.yml
+expect "an escaped dollar before a quote keeps its dollar" 1 dollar-quote-escaped \
+    "installs a package apt cannot resolve"
+
+# ------------------------------------------- quoting one alternative of a brace
+# Bash expands `lib{asound2,"pulse"}-dev` — quoting an alternative does not
+# suppress the expansion, only quoting the braces or the comma does. A
+# word-level "was anything quoted" test says the wrong thing about both.
+write_workflow brace-partly-quoted ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y lib{asound2,"pulse"}-dev
+YAML
+expect "quoting an alternative does not stop the expansion" 0 brace-partly-quoted \
+    "All 1 apt package(s)" "not checked"
+
+# ...while quoting the COMMA does stop it, and the literal word is a name apt
+# rejects.
+write_workflow brace-quoted-comma ci.yml <<'YAML'
+        run: sudo apt-get install -y lib{asound2","pulse}-dev
+YAML
+expect "quoting the comma stops the expansion" 1 brace-quoted-comma \
+    "installs a package apt cannot resolve"
+
+# --------------------------------- a process substitution ends at its bracket
+# The same walk that swallowed a command after `$( )` and after backticks.
+write_workflow process-sub-then-command ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y <(echo x);sudo apt-get install -y libfcitx5-dev
+YAML
+expect "a command after a process substitution is not swallowed" 1 process-sub-then-command \
+    "libfcitx5-dev" "installs a package apt cannot resolve"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
