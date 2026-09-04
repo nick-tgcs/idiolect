@@ -4257,6 +4257,49 @@ YAML
 expect "a local does not erase the caller's value" 1 local-restores-caller \
     "codex-no-such-package"
 
+# ------------------------------------------- `declare -x` exports as well
+# The attribute is what exports, not the name of the builtin: `declare -x
+# COMMAND=…` puts the value in the child's environment exactly as `export`
+# does.
+write_workflow declare-export ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare -x COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare -x exports" 1 declare-export \
+    "codex-no-such-package"
+
+# ...while `declare` without it does not: the value is this shell's alone.
+write_workflow declare-without-x ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare without -x does not export" 0 declare-without-x \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and an option that is not `-x` exports nothing either: `declare -r` marks
+# the variable read-only and leaves the environment as it was.
+write_workflow declare-other-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare -r COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an option other than -x exports nothing" 0 declare-other-option \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

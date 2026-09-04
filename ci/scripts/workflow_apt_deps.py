@@ -784,7 +784,8 @@ def scan_command(path, line, words, expressions, defined=None):
             saw_install = True
 
         if token in SEPARATORS and not word.quoted:
-            remember(pending if at_command else [], defined, expressions, declaring)
+            remember(pending if at_command else [], defined, expressions,
+                     declaring, namespace)
             pending = []
             declaring = None
             namespace = None
@@ -1034,7 +1035,7 @@ def scan_command(path, line, words, expressions, defined=None):
             # opposite effect.
             declaring = token
         elif declaring and NAME_ONLY.match(token) and not word.quoted and defined is not None:
-            if declaring == "export":
+            if exports(declaring, namespace):
                 # `export COMMAND` on its own exports what is already there, so
                 # the value assigned on an earlier line is what the child sees.
                 defined[("exported", token)] = ((), expressions)
@@ -1144,7 +1145,7 @@ def scan_command(path, line, words, expressions, defined=None):
         else:
             at_command = False
 
-    remember(pending if at_command else [], defined, expressions, declaring)
+    remember(pending if at_command else [], defined, expressions, declaring, namespace)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -1970,7 +1971,20 @@ def remember_array(prefix, inside, defined, expressions):
     defined[("array", name)] = (before + inside, expressions)
 
 
-def remember(assignments, defined, expressions, declaring=None):
+def exports(declaring, namespace):
+    """Whether this declaration puts its names in the child's environment.
+
+    `export` does by name; `declare -x` and `typeset -x` do by ATTRIBUTE, which
+    is the same fact spelled with an option. `readonly` and `local` set a
+    variable and leave the environment alone.
+    """
+    if declaring == "export":
+        return True
+    return declaring in ("declare", "typeset") and namespace is not None \
+        and namespace.startswith("-") and "x" in namespace[1:]
+
+
+def remember(assignments, defined, expressions, declaring=None, namespace=None):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
@@ -1994,7 +2008,7 @@ def remember(assignments, defined, expressions, declaring=None):
                       for part in value.split()],
             expressions,
         )
-        if declaring == "export":
+        if exports(declaring, namespace):
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)

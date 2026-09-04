@@ -144,11 +144,19 @@ resolve_candidate() {
         return
     fi
 
-    CANDIDATE="$(apt-cache policy "$package" 2>/dev/null |
+    local policy
+    policy="$(apt-cache policy "$package" 2>/dev/null)"
+    CANDIDATE="$(printf '%s\n' "$policy" |
         sed -n 's/^  Candidate: //p' |
         grep -v '^(none)$')"
 
-    if [ -z "$CANDIDATE" ]; then
+    # Only where apt KNOWS the name. `apt-cache policy` prints nothing at all
+    # for a name it has never heard of and a stanza with `Candidate: (none)`
+    # for one it knows without a version — which is what a virtual package
+    # looks like. Asking `apt-get` about a name apt does not know is a slower
+    # way of hearing the same no, and the self-test asks it a few hundred
+    # times.
+    if [ -z "$CANDIDATE" ] && [ -n "$policy" ]; then
         # A VIRTUAL package has no candidate of its own: `libz-dev` is a name
         # `zlib1g-dev` PROVIDES, and `apt-cache policy` reports
         # `Candidate: (none)` for it while `apt-get install libz-dev` takes it
@@ -157,9 +165,8 @@ resolve_candidate() {
         # apt makes — so the install itself is asked, in simulation.
         #
         # Only from here, and only in this direction: this branch can turn a
-        # rejection into an acceptance and never the reverse, so the cost of
-        # asking is bounded to the names already about to be reported. `--`
-        # because a package name is not an option, whatever it starts with.
+        # rejection into an acceptance and never the reverse. `--` because a
+        # package name is not an option, whatever it starts with.
         if apt-get -s install -- "$package" >/dev/null 2>&1; then
             CANDIDATE="provided by another package"
         fi
