@@ -759,10 +759,15 @@ def scan_shell(path, text, first_line, exact_lines):
         masked, expressions = mask_expressions(command)
         try:
             words = lex_words(masked)
-        except ValueError as error:
+        except Unlexable as error:
             # Only worth reporting for a line that could hold an install; every
             # other unbalanced quote in a workflow is somebody else's business.
-            if "apt" in command and "install" in command:
+            # Asked of the words read BEFORE the quote where there are any,
+            # since the raw text does not spell `a\pt-get` as apt.
+            if (
+                any(is_apt(word.value) for word in error.words)
+                or ("apt" in command and "install" in command)
+            ):
                 emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
             return []
         if any(is_apt(word.value) for word in words):

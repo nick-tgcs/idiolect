@@ -1520,6 +1520,18 @@ printf '%s\n' \
 expect "an escaped command name is still apt" 1 escaped-command-name \
     "codex-no-such-package" "installs a package apt cannot resolve"
 
+# ...and the same question, asked where the line cannot be lexed at all. The
+# untokenisable-line notice was the last test left reading raw source text, so
+# `a\pt-get install -y 'unterminated` was skipped in silence — the very
+# combination the token prefilter above exists to prevent.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    "          sudo a\\pt-get install -y 'unterminated" \
+    | write_workflow escaped-name-unlexable ci.yml
+expect "an unlexable line with an escaped name is announced" 0 escaped-name-unlexable \
+    "could not be tokenised" "All 1 apt package(s)"
+
 # ------------------------------------ a quoted digit is not an IO number
 # `2>out` redirects; `'2'>out` passes `2` as an argument, because a QUOTED word
 # is never an IO number. The adjacency test alone is not enough.
