@@ -1003,7 +1003,7 @@ def scan_command(path, line, words, expressions, defined=None):
             # `bash build.sh -c x` came to be read as an invocation option.
             script = script_argument(words[index - 1:command_ends(words, index - 1)])
             if script is not None:
-                scan_shell(path, script.value, line, exact_lines=False)
+                scan_shell(path, script.value, line, exact_lines=False, defined=defined)
             at_command = False
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
@@ -1229,14 +1229,20 @@ def shell_commands(text):
         yield pending_offset, pending, False
 
 
-def scan_shell(path, text, first_line, exact_lines):
+def scan_shell(path, text, first_line, exact_lines, defined=None):
     """Report the packages installed by a block of shell.
 
     `exact_lines` says whether a physical line of `text` maps to a file line —
     true for a literal block or a plain scalar, false once YAML has folded the
     block, where every finding is reported against the line the block starts on.
+
+    `defined` is what the block AROUND this one has remembered, for a script
+    handed to a shell: `SCRIPT='apt-get …'` and the `bash -c "$SCRIPT"` that
+    runs it are two commands of the same block, and reading the script in a
+    fresh scope loses the assignment above it.
     """
-    defined = {}
+    if defined is None:
+        defined = {}
     for offset, command, in_heredoc in shell_commands(text):
         line = first_line + offset if exact_lines else first_line
 
@@ -1811,19 +1817,29 @@ def defined_function(words, index):
     a function RUNS none of it, so the body is remembered rather than read
     where it is written — the same rule an array's elements follow.
 
-    The brackets have to be next to each other: `foo (cmd)` is the command foo
-    followed by a subshell, while `foo ()`, `foo()` and `foo ( )` all declare.
+    Two spellings, both bash's: `NAME () { … }` and `function NAME { … }`. The
+    brackets have to be next to each other, since `foo (cmd)` is the command
+    foo followed by a subshell — `foo ()`, `foo()` and `foo ( )` all declare —
+    and after the keyword they are optional.
     """
-    if index + 3 >= len(words):
+    keyword = words[index].value == "function" and not words[index].quoted
+    at = index + 2 if keyword else index + 1
+    if at >= len(words):
         return None
-    opener, closer, body = words[index + 1], words[index + 2], words[index + 3]
+    name = words[index + 1].value if keyword else words[index].value
     if (
-        opener.value != "(" or closer.value != ")" or body.value != "{"
-        or opener.quoted or closer.quoted or body.quoted
+        at + 1 < len(words)
+        and words[at].value == "(" and words[at + 1].value == ")"
+        and not words[at].quoted and not words[at + 1].quoted
     ):
+        at += 2
+    elif not keyword:
         return None
+    if at >= len(words) or words[at].value != "{" or words[at].quoted:
+        return None
+    body_start = at
     depth = 0
-    for position in range(index + 3, len(words)):
+    for position in range(body_start, len(words)):
         if words[position].quoted:
             continue
         if words[position].value == "{":
@@ -1831,8 +1847,8 @@ def defined_function(words, index):
         elif words[position].value == "}":
             depth -= 1
             if not depth:
-                return words[index].value, words[index + 4:position], position + 1
-    return words[index].value, words[index + 4:], len(words)
+                return name, words[body_start + 1:position], position + 1
+    return name, words[body_start + 1:], len(words)
 
 
 def touches_a_definition(words, defined):

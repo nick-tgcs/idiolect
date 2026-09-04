@@ -3800,6 +3800,106 @@ YAML
 expect "a conditional's literal branches are commands" 1 conditional-literals \
     "codex-no-such-package"
 
+# ------------------- a script handed to a shell sees what the block remembers
+# `SCRIPT='apt-get …'` then `bash -c "$SCRIPT"` runs it. Scanning the argument
+# in a fresh scope lost the assignment three lines above it.
+write_workflow script-from-local-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          SCRIPT='apt-get install -y codex-no-such-package'
+          bash -c "$SCRIPT"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a script from a local variable is followed" 1 script-from-local-variable \
+    "codex-no-such-package"
+
+# ...and eval reaches the same value the same way.
+write_workflow eval-from-local-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          eval "$COMMAND"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "eval reaches a local variable" 1 eval-from-local-variable \
+    "codex-no-such-package"
+
+# ----------------------------- `function name { … }` declares one as well
+# Bash takes the keyword form with no brackets at all. Requiring them left the
+# declaration unremembered, so the call was read as a command nobody wrote.
+write_workflow function-keyword-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          function install_deps {
+            apt-get install -y codex-no-such-package
+          }
+          install_deps
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the function keyword declares one too" 1 function-keyword-called \
+    "codex-no-such-package"
+
+# ...and one declared that way and never called still installs nothing.
+write_workflow function-keyword-uncalled ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          function unused {
+            apt-get install -y codex-no-such-package
+          }
+          echo ok
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an uncalled keyword function installs nothing" 0 function-keyword-uncalled \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the keyword form may carry the brackets too.
+write_workflow function-keyword-brackets ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          function install_deps() { apt-get install -y codex-no-such-package; }
+          install_deps
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the keyword form may keep its brackets" 1 function-keyword-brackets \
+    "codex-no-such-package"
+
+# ...but QUOTED it is not the keyword: bash looks for a command called
+# `function`, finds none, and declares nothing — so the name that follows is
+# never a function and a later call to it runs nothing.
+write_workflow function-keyword-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          'function' install_deps { apt-get install -y codex-no-such-package; }
+          install_deps
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted function keyword declares nothing" 0 function-keyword-quoted \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and without the keyword the brackets are REQUIRED: `then { … }` is a
+# group, and reading it as a declaration would put a real install out of reach.
+write_workflow group-after-then ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          if true; then { apt-get install -y codex-no-such-package; }; fi
+YAML
+expect "a group is not a declaration" 1 group-after-then \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
