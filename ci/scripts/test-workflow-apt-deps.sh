@@ -5158,6 +5158,77 @@ YAML
 expect "a select body that may not run keeps the earlier value" 1 branch-select \
     "codex-no-such-package"
 
+# ------------- a prefix assignment is the COMMAND's, even when the command
+#               is the one that makes assignments
+# `A=1 export B=2` sets B and does NOT keep A, in bash's default mode — which
+# is what a `run:` block runs. Checked across every builtin of the shape, and
+# against `true` for contrast: `A=1 true` does not keep A either, so this is
+# the ordinary prefix rule and not a special case. (POSIX mode and dash DO
+# keep it for a special builtin; nothing here runs in either, and modelling a
+# shell no workflow selects would be guessing.)
+write_workflow prefix-before-export ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' export FOO=x
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment before export does not persist" 0 prefix-before-export \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow prefix-before-declare ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' declare FOO=x
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment before declare does not persist" 0 prefix-before-declare \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow prefix-before-unset ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' unset FOO
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment before unset does not persist" 0 prefix-before-unset \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the builtin's OWN operand is still remembered, which is the thing the
+# fix must not take away with it.
+write_workflow export-operand-kept ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          FOO=x export COMMAND='apt-get install -y codex-no-such-package'
+          $COMMAND
+YAML
+expect "the builtin's own operand is still remembered" 1 export-operand-kept \
+    "codex-no-such-package"
+
+# ...and it is still EXPORTED, so a child shell still sees it. The prefix is
+# dropped from the same list the export attribute is read against, so this is
+# the case that fails if the drop takes the operand with it.
+write_workflow export-operand-still-exported ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          FOO=x export COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+YAML
+expect "the builtin's own operand is still exported" 1 export-operand-still-exported \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

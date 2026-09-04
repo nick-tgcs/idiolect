@@ -1143,6 +1143,19 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # so the words after it are still assignments and the command
             # position survives them. `unset NAME` is the same shape and the
             # opposite effect.
+            #
+            # What came BEFORE the builtin is a different thing wearing the
+            # same shape. `A=1 export B=2` sets B and does not keep A: the
+            # command position surviving is what lets the OPERANDS be read as
+            # assignments, and it must not also promote the prefix that ran
+            # ahead of it. Checked against bash for every builtin of this
+            # shape, and against `true` for contrast — `A=1 true` does not keep
+            # A either, so this is the ordinary prefix rule reasserting itself
+            # rather than a rule about declarations. (POSIX mode and dash DO
+            # keep it for a special builtin; a `run:` block is neither, and
+            # guessing at a shell no workflow selects would trade a false
+            # negative here for a false positive everywhere.)
+            pending = []
             declaring = token
         elif declaring and NAME_ONLY.match(token) and not word.quoted and defined is not None:
             if unexports(declaring, namespace):
