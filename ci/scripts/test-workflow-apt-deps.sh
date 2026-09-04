@@ -5331,6 +5331,153 @@ YAML
 expect "a lone semicolon inside an arm is not a boundary" 0 case-lone-semicolon \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------- a subshell is a subshell however the command ends
+# The restore was hung on the separator being `|`, which only ever ends a
+# NON-final element. Bash isolates the last one too, and isolates an
+# asynchronous command as well — `unset COMMAND & wait` leaves COMMAND set.
+# Both verified against bash.
+write_workflow pipeline-last-element ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          echo x | unset COMMAND
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the last element of a pipeline is a subshell too" 1 pipeline-last-element \
+    "codex-no-such-package"
+
+write_workflow async-subshell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          unset COMMAND & wait
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an asynchronous command runs in a subshell" 1 async-subshell \
+    "codex-no-such-package"
+
+# ...and the guards: a subshell still INSTALLS, whichever way it ends.
+write_workflow pipeline-last-installs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo x | apt-get install -y codex-no-such-package
+YAML
+expect "an install as the last pipeline element is still found" 1 pipeline-last-installs \
+    "codex-no-such-package"
+
+write_workflow async-installs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: apt-get install -y codex-no-such-package & wait
+YAML
+expect "an install run asynchronously is still found" 1 async-installs \
+    "codex-no-such-package"
+
+# ------------------------- a region's CONDITION runs; its branches may not
+# `if COMMAND=true; then :; fi` always replaces COMMAND before choosing a
+# branch, so the value before the `if` is not a possibility afterwards —
+# verified against bash. The same holds for a `while`, whose condition is
+# evaluated at least once.
+write_workflow if-condition-certain ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          if COMMAND=true; then :; fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an assignment in an if condition always runs" 0 if-condition-certain \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow while-condition-certain ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          while COMMAND=true; do break; done
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an assignment in a while condition always runs" 0 while-condition-certain \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...but an ELIF's condition is reached only when the ones before it failed, so
+# it is a branch like any other. Verified against bash: with CI set the elif
+# condition never runs and the earlier value is what executes.
+write_workflow elif-condition-conditional ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          if [ -n "$CI" ]; then
+            :
+          elif COMMAND=true; then
+            :
+          fi
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an elif condition may not run at all" 1 elif-condition-conditional \
+    "codex-no-such-package"
+
+# ------------------------ unset -f takes the export attribute with it
+# `unset -f f` removes the function AND its place in the environment, so a
+# function defined under the same name afterwards is not exported and no child
+# receives it — verified against bash, where the child reports `f: command not
+# found`.
+write_workflow unset-f-unexports ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { true; }
+          export -f f
+          unset -f f
+          f() { apt-get install -y codex-no-such-package; }
+          bash -c f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unset -f takes the export attribute with it" 0 unset-f-unexports \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...the same where the pipeline shares a line with what follows it, so the
+# last element ends at a separator rather than at the end of the line. The two
+# places a command can end owe the same restore.
+write_workflow pipeline-last-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: COMMAND='apt-get install -y codex-no-such-package'; echo x | unset COMMAND; $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "the last element ending at a separator does the same" 1 pipeline-last-one-line \
+    "codex-no-such-package"
+
+# ...and the command AFTER a pipeline is not isolated. Nothing about it ran
+# anywhere else, so its assignment replaces what came before rather than
+# joining it — verified against bash, where the earlier value is gone.
+write_workflow after-pipeline-not-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: COMMAND='apt-get install -y codex-no-such-package'; echo x | cat; COMMAND=true; $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a command after a pipeline is not isolated" 0 after-pipeline-not-isolated \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

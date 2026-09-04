@@ -87,12 +87,17 @@ CONTROL_PREFIXES = {
 REGION_OPENERS = {"if", "while", "until", "for", "select", "case"}
 REGION_CLOSERS = {"fi", "done", "esac"}
 
-# ...and the words that end one BRANCH of a region and begin the next. The
+# ...and the words that end one PART of a region and begin the next. The
 # branches of an `if` are alternatives to each other, not to nothing: exactly
 # one of them runs, so each is a state the runner may end in. A case arm ends
 # with `;;` instead of a keyword, which is handled where separators are read.
-# A loop body has no branches, so nothing here belongs to one.
-REGION_BRANCHES = {"then", "elif", "else"}
+#
+# `then` and `do` also end the region's CONDITION, which is a different thing:
+# `if COMMAND=true; then` and `while COMMAND=true; do` both RUN that assignment
+# before choosing anything, so it is a fact and not a possibility. Only the
+# FIRST of them in a region closes a condition — the one after an `elif` closes
+# a condition that is itself reached only when the tests before it failed.
+REGION_BRANCHES = {"then", "elif", "else", "do"}
 
 APT_COMMANDS = {"apt", "apt-get"}
 
@@ -799,6 +804,9 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
     # ...and what was remembered before THIS command, since a pipeline runs
     # every one of its elements in a subshell and only finds out afterwards.
     starting = dict(defined) if defined is not None else None
+    # ...and whether the command now ending began after a `|`, since what ends
+    # the LAST element of a pipeline is whatever ends the line.
+    piped = False
     # Only `scan_shell` passes one in, because only IT reads a region that
     # spans lines. Every other caller hands over a self-contained word list —
     # a function's body, a value expanded at a command position — and gets its
@@ -827,17 +835,23 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # assigned is kept too, because it might have run: both values are
             # possible and a package named by either is one the workflow may
             # install.
-            if conditional is not None and defined is not None:
-                displaced(conditional, defined)
             # Bash runs EVERY element of a pipeline in a subshell, not just the
             # ones before the last: `unset COMMAND | cat` leaves COMMAND set,
-            # and so does `echo x | { COMMAND=y; }`. So what the element just
-            # ended changed is not this shell's — except under `shopt -s
-            # lastpipe`, which a script may set and this scanner cannot see, so
-            # the element's own values are kept as the other possibility rather
-            # than dropped.
-            if token == "|" and starting is not None and defined is not None:
-                displaced(starting, defined)
+            # and so does `echo x | unset COMMAND`. An ASYNCHRONOUS command is
+            # isolated the same way — `unset COMMAND & wait` leaves it set.
+            #
+            # So the question is not which separator this is. It is whether the
+            # command that just ENDED ran somewhere else: after a `|`, before
+            # one, or before an `&`. Hanging it on the `|` alone covered only
+            # the elements that had another element after them.
+            #
+            # The isolated command's own values are kept as the other
+            # possibility rather than dropped, because `shopt -s lastpipe` makes
+            # the last element run in this shell after all and nothing in a file
+            # says whether a script set it.
+            command_ended(conditional, starting, piped or token in ("|", "&"),
+                          defined)
+            piped = token == "|"
             # `;;` ends a case ARM. It arrives as two separators rather than
             # one token, because the lexer splits a run of punctuation — so it
             # is the SECOND `;` that names it, and a lone `;` between two
@@ -890,11 +904,16 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         # `'fi'` is a command bash goes looking for.
         if at_command and not word.quoted and defined is not None:
             if token in REGION_OPENERS:
-                regions.append(dict(defined))
+                # The second entry is whether a CONDITION is still to come.
+                # `case x in` runs no commands between the opener and the first
+                # arm, so it has none; every other opener does.
+                regions.append([dict(defined), token != "case"])
             elif token in REGION_BRANCHES:
-                branched(regions, defined)
+                branched(regions, defined,
+                         ran=bool(regions) and regions[-1][1]
+                         and token in ("then", "do"))
             elif token in REGION_CLOSERS and regions:
-                displaced(regions.pop(), defined)
+                displaced(regions.pop()[0], defined)
 
         if (
             token == "("
@@ -1204,14 +1223,21 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 # bash forgets a variable if there is one and a function if
                 # there is not.
                 variables = ("variable", "array", "exported")
+                # A name's ATTRIBUTES go with it. `unset -f f` takes the
+                # function out of the environment as well as out of the shell,
+                # so a function defined under that name afterwards is not
+                # exported and no child receives it — checked against bash,
+                # where the child reports `f: command not found`. The same rule
+                # as the variables beside it, which already drop `exported`.
+                functions = ("function", "exported-function")
                 if attribute(namespace, "-", "f"):
-                    kinds = ("function",)
+                    kinds = functions
                 elif attribute(namespace, "-", "v") or any(
                     (kind, token) in defined for kind in variables
                 ):
                     kinds = variables
                 else:
-                    kinds = ("function",)
+                    kinds = functions
                 for kind in kinds:
                     defined.pop((kind, token), None)
             elif is_local(declaring, namespace, in_function):
@@ -1369,8 +1395,9 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
 
     remember(pending if at_command else [], defined, expressions, declaring, namespace,
              in_function)
-    if conditional is not None and defined is not None:
-        displaced(conditional, defined)
+    # The last element of a pipeline ends where the LINE does, with no
+    # separator after it to notice.
+    command_ended(conditional, starting, piped, defined)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -2250,18 +2277,47 @@ def alternatives(key, defined, expressions):
             for what in defined.get(("alternative", key[1], key[0]), [])]
 
 
-def branched(regions, defined):
-    """One branch of the region in progress has ended.
+def command_ended(conditional, starting, isolated, defined):
+    """What the command that just ended owes the shell it ran beside.
 
-    What that branch changed becomes one of the possibilities rather than the
-    only one, and the branch after it starts from here — so a `case` of three
-    arms ends with all three values scannable instead of the last. Called from
-    the two places a branch can end, a keyword and a `;;`, so the two cannot
-    answer it differently.
+    Two restores, and they are owed at both places a command can end — at a
+    separator, and at the end of the line, since `echo x | unset COMMAND` has
+    no separator after its last element. Holding them in one function is how
+    those two places cannot come to disagree, which is what let the last
+    element of a pipeline keep its `unset`.
+
+    `conditional` is what was remembered before a `&&` or `||`, since the
+    command after one may not have run. `starting` is what was remembered
+    before THIS command, owed when it was `isolated` — run in a subshell, so
+    nothing it did reaches here.
     """
-    if regions and defined is not None:
-        displaced(regions[-1], defined)
-        regions[-1] = dict(defined)
+    if defined is None:
+        return
+    if conditional is not None:
+        displaced(conditional, defined)
+    if isolated and starting is not None:
+        displaced(starting, defined)
+
+
+def branched(regions, defined, ran=False):
+    """One part of the region in progress has ended, and the next begins here.
+
+    `ran` says that part RAN — a region's condition does, before it chooses
+    anything. Its assignments are facts, so nothing before them survives as an
+    alternative. A BRANCH is the other case: it may not have run, so what it
+    changed becomes one of the possibilities and the branch after it starts
+    from the same place — which is how a `case` of three arms ends with all
+    three values scannable instead of only the last.
+
+    Called from the two places a part can end, a keyword and a `;;`, so the two
+    cannot answer it differently.
+    """
+    if not regions or defined is None:
+        return
+    if not ran:
+        displaced(regions[-1][0], defined)
+    regions[-1][0] = dict(defined)
+    regions[-1][1] = False
 
 
 def displaced(before, defined):
