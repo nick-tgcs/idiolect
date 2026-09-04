@@ -159,7 +159,8 @@ def runs_a_script(words):
 # because independently optional braces match `$NAME}` — which bash expands and
 # then appends the `}` to, asking apt for a package that does not exist.
 SHELL_VARIABLE = re.compile(
-    r"^\$([A-Za-z_][A-Za-z0-9_]*|[0-9]+)$|^\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+)\}$"
+    r"^\$([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])$"
+    r"|^\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])\}$"
 )
 
 
@@ -768,6 +769,7 @@ def scan_command(path, line, words, expressions, defined=None):
     parsed_install = False
     pending = []
     declaring = None
+    namespace = None
     end_of_options = False
 
     index = 0
@@ -785,6 +787,7 @@ def scan_command(path, line, words, expressions, defined=None):
             remember(pending if at_command else [], defined, expressions, declaring)
             pending = []
             declaring = None
+            namespace = None
             state = "idle"
             at_command = True
             end_of_options = False
@@ -1019,6 +1022,11 @@ def scan_command(path, line, words, expressions, defined=None):
 
         if is_apt(token):
             state = "options"
+        elif declaring and token.startswith("-") and not word.quoted:
+            # `unset -f NAME` names a FUNCTION and leaves the variable alone;
+            # `-v` is the other way round. The option belongs to the builtin
+            # in front of it.
+            namespace = token
         elif token in NAME_BUILTINS and not word.quoted:
             # `export NAME=value` sets the variable as a bare assignment does,
             # so the words after it are still assignments and the command
@@ -1031,11 +1039,27 @@ def scan_command(path, line, words, expressions, defined=None):
                 # the value assigned on an earlier line is what the child sees.
                 defined[("exported", token)] = ((), expressions)
             elif declaring == "unset":
-                # Nothing is left to expand, whichever kind it was.
-                for kind in ("variable", "array", "function", "exported"):
+                # `-f` names functions, `-v` names variables, and with neither
+                # bash forgets a variable if there is one and a function if
+                # there is not.
+                variables = ("variable", "array", "exported")
+                if namespace == "-f":
+                    kinds = ("function",)
+                elif namespace == "-v" or any(
+                    (kind, token) in defined for kind in variables
+                ):
+                    kinds = variables
+                else:
+                    kinds = ("function",)
+                for kind in kinds:
                     defined.pop((kind, token), None)
             elif declaring == "local":
+                # An EMPTY local, which shadows whatever the caller holds:
+                # `local COMMAND` then `$COMMAND` runs nothing at all. The
+                # caller's value is untouched, since a function is read in a
+                # copy and locals are what the copy keeps to itself.
                 defined[("local", token)] = ((), expressions)
+                defined[("variable", token)] = ([], expressions)
         elif is_an_assignment(word):
             # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
             # names no command, and announcing those flagged two lines of this
@@ -1070,8 +1094,11 @@ def scan_command(path, line, words, expressions, defined=None):
                 # A function's arguments arrive as `$1`, `$2`, … rather than as
                 # more words of the command: `install_deps pkg` runs the body
                 # with pkg as `$1`.
-                for position, argument in enumerate(words[index:command_ends(words, index)], 1):
+                arguments = words[index:command_ends(words, index)]
+                for position, argument in enumerate(arguments, 1):
                     elsewhere[("variable", str(position))] = ([argument], expressions)
+                for every in ("@", "*"):
+                    elsewhere[("variable", every)] = (arguments, expressions)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
                          expressions, elsewhere)
             if key[0] == "function":
@@ -1871,10 +1898,21 @@ def substitution_bodies(token):
     position = token.find("$(")
     while position != -1:
         depth = 0
+        quote = None
         for at in range(position + 1, len(token)):
-            if token[at] == "(":
+            character = token[at]
+            if quote is not None:
+                # A bracket inside quotes is a character: `$(printf ')' ; cmd)`
+                # ends at the LAST bracket, and counting the quoted one cuts
+                # the substitution short and loses the command after it.
+                if character == quote:
+                    quote = None
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "(":
                 depth += 1
-            elif token[at] == ")":
+            elif character == ")":
                 depth -= 1
                 if not depth:
                     bodies.append(token[position + 2:at])

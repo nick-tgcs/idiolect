@@ -4166,6 +4166,97 @@ YAML
 expect "unset forgets the value" 0 unset-variable \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------------------------ `unset` takes a namespace with `-f`
+# `unset -f COMMAND` forgets a FUNCTION by that name and leaves the variable
+# alone, so the `$COMMAND` beneath it still runs what was assigned.
+write_workflow unset-function-only ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          unset -f COMMAND
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unset -f leaves the variable" 1 unset-function-only \
+    "codex-no-such-package"
+
+# ...while `-v` names the variable, and the value really is gone.
+write_workflow unset-variable-only ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          unset -v COMMAND
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unset -v forgets the variable" 0 unset-variable-only \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------------ `"$@"` is every argument of the call
+# `install_deps pkg` with a body of `apt-get install -y "$@"` installs pkg:
+# the operands arrive together as well as numbered.
+write_workflow function-all-arguments ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() { apt-get install -y "$@"; }
+          install_deps codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a function's arguments arrive together" 1 function-all-arguments \
+    "codex-no-such-package"
+
+# -------------------- a QUOTED parenthesis inside a substitution is data
+# `"$(printf ')' ; apt-get …)"` runs both commands: the bracket in quotes is a
+# character, not the end of the substitution. Counting every bracket cut the
+# substitution short and lost the install after it.
+write_workflow substitution-quoted-paren ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "$(printf ')' ; sudo apt-get install -y codex-no-such-package)"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted bracket does not end a substitution" 1 substitution-quoted-paren \
+    "codex-no-such-package"
+
+# ------------------------- a bare `local NAME` shadows the caller's value
+# `local COMMAND` with nothing assigned makes an EMPTY local, so the function
+# runs no command at all — and the caller's value is untouched afterwards.
+write_workflow local-shadows ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { local COMMAND; $COMMAND; }
+          f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a bare local shadows the caller's value" 0 local-shadows \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the caller still has its own value after the call returns.
+write_workflow local-restores-caller ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { local COMMAND; echo shadowed; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a local does not erase the caller's value" 1 local-restores-caller \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
