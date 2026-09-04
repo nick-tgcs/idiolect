@@ -41,9 +41,24 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # `write_workflow <dir-name> <file-name>` reading the body from stdin.
+#
+# A body that is not already a workflow document is WRAPPED in the steps
+# structure a real workflow has. Most cases here are a single `run:` and read
+# far better without the scaffolding — but a `run:` is only a script when it
+# belongs to a step, so an unwrapped fragment tests a shape GitHub never
+# produces, and a rule that accepted it would be a rule written for the
+# fixtures rather than for workflows.
 write_workflow() {
     mkdir -p "$WORK/$1"
-    cat >"$WORK/$1/$2"
+    local body first
+    body="$(cat)"
+    first="$(printf '%s\n' "$body" | grep -m1 -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//')"
+    case "$first" in
+    -*) printf 'jobs:\n  build:\n    steps:\n%s\n' "$body" >"$WORK/$1/$2" ;;
+    run:* | name:* | env:* | uses:* | with:* | if:*)
+        printf 'jobs:\n  build:\n    steps:\n      - name: fixture\n%s\n' "$body" >"$WORK/$1/$2" ;;
+    *) printf '%s\n' "$body" >"$WORK/$1/$2" ;;
+    esac
 }
 
 run_check() { # run_check "<path> [path ...]" -> exit code, output on stdout
@@ -97,7 +112,7 @@ write_workflow real release-main.yml <<'YAML'
           sudo apt-get install -y cmake g++ libfcitx5-dev libfcitx5utils-dev libfcitx5config-dev libfcitx5qt-dev libfcitx5qt1-dev qtbase5-dev libglib2.0-dev dpkg-dev
 YAML
 expect "the historical release-main.yml line is rejected" 1 real \
-    "libfcitx5-dev" "libfcitx5qt-dev" "libfcitx5qt1-dev" "release-main.yml:4"
+    "libfcitx5-dev" "libfcitx5qt-dev" "libfcitx5qt1-dev" "release-main.yml:7"
 
 # The corrected list, taken from the CI job that passes. This is the other half
 # of the same case: the fix has to actually satisfy the gate.
@@ -315,7 +330,7 @@ write_workflow continuation ci.yml <<'YAML'
             libglib2.0-dev
 YAML
 expect "packages after a line continuation are checked" 1 continuation \
-    "libfcitx5-dev" "ci.yml:2"
+    "libfcitx5-dev" "ci.yml:6"
 
 # A trailing backslash with nothing after it continues into nothing, so the
 # command is complete and its packages are still checked. The bash reader used to
@@ -418,7 +433,7 @@ write_workflow folded ci.yml <<'YAML'
           libfcitx5-dev
 YAML
 expect "a folded run block is one command" 1 folded \
-    "libfcitx5-dev" "ci.yml:4"
+    "libfcitx5-dev" "ci.yml:7"
 
 # YAML does not fold a MORE-indented line into the line above it: the newline is
 # kept, so it is its own command. Joining it with a space hides the command it
@@ -432,7 +447,7 @@ write_workflow folded-more-indented ci.yml <<'YAML'
             sudo apt-get install -y libfcitx5-dev
 YAML
 expect "a more-indented folded line is its own command" 1 folded-more-indented \
-    "libfcitx5-dev" "ci.yml:4"
+    "libfcitx5-dev" "ci.yml:7"
 
 # A blank line inside a folded block is a paragraph break, NOT the end of the
 # block: YAML keeps folding the lines after it. Confirmed against PyYAML:
@@ -2129,6 +2144,72 @@ jobs:
       - run: sudo apt-get install -y cmake
 YAML
 expect "an action input named run is not a step's script" 0 with-named-run \
+    "All 1 apt package(s)"
+
+
+# --------------------------- an expression may be a command after a separator
+# `echo preparing; ${{ env.command }}` runs the value after the semicolon.
+# Asking the question per LINE was one granularity short: the line holds
+# ordinary text, but the SEGMENT after the separator is nothing but the
+# expression.
+write_workflow expression-after-separator ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo preparing; ${{ env.command }}
+YAML
+expect "an expression after a separator is a command" 1 expression-after-separator \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and a segment with an expression IN it is still data.
+write_workflow expression-in-segment ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo preparing; echo "install with ${{ env.help }}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an expression inside a segment is still data" 0 expression-in-segment \
+    "All 1 apt package(s)"
+
+# ...and the segments come from the LEXER, so a quoted `;` stays part of its
+# word. Here the command is the referenced value plus a literal `;` argument —
+# something IS written on that segment, so the value is not the command and is
+# not followed. Splitting on the quoted separator would leave the expression
+# alone in a segment and follow it.
+write_workflow quoted-separator-segment ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo x; ${{ env.command }} ';'
+      - run: sudo apt-get install -y cmake
+YAML
+# The leading `echo x;` is load-bearing: without a real separator the line is
+# never segmented at all, and the case would pass without the lexer's quoting
+# ever being consulted.
+expect "a quoted separator does not split a segment" 0 quoted-separator-segment \
+    "All 1 apt package(s)"
+
+# ---------------------------------- only a STEP's run: is a step's script
+# A job output named `run` is defined, not executed. Naming the contexts that
+# are NOT scripts is a list that grows one review round at a time — `env`,
+# then `with`, now `outputs` — so the rule is the other way round: a `run:` is
+# a script when it belongs to a step.
+write_workflow outputs-named-run ci.yml <<'YAML'
+jobs:
+  build:
+    outputs:
+      run: apt-get install -y codex-no-such-package
+    steps:
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a job output named run is not a step's script" 0 outputs-named-run \
     "All 1 apt package(s)"
 
 # ------------------------------------------------------------------------ done

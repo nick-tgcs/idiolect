@@ -1058,6 +1058,43 @@ def is_a_plain_reference(expression):
     return re.sub(r"\|\||&&|''|\s+", "", remainder) == ""
 
 
+def command_segments(line):
+    """The line split at its unquoted separators, or the whole line if it will
+    not lex.
+
+    Built on the lexer so a `;` inside quotes stays part of its word — the
+    distinction string splitting cannot make.
+    """
+    try:
+        words = lex_words(line)
+    except ValueError:
+        return [line]
+    if not any(word.value in SEPARATORS and not word.quoted for word in words):
+        return [line]
+    segments = [[]]
+    for word in words:
+        if word.value in SEPARATORS and not word.quoted:
+            segments.append([])
+        else:
+            segments[-1].append(word.value)
+    return [" ".join(parts) for parts in segments if parts]
+
+
+def is_a_step_script(path):
+    """Whether this scalar is a step's `run:`, and so a script GitHub executes.
+
+    `env: {run: ...}` is a variable it exports, `outputs: {run: ...}` is a value
+    it publishes, and `with: {run: ...}` is an input it passes on. None of them
+    are executed, and all of them end in a key called `run`.
+    """
+    return (
+        len(path) >= 3
+        and path[-1] == "run"
+        and isinstance(path[-2], int)
+        and path[-3] == "steps"
+    )
+
+
 def scalar_line(value, offset=0):
     """The file line a scalar's Nth line sits on.
 
@@ -1104,46 +1141,52 @@ def scan_workflow(path, text):
     scanned = set()
 
     for run_path, value in values:
-        # `env: {run: ...}` is a variable GitHub exports and never executes, and
-        # an action input called `run` is not a script either. A step's `run:`
-        # is not written inside one of those.
-        if (
-            not run_path
-            or run_path[-1] != "run"
-            or "env" in run_path[:-1]
-            or "with" in run_path[:-1]
-        ):
+        # A `run:` is a script when it belongs to a STEP, and only then. Naming
+        # the contexts that are NOT scripts is a list that grows one review
+        # round at a time — `env`, then `with`, then `outputs` — because a key
+        # may be called `run` anywhere. This asks the question the other way
+        # round, and the answer stops changing.
+        if not is_a_step_script(run_path):
             continue
         if id(value) not in scanned:
             scanned.add(id(value))
             scan_scalar(path, value)
 
-        # Per LINE, not per scalar: a block may hold ordinary script AND a
-        # line that is nothing but an expression, and deciding once for the
-        # whole value never follows the second.
+        # Per SEGMENT, not per scalar and not per line: a line may hold
+        # ordinary text AND a command after a separator that is nothing but an
+        # expression, as in `echo preparing; ${{ env.command }}`.
         for offset, line_text in enumerate(value.value.splitlines()):
-            masked, expressions = mask_expressions(line_text)
-            # Whether anything of the command is written HERE. `echo ${{ github.ref }}`
-            # is an ordinary line with a value interpolated into it, and its apt
-            # is read as usual; a line that is nothing but an expression has no
-            # command here at all.
-            written_here = re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip()
-            if written_here or not expressions:
-                continue
+            # MASKED before segmenting: `${{ a || b }}` holds a `||` that is
+            # part of the expression, not a shell separator, and splitting the
+            # raw line tears the expression in half.
+            masked_line, all_expressions = mask_expressions(line_text)
+            for masked in command_segments(masked_line):
+                expressions = [
+                    all_expressions[int(position)]
+                    for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", masked)
+                ]
+                if not expressions:
+                    continue
+                # Whether anything of the command is written HERE.
+                # `echo ${{ github.ref }}` is an ordinary command with a value
+                # interpolated into it, and its apt is read as usual; a segment
+                # that is nothing but an expression has no command here at all.
+                if re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip():
+                    continue
 
-            for expression in expressions:
-                for context, name in referenced_values(expression):
-                    for referenced in resolve_reference(run_path, context, name, values):
-                        if id(referenced) not in scanned:
-                            scanned.add(id(referenced))
-                            scan_scalar(path, referenced)
-                if not is_a_plain_reference(expression):
-                    # The whole command is built by the expression, so it
-                    # exists nowhere in the file to be checked. Announced,
-                    # never silent.
-                    emit("NOTICE", path, scalar_line(value, offset),
-                         f"builds its command with an expression, assembled at run time "
-                         f"and not checked: {expression}")
+                for expression in expressions:
+                    for context, name in referenced_values(expression):
+                        for referenced in resolve_reference(run_path, context, name, values):
+                            if id(referenced) not in scanned:
+                                scanned.add(id(referenced))
+                                scan_scalar(path, referenced)
+                    if not is_a_plain_reference(expression):
+                        # The whole command is built by the expression, so it
+                        # exists nowhere in the file to be checked. Announced,
+                        # never silent.
+                        emit("NOTICE", path, scalar_line(value, offset),
+                             f"builds its command with an expression, assembled at run time "
+                             f"and not checked: {expression}")
 
 
 def main(argv):
