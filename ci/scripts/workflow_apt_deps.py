@@ -804,6 +804,13 @@ def scan_command(path, line, words, expressions):
             # names no command, and announcing those flagged two lines of this
             # repository's own workflows.
             pass
+        elif token in CONTROL_PREFIXES and not word.quoted:
+            # A reserved word INTRODUCES a command: `if apt-get install -y x;
+            # then` installs x, and so does `( apt-get ... )`. Ending the
+            # command position here left a real install announced as unparsed —
+            # a notice, which nothing fails on. Quoted it is no longer reserved:
+            # bash looks for a command called `if` and never runs what follows.
+            pass
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
             # not appear in the file.
@@ -886,45 +893,33 @@ def heredocs_opened(words):
     return opened
 
 
-def scan_shell(path, text, first_line, exact_lines):
-    """Report the packages installed by a block of shell.
+def heredocs_opened_by(command):
+    """The heredocs one command opens, or none if it cannot be tokenised."""
+    masked, _ = mask_expressions(command)
+    try:
+        return heredocs_opened(lex_words(masked))
+    except ValueError:
+        return []
 
-    `exact_lines` says whether a physical line of `text` maps to a file line —
-    true for a literal block or a plain scalar, false once YAML has folded the
-    block, where every finding is reported against the line the block starts on.
+
+def shell_commands(text):
+    r"""Every complete command in a block of shell, and where it starts.
+
+    Yields `(offset, text, in_heredoc)`, the offset counting PHYSICAL lines
+    from the start of the block. A command is not a line: a backslash
+    continuation and a quote left open each carry it onto the next one, and a
+    heredoc BODY is data the shell runs none of.
+
+    Both readers of a block ask this — the one checking literal apt commands
+    and the one following `${{ }}` references — because asking it in two places
+    is how an expression on the far side of an `echo \` came to be read as a
+    command of its own, and a workflow that never runs apt was rejected for a
+    package inside a variable it only echoes.
     """
     heredocs = []
     pending = None
     pending_offset = 0
-
-    def scan_one(command, offset):
-        """Scan one complete command; returns the heredocs it opens."""
-        line = first_line + offset if exact_lines else first_line
-        masked, expressions = mask_expressions(command)
-        try:
-            words = lex_words(masked)
-        except Unlexable as error:
-            # Only worth reporting for a line that could hold an install; every
-            # other unbalanced quote in a workflow is somebody else's business.
-            # Asked of the words read BEFORE the quote where there are any,
-            # since the raw text does not spell `a\pt-get` as apt.
-            if (
-                any(is_apt(word.value) for word in error.words)
-                or ("apt" in command and "install" in command)
-            ):
-                emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
-            return []
-        if any(is_apt(word.value) or is_partly_assembled(word.value) for word in words):
-            # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
-            # once the escape is gone, and a substring test on the source text
-            # skips it without checking a package or saying a word. A word part
-            # literal and part expression may be an apt invocation too, and is
-            # announced rather than passed over.
-            scan_command(path, line, words, expressions)
-        # Looked for on EVERY command, not only the ones naming apt: the line
-        # that opens a heredoc is usually `cat > file <<EOF`, which names
-        # nothing. The body starts after the command's LAST physical line.
-        return heredocs_opened(words)
+    separator = ""
 
     for offset, raw in enumerate(text.splitlines()):
         if heredocs:
@@ -934,15 +929,8 @@ def scan_shell(path, text, first_line, exact_lines):
             delimiter, tabs_stripped = heredocs[0]
             if (raw.lstrip("\t") if tabs_stripped else raw) == delimiter:
                 heredocs.pop(0)
-            elif "apt" in raw and "install" in raw:
-                # A heredoc body is data, not commands. Announced anyway, so a
-                # misread delimiter cannot hide an install silently.
-                emit(
-                    "NOTICE",
-                    path,
-                    first_line + offset if exact_lines else first_line,
-                    f"is inside a heredoc, so it is data and not a command — not checked: {raw.strip()}",
-                )
+            else:
+                yield offset, raw, True
             continue
 
         if pending is None:
@@ -974,12 +962,61 @@ def scan_shell(path, text, first_line, exact_lines):
             continue
 
         command, pending = pending, None
-        heredocs = scan_one(command, pending_offset)
+        yield pending_offset, command, False
+        # Looked for on EVERY command, not only the ones naming apt: the line
+        # that opens a heredoc is usually `cat > file <<EOF`, which names
+        # nothing. The body starts after the command's LAST physical line.
+        heredocs = heredocs_opened_by(command)
 
     if pending is not None:
         # A trailing `\` at the end of the block: still a command, and the last
         # one, so whatever heredoc it opens has no body to open.
-        scan_one(pending, pending_offset)
+        yield pending_offset, pending, False
+
+
+def scan_shell(path, text, first_line, exact_lines):
+    """Report the packages installed by a block of shell.
+
+    `exact_lines` says whether a physical line of `text` maps to a file line —
+    true for a literal block or a plain scalar, false once YAML has folded the
+    block, where every finding is reported against the line the block starts on.
+    """
+    for offset, command, in_heredoc in shell_commands(text):
+        line = first_line + offset if exact_lines else first_line
+
+        if in_heredoc:
+            if "apt" in command and "install" in command:
+                # A heredoc body is data, not commands. Announced anyway, so a
+                # misread delimiter cannot hide an install silently.
+                emit(
+                    "NOTICE",
+                    path,
+                    line,
+                    f"is inside a heredoc, so it is data and not a command — not checked: {command.strip()}",
+                )
+            continue
+
+        masked, expressions = mask_expressions(command)
+        try:
+            words = lex_words(masked)
+        except Unlexable as error:
+            # Only worth reporting for a line that could hold an install; every
+            # other unbalanced quote in a workflow is somebody else's business.
+            # Asked of the words read BEFORE the quote where there are any,
+            # since the raw text does not spell `a\pt-get` as apt.
+            if (
+                any(is_apt(word.value) for word in error.words)
+                or ("apt" in command and "install" in command)
+            ):
+                emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
+            continue
+        if any(is_apt(word.value) or is_partly_assembled(word.value) for word in words):
+            # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
+            # once the escape is gone, and a substring test on the source text
+            # skips it without checking a package or saying a word. A word part
+            # literal and part expression may be an apt invocation too, and is
+            # announced rather than passed over.
+            scan_command(path, line, words, expressions)
 
 
 def scalar_values(node, path=()):
@@ -1084,9 +1121,14 @@ def resolve_reference(run_path, context, name, values):
     """
     scope = job_scope(run_path)
     if context == "matrix":
+        # A dimension is usually a LIST — `command: [a, b]` runs a job per
+        # entry — so an entry's own path ends in its INDEX and the name is the
+        # key above it. Matching the last key alone selected none of them, and
+        # a reference to the dimension resolved to nothing at all.
         return [
             value for path, value in values
-            if path[-1] == name and "matrix" in path and path[:len(scope)] == scope
+            if "matrix" in path and path[:len(scope)] == scope
+            and (path[-1] == name or (len(path) >= 2 and path[-2] == name))
         ]
     if context == "env":
         # env is INHERITED, not shared: a step sees its own, then its job's,
@@ -1279,10 +1321,17 @@ def scan_workflow(path, text):
             scanned.add(id(value))
             scan_scalar(path, value)
 
-        # Per SEGMENT, not per scalar and not per line: a line may hold
-        # ordinary text AND a command after a separator that is nothing but an
+        # Per SEGMENT, not per scalar and not per line: a command may hold
+        # ordinary text AND another after a separator that is nothing but an
         # expression, as in `echo preparing; ${{ env.command }}`.
-        for offset, line_text in enumerate(value.value.splitlines()):
+        #
+        # Over the block's COMMANDS rather than its lines, and the same reading
+        # of them the literal scan uses: `echo \` continued onto an expression
+        # passes it to echo as arguments, and a heredoc body is data — read as
+        # lines, both looked like a command the expression supplied.
+        for offset, line_text, in_heredoc in shell_commands(value.value):
+            if in_heredoc:
+                continue
             # MASKED before segmenting: `${{ a || b }}` holds a `||` that is
             # part of the expression, not a shell separator, and splitting the
             # raw line tears the expression in half.

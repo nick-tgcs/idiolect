@@ -2448,6 +2448,136 @@ YAML
 expect 'a $"..." span closes where shlex says it does' 1 dollar-double-quote-escaped \
     'codex-no"such-package'
 
+# ---------------------------------- a control word is a command position too
+# The expression path learned that `if` introduces a command; the scanner that
+# reads LITERAL commands had not. `if apt-get install -y bad; then` produced a
+# "not parsed" notice — which does not fail — so the package went unchecked.
+write_workflow control-word-literal-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          if apt-get install -y codex-no-such-package; then :; fi
+          sudo apt-get install -y cmake
+YAML
+expect "a control word still leaves a command position" 1 control-word-literal-command \
+    "codex-no-such-package" "installs a package apt cannot resolve" \
+    '!looks like an apt install command but was not parsed'
+
+# ...and so does a subshell.
+write_workflow subshell-literal-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          ( apt-get install -y codex-no-such-package )
+          sudo apt-get install -y cmake
+YAML
+expect "a subshell still leaves a command position" 1 subshell-literal-command \
+    "codex-no-such-package"
+
+# ...and a brace group.
+write_workflow group-literal-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          { apt-get install -y codex-no-such-package; }
+          sudo apt-get install -y cmake
+YAML
+expect "a brace group still leaves a command position" 1 group-literal-command \
+    "codex-no-such-package"
+
+# ...while QUOTED it is not reserved at all: bash looks for a command called
+# `if`, does not find one, and never runs the install — so checking its
+# packages would be a red on something that cannot happen, and the notice is
+# the honest answer.
+write_workflow quoted-control-word-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          "if" apt-get install -y codex-no-such-package
+          sudo apt-get install -y cmake
+YAML
+expect "a quoted control word opens no command position" 0 quoted-control-word-literal \
+    "looks like an apt install command but was not parsed" '!cannot resolve'
+
+# --------------------------- an expression stands where its LOGICAL line does
+# `echo \` continued onto `${{ env.command }}` passes the value to echo as
+# arguments; bash runs no command from it. Reading the second PHYSICAL line as
+# a segment of its own made the expression look like a command being supplied,
+# and a workflow that never runs apt was rejected for a package inside a
+# variable it only ever echoes.
+write_workflow continuation-before-expression ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          echo \
+            ${{ env.command }}
+          sudo apt-get install -y cmake
+YAML
+expect "a continued line is one command" 0 continuation-before-expression \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and a heredoc BODY is data by the same argument: the shell runs none of
+# it, so an expression in one supplies no command either.
+write_workflow heredoc-body-expression ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          cat <<'EOF'
+          ${{ env.command }}
+          EOF
+          sudo apt-get install -y cmake
+YAML
+expect "an expression in a heredoc body is data" 0 heredoc-body-expression \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------------------- a matrix dimension is usually a LIST
+# `matrix.command: [a, b]` runs a job per entry, and each entry's own path ends
+# in its INDEX rather than the dimension's name — so a reference to it selected
+# nothing at all, and the install inside went neither checked nor announced.
+write_workflow matrix-list-command ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        command:
+          - apt-get install -y cmake
+          - apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.command }}
+YAML
+expect "a list-valued matrix dimension resolves" 1 matrix-list-command \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...but an entry's KEYS are not the dimension: a dimension whose entries are
+# objects is referenced as `matrix.target.command`, and `${{ matrix.target }}`
+# interpolates the object itself, which runs no install. Matching the name
+# anywhere in the path would follow the value inside it and reject a workflow
+# for a package apt is never asked for.
+write_workflow matrix-object-entries ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - os: ubuntu
+            command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.target }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a matrix entry's keys are not the dimension" 0 matrix-object-entries \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
