@@ -2578,6 +2578,60 @@ YAML
 expect "a matrix entry's keys are not the dimension" 0 matrix-object-entries \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# --------------------------------------- a command may be more than one hop away
+# A step's `env.COMMAND: ${{ matrix.install }}` run as `${{ env.COMMAND }}`
+# reaches its apt line through TWO references. Stopping at the first scanned an
+# env value that is itself only an expression, and the matrix entry holding the
+# install went neither checked nor announced.
+write_workflow chained-reference ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        install:
+          - apt-get install -y codex-no-such-package
+    steps:
+      - env:
+          COMMAND: ${{ matrix.install }}
+        run: ${{ env.COMMAND }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a reference through a reference is followed" 1 chained-reference \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and two values that name each other must not chase one another for ever.
+# This case is here to TERMINATE; the packages it reports are beside the point.
+write_workflow cyclic-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      A: ${{ env.B }}
+      B: ${{ env.A }}
+    steps:
+      - run: ${{ env.A }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "values naming each other terminate" 0 cyclic-reference \
+    "All 1 apt package(s)"
+
+# ...and a hop still ends where the command is WRITTEN: an env value that runs a
+# command of its own with the next reference as an argument supplies nothing.
+write_workflow chained-reference-argument ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        install:
+          - apt-get install -y codex-no-such-package
+    steps:
+      - env:
+          COMMAND: echo ${{ matrix.install }}
+        run: ${{ env.COMMAND }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a hop stops where a command is written" 0 chained-reference-argument \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

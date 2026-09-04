@@ -1101,16 +1101,6 @@ def referenced_values(expression):
     return found
 
 
-def shared_prefix(first, second):
-    """How many leading path elements two scalars have in common."""
-    length = 0
-    for one, other in zip(first, second):
-        if one != other:
-            break
-        length += 1
-    return length
-
-
 def resolve_reference(run_path, context, name, values):
     """The scalar(s) a reference selects from where the `run:` stands.
 
@@ -1293,6 +1283,60 @@ def scan_scalar(path, value):
         scan_shell(path, value.value, line, exact_lines=False)
 
 
+def follow_references(path, value, run_path, values, scanned, followed):
+    """Scan the values this scalar's expressions name, and the values THOSE name.
+
+    A `run:` may reach its command through more than one hop — a step writing
+    `env.COMMAND: ${{ matrix.install }}` and running `${{ env.COMMAND }}` —
+    and stopping at the first hop scanned an env value that is itself only an
+    expression, leaving the matrix entry that holds the install neither checked
+    nor announced.
+
+    Resolution stays anchored to the `run:`, because that is where GitHub
+    evaluates the expression; `followed` is what stops two values that name
+    each other from chasing one another for ever.
+    """
+    for offset, command, in_heredoc in shell_commands(value.value):
+        if in_heredoc:
+            continue
+        # MASKED before segmenting: `${{ a || b }}` holds a `||` that is part
+        # of the expression, not a shell separator, and splitting the raw text
+        # tears the expression in half.
+        masked, all_expressions = mask_expressions(command)
+        for segment in command_segments(masked):
+            expressions = [
+                all_expressions[int(position)]
+                for word in segment
+                for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
+            ]
+            if not expressions:
+                continue
+            # Whether anything of the command is written HERE.
+            # `echo ${{ github.ref }}` is an ordinary command with a value
+            # interpolated into it, and its apt is read as usual; a segment
+            # that is nothing but an expression has no command here at all.
+            if written_before_the_command(segment):
+                continue
+
+            for expression in expressions:
+                for context, name in referenced_values(expression):
+                    for referenced in resolve_reference(run_path, context, name, values):
+                        if id(referenced) not in scanned:
+                            scanned.add(id(referenced))
+                            scan_scalar(path, referenced)
+                        if id(referenced) not in followed:
+                            followed.add(id(referenced))
+                            follow_references(path, referenced, run_path, values,
+                                              scanned, followed)
+                if not is_a_plain_reference(expression):
+                    # The whole command is built by the expression, so it
+                    # exists nowhere in the file to be checked. Announced,
+                    # never silent.
+                    emit("NOTICE", path, scalar_line(value, offset),
+                         f"builds its command with an expression, assembled at run time "
+                         f"and not checked: {expression}")
+
+
 def scan_workflow(path, text):
     """Scan every scalar a workflow can EXECUTE.
 
@@ -1320,50 +1364,9 @@ def scan_workflow(path, text):
         if id(value) not in scanned:
             scanned.add(id(value))
             scan_scalar(path, value)
-
-        # Per SEGMENT, not per scalar and not per line: a command may hold
-        # ordinary text AND another after a separator that is nothing but an
-        # expression, as in `echo preparing; ${{ env.command }}`.
-        #
-        # Over the block's COMMANDS rather than its lines, and the same reading
-        # of them the literal scan uses: `echo \` continued onto an expression
-        # passes it to echo as arguments, and a heredoc body is data — read as
-        # lines, both looked like a command the expression supplied.
-        for offset, line_text, in_heredoc in shell_commands(value.value):
-            if in_heredoc:
-                continue
-            # MASKED before segmenting: `${{ a || b }}` holds a `||` that is
-            # part of the expression, not a shell separator, and splitting the
-            # raw line tears the expression in half.
-            masked_line, all_expressions = mask_expressions(line_text)
-            for segment in command_segments(masked_line):
-                expressions = [
-                    all_expressions[int(position)]
-                    for word in segment
-                    for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
-                ]
-                if not expressions:
-                    continue
-                # Whether anything of the command is written HERE.
-                # `echo ${{ github.ref }}` is an ordinary command with a value
-                # interpolated into it, and its apt is read as usual; a segment
-                # that is nothing but an expression has no command here at all.
-                if written_before_the_command(segment):
-                    continue
-
-                for expression in expressions:
-                    for context, name in referenced_values(expression):
-                        for referenced in resolve_reference(run_path, context, name, values):
-                            if id(referenced) not in scanned:
-                                scanned.add(id(referenced))
-                                scan_scalar(path, referenced)
-                    if not is_a_plain_reference(expression):
-                        # The whole command is built by the expression, so it
-                        # exists nowhere in the file to be checked. Announced,
-                        # never silent.
-                        emit("NOTICE", path, scalar_line(value, offset),
-                             f"builds its command with an expression, assembled at run time "
-                             f"and not checked: {expression}")
+        # The `run:` itself counts as followed, so a value that names it back
+        # cannot start the walk over.
+        follow_references(path, value, run_path, values, scanned, {id(value)})
 
 
 def main(argv):
