@@ -3740,6 +3740,66 @@ YAML
 expect "a comment line inside a body hides nothing" 1 group-multiline-comment \
     "codex-no-such-package"
 
+# --------------------------- `NAME=$( … )` runs what is inside the brackets
+# The bracket sits against a word holding an `=`, which is what an array
+# initializer looks like — but the word ends in `$`, not in `=`, and bash RUNS
+# the substitution. Discarding it as an array left a real install unread.
+write_workflow assignment-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          RESULT=$(apt-get install -y codex-no-such-package)
+          echo "$RESULT"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an assignment from a substitution runs its command" 1 assignment-substitution \
+    "codex-no-such-package"
+
+# ------------------------------------------------ `+=` APPENDS to a variable
+# A script that builds its command in pieces — `COMMAND='apt-get install -y '`
+# then `COMMAND+=pkg` — installs pkg. Replacing the value instead of appending
+# left a command that is not apt and a package nobody checked.
+write_workflow append-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y '
+          COMMAND+=codex-no-such-package
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an appended assignment keeps what came before" 1 append-assignment \
+    "codex-no-such-package"
+
+# ...and an ARRAY appends the same way, so a list built in pieces is read whole.
+write_workflow append-array ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          deps=(apt-get install -y)
+          deps+=(codex-no-such-package)
+          sudo "${deps[@]}"
+YAML
+expect "an appended array keeps its earlier elements" 1 append-array \
+    "codex-no-such-package"
+
+# ------------------------- an expression may CHOOSE between literal commands
+# `${{ ref == 'main' && 'apt-get …' || 'true' }}` runs one of its literals, and
+# which one depends on a value only the runner has. Both are commands the
+# workflow may run, and announcing the expression instead checked neither.
+write_workflow conditional-literals ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: ${{ github.ref == 'refs/heads/main' && 'apt-get install -y codex-no-such-package' || 'true' }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional's literal branches are commands" 1 conditional-literals \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

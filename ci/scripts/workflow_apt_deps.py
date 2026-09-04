@@ -78,6 +78,12 @@ CONTROL_PREFIXES = {
 
 APT_COMMANDS = {"apt", "apt-get"}
 
+# What an array's bracket is written against: `deps=(` or `deps+=(`. A word
+# merely CONTAINING an `=` is not one — `RESULT=$(` ends in a dollar, and bash
+# runs the substitution that opens there.
+ARRAY_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=$")
+
+
 # `"${deps[@]}"` is the whole array as separate words. Only THERE do its
 # elements become a command; the initializer says what the words are, not that
 # they will ever be run.
@@ -791,9 +797,9 @@ def scan_command(path, line, words, expressions, defined=None):
             # Its elements are REMEMBERED rather than read as a command: an
             # initializer says what the words are, not that they will ever be
             # run, and `printf '%s\n' "${deps[@]}"` only prints them.
-            name, inside, index = assignment
+            prefix, inside, index = assignment
             if defined is not None:
-                defined[("array", name)] = (inside, expressions)
+                remember_array(prefix, inside, defined, expressions)
             continue
 
         if (
@@ -1486,16 +1492,37 @@ def literal_alternatives(expression):
     ]
 
 
-def is_a_plain_reference(expression):
-    """Whether this expression is just value names, and not a command built here.
+# A name, or a chain of them: `matrix`, `github.ref`, `steps.build.outputs.x`.
+# Blanked before the operators are, so that what remains of a CHOICE is
+# nothing — while a function call leaves its brackets and commas behind.
+IDENTIFIER_CHAIN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_-]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*"
+)
 
-    `${{ matrix.extra_deps }}` and `${{ a || b }}` name values whose contents
-    ARE the command. `${{ format('sudo apt-get install -y {0}', matrix.package) }}`
-    assembles one instead: the `run:` text holds no apt invocation and the
-    matrix value is a bare word, so checking either of them checks nothing.
+# The operators an expression may CHOOSE with: alternation, and the
+# comparisons that decide which alternative wins.
+CHOICE_OPERATORS = re.compile(r"\|\||&&|==|!=|>=|<=|[<>!]|''|\s+")
+
+
+def chooses_a_command(expression):
+    """Whether this expression CHOOSES among the things written in it.
+
+    `${{ matrix.extra_deps }}`, `${{ a || b }}` and
+    `${{ ref == 'main' && 'apt-get …' || 'true' }}` each evaluate to one of
+    their parts, so every part is something the workflow may run.
+    `${{ format('sudo apt-get install -y {0}', matrix.package) }}` ASSEMBLES
+    one instead: the `run:` text holds no apt invocation and the matrix value
+    is a bare word, so checking either of them checks nothing.
+
+    APPROXIMATION: the operand of a comparison is read as an alternative too,
+    since telling `a == 'x' && 'cmd'` apart from `a || 'cmd'` needs the
+    expression's grammar rather than its vocabulary. A comparison operand is
+    not a command, but reading one as a command finds no apt in it.
     """
-    remainder = CONTEXT_REFERENCE.sub("", without_literals(expression)[3:-2])
-    return re.sub(r"\|\||&&|''|\s+", "", remainder) == ""
+    # Every NAME, not only the ones that can carry a command: `github.ref` is
+    # not a command context and still belongs to the choice being made.
+    remainder = IDENTIFIER_CHAIN.sub("", without_literals(expression)[3:-2])
+    return CHOICE_OPERATORS.sub("", remainder) == ""
 
 
 def command_segments(line):
@@ -1684,8 +1711,9 @@ def assigned_array(words, index):
     """The array `NAME=( … )` whose bracket is at `index`, or None.
 
     Returns the name, the words inside, and the index after the group. The
-    bracket has to be written hard against an assignment: a spaced `(` is a
-    subshell, and the assignment is what makes this an array rather than one.
+    bracket has to be written hard against a bare `NAME=` or `NAME+=`: a spaced
+    `(` is a subshell, and a word that merely holds an `=` is not an array
+    prefix — `RESULT=$(` ends in a dollar and RUNS what the bracket opens.
     """
     if (
         index < 1
@@ -1693,11 +1721,11 @@ def assigned_array(words, index):
         or words[index].value != "("
         or words[index].quoted
         or words[index].space_before
-        or not is_an_assignment(words[index - 1])
+        or not ARRAY_PREFIX.match(words[index - 1].value)
     ):
         return None
     inside, after = walk_to_closing_paren(words, index)
-    return words[index - 1].value.split("=", 1)[0].rstrip("+"), inside, after
+    return words[index - 1].value, inside, after
 
 
 def rebased(words, expressions, into):
@@ -1737,21 +1765,41 @@ def remembered(token, defined):
     return None
 
 
+def held(name, kind, defined, expressions):
+    """What is remembered under this name, renumbered into `expressions`."""
+    remembered_words = defined.get((kind, name))
+    return rebased(*remembered_words, expressions) if remembered_words else []
+
+
+def remember_array(prefix, inside, defined, expressions):
+    """Remember an array's elements, appending when the prefix says `+=`."""
+    name = prefix.rstrip("=").rstrip("+")
+    before = held(name, "array", defined, expressions) if prefix.endswith("+=") else []
+    defined[("array", name)] = (before + inside, expressions)
+
+
 def remember(assignments, defined, expressions):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
     of the script; `FLAG=1 cmd` sets it for cmd alone and is gone after. The
     value becomes WORDS, because that is what `$COMMAND` expands to.
+
+    `NAME+=` APPENDS: a script that builds its command in pieces —
+    `COMMAND='apt-get install -y '` then `COMMAND+=pkg` — installs pkg, and
+    replacing the value would leave a command that is not apt.
     """
     if defined is None:
         return
     for word in assignments:
         name, _, value = word.value.partition("=")
-        defined[("variable", name.rstrip("+"))] = (
-            [Word(part, quoted=True, literal_dollar=True, literal_backtick=True,
-                  literal_brace=True)
-             for part in value.split()],
+        appending = name.endswith("+")
+        name = name.rstrip("+")
+        before = held(name, "variable", defined, expressions) if appending else []
+        defined[("variable", name)] = (
+            before + [Word(part, quoted=True, literal_dollar=True, literal_backtick=True,
+                           literal_brace=True)
+                      for part in value.split()],
             expressions,
         )
 
@@ -1931,12 +1979,12 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
                 # Remembered, and the segment read on: an assignment can be a
                 # PREFIX — `deps=(x) cmd` sets it for that one command and runs
                 # cmd — so what follows the group is still a command.
-                arrays[assignment[0]] = (assignment[1], all_expressions)
+                remember_array(assignment[0], assignment[1], arrays, all_expressions)
 
             word = command_word(segment)
             expanded = ARRAY_EXPANSION.match(word.value) if word is not None else None
-            if expanded is not None and expanded.group(1) in arrays:
-                elements = rebased(*arrays[expanded.group(1)], all_expressions)
+            if expanded is not None and ("array", expanded.group(1)) in arrays:
+                elements = held(expanded.group(1), "array", arrays, all_expressions)
                 segment = elements + segment[segment.index(word) + 1:]
 
             found = [
@@ -2010,7 +2058,7 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
                             continue
                         visit_reference(path, referenced, run_path, values, scanned,
                                         followed, scalar_line(value, offset), carried)
-                if not is_a_plain_reference(expression):
+                if not chooses_a_command(expression):
                     # The whole command is built by the expression, so it
                     # exists nowhere in the file to be checked. Announced,
                     # never silent.
