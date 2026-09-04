@@ -62,6 +62,19 @@ OPTIONS_WITH_ARGUMENT = {
 # prefix words and their options.
 INVOCATION_PREFIXES = {"sudo", "env"}
 
+APT_COMMANDS = {"apt", "apt-get"}
+
+
+def is_apt(token):
+    """Whether this word names apt, however it is spelled.
+
+    `/usr/bin/apt-get` is the same command as `apt-get`. Matching the name
+    exactly missed it entirely — and because the "looks like an apt install
+    command" safety net matched exactly too, its packages went unexamined AND
+    unmentioned, which is the one combination this scanner must never produce.
+    """
+    return token.rsplit("/", 1)[-1] in APT_COMMANDS
+
 SEPARATORS = {";", "|", "&&", "||", "&", "\n"}
 
 # `<<` belongs here as well as to the heredoc tracking: `apt-get install -y
@@ -146,6 +159,11 @@ class Word:
     with the dollar sign in it, so it is a package name to resolve and not a
     variable to excuse.
 
+    `quoted` is true when any part of the word was quoted or escaped, which is
+    what makes it a WORD and not an operator: bash passes `'<<'` and `';'` to
+    the command as arguments, and shlex hands back tokens indistinguishable
+    from the real operators.
+
     `space_before` is false when no whitespace separates this word from the one
     before it. shlex splits `<<-EOF` and `<< -EOF` into the same three tokens,
     and `c$(printf make)` into five, so adjacency is the only thing that says
@@ -153,18 +171,20 @@ class Word:
     fragment belongs to the word beside it.
     """
 
-    __slots__ = ("value", "literal_dollar", "space_before", "literal_backtick")
+    __slots__ = ("value", "literal_dollar", "space_before", "literal_backtick", "quoted")
 
-    def __init__(self, value, literal_dollar=False, space_before=True, literal_backtick=False):
+    def __init__(self, value, literal_dollar=False, space_before=True,
+                 literal_backtick=False, quoted=False):
         self.value = value
         self.literal_dollar = literal_dollar
         self.space_before = space_before
         self.literal_backtick = literal_backtick
+        self.quoted = quoted
 
     def __repr__(self):
         return (f"Word({self.value!r}, literal_dollar={self.literal_dollar}, "
                 f"space_before={self.space_before}, "
-                f"literal_backtick={self.literal_backtick})")
+                f"literal_backtick={self.literal_backtick}, quoted={self.quoted})")
 
 
 class _QuoteWatchingStream(io.StringIO):
@@ -185,11 +205,14 @@ class _QuoteWatchingStream(io.StringIO):
         self.lexer = None
         self.literal_dollar = False
         self.literal_backtick = False
+        self.quoted = False
         self.last_char = None
 
     def read(self, size=-1):
         char = super().read(size)
         if char:
+            if self.lexer.state in ("'", '"', self.lexer.escape):
+                self.quoted = True
             if char in "$`" and self.lexer.state in ("'", self.lexer.escape):
                 # Single quotes and a backslash suppress BOTH forms of
                 # expansion; double quotes suppress neither.
@@ -201,8 +224,8 @@ class _QuoteWatchingStream(io.StringIO):
         return char
 
 
-def lex_words(text, commenters="#"):
-    """Tokenise one shell command line. Raises ValueError on an unclosed quote."""
+def _lex(text, commenters):
+    """Tokenise, with shlex's own comment handling set to `commenters`."""
     stream = _QuoteWatchingStream(text)
     lexer = shlex.shlex(stream, posix=True, punctuation_chars=True)
     stream.lexer = lexer
@@ -216,6 +239,7 @@ def lex_words(text, commenters="#"):
         # before returning it and pushes punctuation back unread.
         stream.literal_dollar = False
         stream.literal_backtick = False
+        stream.quoted = False
         # The character last read is either the whitespace that ended the word
         # before, or — when shlex pushed one back — the first character of this
         # word. Either way, whitespace here means the two words are separated.
@@ -223,11 +247,49 @@ def lex_words(text, commenters="#"):
         token = lexer.get_token()
         if token is lexer.eof:
             return words
+        if stream.quoted:
+            # A quoted run of punctuation is an argument, not a sequence of
+            # operators, so it is not taken apart.
+            words.append(Word(token, stream.literal_dollar, space_before,
+                              stream.literal_backtick, True))
+            continue
         for position, part in enumerate(split_operators(token)):
             # Only the first part can have had whitespace before it; the rest
             # were welded to their predecessor by definition.
             words.append(Word(part, stream.literal_dollar,
                               space_before and position == 0, stream.literal_backtick))
+
+
+def starts_a_comment(word):
+    """Whether this word is where bash would start a comment.
+
+    `#` opens a comment only where a WORD can begin. After other characters it
+    is an ordinary character — `cmake#typo` is a package name and apt rejects
+    it — and quoted it is a package name of its own.
+    """
+    return word.value.startswith("#") and not word.quoted and word.space_before
+
+
+def lex_words(text):
+    """Tokenise one shell command line. Raises ValueError on an unclosed quote.
+
+    Comments are applied by bash's rule rather than shlex's, which treats every
+    unquoted `#` as one wherever it appears.
+    """
+    try:
+        words = _lex(text, commenters="")
+    except ValueError:
+        # A quote character inside a COMMENT is not an unbalanced quote in the
+        # command — `# don't` is a perfectly ordinary line — so fall back to
+        # shlex's own comment handling, which never reads that far. LIMITATION:
+        # on this path a `#` inside a word is treated as a comment after all,
+        # which needs a line carrying both an apostrophe in its comment and a
+        # hash inside a word before it.
+        return _lex(text, commenters="#")
+    for index, word in enumerate(words):
+        if starts_a_comment(word):
+            return words[:index]
+    return words
 
 
 def holds_a_comment(text):
@@ -239,7 +301,7 @@ def holds_a_comment(text):
     comment — and shlex is the thing that already knows about quoting.
     """
     try:
-        return len(lex_words(text, commenters="")) != len(lex_words(text))
+        return any(starts_a_comment(word) for word in _lex(text, commenters=""))
     except ValueError:
         # An unbalanced quote is reported where the command is scanned; here it
         # only means the question cannot be answered, so assume no comment and
@@ -265,17 +327,17 @@ def scan_command(path, line, words, expressions):
         token = word.value
         index += 1
 
-        if token in ("apt", "apt-get"):
+        if is_apt(token):
             saw_apt = True
         elif token == "install":
             saw_install = True
 
-        if token in SEPARATORS:
+        if token in SEPARATORS and not word.quoted:
             state = "idle"
             at_command = True
             continue
 
-        if token in REDIRECTIONS:
+        if token in REDIRECTIONS and not word.quoted:
             # A redirection does not end an argument list — `cmd a >log b`
             # passes both a and b — so consume only its target.
             if (
@@ -292,7 +354,12 @@ def scan_command(path, line, words, expressions):
 
         # `2>&1`: an all-digit word in front of a redirection is a file
         # descriptor, not a package.
-        if token.isdigit() and index < len(words) and words[index].value in REDIRECTIONS:
+        if (
+            token.isdigit()
+            and index < len(words)
+            and words[index].value in REDIRECTIONS
+            and not words[index].quoted
+        ):
             continue
 
         if state == "packages":
@@ -386,7 +453,7 @@ def scan_command(path, line, words, expressions):
         if not at_command:
             continue
 
-        if token in ("apt", "apt-get"):
+        if is_apt(token):
             state = "options"
         elif token in INVOCATION_PREFIXES or token.startswith("-") or "=" in token:
             pass
@@ -420,7 +487,7 @@ def heredocs_opened(words):
     opened = []
     index = 0
     while index < len(words):
-        if words[index].value != "<<" or index + 1 >= len(words):
+        if words[index].value != "<<" or words[index].quoted or index + 1 >= len(words):
             index += 1
             continue
         word = words[index + 1]

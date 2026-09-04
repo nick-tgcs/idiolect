@@ -130,8 +130,14 @@ expect "an operator is a command position on its own" 1 chained-nosudo \
 
 # A `#` starts a comment that runs to the end of the line. Reading its words as
 # packages fails a perfectly good workflow, and this gate blocks PRs.
+# A BLOCK scalar: in a plain YAML scalar a `#` after whitespace is a YAML
+# comment, which YAML strips before the scanner ever sees it — the case would
+# pass without the shell's comment rule being exercised at all. This test was
+# written against a line-reading implementation, where that distinction did not
+# exist, and quietly stopped testing anything when the scanner moved to PyYAML.
 write_workflow commented ci.yml <<'YAML'
-        run: sudo apt-get install -y cmake # needed for the fcitx5 addon
+        run: |
+          sudo apt-get install -y cmake # needed for the fcitx5 addon
 YAML
 expect "an inline shell comment is not a package list" 0 commented \
     "All 1 apt package(s)"
@@ -1073,6 +1079,76 @@ write_workflow backtick-double-quoted ci.yml <<'YAML'
 YAML
 expect "double-quoted backticks still substitute" 0 backtick-double-quoted \
     "All 1 apt package(s)" "not checked"
+
+
+# ------------------------------------------- a hash is only sometimes a comment
+# Bash starts a comment at `#` only where a WORD can begin. After other
+# characters it is an ordinary character: `cmake#typo` is a package name, and
+# apt rejects it. Letting the lexer treat every `#` as a comment truncates the
+# word to `cmake`, which resolves, and the broken install passes the gate.
+write_workflow hash-inside-word ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake#typo
+YAML
+expect "a hash inside a word is part of the name" 1 hash-inside-word \
+    "cmake#typo" "installs a package apt cannot resolve"
+
+# ...and where a word DOES begin it is still a comment, which is the half that
+# stops the gate inventing packages out of prose.
+# A BLOCK scalar, because `#` after a space in a plain YAML scalar is a YAML
+# comment: YAML would strip it and the case would pass without the shell rule
+# being exercised at all.
+write_workflow hash-at-word-start ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake # codex-no-such-package
+YAML
+expect "a hash starting a word is still a comment" 0 hash-at-word-start \
+    "All 1 apt package(s)"
+
+# -------------------------------------------------- quoted operators are words
+# `'<<'` is an argument, not a redirection: bash passes it to the command and
+# opens no heredoc. shlex removes the quotes, so the token is indistinguishable
+# from the operator unless the quoting is tracked — and a heredoc opened here
+# never closes, swallowing every command after it as data.
+write_workflow quoted-heredoc-operator ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          printf '%s\n' '<<' EOF
+          sudo apt-get install -y codex-no-such-package
+YAML
+expect "a quoted heredoc operator opens no heredoc" 1 quoted-heredoc-operator \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# Same for a separator. `';'` is a package name apt will reject, not the end of
+# the package list — dropping it loses a broken install without a word.
+write_workflow quoted-separator ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake ';'
+YAML
+expect "a quoted separator is a package name" 1 quoted-separator \
+    "installs a package apt cannot resolve"
+
+# ------------------------------------------------ apt invoked by absolute path
+# `/usr/bin/apt-get install -y ...` is the same command. Matching the name
+# exactly missed it entirely — not even the "looks like an apt install command"
+# notice fired, because that test was exact too, so the packages went
+# unexamined and unmentioned.
+write_workflow apt-by-path ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          /usr/bin/apt-get install -y codex-no-such-package
+YAML
+expect "apt invoked by absolute path is still apt" 1 apt-by-path \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and nothing else is. A different program whose path merely ends in a
+# similar name installs nothing, and reading its arguments as packages would be
+# a false red.
+write_workflow not-apt-by-path ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          /usr/bin/aptitude install -y codex-no-such-package
+YAML
+expect "a different program by path is not apt" 0 not-apt-by-path \
+    "All 1 apt package(s)"
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
