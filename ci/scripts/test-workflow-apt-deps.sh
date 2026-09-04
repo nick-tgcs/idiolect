@@ -1267,6 +1267,58 @@ YAML
 expect "an expression inside a word is one dynamic argument" 0 expression-embedded \
     "All 1 apt package(s)" "lib\${{ matrix.flavor }}" "\${{ matrix.prefix }}-dev"
 
+
+# --------------------------------------- a dollar sign is not always a dollar
+# `$` only begins an expansion when something can follow it: a name, `{`, `(`,
+# or one of the special parameters. At the end of a word it is an ordinary
+# character, and apt is handed a name it rejects. Excusing every word that
+# merely CONTAINS a `$` lets that through as an unresolvable variable.
+write_workflow dollar-trailing ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake codex-no-such-package$
+YAML
+expect "a trailing dollar is part of the name" 1 dollar-trailing \
+    "installs a package apt cannot resolve"
+
+# ...while the forms that DO expand are still excused, which is the half that
+# keeps the gate off working matrix workflows.
+write_workflow dollar-forms ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake $NAME
+          sudo apt-get install -y cmake ${BRACED}
+          sudo apt-get install -y cmake $1
+YAML
+expect "the expanding dollar forms are still excused" 0 dollar-forms \
+    "All 3 apt package(s)" "not checked: \$NAME" "not checked: \${BRACED}" "not checked: \$1"
+
+# ------------------------------------------------------- brace expansion
+# `lib{asound2,pulse}-dev` is two package names, both of which exist. Resolving
+# the unexpanded word asks apt for something no workflow ever installs, and
+# blocks a PR over a line that works.
+write_workflow brace-expansion ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y lib{asound2,pulse}-dev
+YAML
+expect "a brace expansion is not a package name" 0 brace-expansion \
+    "All 1 apt package(s)" "not checked"
+
+# ...but bash expands braces only where there is something to expand: `{only}`
+# has no comma and no range, so the word is passed through unchanged and apt
+# rejects it. Excusing every brace would hide that.
+write_workflow brace-single ci.yml <<'YAML'
+        run: sudo apt-get install -y lib{only}-dev
+YAML
+expect "a brace with nothing to expand is a package name" 1 brace-single \
+    "installs a package apt cannot resolve"
+
+# ...and quoting suppresses it entirely: `'{a,b}'` is one literal argument, so
+# apt is handed a name with braces in it and rejects it.
+write_workflow brace-quoted ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '{asound2,pulse}'
+YAML
+expect "quoted braces are part of the name" 1 brace-quoted \
+    "installs a package apt cannot resolve"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

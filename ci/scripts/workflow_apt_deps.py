@@ -40,6 +40,7 @@ lexing or parsing, the library is being worked around rather than used.
 
 import io
 import shlex
+import string
 import sys
 
 import yaml
@@ -115,6 +116,38 @@ def split_operators(token):
             parts.append(token[index])
             index += 1
     return parts
+
+
+# What a `$` must be followed by to begin an expansion: a name, `{`, `(`, or one
+# of the special parameters. Anything else — including the end of the word —
+# leaves it an ordinary character, and `codex-no-such-package$` is a name apt
+# rejects rather than a variable to excuse.
+EXPANSION_INTRODUCERS = frozenset(string.ascii_letters + string.digits + "_{(@*#?-!$")
+
+
+def expands_a_dollar(token):
+    """Whether any `$` in this word begins a shell expansion."""
+    return any(
+        char == "$" and position + 1 < len(token) and token[position + 1] in EXPANSION_INTRODUCERS
+        for position, char in enumerate(token)
+    )
+
+
+def expands_a_brace(token):
+    """Whether bash would brace-expand this word.
+
+    Only where there is something to expand: `lib{asound2,pulse}-dev` becomes
+    two package names, while `lib{only}-dev` has no comma and no range and is
+    passed through unchanged — so excusing every brace would hide a name apt
+    rejects.
+    """
+    start = token.find("{")
+    while start != -1:
+        end = token.find("}", start + 1)
+        if end != -1 and ("," in token[start + 1:end] or ".." in token[start + 1:end]):
+            return True
+        start = token.find("{", start + 1)
+    return False
 
 
 EXPRESSION_PREFIX = "__GITHUB_EXPRESSION_"
@@ -503,8 +536,18 @@ def scan_command(path, line, words, expressions):
                 emit("NOTICE", path, line,
                      f"names a package through a variable, not checked: {unmask(token, expressions)}")
                 continue
-            if "$" in token and not word.literal_dollar:
+            if expands_a_dollar(token) and not word.literal_dollar:
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
+                continue
+            if expands_a_brace(token) and not word.quoted:
+                # Announced rather than expanded. Expanding would check more —
+                # both halves of `lib{asound2,pulse}-dev` exist — but brace
+                # expansion is a grammar of its own, with ranges and nesting,
+                # and the standard library does not implement it. Writing that
+                # by hand is the mistake this file was rewritten to undo. Spell
+                # the packages out in the workflow and the gate checks them.
+                emit("NOTICE", path, line,
+                     f"names packages through a brace expansion, not checked: {token}")
                 continue
             if token in OPTIONS_WITH_ARGUMENT:
                 index += 1
