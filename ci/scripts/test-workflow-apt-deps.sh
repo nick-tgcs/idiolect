@@ -3323,6 +3323,55 @@ YAML
 expect "a hop through a shell variable keeps the arguments" 1 shell-variable-chain \
     "codex-no-such-package"
 
+# ------------------------- a shell variable can be the script `bash -c` runs
+# `bash -c "$SCRIPT"` runs whatever the variable holds, and the quotes do not
+# stop it: the value is the script, not an argument. Only a `${{ }}` argument
+# was being followed.
+write_workflow shell-script-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          SCRIPT: apt-get install -y codex-no-such-package
+        run: bash -c "$SCRIPT"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a variable handed to bash -c is followed" 1 shell-script-variable \
+    "codex-no-such-package"
+
+# ------------------------------- an expression may fall back to a LITERAL command
+# `${{ env.COMMAND || 'apt-get …' }}` runs the literal when the value is empty,
+# so the literal is a command like any other. Blanking every quoted string made
+# the expression look like a plain reference with nothing else in it.
+write_workflow literal-fallback ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: ''
+    steps:
+      - run: ${{ env.COMMAND || 'apt-get install -y codex-no-such-package' }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a literal fallback is a command" 1 literal-fallback \
+    "codex-no-such-package"
+
+# ...while a literal that an expression BUILDS a command out of is not one:
+# `format('… {0}', matrix.pkg)` has no package in it, and reading its template
+# as a command would report `{0}` as a name apt cannot resolve.
+write_workflow literal-template ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        pkg:
+          - cmake
+    steps:
+      - run: ${{ format('apt-get install -y {0}', matrix.pkg) }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a format template is not a command" 0 literal-template \
+    "assembled at run time" '!cannot resolve: {0}'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

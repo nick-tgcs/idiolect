@@ -1354,6 +1354,23 @@ def resolve_reference(run_path, context, chain, values):
     return []
 
 
+def literal_alternatives(expression):
+    """The string LITERALS an expression may evaluate to.
+
+    `${{ env.COMMAND || 'apt-get install -y cmake' }}` runs the literal when
+    the value is empty, so the literal is a command like any other. An index
+    is not an alternative — `matrix['pkg']` names a value — and neither is the
+    template of a function call, where `format('… {0}', x)` holds no command
+    until it is assembled; that shape is not a plain reference and never
+    reaches here.
+    """
+    return [
+        match.group(3)[1:-1]
+        for match in EXPRESSION_STRING.finditer(expression)
+        if match.group(3)
+    ]
+
+
 def is_a_plain_reference(expression):
     """Whether this expression is just value names, and not a command built here.
 
@@ -1644,7 +1661,18 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
             # executed all the same, as the script the shell is handed.
             if written_before_the_command(segment):
                 script = script_argument(segment)
-                if script is None or not WHOLE_EXPRESSION.match(script.value):
+                if script is None:
+                    continue
+                # A variable is a script as readily as an expression is, and
+                # the quotes around `bash -c "$SCRIPT"` do not stop it being
+                # one: the value is what bash reads, not an argument to it.
+                variable = SHELL_VARIABLE.match(script.value)
+                if variable:
+                    name = variable.group(1) or variable.group(2)
+                    for referenced in resolve_reference(run_path, "env", (name,), values):
+                        visit_reference(path, referenced, run_path, values, scanned,
+                                        followed, scalar_line(value, offset), arguments)
+                if not WHOLE_EXPRESSION.match(script.value):
                     continue
                 supplying = [
                     (all_expressions[int(number)], [])
@@ -1670,7 +1698,16 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
                     emit("NOTICE", path, scalar_line(value, offset),
                          f"builds its command with an expression, assembled at run time "
                          f"and not checked: {expression}")
-                elif not resolved:
+                    continue
+
+                # `a || 'literal'` runs the literal when the value is empty, so
+                # the literal is one of the commands this may be.
+                for literal in literal_alternatives(expression):
+                    resolved += 1
+                    scan_shell(path, " ".join(part for part in (literal, carried) if part),
+                               scalar_line(value, offset), exact_lines=False)
+
+                if not resolved:
                     # `${{ vars.COMMAND }}` is a repository setting, and a
                     # required input has no default: the command exists, but
                     # not in this file. Resolving to nothing and saying nothing
