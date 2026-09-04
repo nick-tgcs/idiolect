@@ -3988,6 +3988,51 @@ YAML
 expect "a backtick command on its own is read" 1 backtick-alone \
     "codex-no-such-package"
 
+# ------------------------------- `-O` takes an argument, like `-o` before it
+# `bash -O extglob -c '…'` runs the script. Reading `extglob` as the script
+# FILE ended the options there and left the real `-c` unread.
+write_workflow shell-option-O ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -O extglob -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a shopt option takes its argument" 1 shell-option-O \
+    "codex-no-such-package"
+
+# ------------------------------- `export NAME` exports what is already there
+# The value was assigned on the line before and exported on its own, so the
+# child sees it — and neither line looks like an assignment to export.
+write_workflow bare-export ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          export COMMAND
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a bare export reaches the child" 1 bare-export \
+    "codex-no-such-package"
+
+# ...while the other declaration builtins do NOT export: `readonly COMMAND`
+# marks it unwritable and leaves it out of the child's environment, so nothing
+# runs over there.
+write_workflow readonly-does-not-export ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          readonly COMMAND
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "readonly does not export" 0 readonly-does-not-export \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

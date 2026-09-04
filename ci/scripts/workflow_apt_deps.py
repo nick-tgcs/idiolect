@@ -90,6 +90,10 @@ ARRAY_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=$")
 ARRAY_EXPANSION = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}$")
 
 
+# A bare variable NAME, with nothing assigned to it: what `export COMMAND`
+# names.
+NAME_ONLY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 # Builtins that take an assignment as their ARGUMENT: `export NAME=value` sets
 # the variable exactly as a bare assignment does, and marks it for the child
 # shells too.
@@ -100,8 +104,10 @@ DECLARATION_BUILTINS = {"export", "declare", "typeset", "readonly", "local"}
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
 
 # Options a shell takes an argument for, so the word after one is not the
-# script FILE that ends the invocation's options.
-SHELL_OPTIONS_WITH_ARGUMENT = {"-o", "+o", "--rcfile", "--init-file"}
+# script FILE that ends the invocation's options. Every one bash's own `--help`
+# lists with an operand: `-c command` is handled separately, being the one that
+# hands over a script.
+SHELL_OPTIONS_WITH_ARGUMENT = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 
 
 def hands_over_a_script(word):
@@ -991,6 +997,11 @@ def scan_command(path, line, words, expressions, defined=None):
             # so the words after it are still assignments and the command
             # position survives them.
             declaring = token
+        elif declaring == "export" and NAME_ONLY.match(token) and not word.quoted:
+            # `export COMMAND` on its own exports what is already there, so
+            # the value assigned on an earlier line is what the child sees.
+            if defined is not None:
+                defined[("exported", token)] = ((), expressions)
         elif is_an_assignment(word):
             # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
             # names no command, and announcing those flagged two lines of this
@@ -1921,7 +1932,7 @@ def touches_a_definition(words, defined):
     for index, word in enumerate(words):
         if assigned_array(words, index) is not None or defined_function(words, index):
             return True
-        if is_an_assignment(word):
+        if is_an_assignment(word) or (word.value in DECLARATION_BUILTINS and not word.quoted):
             return True
         expansion = ARRAY_EXPANSION.match(word.value)
         variable = SHELL_VARIABLE.match(word.value)
