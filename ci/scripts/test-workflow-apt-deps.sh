@@ -66,9 +66,19 @@ expect() { # expect <label> <want-exit> "<path> [path ...]" [must-contain ...]
         printf '%s\n' "$out" | sed 's/^/    | /' >&2
         return
     fi
+    # A needle written `!text` must be ABSENT. Without that, a case can only
+    # say what the gate reported and never that it kept quiet — which is how
+    # two mutations that made the scanner announce things it should not both
+    # survived a battery.
     local needle
     for needle in "$@"; do
-        if ! printf '%s' "$out" | grep -qF -- "$needle"; then
+        if [ "${needle#!}" != "$needle" ]; then
+            if printf '%s' "$out" | grep -qF -- "${needle#!}"; then
+                fail "$label: output should not mention '${needle#!}'"
+                printf '%s\n' "$out" | sed 's/^/    | /' >&2
+                return
+            fi
+        elif ! printf '%s' "$out" | grep -qF -- "$needle"; then
             fail "$label: output does not mention '$needle'"
             printf '%s\n' "$out" | sed 's/^/    | /' >&2
             return
@@ -614,9 +624,19 @@ expect_path() { # expect_path <label> <PATH> <want-exit> "<paths>" [must-contain
         printf '%s\n' "$out" | sed 's/^/    | /' >&2
         return
     fi
+    # A needle written `!text` must be ABSENT. Without that, a case can only
+    # say what the gate reported and never that it kept quiet — which is how
+    # two mutations that made the scanner announce things it should not both
+    # survived a battery.
     local needle
     for needle in "$@"; do
-        if ! printf '%s' "$out" | grep -qF -- "$needle"; then
+        if [ "${needle#!}" != "$needle" ]; then
+            if printf '%s' "$out" | grep -qF -- "${needle#!}"; then
+                fail "$label: output should not mention '${needle#!}'"
+                printf '%s\n' "$out" | sed 's/^/    | /' >&2
+                return
+            fi
+        elif ! printf '%s' "$out" | grep -qF -- "$needle"; then
             fail "$label: output does not mention '$needle'"
             printf '%s\n' "$out" | sed 's/^/    | /' >&2
             return
@@ -1874,6 +1894,102 @@ jobs:
 YAML
 expect "a matrix reference does not reach another job" 0 matrix-other-job \
     "All 1 apt package(s)"
+
+
+# --------------------------------------------- env precedence, step by step
+# Two steps in one job may each set `env.command`, and a `run:` sees its OWN.
+# Selecting every match in the job scans a value the referencing step overrode
+# and rejects a workflow that works.
+write_workflow env-step-precedence ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          command: sudo apt-get install -y codex-no-such-package
+        run: echo not-executed
+      - env:
+          command: sudo apt-get install -y cmake
+        run: ${{ env.command }}
+YAML
+expect "a step sees its own env, not its neighbour's" 0 env-step-precedence \
+    "All 1 apt package(s)"
+
+# ...and a step's env overrides the job's, which is the same rule one level up.
+write_workflow env-step-over-job ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - env:
+          command: sudo apt-get install -y cmake
+        run: ${{ env.command }}
+YAML
+expect "a step's env overrides the job's" 0 env-step-over-job \
+    "All 1 apt package(s)"
+
+# ...while the job's is used when the step sets none.
+write_workflow env-job-fallback ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y libfcitx5-dev
+    steps:
+      - run: ${{ env.command }}
+YAML
+expect "a job's env is used when the step sets none" 1 env-job-fallback \
+    "libfcitx5-dev"
+
+# ------------------------------------- commands assembled at run time
+# `${{ format('sudo apt-get install -y {0}', matrix.package) }}` builds the
+# command itself: the `run:` text holds no apt invocation and the matrix value
+# is a bare word, so nothing was checked AND nothing was said. This scanner
+# announces what it cannot resolve — that is the whole contract — so an
+# assembled command is announced.
+write_workflow assembled-command ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - package: codex-no-such-package
+    steps:
+      - run: sudo apt-get install -y cmake
+      - run: ${{ format('sudo apt-get install -y {0}', matrix.package) }}
+YAML
+expect "a command assembled by an expression is announced" 0 assembled-command \
+    "All 1 apt package(s)" "assembled at run time"
+
+# ...but a plain reference is not "assembled": its value IS the command, and it
+# is scanned rather than excused.
+write_workflow plain-reference-not-assembled ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: sudo apt-get install -y libfcitx5-dev
+    steps:
+      - run: ${{ matrix.extra_deps }}
+YAML
+expect "a plain reference is scanned, not announced" 1 plain-reference-not-assembled \
+    "libfcitx5-dev" '!assembled at run time'
+
+# ...and an expression INSIDE an ordinary script is not an assembled command.
+# `echo ${{ github.ref }}` is a script with a value interpolated into it, and
+# its apt lines are read as usual — announcing those would bury the real
+# notices under one per metadata reference, which is what the first version of
+# this rule did to nineteen lines of this repository's own workflows.
+write_workflow interpolation-in-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo ${{ github.ref }}
+          sudo apt-get install -y cmake
+YAML
+expect "an interpolation inside a script is not an assembled command" 0 interpolation-in-script \
+    "All 1 apt package(s)" '!assembled at run time'
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

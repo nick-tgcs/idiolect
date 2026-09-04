@@ -905,11 +905,13 @@ def scalar_values(node, path=()):
             else:
                 yield from scalar_values(value, inner)
     elif isinstance(node, yaml.SequenceNode):
-        for child in node.value:
+        for position, child in enumerate(node.value):
+            # The INDEX is part of the path: two steps in one job each set
+            # `env.command`, and without it their values are indistinguishable.
             if isinstance(child, yaml.ScalarNode):
-                yield path, child
+                yield path + (position,), child
             else:
-                yield from scalar_values(child, path)
+                yield from scalar_values(child, path + (position,))
 
 
 # The contexts whose values can hold a command a `run:` then executes. `github`
@@ -950,34 +952,6 @@ def job_scope(path):
     return ()
 
 
-def resolves_reference(path, scope, context, name):
-    """Whether the scalar at `path` is the value this reference names.
-
-    A reference names a value IN SCOPE, not every scalar in the document with
-    that key — two jobs may each define `env.command`, and a `run:` in one of
-    them names its own.
-    """
-    if context == "matrix":
-        # A matrix belongs to its job, and its entries sit under `include:`.
-        return path[:len(scope)] == scope and "matrix" in path and path[-1] == name
-    if context == "env":
-        # env may be set on the step, the job, or the workflow itself.
-        return (
-            "env" in path
-            and path[-1] == name
-            and (path[:len(scope)] == scope or not job_scope(path))
-        )
-    if context == "inputs":
-        # A workflow input's value lives under `default:`, one level below the
-        # name the expression uses.
-        return "inputs" in path and (
-            path[-1] == name
-            or (len(path) >= 2 and path[-1] == "default" and path[-2] == name)
-        )
-    # `vars` are repository settings; nothing in the file to scan.
-    return False
-
-
 def referenced_values(expression):
     """Every (context, value name) a `${{ ... }}` selects.
 
@@ -996,64 +970,124 @@ def referenced_values(expression):
     return found
 
 
-def referenced_by_run(values):
-    """The (job scope, context, name) triples a `run:` interpolates.
+def shared_prefix(first, second):
+    """How many leading path elements two scalars have in common."""
+    length = 0
+    for one, other in zip(first, second):
+        if one != other:
+            break
+        length += 1
+    return length
 
-    Shell does not only live under `run:`. desktop-app-release.yml keeps an
-    install in a matrix entry and executes it later through
-    `run: ${{ matrix.extra_deps }}`, so a scan that trusted the key name alone
-    missed five packages — caught by comparing counts against the
-    implementation this replaced, not by any test.
+
+def resolve_reference(run_path, context, name, values):
+    """The scalar(s) a reference selects from where the `run:` stands.
+
+    A reference names a value IN SCOPE, and the nearest definition wins: two
+    steps in one job may each set `env.command`, and a `run:` sees its own.
+    A matrix is the exception — every `include:` entry runs, so all of them
+    count.
     """
-    names = set()
-    for path, node in values:
-        if not path or path[-1] != "run":
-            continue
-        scope = job_scope(path)
-        _, expressions = mask_expressions(node.value)
-        for expression in expressions:
-            for context, name in referenced_values(expression):
-                names.add((scope, context, name))
-    return names
+    scope = job_scope(run_path)
+    if context == "matrix":
+        return [
+            value for path, value in values
+            if path[-1] == name and "matrix" in path and path[:len(scope)] == scope
+        ]
+    if context == "env":
+        # env may be set on the step, the job, or the workflow, and the closest
+        # one to this `run:` is the one it sees.
+        candidates = [
+            (path, value) for path, value in values
+            if path[-1] == name
+            and "env" in path
+            and (path[:len(scope)] == scope or not job_scope(path))
+        ]
+        if not candidates:
+            return []
+        return [max(candidates, key=lambda found: shared_prefix(found[0], run_path))[1]]
+    if context == "inputs":
+        # A workflow input's value lives under `default:`, one level below the
+        # name the expression uses.
+        return [
+            value for path, value in values
+            if "inputs" in path
+            and (path[-1] == name
+                 or (len(path) >= 2 and path[-1] == "default" and path[-2] == name))
+        ]
+    # `vars` are repository settings; nothing in the file to scan.
+    return []
 
 
-def shell_scalars(node):
-    """Every scalar a workflow can EXECUTE, with the line it starts on and style.
+def is_a_plain_reference(expression):
+    """Whether this expression is just value names, and not a command built here.
 
-    `run:`, and whatever a `run:` interpolates — the latter matched by CONTEXT
-    as well as name, so `${{ env.command }}` reaches the `command` under `env:`
-    and not an action input of the same name that the runner never executes.
-
-    LIMITATION: shell reached any other way — an action's `with:` inputs, a
-    composite action's own steps — is not scanned. Nothing here uses those; a
-    workflow that starts to would need this list widened.
+    `${{ matrix.extra_deps }}` and `${{ a || b }}` name values whose contents
+    ARE the command. `${{ format('sudo apt-get install -y {0}', matrix.package) }}`
+    assembles one instead: the `run:` text holds no apt invocation and the
+    matrix value is a bare word, so checking either of them checks nothing.
     """
-    values = list(scalar_values(node))
-    referenced = referenced_by_run(values)
-    for path, value in values:
-        if not path:
-            continue
-        if path[-1] == "run" or any(
-            resolves_reference(path, scope, context, name)
-            for scope, context, name in referenced
-        ):
-            yield value.start_mark.line + 1, value.style, value.value
+    remainder = CONTEXT_REFERENCE.sub("", without_literals(expression)[3:-2])
+    return re.sub(r"\|\||&&|''|\s+", "", remainder) == ""
+
+
+def scan_scalar(path, value):
+    """Scan one YAML scalar as shell, honouring how its block was written."""
+    line = value.start_mark.line + 1
+    # A plain scalar sits ON its line; a literal block keeps its lines, so they
+    # follow the indicator; a folded block no longer has a line-for-line
+    # mapping, so its findings are reported against the block itself.
+    if value.style is None or value.style == "":
+        scan_shell(path, value.value, line, exact_lines=True)
+    elif value.style == "|":
+        scan_shell(path, value.value, line + 1, exact_lines=True)
+    else:
+        scan_shell(path, value.value, line, exact_lines=False)
 
 
 def scan_workflow(path, text):
+    """Scan every scalar a workflow can EXECUTE.
+
+    `run:`, and whatever a `run:` interpolates — resolved from where that
+    `run:` stands, so a name reaches the value it actually names.
+
+    LIMITATION: shell reached any other way — an action's `with:` inputs, a
+    composite action's own steps — is not scanned. Nothing here uses those; a
+    workflow that starts to would need this widened.
+    """
     node = yaml.compose(text)
     if node is None:
         return
-    for line, style, value in shell_scalars(node):
-        # A plain scalar sits ON its line; a literal block keeps its lines, so
-        # they follow the indicator; a folded block no longer has a line-for-line
-        # mapping, so its findings are reported against the block itself.
-        if style is None or style == "":
-            scan_shell(path, value, line, exact_lines=True)
-        elif style == "|":
-            scan_shell(path, value, line + 1, exact_lines=True)
-        else:
-            scan_shell(path, value, line, exact_lines=False)
+    values = list(scalar_values(node))
+    scanned = set()
+
+    for run_path, value in values:
+        if not run_path or run_path[-1] != "run":
+            continue
+        if id(value) not in scanned:
+            scanned.add(id(value))
+            scan_scalar(path, value)
+
+        masked, expressions = mask_expressions(value.value)
+        # Whether anything of the command survives the masking. `echo ${{ github.ref }}`
+        # is an ordinary script with a value interpolated INTO it, and its apt
+        # lines are read as usual; a `run:` that is nothing but an expression
+        # has no command here at all.
+        written_here = re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip()
+
+        for expression in expressions:
+            references = referenced_values(expression)
+            for context, name in references:
+                for referenced in resolve_reference(run_path, context, name, values):
+                    if id(referenced) not in scanned:
+                        scanned.add(id(referenced))
+                        scan_scalar(path, referenced)
+            if not written_here and not is_a_plain_reference(expression):
+                # The whole command is built by the expression, so it exists
+                # nowhere in the file to be checked. Announced, never silent.
+                emit("NOTICE", path, value.start_mark.line + 1,
+                     f"builds its command with an expression, assembled at run time "
+                     f"and not checked: {expression}")
 
 
 def main(argv):
