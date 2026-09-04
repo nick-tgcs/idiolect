@@ -471,6 +471,28 @@ def holds_a_comment(text):
     return any(starts_a_comment(words, index) for index in range(len(words)))
 
 
+def walk_to_closing_paren(words, index):
+    """Consume a parenthesised group; returns its words and the index after it.
+
+    `index` must point AT the opening `(`. Nesting is counted, so `$(a $(b) c)`
+    ends on its own bracket rather than the first one it meets.
+    """
+    depth = 1
+    index += 1
+    parts = []
+    while index < len(words) and depth:
+        inner = words[index].value
+        index += 1
+        if inner == "(":
+            depth += 1
+        elif inner == ")":
+            depth -= 1
+            if not depth:
+                break
+        parts.append(inner)
+    return parts, index
+
+
 def scan_command(path, line, words, expressions):
     """Report the packages installed by one already-tokenised command line."""
     state = "idle"
@@ -509,19 +531,7 @@ def scan_command(path, line, words, expressions):
             # `<(cmd)` is process substitution, not a redirection: bash replaces
             # the whole construct with a /dev/fd path. Consuming only the `(`
             # left the command inside it being read as a package list.
-            depth = 1
-            index += 1
-            parts = []
-            while index < len(words) and depth:
-                inner = words[index].value
-                index += 1
-                if inner == "(":
-                    depth += 1
-                elif inner == ")":
-                    depth -= 1
-                    if not depth:
-                        break
-                parts.append(inner)
+            parts, index = walk_to_closing_paren(words, index)
             if state == "packages":
                 emit("NOTICE", path, line,
                      f"names a package through a substitution, not checked: {token}({' '.join(parts)})")
@@ -588,19 +598,7 @@ def scan_command(path, line, words, expressions):
                 # `c$(printf make)` is one word that expands to `cmake`, and
                 # apt installs it. Reporting the fragments around it as package
                 # names rejects a workflow that works.
-                parts = []
-                index += 1
-                depth = 1
-                while index < len(words) and depth:
-                    inner = words[index].value
-                    index += 1
-                    if inner == "(":
-                        depth += 1
-                    elif inner == ")":
-                        depth -= 1
-                        if not depth:
-                            break
-                    parts.append(inner)
+                parts, index = walk_to_closing_paren(words, index)
                 rendered = token[:-1] + "$(" + " ".join(parts) + ")"
                 # Whatever is written hard against the closing `)` is part of
                 # the same word — but a separator or a redirection is not, and
