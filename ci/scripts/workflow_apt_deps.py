@@ -39,6 +39,7 @@ lexing or parsing, the library is being worked around rather than used.
 """
 
 import io
+import re
 import shlex
 import string
 import sys
@@ -714,9 +715,28 @@ def heredocs_opened(words):
     the terminator: bash strips leading TABS from it before comparing.
     """
     opened = []
+    arithmetic = 0
     index = 0
     while index < len(words):
-        if words[index].value != "<<" or words[index].quoted or index + 1 >= len(words):
+        # `(( ... ))` is arithmetic, where `<<` is a left shift. A heredoc
+        # opened there never closes and swallows the rest of the block as data.
+        if (
+            index + 1 < len(words)
+            and not words[index].quoted
+            and words[index].value in ("(", ")")
+            and words[index + 1].value == words[index].value
+            and not words[index + 1].space_before
+        ):
+            arithmetic += 1 if words[index].value == "(" else -1
+            arithmetic = max(arithmetic, 0)
+            index += 2
+            continue
+        if (
+            arithmetic
+            or words[index].value != "<<"
+            or words[index].quoted
+            or index + 1 >= len(words)
+        ):
             index += 1
             continue
         word = words[index + 1]
@@ -848,6 +868,32 @@ def scalar_values(node, key=None):
                 yield from scalar_values(child, key)
 
 
+# The contexts whose values can hold a command a `run:` then executes. `github`
+# and the rest are metadata: following `github.event.repository.name` would put
+# `name` in scope and drag every step's name back in.
+COMMAND_CONTEXTS = ("matrix", "env", "inputs", "vars")
+
+# `matrix.extra_deps` and `matrix['extra_deps']` select the same value.
+PROPERTY_ACCESS = re.compile(
+    r"""\.\s*([A-Za-z_][A-Za-z0-9_-]*)|\[\s*'([^']*)'\s*\]|\[\s*"([^"]*)"\s*\]"""
+)
+
+
+def referenced_value(expression):
+    """The value name a `${{ ... }}` selects, or None if it names no command.
+
+    Only the LAST property access matters — `matrix.include.extra_deps` selects
+    `extra_deps` — and only within a context that can carry a command.
+    """
+    inner = expression[3:-2].strip()
+    if not inner.startswith(COMMAND_CONTEXTS):
+        return None
+    accesses = PROPERTY_ACCESS.findall(inner)
+    if not accesses:
+        return None
+    return next((name for name in accesses[-1] if name), None)
+
+
 def referenced_by_run(values):
     """The value names a `run:` interpolates, as in `${{ matrix.extra_deps }}`.
 
@@ -863,9 +909,9 @@ def referenced_by_run(values):
             continue
         _, expressions = mask_expressions(node.value)
         for expression in expressions:
-            path = expression[3:-2].strip()
-            if path:
-                names.add(path.split(".")[-1].strip())
+            name = referenced_value(expression)
+            if name:
+                names.add(name)
     return names
 
 

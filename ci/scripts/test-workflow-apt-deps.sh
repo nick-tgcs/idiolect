@@ -1574,6 +1574,65 @@ YAML
 expect "a value a run: refers to is still scanned" 1 metadata-vs-matrix \
     "libfcitx5-dev"
 
+
+# ------------------------------------------- references written with brackets
+# `${{ matrix['extra_deps'] }}` selects the same value as `matrix.extra_deps`.
+# Splitting on dots alone records the whole `matrix['extra_deps']` as the name,
+# so the referenced value is never scanned and its packages go unexamined and
+# unmentioned.
+write_workflow matrix-bracket ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: sudo apt-get install -y cmake
+      - run: ${{ matrix['extra_deps'] }}
+YAML
+expect "a bracketed reference is followed too" 1 matrix-bracket \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...but only for contexts that can carry a command. `github.event.repository.name`
+# ends in `name` as well, and putting THAT in scope would drag every step's
+# `name:` back in and reject the workflow all over again.
+write_workflow metadata-reference ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - name: apt-get install dependencies
+        run: echo ${{ github.event.repository.name }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a metadata reference brings nothing into scope" 0 metadata-reference \
+    "All 1 apt package(s)"
+
+# ------------------------------------------------- `<<` is also a left shift
+# Inside `(( ))` bash reads `<<` as arithmetic, not as a heredoc. Opening one
+# there swallows every command after it as data.
+write_workflow arithmetic-shift ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          (( value = 1 << 2 ))
+          sudo apt-get install -y codex-no-such-package
+YAML
+expect "a left shift is not a heredoc" 1 arithmetic-shift \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and the arithmetic ENDS. A `<<` after `(( ))` on the same line is a
+# heredoc again, so a depth that only ever grows leaves the body being read as
+# commands.
+write_workflow arithmetic-then-heredoc ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          (( value = 1 )) ; cat > x.sh <<'EOF'
+          sudo apt-get install -y codex-no-such-package
+          EOF
+YAML
+expect "arithmetic ends before the next heredoc" 0 arithmetic-then-heredoc \
+    "All 1 apt package(s)" "inside a heredoc"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
