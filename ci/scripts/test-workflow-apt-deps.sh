@@ -1225,8 +1225,13 @@ printf '%s\n' \
     "          sudo apt-get install -y 'cma\\" \
     "          ke'" \
     | write_workflow backslash-in-single-quotes ci.yml
-expect "a backslash inside single quotes continues nothing" 0 backslash-in-single-quotes \
-    "could not be tokenised"
+# The result is the WORD bash builds — `cma\`, a newline, `ke` — which apt
+# rejects, rather than the `cmake` a backslash continuation would have produced.
+# This case used to expect the weaker "could not be tokenised" notice, because
+# the scanner gave up at the end of the first physical line; carrying the open
+# quote across the newline lets it name the package apt will refuse instead.
+expect "a backslash inside single quotes continues nothing" 1 backslash-in-single-quotes \
+    "installs a package apt cannot resolve"
 
 # ...and double quotes are the other half of that rule: inside them a
 # backslash-newline IS removed, so `"cma\` + `ke"` is the one word `cmake` and
@@ -1632,6 +1637,61 @@ write_workflow arithmetic-then-heredoc ci.yml <<'YAML'
 YAML
 expect "arithmetic ends before the next heredoc" 0 arithmetic-then-heredoc \
     "All 1 apt package(s)" "inside a heredoc"
+
+
+# ------------------------------------------ a quote may span physical lines
+# Bash carries an open quote across the newline, so `'codex-` and
+# `no-such-package'` are ONE argument holding a newline — a name apt rejects.
+# Scanning each physical line alone reduced the install to a non-failing
+# "could not be tokenised" notice and ignored the closing fragment entirely.
+write_workflow quote-across-lines ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y libfcitx5core-dev
+          sudo apt-get install -y cmake 'codex-
+          no-such-package'
+YAML
+expect "an open quote carries to the next line" 1 quote-across-lines \
+    "installs a package apt cannot resolve"
+
+# ...and the newline is KEPT, which is the whole difference. `'cma` + `ke'` is
+# `cma`, a newline, `ke` — a name apt rejects — where joining the fragments
+# without it would spell the perfectly valid `cmake` and pass the gate.
+write_workflow quote-across-lines-newline ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y libfcitx5core-dev
+          sudo apt-get install -y 'cma
+          ke'
+YAML
+expect "the newline inside a carried quote is kept" 1 quote-across-lines-newline \
+    "installs a package apt cannot resolve"
+
+# The predicate behind that, pinned directly. A line ending in a lone backslash
+# also stops the lexer, and reporting THAT as an open quote would join lines the
+# shell keeps apart. The guard is unreachable from `scan_shell` — the backslash
+# branch runs first — so it is asserted here rather than through a fixture.
+if SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PYPIN'
+import os
+import sys
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+from workflow_apt_deps import ends_inside_a_quote
+
+for text, want in [
+    ("echo 'x", "'"),
+    ('echo "x', '"'),
+    ("echo x", None),
+    ("echo x\\", None),
+    ("echo 'x' y", None),
+]:
+    got = ends_inside_a_quote(text)
+    if got != want:
+        print(f"{text!r}: expected {want!r}, got {got!r}")
+        raise SystemExit(1)
+PYPIN
+then
+    ok "only an open quote carries a line, not a dangling escape"
+else
+    fail "only an open quote carries a line, not a dangling escape"
+fi
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

@@ -464,6 +464,21 @@ def continues_the_line(text):
     return True
 
 
+def ends_inside_a_quote(text):
+    """The quote character still open at the end of this text, or None.
+
+    Bash carries an open quote across the newline, so a word may span physical
+    lines and the newline is part of it. Scanning each line alone turns that
+    into an untokenisable fragment and loses the command.
+    """
+    try:
+        _lex(text, commenters="")
+    except Unlexable as error:
+        if error.state in ("'", '"'):
+            return error.state
+    return None
+
+
 def holds_a_comment(text):
     """Whether an unquoted `#` starts a comment somewhere in this line.
 
@@ -822,13 +837,14 @@ def scan_shell(path, text, first_line, exact_lines):
         if pending is None:
             pending_offset = offset
             pending = raw
+            separator = ""
         else:
-            # Joined with NOTHING: the shell removes a backslash-newline pair
-            # entirely, so `cma\` followed by `ke` is the one word `cmake`. The
-            # conventional layout keeps its separator either way — it is the
-            # whitespace already sitting before the backslash, or the next
-            # line's indentation.
-            pending = f"{pending}{raw}"
+            # A backslash-newline pair is removed ENTIRELY, so `cma\` followed
+            # by `ke` is the one word `cmake`; the conventional layout keeps its
+            # separator either way, being the whitespace already before the
+            # backslash or the next line's indentation. An open QUOTE is the
+            # other case: there the newline is part of the word and is kept.
+            pending = f"{pending}{separator}{raw}"
 
         # A backslash ending a COMMENT continues nothing: bash discarded the
         # rest of that line before ever seeing it, and the command beneath runs
@@ -836,6 +852,14 @@ def scan_shell(path, text, first_line, exact_lines):
         # it vanishes without even a notice.
         if continues_the_line(pending) and not holds_a_comment(pending[:-1]):
             pending = pending[:-1]
+            separator = ""
+            continue
+
+        # ...but not a quote inside a COMMENT: bash discarded the rest of that
+        # line before ever seeing the apostrophe in `# don't`, so carrying it
+        # would swallow the command beneath into the comment.
+        if not holds_a_comment(pending) and ends_inside_a_quote(pending):
+            separator = "\n"
             continue
 
         command, pending = pending, None
