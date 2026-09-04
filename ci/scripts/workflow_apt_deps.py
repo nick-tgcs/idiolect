@@ -543,6 +543,7 @@ def scan_command(path, line, words, expressions):
     saw_apt = False
     saw_install = False
     parsed_install = False
+    end_of_options = False
 
     index = 0
     while index < len(words):
@@ -558,6 +559,7 @@ def scan_command(path, line, words, expressions):
         if token in SEPARATORS and not word.quoted:
             state = "idle"
             at_command = True
+            end_of_options = False
             continue
 
         if (
@@ -683,11 +685,18 @@ def scan_command(path, line, words, expressions):
                 emit("NOTICE", path, line,
                      f"names packages through a brace expansion, not checked: {token}")
                 continue
-            if token in OPTIONS_WITH_ARGUMENT:
-                index += 1
-                continue
-            if token.startswith("-"):
-                continue
+            if not end_of_options:
+                if token == "--":
+                    # Everything after this is an operand, however it starts:
+                    # apt rejects `-codex-no-such-package` as a package name
+                    # rather than reading it as an option.
+                    end_of_options = True
+                    continue
+                if token in OPTIONS_WITH_ARGUMENT:
+                    index += 1
+                    continue
+                if token.startswith("-"):
+                    continue
             # A literal `$` falls through to here on purpose: the shell expands
             # nothing inside single quotes or after a backslash, so apt is
             # handed the dollar sign and rejects the name. That is a broken
@@ -920,6 +929,55 @@ PROPERTY_ACCESS = re.compile(
 )
 
 
+# `${{ 'env.command' }}` is a string LITERAL and dereferences nothing, while the
+# quotes in `matrix['extra_deps']` are an INDEX and name a value. The index form
+# is matched first and kept; whatever else is quoted is blanked before any
+# reference is looked for.
+EXPRESSION_STRING = re.compile(
+    r"""(\[\s*(['"])[^'"]*\2\s*\])|('[^']*'|"[^"]*")"""
+)
+
+
+def without_literals(text):
+    """The expression with its string literals blanked, indexes left alone."""
+    return EXPRESSION_STRING.sub(lambda found: found.group(1) or "''", text)
+
+
+def job_scope(path):
+    """The job a path belongs to, as a prefix, or () for the workflow itself."""
+    if len(path) >= 2 and path[0] == "jobs":
+        return path[:2]
+    return ()
+
+
+def resolves_reference(path, scope, context, name):
+    """Whether the scalar at `path` is the value this reference names.
+
+    A reference names a value IN SCOPE, not every scalar in the document with
+    that key — two jobs may each define `env.command`, and a `run:` in one of
+    them names its own.
+    """
+    if context == "matrix":
+        # A matrix belongs to its job, and its entries sit under `include:`.
+        return path[:len(scope)] == scope and "matrix" in path and path[-1] == name
+    if context == "env":
+        # env may be set on the step, the job, or the workflow itself.
+        return (
+            "env" in path
+            and path[-1] == name
+            and (path[:len(scope)] == scope or not job_scope(path))
+        )
+    if context == "inputs":
+        # A workflow input's value lives under `default:`, one level below the
+        # name the expression uses.
+        return "inputs" in path and (
+            path[-1] == name
+            or (len(path) >= 2 and path[-1] == "default" and path[-2] == name)
+        )
+    # `vars` are repository settings; nothing in the file to scan.
+    return False
+
+
 def referenced_values(expression):
     """Every (context, value name) a `${{ ... }}` selects.
 
@@ -929,7 +987,7 @@ def referenced_values(expression):
     command.
     """
     found = set()
-    for context, path in CONTEXT_REFERENCE.findall(expression):
+    for context, path in CONTEXT_REFERENCE.findall(without_literals(expression)):
         accesses = PROPERTY_ACCESS.findall(path)
         if accesses:
             name = next((part for part in accesses[-1] if part), None)
@@ -939,7 +997,7 @@ def referenced_values(expression):
 
 
 def referenced_by_run(values):
-    """The (context, name) pairs a `run:` interpolates.
+    """The (job scope, context, name) triples a `run:` interpolates.
 
     Shell does not only live under `run:`. desktop-app-release.yml keeps an
     install in a matrix entry and executes it later through
@@ -951,9 +1009,11 @@ def referenced_by_run(values):
     for path, node in values:
         if not path or path[-1] != "run":
             continue
+        scope = job_scope(path)
         _, expressions = mask_expressions(node.value)
         for expression in expressions:
-            names |= referenced_values(expression)
+            for context, name in referenced_values(expression):
+                names.add((scope, context, name))
     return names
 
 
@@ -974,7 +1034,8 @@ def shell_scalars(node):
         if not path:
             continue
         if path[-1] == "run" or any(
-            path[-1] == name and context in path for context, name in referenced
+            resolves_reference(path, scope, context, name)
+            for scope, context, name in referenced
         ):
             yield value.start_mark.line + 1, value.style, value.value
 

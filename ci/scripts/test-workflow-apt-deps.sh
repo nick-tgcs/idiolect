@@ -1772,6 +1772,109 @@ YAML
 expect "the value in the named context is scanned" 1 reference-scope-hit \
     "libfcitx5-dev"
 
+
+# ------------------------------------------- a reference names a value IN SCOPE
+# Two jobs may each define `env.command`. A `run:` in one of them names its own,
+# not every value in the file with that key — matching names across the whole
+# document rejects a workflow because of a string another job never executes.
+write_workflow reference-other-job ci.yml <<'YAML'
+jobs:
+  first:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo not-executed
+  second:
+    env:
+      command: sudo apt-get install -y cmake
+    steps:
+      - run: ${{ env.command }}
+YAML
+expect "a reference does not reach another job" 0 reference-other-job \
+    "All 1 apt package(s)"
+
+# A workflow input's value lives under `default:`, one level below the name the
+# expression uses. An invocation that omits the input runs exactly that string.
+write_workflow input-default ci.yml <<'YAML'
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        default: sudo apt-get install -y codex-no-such-package
+jobs:
+  build:
+    steps:
+      - run: ${{ inputs.command }}
+YAML
+expect "an input default is the command that runs" 1 input-default \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# `${{ 'env.command' }}` is a string LITERAL, not a dereference. Reading the
+# expression as raw text made it one, and the value it named was checked and
+# the workflow rejected over a command nothing executes.
+write_workflow expression-string ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo "${{ 'env.command' }}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted expression string names nothing" 0 expression-string \
+    "All 1 apt package(s)"
+
+# ------------------------------------------------- the end-of-options marker
+# After `--` a dash-prefixed word is a package operand, not an option. apt
+# agrees: `apt-get -s install cmake -- -codex-no-such-package` exits 100 with
+# "Unable to locate package -codex-no-such-package".
+write_workflow end-of-options ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake -- -codex-no-such-package
+YAML
+expect "a dash after -- is a package name" 1 end-of-options \
+    "installs a package apt cannot resolve"
+
+# ...and before it, options are still options.
+write_workflow options-before-marker ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install --no-install-recommends -y cmake
+YAML
+expect "options before the marker are still options" 0 options-before-marker \
+    "All 2 apt package(s)"
+
+
+# ...and the marker belongs to the command that carried it. Left standing, the
+# next command's options are read as package names and a correct workflow is
+# rejected.
+write_workflow marker-then-command ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake -- libfcitx5core-dev; sudo apt-get install --no-install-recommends -y cmake
+YAML
+expect "the end-of-options marker ends with its command" 0 marker-then-command \
+    "All 3 apt package(s)"
+
+# The same scoping for a matrix as for env: two jobs may each define
+# `extra_deps`, and only the job that references it runs it.
+write_workflow matrix-other-job ci.yml <<'YAML'
+jobs:
+  first:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo not-executed
+  second:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: sudo apt-get install -y cmake
+    steps:
+      - run: ${{ matrix.extra_deps }}
+YAML
+expect "a matrix reference does not reach another job" 0 matrix-other-job \
+    "All 1 apt package(s)"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
