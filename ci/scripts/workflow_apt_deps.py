@@ -99,6 +99,10 @@ NAME_ONLY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # shells too.
 DECLARATION_BUILTINS = {"export", "declare", "typeset", "readonly", "local"}
 
+# Those, and the one that takes a name away again. What they share is the
+# shape: a builtin followed by names, where the names are what matters.
+NAME_BUILTINS = DECLARATION_BUILTINS | {"unset"}
+
 
 # Shells whose `-c` argument is a script rather than an operand.
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
@@ -778,8 +782,7 @@ def scan_command(path, line, words, expressions, defined=None):
             saw_install = True
 
         if token in SEPARATORS and not word.quoted:
-            remember(pending if at_command else [], defined, expressions,
-                     declaring == "export")
+            remember(pending if at_command else [], defined, expressions, declaring)
             pending = []
             declaring = None
             state = "idle"
@@ -828,6 +831,10 @@ def scan_command(path, line, words, expressions, defined=None):
             # the whole construct with a /dev/fd path. Consuming only the `(`
             # left the command inside it being read as a package list.
             inside, index = walk_to_closing_paren(words, index)
+            # The command inside RUNS — `cat <(apt-get …)` installs — and what
+            # the outer command receives is a /dev/fd path, which is why the
+            # words are not read as packages where they stand.
+            scan_command(path, line, inside, expressions, defined)
             if state == "packages":
                 substituted = " ".join(word.value for word in inside)
                 emit("NOTICE", path, line,
@@ -1012,16 +1019,23 @@ def scan_command(path, line, words, expressions, defined=None):
 
         if is_apt(token):
             state = "options"
-        elif token in DECLARATION_BUILTINS and not word.quoted:
+        elif token in NAME_BUILTINS and not word.quoted:
             # `export NAME=value` sets the variable as a bare assignment does,
             # so the words after it are still assignments and the command
-            # position survives them.
+            # position survives them. `unset NAME` is the same shape and the
+            # opposite effect.
             declaring = token
-        elif declaring == "export" and NAME_ONLY.match(token) and not word.quoted:
-            # `export COMMAND` on its own exports what is already there, so
-            # the value assigned on an earlier line is what the child sees.
-            if defined is not None:
+        elif declaring and NAME_ONLY.match(token) and not word.quoted and defined is not None:
+            if declaring == "export":
+                # `export COMMAND` on its own exports what is already there, so
+                # the value assigned on an earlier line is what the child sees.
                 defined[("exported", token)] = ((), expressions)
+            elif declaring == "unset":
+                # Nothing is left to expand, whichever kind it was.
+                for kind in ("variable", "array", "function", "exported"):
+                    defined.pop((kind, token), None)
+            elif declaring == "local":
+                defined[("local", token)] = ((), expressions)
         elif is_an_assignment(word):
             # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
             # names no command, and announcing those flagged two lines of this
@@ -1060,6 +1074,16 @@ def scan_command(path, line, words, expressions, defined=None):
                     elsewhere[("variable", str(position))] = ([argument], expressions)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
                          expressions, elsewhere)
+            if key[0] == "function":
+                # What the body assigned stays assigned: a function's variables
+                # are the CALLER's unless it declared them local. Its arguments
+                # are not — `$1` belongs to the call.
+                for name, what in elsewhere.items():
+                    if name[0] == "variable" and (name[1].isdigit()
+                                                  or ("local", name[1]) in elsewhere):
+                        continue
+                    if name[0] != "local":
+                        defined[name] = what
             index = end if key[0] != "function" else index
             at_command = False
         elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS or token.rsplit("/", 1)[-1] == "eval":
@@ -1078,7 +1102,7 @@ def scan_command(path, line, words, expressions, defined=None):
                 # without being exported — and is gone from this shell after.
                 environment = dict(defined) if defined is not None else None
                 if environment is not None:
-                    remember(pending, environment, expressions, exported=True)
+                    remember(pending, environment, expressions, "export")
                 scan_shell(path, script.value, line, exact_lines=False,
                            defined=child_scope(environment, script,
                                                token.rsplit("/", 1)[-1]))
@@ -1093,7 +1117,7 @@ def scan_command(path, line, words, expressions, defined=None):
         else:
             at_command = False
 
-    remember(pending if at_command else [], defined, expressions, declaring == "export")
+    remember(pending if at_command else [], defined, expressions, declaring)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -1908,7 +1932,7 @@ def remember_array(prefix, inside, defined, expressions):
     defined[("array", name)] = (before + inside, expressions)
 
 
-def remember(assignments, defined, expressions, exported=False):
+def remember(assignments, defined, expressions, declaring=None):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
@@ -1932,10 +1956,14 @@ def remember(assignments, defined, expressions, exported=False):
                       for part in value.split()],
             expressions,
         )
-        if exported:
+        if declaring == "export":
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)
+        elif declaring == "local":
+            # A local belongs to the function that declared it and does not
+            # follow the value back out to the caller.
+            defined[("local", name)] = ((), expressions)
 
 
 def defined_function(words, index):
@@ -1989,7 +2017,7 @@ def touches_a_definition(words, defined):
     for index, word in enumerate(words):
         if assigned_array(words, index) is not None or defined_function(words, index):
             return True
-        if is_an_assignment(word) or (word.value in DECLARATION_BUILTINS and not word.quoted):
+        if is_an_assignment(word) or (word.value in NAME_BUILTINS and not word.quoted):
             return True
         expansion = ARRAY_EXPANSION.match(word.value)
         variable = SHELL_VARIABLE.match(word.value)

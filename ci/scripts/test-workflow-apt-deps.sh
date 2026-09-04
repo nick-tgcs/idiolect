@@ -4090,6 +4090,82 @@ YAML
 expect "a function's argument reaches its body" 1 function-positional \
     "codex-no-such-package"
 
+# ------------------------------- a process substitution runs its command
+# `cat <(apt-get …)` starts apt and hands cat a /dev/fd path. The construct was
+# consumed so its words would not be read as packages, and then nothing read
+# them at all.
+write_workflow process-substitution-runs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <(sudo apt-get install -y codex-no-such-package)
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a process substitution runs its command" 1 process-substitution-runs \
+    "codex-no-such-package"
+
+# ------------------------- a function's assignments escape into the caller
+# `set_command() { COMMAND=…; }` followed by `set_command` leaves COMMAND set
+# for everything after it, so the `$COMMAND` below runs what the function put
+# there.
+write_workflow function-assigns-caller ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          set_command() { COMMAND='apt-get install -y codex-no-such-package'; }
+          set_command
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a function's assignment escapes into the caller" 1 function-assigns-caller \
+    "codex-no-such-package"
+
+# ...while a LOCAL one does not: it belongs to the call and is gone after it.
+write_workflow function-local-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          set_command() { local COMMAND='apt-get install -y codex-no-such-package'; }
+          set_command
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a local assignment stays in the function" 0 function-local-assignment \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and a function's own arguments are the CALL's: `$1` does not survive it.
+write_workflow positional-not-inherited ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          show() { echo "$1"; }
+          show codex-no-such-package
+          apt-get install -y "$1"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a call's arguments do not outlive it" 0 positional-not-inherited \
+    "All 1 apt package(s)" '!cannot resolve: codex-no-such-package'
+
+# ------------------------------------------ `unset` forgets what was there
+# `unset COMMAND` leaves nothing to expand, so the `$COMMAND` after it runs no
+# command at all and its packages are installed by nobody.
+write_workflow unset-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          unset COMMAND
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unset forgets the value" 0 unset-variable \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
