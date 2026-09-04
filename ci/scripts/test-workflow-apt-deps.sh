@@ -2990,6 +2990,24 @@ YAML
 expect "inputs names the workflow's own declarations" 0 inputs-vs-matrix \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ...and `env` is scoped the same way, by where the block CONTAINS the run:
+# rather than by the word appearing in the path. A matrix dimension called
+# `env` sits under `strategy`, which contains no step, so it is not one.
+write_workflow env-vs-matrix ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        env:
+          - command: apt-get install -y codex-no-such-package
+    steps:
+      - env:
+          command: apt-get install -y cmake
+        run: ${{ env.command }}
+YAML
+expect "env names the block containing the run" 0 env-vs-matrix \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
