@@ -1506,6 +1506,62 @@ YAML
 expect "an unquoted tilde-slash is a path without a suffix" 0 tilde-slash-no-suffix \
     "All 1 apt package(s)" "a local package file"
 
+
+# ----------------------------------- the prefilter must read TOKENS, not text
+# `a\pt-get` is `apt-get`: a backslash before an ordinary character is just an
+# escape. The raw line holds no contiguous "apt", so a substring prefilter
+# skipped the command entirely — no packages checked and no notice either,
+# which is the one combination this scanner must never produce.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    '          sudo a\pt-get install -y codex-no-such-package' \
+    | write_workflow escaped-command-name ci.yml
+expect "an escaped command name is still apt" 1 escaped-command-name \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ------------------------------------ a quoted digit is not an IO number
+# `2>out` redirects; `'2'>out` passes `2` as an argument, because a QUOTED word
+# is never an IO number. The adjacency test alone is not enough.
+write_workflow fd-quoted ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '2'>out
+YAML
+expect "a quoted digit is an argument, not a descriptor" 1 fd-quoted \
+    "installs a package apt cannot resolve"
+
+# ------------------------------------- only values that can carry shell
+# A step's `name:` is metadata the runner never executes. Reading every scalar
+# in the file made `name: apt-get install dependencies` an invocation, and the
+# gate rejected the workflow over a package nobody installs — a false red on a
+# file that is perfectly correct.
+write_workflow step-name ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - name: apt-get install dependencies
+        run: sudo apt-get install -y cmake
+YAML
+expect "a step name is not a command" 0 step-name \
+    "All 1 apt package(s)"
+
+# ...and the matrix value above still is one, because a `run:` refers to it.
+# Narrowing this is exactly how the first library-based scanner lost five
+# packages, so both halves stay pinned.
+write_workflow metadata-vs-matrix ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            extra_deps: sudo apt-get install -y libfcitx5-dev
+    steps:
+      - name: apt-get install dependencies
+        run: ${{ matrix.extra_deps }}
+YAML
+expect "a value a run: refers to is still scanned" 1 metadata-vs-matrix \
+    "libfcitx5-dev"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

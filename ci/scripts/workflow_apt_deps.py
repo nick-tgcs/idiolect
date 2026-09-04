@@ -571,6 +571,7 @@ def scan_command(path, line, words, expressions):
         # descriptor, not a package.
         if (
             token.isdigit()
+            and not word.quoted
             and index < len(words)
             and words[index].value in REDIRECTIONS
             and not words[index].quoted
@@ -764,7 +765,10 @@ def scan_shell(path, text, first_line, exact_lines):
             if "apt" in command and "install" in command:
                 emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
             return []
-        if "apt" in command:
+        if any(is_apt(word.value) for word in words):
+            # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
+            # once the escape is gone, and a substring test on the source text
+            # skips it without checking a package or saying a word.
             scan_command(path, line, words, expressions)
         # Looked for on EVERY command, not only the ones naming apt: the line
         # that opens a heredoc is usually `cat > file <<EOF`, which names
@@ -818,26 +822,65 @@ def scan_shell(path, text, first_line, exact_lines):
         scan_one(pending, pending_offset)
 
 
-def shell_scalars(node):
-    """Every scalar VALUE in a workflow, with the line it starts on and style.
+def scalar_values(node, key=None):
+    """Every scalar in a workflow, paired with the key it was stored under.
 
-    Not only `run:`. desktop-app-release.yml keeps an install in a matrix entry
-    (`extra_deps: |`) and executes it later through `run: ${{ matrix.extra_deps }}`,
-    so a scan that trusted the key name missed five packages — caught by
-    comparing counts against the implementation this replaced.
+    A sequence passes its own key down, so the entries of `restore-keys:` are
+    still that key's, and a mapping's entries take their own.
     """
     if isinstance(node, yaml.MappingNode):
-        for key, value in node.value:
+        for name, value in node.value:
+            inner = name.value if isinstance(name, yaml.ScalarNode) else None
             if isinstance(value, yaml.ScalarNode):
-                yield value.start_mark.line + 1, value.style, value.value
+                yield inner, value
             else:
-                yield from shell_scalars(value)
+                yield from scalar_values(value, inner)
     elif isinstance(node, yaml.SequenceNode):
         for child in node.value:
             if isinstance(child, yaml.ScalarNode):
-                yield child.start_mark.line + 1, child.style, child.value
+                yield key, child
             else:
-                yield from shell_scalars(child)
+                yield from scalar_values(child, key)
+
+
+def referenced_by_run(values):
+    """The value names a `run:` interpolates, as in `${{ matrix.extra_deps }}`.
+
+    Shell does not only live under `run:`. desktop-app-release.yml keeps an
+    install in a matrix entry and executes it later through
+    `run: ${{ matrix.extra_deps }}`, so a scan that trusted the key name alone
+    missed five packages — caught by comparing counts against the
+    implementation this replaced, not by any test.
+    """
+    names = set()
+    for key, node in values:
+        if key != "run":
+            continue
+        _, expressions = mask_expressions(node.value)
+        for expression in expressions:
+            path = expression[3:-2].strip()
+            if path:
+                names.add(path.split(".")[-1].strip())
+    return names
+
+
+def shell_scalars(node):
+    """Every scalar a workflow can EXECUTE, with the line it starts on and style.
+
+    `run:`, and whatever a `run:` interpolates. Not every scalar in the file: a
+    step's `name:` is metadata the runner never executes, and reading
+    `name: apt-get install dependencies` as an invocation rejects a workflow
+    that is perfectly correct.
+
+    LIMITATION: shell reached any other way — an action's `with:` inputs, a
+    composite action's own steps — is not scanned. Nothing here uses those; a
+    workflow that starts to would need this list widened.
+    """
+    values = list(scalar_values(node))
+    executable = {"run"} | referenced_by_run(values)
+    for key, value in values:
+        if key in executable:
+            yield value.start_mark.line + 1, value.style, value.value
 
 
 def scan_workflow(path, text):
