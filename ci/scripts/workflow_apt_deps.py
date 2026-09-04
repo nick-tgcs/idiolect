@@ -681,9 +681,10 @@ def case_pattern_end(words):
     `)` closes nothing — in `( cmd )` the parenthesis has an opener, and comes
     after what runs rather than before it.
 
-    Shared, because BOTH readers of a command have to know where one begins:
-    answering it in two places is how `x) apt-get install …` came to be
-    announced as unparsed while `x) ${{ env.command }}` was followed.
+    Asked of a SEGMENT, which is split at separators, so the one arm in view
+    has at most one pattern. The literal scan walks whole lines instead and
+    reads every `)` as it reaches it, since `x) …;; y) …;;` is one line with
+    two arms in it.
     """
     depth = 0
     for position, word in enumerate(words):
@@ -711,7 +712,6 @@ def scan_command(path, line, words, expressions):
     saw_shell = False
     parsed_install = False
     end_of_options = False
-    pattern_end = case_pattern_end(words)
 
     index = 0
     while index < len(words):
@@ -739,11 +739,18 @@ def scan_command(path, line, words, expressions):
             index += 1
             continue
 
-        if index - 1 == pattern_end:
-            # A case ARM's `)` ends its pattern, and what follows is a command
-            # exactly as after a separator.
+        if token == ")" and not word.quoted:
+            # A closing bracket is syntax either way, and either way a command
+            # may follow it: a case ARM's `)` ends its pattern, and a
+            # subshell's ends the list inside it. One rule, because a line may
+            # hold several arms — `x) …;; y) …;;` — and remembering a single
+            # position covered only the first.
+            #
+            # The brackets that belong to a substitution or an array never
+            # reach here: those are consumed whole, above.
             state = "idle"
             at_command = True
+            saw_shell = False
             end_of_options = False
             continue
 
@@ -1424,7 +1431,10 @@ def command_word(words):
         if not word.quoted and token in CONTROL_PREFIXES:
             index += 1
             continue
-        if not word.quoted and token in INVOCATION_PREFIXES:
+        if token in INVOCATION_PREFIXES:
+            # No quoting guard, unlike the reserved words above: `'sudo' cmd`
+            # runs sudo. Quotes take a RESERVED WORD's meaning away and leave a
+            # command name exactly as it was.
             saw_invocation = True
             index += 1
             continue
@@ -1517,9 +1527,54 @@ def scan_scalar(path, value):
         scan_shell(path, value.value, line, exact_lines=False)
 
 
-def visit_reference(path, referenced, run_path, values, scanned, followed):
-    """Scan a value a reference reached, and follow whatever IT names."""
-    if id(referenced) not in scanned:
+def as_written(word, expressions):
+    """One word, back as shell text that lexes to exactly this word again.
+
+    An operator is written as it stands — quoting a `>` would turn a
+    redirection into a package name — and everything else goes through
+    shlex.quote, which is what carries a name holding a space or a bracket
+    across the trip intact.
+    """
+    text = unmask(word.value, expressions)
+    if not word.quoted and word.value in WORD_BOUNDARIES:
+        return text
+    return shlex.quote(text)
+
+
+def script_argument(words):
+    """The word a shell runs as a SCRIPT, or None if nothing hands one over.
+
+    GitHub substitutes into the `run:` text before bash sees any of it, so an
+    expression written there IS the script — quoted or not, because the quotes
+    are the shell's and the value lands inside them.
+
+    Quoting the SHELL's own name changes nothing either: `'bash' -c '…'` runs
+    bash. That is what separates a command name from a reserved word, where
+    the quotes do matter — bash looks for a command called `if` and finds none.
+    """
+    word = command_word(words)
+    if word is None or word.value.rsplit("/", 1)[-1] not in SHELL_COMMANDS:
+        return None
+    for index, candidate in enumerate(words):
+        if hands_over_a_script(candidate) and index + 1 < len(words):
+            return words[index + 1]
+    return None
+
+
+def visit_reference(path, referenced, run_path, values, scanned, followed,
+                    line=None, arguments=""):
+    """Scan a value a reference reached, and follow whatever IT names.
+
+    `arguments` is what the call site wrote AFTER the reference. A value may
+    supply only part of a command — `env.COMMAND: apt-get install -y` with
+    `run: ${{ env.COMMAND }} pkg` — and neither half holds a package on its
+    own, so the two are read together or the install is never seen.
+    """
+    if arguments:
+        if (id(referenced), arguments) not in scanned:
+            scanned.add((id(referenced), arguments))
+            scan_shell(path, f"{referenced.value} {arguments}", line, exact_lines=False)
+    elif id(referenced) not in scanned:
         scanned.add(id(referenced))
         scan_scalar(path, referenced)
     if id(referenced) not in followed:
@@ -1548,10 +1603,10 @@ def follow_references(path, value, run_path, values, scanned, followed):
         # tears the expression in half.
         masked, all_expressions = mask_expressions(command)
         for segment in command_segments(masked):
-            expressions = [
-                all_expressions[int(position)]
-                for word in segment
-                for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
+            found = [
+                (position, all_expressions[int(number)])
+                for position, word in enumerate(segment)
+                for number in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
             ]
             # `$COMMAND` at a command position runs whatever the variable
             # holds, bash splitting it into words. When the workflow's own
@@ -1566,21 +1621,34 @@ def follow_references(path, value, run_path, values, scanned, followed):
                     for referenced in resolve_reference(run_path, "env", (name,), values):
                         visit_reference(path, referenced, run_path, values, scanned, followed)
 
-            if not expressions:
-                continue
             # Whether anything of the command is written HERE.
             # `echo ${{ github.ref }}` is an ordinary command with a value
             # interpolated into it, and its apt is read as usual; a segment
             # that is nothing but an expression has no command here at all.
+            #
+            # `bash -c '${{ env.SCRIPT }}'` is the other way a value becomes a
+            # command: the segment's command IS written here, and the value is
+            # executed all the same, as the script the shell is handed.
             if written_before_the_command(segment):
-                continue
+                script = script_argument(segment)
+                if script is None or not WHOLE_EXPRESSION.match(script.value):
+                    continue
+                supplying = [
+                    (all_expressions[int(number)], [])
+                    for number in re.findall(EXPRESSION_PREFIX + r"(\d+)__", script.value)
+                ]
+            else:
+                supplying = [(expression, segment[position + 1:])
+                             for position, expression in found]
 
-            for expression in expressions:
+            for expression, suffix in supplying:
                 resolved = 0
+                arguments = " ".join(as_written(word, all_expressions) for word in suffix)
                 for context, chain in referenced_values(expression):
                     for referenced in resolve_reference(run_path, context, chain, values):
                         resolved += 1
-                        visit_reference(path, referenced, run_path, values, scanned, followed)
+                        visit_reference(path, referenced, run_path, values, scanned,
+                                        followed, scalar_line(value, offset), arguments)
                 if not is_a_plain_reference(expression):
                     # The whole command is built by the expression, so it
                     # exists nowhere in the file to be checked. Announced,

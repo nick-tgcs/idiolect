@@ -2833,9 +2833,12 @@ YAML
 expect "a case arm's own command is checked" 1 case-arm-literal \
     "codex-no-such-package" '!looks like an apt install command but was not parsed'
 
-# ...and the parenthesis of a function DEFINITION closes one, so it is not an
-# arm's and opens no command position: the body runs when the function is
-# called, not where it is written.
+# ...and a function BODY is checked as well. The bracket of a definition closes
+# the same way an arm's does, and one rule for both is worth more than the
+# distinction: a workflow that defines `install_deps` calls it, and a name apt
+# cannot resolve inside one is a defect whether or not this scanner can see the
+# call. The cost is a red on a broken function nobody invokes, which is not a
+# workflow that works either.
 write_workflow function-definition-literal ci.yml <<'YAML'
 jobs:
   build:
@@ -2844,8 +2847,8 @@ jobs:
           install_deps() { apt-get install -y codex-no-such-package; }
           sudo apt-get install -y cmake
 YAML
-expect "a function definition is not a case arm" 0 function-definition-literal \
-    "looks like an apt install command but was not parsed" '!cannot resolve'
+expect "a function body is checked too" 1 function-definition-literal \
+    "codex-no-such-package" '!looks like an apt install command but was not parsed'
 
 # ------------------------------------- `name=(...)` is an ARRAY, not a subshell
 # Reading the parenthesis as a command position — which is what made `( apt-get
@@ -3077,6 +3080,160 @@ jobs:
       - run: sudo apt-get install -y cmake
 YAML
 expect "a fully braced variable is followed" 1 shell-variable-braced \
+    "codex-no-such-package"
+
+# ------------------------------------ a subshell's `)` is syntax, not a package
+# `( apt-get install -y cmake )` installs cmake and closes the subshell. The
+# package list ran on through the bracket, so the gate asked apt to resolve `)`
+# and rejected a working workflow.
+write_workflow subshell-closing-paren ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: ( apt-get install -y cmake )
+YAML
+expect "a subshell's closing bracket is not a package" 0 subshell-closing-paren \
+    "All 1 apt package(s)" '!: )'
+
+# ...while a QUOTED bracket is an ordinary character in a package name, and apt
+# rejects it. Reading that one as syntax would end the package list early and
+# let a name apt cannot resolve through.
+write_workflow quoted-closing-paren ci.yml <<'YAML'
+        run: sudo apt-get install -y 'cmake)'
+YAML
+expect "a quoted bracket is part of a package name" 1 quoted-closing-paren \
+    "cmake)"
+
+# ...and a bracket that is the WHOLE argument is a package name too. No
+# workflow writes this, but the rule that quoting makes a metacharacter an
+# ordinary character is the one every case here rests on, and it must not be
+# free to disappear: apt answers `E: Unable to locate package )`.
+write_workflow quoted-bare-paren ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake ')'
+YAML
+expect "a quoted bracket on its own is a package" 1 quoted-bare-paren \
+    "cannot resolve: )"
+
+# ...and every arm of a case gets its own command position: bash allows the
+# arms on one line, and remembering only the first `)` left the second arm's
+# install announced as unparsed.
+write_workflow case-arms-on-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          case "$x" in x) echo ok;; y) apt-get install -y codex-no-such-package;; esac
+          sudo apt-get install -y cmake
+YAML
+expect "every case arm is a command position" 1 case-arms-on-one-line \
+    "codex-no-such-package" '!looks like an apt install command but was not parsed'
+
+# ------------------------------- a reference may supply only PART of a command
+# `env.COMMAND: apt-get install -y` with `run: ${{ env.COMMAND }} pkg` installs
+# pkg: the value holds no package and the call site holds no apt, so scanning
+# either alone finds nothing at all.
+write_workflow reference-with-arguments ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: apt-get install -y
+    steps:
+      - run: ${{ env.COMMAND }} codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a reference is read with the words after it" 1 reference-with-arguments \
+    "codex-no-such-package"
+
+# ...and a redirection among those words is still a redirection, not a package
+# name that happens to be spelled `>`.
+write_workflow reference-with-redirection ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: apt-get install -y
+    steps:
+      - run: ${{ env.COMMAND }} cmake >/dev/null
+YAML
+expect "a redirection after a reference is not a package" 0 reference-with-redirection \
+    "All 1 apt package(s)"
+
+# ----------------------------- an expression may BE the script `bash -c` runs
+# GitHub substitutes before bash ever sees the argument, so the value is the
+# script. The walker saw `bash` as the command and declined to follow it.
+write_workflow shell-script-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      SCRIPT: apt-get install -y codex-no-such-package
+    steps:
+      - run: bash -c '${{ env.SCRIPT }}'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an expression handed to bash -c is followed" 1 shell-script-reference \
+    "codex-no-such-package"
+
+# ...but only when the expression IS the whole script. `bash -c 'echo ${{ … }}'`
+# echoes the value; following it would red a workflow for a package nothing
+# installs.
+write_workflow shell-script-partial ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      SCRIPT: apt-get install -y codex-no-such-package
+    steps:
+      - run: bash -c 'echo ${{ env.SCRIPT }}'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a value echoed by a script is not run" 0 shell-script-partial \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and only a SHELL runs a script: `-c` means something else to every other
+# command. The value here is written as an apt line precisely so that following
+# it would show, since a filename would look the same either way.
+write_workflow non-shell-dash-c ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      SOURCE: apt-get install -y codex-no-such-package
+    steps:
+      - run: gcc -c ${{ env.SOURCE }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "only a shell is handed a script" 0 non-shell-dash-c \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and quoting the shell's own NAME changes nothing: `'bash' -c '…'` runs
+# bash. Quotes take a reserved word's meaning away — `"if"` is a command that
+# does not exist — and leave a command name exactly as it was.
+#
+# Block scalars below because a plain one cannot OPEN with a quote: YAML reads
+# it as a quoted scalar and rejects what follows.
+write_workflow quoted-shell-name ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      SCRIPT: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          'bash' -c '${{ env.SCRIPT }}'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted shell name still runs a script" 1 quoted-shell-name \
+    "codex-no-such-package"
+
+# ...as does quoting an invocation prefix: `'sudo' ${{ env.command }}` runs the
+# value as root exactly as the bare word does.
+write_workflow quoted-invocation-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          'sudo' ${{ env.command }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted invocation prefix is still one" 1 quoted-invocation-prefix \
     "codex-no-such-package"
 
 # ------------------------------------------------------------------------ done
