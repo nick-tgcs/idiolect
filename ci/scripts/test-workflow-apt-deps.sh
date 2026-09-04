@@ -2816,6 +2816,37 @@ YAML
 expect "exec runs its argument" 1 exec-builtin \
     "codex-no-such-package"
 
+# ------------------------------------ a case arm holds a command, literal or not
+# The expression walk learned that `x) …` runs what follows; the scanner reading
+# LITERAL commands had not, so a real install in an arm was announced as
+# unparsed — a notice, which nothing fails on.
+write_workflow case-arm-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          case "$x" in
+          x) apt-get install -y codex-no-such-package;;
+          esac
+          sudo apt-get install -y cmake
+YAML
+expect "a case arm's own command is checked" 1 case-arm-literal \
+    "codex-no-such-package" '!looks like an apt install command but was not parsed'
+
+# ...and the parenthesis of a function DEFINITION closes one, so it is not an
+# arm's and opens no command position: the body runs when the function is
+# called, not where it is written.
+write_workflow function-definition-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() { apt-get install -y codex-no-such-package; }
+          sudo apt-get install -y cmake
+YAML
+expect "a function definition is not a case arm" 0 function-definition-literal \
+    "looks like an apt install command but was not parsed" '!cannot resolve'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

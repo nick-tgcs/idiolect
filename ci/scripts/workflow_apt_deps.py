@@ -619,6 +619,31 @@ def walk_to_closing_paren(words, index):
     return parts, index
 
 
+def case_pattern_end(words):
+    """Where a case ARM's pattern ends, or None if these words are not one.
+
+    An arm is `pattern ) list` and bash runs the list: the pattern and its
+    parenthesis are syntax. What tells one from a subshell is that the arm's
+    `)` closes nothing — in `( cmd )` the parenthesis has an opener, and comes
+    after what runs rather than before it.
+
+    Shared, because BOTH readers of a command have to know where one begins:
+    answering it in two places is how `x) apt-get install …` came to be
+    announced as unparsed while `x) ${{ env.command }}` was followed.
+    """
+    depth = 0
+    for position, word in enumerate(words):
+        if word.quoted:
+            continue
+        if word.value == "(":
+            depth += 1
+        elif word.value == ")":
+            if depth == 0:
+                return position
+            depth -= 1
+    return None
+
+
 def scan_command(path, line, words, expressions):
     """Report the packages installed by one already-tokenised command line."""
     state = "idle"
@@ -631,6 +656,7 @@ def scan_command(path, line, words, expressions):
     saw_install = False
     parsed_install = False
     end_of_options = False
+    pattern_end = case_pattern_end(words)
 
     index = 0
     while index < len(words):
@@ -644,6 +670,14 @@ def scan_command(path, line, words, expressions):
             saw_install = True
 
         if token in SEPARATORS and not word.quoted:
+            state = "idle"
+            at_command = True
+            end_of_options = False
+            continue
+
+        if index - 1 == pattern_end:
+            # A case ARM's `)` ends its pattern, and what follows is a command
+            # exactly as after a separator.
             state = "idle"
             at_command = True
             end_of_options = False
@@ -1284,21 +1318,10 @@ def written_before_the_command(words):
     uses that form, and the direction of being wrong is a value unread rather
     than a package invented.
     """
-    # A case ARM is `pattern ) list`, and bash runs the list: the pattern and
-    # its parenthesis are syntax. What tells one from a subshell is that the
-    # arm's `)` has no opener before it — in `( cmd )` the parenthesis closes
-    # something, and comes after what runs rather than before it.
-    depth = 0
-    for position, word in enumerate(words):
-        if word.quoted:
-            continue
-        if word.value == "(":
-            depth += 1
-        elif word.value == ")":
-            if depth == 0:
-                words = words[position + 1:]
-                break
-            depth -= 1
+    # A case ARM's pattern is syntax; bash runs the list after it.
+    pattern_end = case_pattern_end(words)
+    if pattern_end is not None:
+        words = words[pattern_end + 1:]
 
     index = 0
     saw_invocation = False
