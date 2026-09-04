@@ -153,9 +153,20 @@ def expands_a_brace(token):
 # apt reads an argument holding a `/` or ending in `.deb` as a local package
 # FILE. Debian names contain neither, so a path is never a name — but
 # `pkg/stable` is the target-release form rather than a path, and stays a name.
-def names_a_file(token):
-    """Whether apt would read this argument as a local .deb rather than a name."""
-    return token.endswith(".deb") or token.startswith(("/", "./", "../", "~"))
+def names_a_file(word):
+    """Whether apt would read this argument as a local .deb rather than a name.
+
+    apt decides that from the text — a `/` or a `.deb` suffix — which quoting
+    does not change. The TILDE is different, because it is the shell that
+    expands it: quoted it is never expanded, and unquoted `~name` expands only
+    if that user exists, bash leaving it alone otherwise. Only `~/` is certainly
+    a home directory, so only that counts here; anything else keeps its tilde
+    and is a name apt will reject.
+    """
+    token = word.value
+    if token.endswith(".deb") or token.startswith(("/", "./", "../")):
+        return True
+    return token.startswith("~/") and not word.quoted
 
 
 # `*`, `?` and `[` make a word a pattern — expanded by the shell if it matches a
@@ -475,21 +486,25 @@ def walk_to_closing_paren(words, index):
     """Consume a parenthesised group; returns its words and the index after it.
 
     `index` must point AT the opening `(`. Nesting is counted, so `$(a $(b) c)`
-    ends on its own bracket rather than the first one it meets.
+    ends on its own bracket rather than the first one it meets — but only
+    UNQUOTED brackets nest. A `(` inside quotes is an ordinary character, and
+    counting it runs the walk past the real closing bracket and swallows the
+    operands after it.
     """
     depth = 1
     index += 1
     parts = []
     while index < len(words) and depth:
-        inner = words[index].value
+        word = words[index]
         index += 1
-        if inner == "(":
-            depth += 1
-        elif inner == ")":
-            depth -= 1
-            if not depth:
-                break
-        parts.append(inner)
+        if not word.quoted:
+            if word.value == "(":
+                depth += 1
+            elif word.value == ")":
+                depth -= 1
+                if not depth:
+                    break
+        parts.append(word.value)
     return parts, index
 
 
@@ -625,7 +640,7 @@ def scan_command(path, line, words, expressions):
             if expands_a_dollar(token) and not word.literal_dollar:
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
                 continue
-            if names_a_file(token):
+            if names_a_file(word):
                 emit("NOTICE", path, line,
                      f"names a local package file, not a name to resolve: {token}")
                 continue

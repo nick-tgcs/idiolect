@@ -1439,6 +1439,73 @@ YAML
 expect "a command after a process substitution is not swallowed" 1 process-sub-then-command \
     "libfcitx5-dev" "installs a package apt cannot resolve"
 
+
+# ------------------------------------- quoted brackets inside a substitution
+# A `(` inside quotes is an ordinary character, not nesting. Counting it makes
+# the walk run past the substitution's real closing bracket and swallow the
+# operands after it — the swallowing shape again, this time reachable from
+# inside the group rather than after it.
+write_workflow substitution-quoted-paren ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake $(printf cmake; : '(') codex-no-such-package
+YAML
+expect "a quoted bracket does not deepen a substitution" 1 substitution-quoted-paren \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ----------------------------------------------- a tilde is not always a path
+# Only `~/` is certainly a home directory. `~name` expands only if that user
+# exists, and bash leaves it alone otherwise — quoted, it is never expanded at
+# all. Either way apt is handed the literal text and rejects it, so calling
+# every leading tilde a local file hides a broken install.
+write_workflow tilde-quoted ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '~codex-no-such-package'
+YAML
+expect "a quoted tilde is part of the name" 1 tilde-quoted \
+    "installs a package apt cannot resolve"
+
+write_workflow tilde-bare ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake ~codex-no-such-package
+YAML
+expect "an unquoted tilde without a slash is part of the name" 1 tilde-bare \
+    "installs a package apt cannot resolve"
+
+# ...while `~/` really is a path, and resolving it as a package name would be a
+# false red on a workflow installing a local build.
+write_workflow tilde-home ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y ~/build/idiolect.deb
+YAML
+expect "a tilde-slash path is still a local file" 0 tilde-home \
+    "All 1 apt package(s)" "a local package file"
+
+# A substitution may contain another. Without counting the nesting the walk
+# ends on the INNER bracket and the rest of the group is read as packages.
+write_workflow substitution-nested ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake $(printf %s $(printf make) suffix)
+YAML
+expect "a nested substitution ends on its own bracket" 0 substitution-nested \
+    "All 1 apt package(s)" "not checked"
+
+# The tilde rules, against what apt itself does — checked with `apt-get -s`:
+#   /tmp/nosuchdir/pkg  ->  E: Unsupported FILE given on commandline
+#   '~/nosuch'          ->  E: Unable to locate PACKAGE ~
+# so a quoted `~/` is a name apt rejects, because the shell never expanded it...
+write_workflow tilde-quoted-slash ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '~/build/idiolect'
+YAML
+expect "a quoted tilde-slash is a name, not a path" 1 tilde-quoted-slash \
+    "installs a package apt cannot resolve"
+
+# ...while an unquoted one is a path even without a `.deb` suffix.
+write_workflow tilde-slash-no-suffix ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y ~/build/idiolect
+YAML
+expect "an unquoted tilde-slash is a path without a suffix" 0 tilde-slash-no-suffix \
+    "All 1 apt package(s)" "a local package file"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
