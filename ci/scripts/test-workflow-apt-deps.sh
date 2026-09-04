@@ -1034,7 +1034,7 @@ expect "a backslash ending a comment continues nothing" 1 comment-continuation \
 # continuation, because that `#` never started a comment.
 printf '%s\n' \
     '        run: |' \
-    "          sudo apt-get install -y '#' \\\\" \
+    "          sudo apt-get install -y '#' \\" \
     '          codex-no-such-package' \
     | write_workflow quoted-hash-continuation ci.yml
 expect "a quoted hash does not make the line a comment" 1 quoted-hash-continuation \
@@ -1149,6 +1149,44 @@ write_workflow not-apt-by-path ci.yml <<'YAML'
 YAML
 expect "a different program by path is not apt" 0 not-apt-by-path \
     "All 1 apt package(s)"
+
+
+# ------------------------------------------- comments that cannot be lexed
+# A comment may contain an apostrophe, which no lexer can read as shell. The
+# first version of this fix handed the whole line to shlex's own comment
+# handling to get past it — and that truncates a `#` ANYWHERE in a word, so
+# `cmake#typo` became the resolvable `cmake` and the broken install passed
+# again, by the back door.
+printf '%s\n' \
+    '        run: |' \
+    "          sudo apt-get install -y cmake#typo # don't use this" \
+    | write_workflow comment-apostrophe ci.yml
+expect "an unlexable comment does not rescue a broken name" 1 comment-apostrophe \
+    "cmake#typo" "installs a package apt cannot resolve"
+
+# ...and a genuinely unbalanced quote in the COMMAND is still announced, which
+# is what stops the recovery above from swallowing real breakage.
+write_workflow quote-unclosed-still ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y 'codex-no-such-package
+YAML
+expect "an unterminated quote in the command is still announced" 0 quote-unclosed-still \
+    "could not be tokenised" "All 1 apt package(s)"
+
+# --------------------------------------------- backslashes come in pairs
+# `foo\\` ends with an ESCAPED backslash, not a continuation: bash keeps the
+# newline and runs the next line as its own command. Counting only the last
+# character joins them, and the install disappears into the middle of the
+# previous line.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    "          printf '%s' foo\\\\" \
+    '          sudo apt-get install -y codex-no-such-package' \
+    | write_workflow escaped-backslash ci.yml
+expect "an escaped backslash does not continue the line" 1 escaped-backslash \
+    "codex-no-such-package" "installs a package apt cannot resolve"
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

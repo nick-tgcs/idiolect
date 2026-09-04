@@ -224,8 +224,21 @@ class _QuoteWatchingStream(io.StringIO):
         return char
 
 
+class Unlexable(ValueError):
+    """An unbalanced quote, carrying the words read before it."""
+
+    def __init__(self, error, words):
+        super().__init__(str(error))
+        self.words = words
+
+
 def _lex(text, commenters):
-    """Tokenise, with shlex's own comment handling set to `commenters`."""
+    """Tokenise, with shlex's own comment handling set to `commenters`.
+
+    Raises Unlexable on an unbalanced quote, carrying the words already read —
+    which is what makes a comment containing an apostrophe recoverable without
+    re-lexing the line under weaker rules.
+    """
     stream = _QuoteWatchingStream(text)
     lexer = shlex.shlex(stream, posix=True, punctuation_chars=True)
     stream.lexer = lexer
@@ -244,7 +257,10 @@ def _lex(text, commenters):
         # before, or — when shlex pushed one back — the first character of this
         # word. Either way, whitespace here means the two words are separated.
         space_before = stream.last_char is None or stream.last_char.isspace()
-        token = lexer.get_token()
+        try:
+            token = lexer.get_token()
+        except ValueError as error:
+            raise Unlexable(error, words) from error
         if token is lexer.eof:
             return words
         if stream.quoted:
@@ -278,18 +294,33 @@ def lex_words(text):
     """
     try:
         words = _lex(text, commenters="")
-    except ValueError:
-        # A quote character inside a COMMENT is not an unbalanced quote in the
-        # command — `# don't` is a perfectly ordinary line — so fall back to
-        # shlex's own comment handling, which never reads that far. LIMITATION:
-        # on this path a `#` inside a word is treated as a comment after all,
-        # which needs a line carrying both an apostrophe in its comment and a
-        # hash inside a word before it.
-        return _lex(text, commenters="#")
+    except Unlexable as error:
+        # A comment may hold an apostrophe — `# don't` is an ordinary line — and
+        # no lexer can read that as shell. But everything after a `#` is comment
+        # anyway, so if one was reached before the quote, the words already read
+        # ARE the command and nothing is missing. Only when no comment was
+        # reached is the quote a real defect in the command itself.
+        #
+        # Re-lexing the line under shlex's own comment rules would get past the
+        # apostrophe too, and would truncate `cmake#typo` to `cmake` on the way.
+        words = error.words
+        if not any(starts_a_comment(word) for word in words):
+            raise
     for index, word in enumerate(words):
         if starts_a_comment(word):
             return words[:index]
     return words
+
+
+def continues_the_line(text):
+    r"""Whether a trailing backslash continues this line onto the next.
+
+    Backslashes come in pairs: `foo\\` is one ESCAPED backslash and the line
+    ends there, while `foo\\\` is an escaped one followed by a continuation.
+    Only an ODD number of them at the end continues anything, and testing the
+    final character alone joins two commands that bash runs separately.
+    """
+    return (len(text) - len(text.rstrip("\\"))) % 2 == 1
 
 
 def holds_a_comment(text):
@@ -577,7 +608,7 @@ def scan_shell(path, text, first_line, exact_lines):
         # rest of that line before ever seeing it, and the command beneath runs
         # on its own. Joining anyway makes that command part of the comment and
         # it vanishes without even a notice.
-        if pending.endswith("\\") and not holds_a_comment(pending[:-1]):
+        if continues_the_line(pending) and not holds_a_comment(pending[:-1]):
             pending = pending[:-1]
             continue
 
