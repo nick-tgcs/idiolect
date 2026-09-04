@@ -155,7 +155,7 @@ def runs_a_script(words):
 # because independently optional braces match `$NAME}` — which bash expands and
 # then appends the `}` to, asking apt for a package that does not exist.
 SHELL_VARIABLE = re.compile(
-    r"^\$([A-Za-z_][A-Za-z0-9_]*)$|^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$"
+    r"^\$([A-Za-z_][A-Za-z0-9_]*|[0-9]+)$|^\$\{([A-Za-z_][A-Za-z0-9_]*|[0-9]+)\}$"
 )
 
 
@@ -863,6 +863,15 @@ def scan_command(path, line, words, expressions, defined=None):
             # argument and apt is asked for a package called `2`.
             continue
 
+        if "$(" in token and not word.literal_dollar:
+            # A quoted substitution RUNS: `echo "$(apt-get …)"` starts apt, and
+            # the whole construct is one word, so the line holds no apt token
+            # of its own. Read as the shell it is, wherever in the command it
+            # stands — the unquoted form arrives split and is announced below,
+            # where its words cannot be put back together reliably.
+            for body in substitution_bodies(token):
+                scan_shell(path, body, line, exact_lines=False, defined=defined)
+
         if "`" in token and not word.literal_backtick and state != "packages" \
                 and token.count("`") % 2:
             # `` RESULT=`apt-get …` `` RUNS apt. Backticks mean nothing to
@@ -940,6 +949,17 @@ def scan_command(path, line, words, expressions, defined=None):
                      f"names a package through a variable, not checked: {unmask(token, expressions)}")
                 continue
             if expands_a_dollar(token) and not word.literal_dollar:
+                if defined is not None and remembered(token, defined) is not None:
+                    # A variable this block set: `PKG=cmake` then
+                    # `apt-get install -y $PKG`, and a function's `"$1"`, name
+                    # packages that are written down after all.
+                    key = remembered(token, defined)
+                    elsewhere = {other: what for other, what in defined.items() if other != key}
+                    for package in rebased(*defined[key], expressions):
+                        scan_command(path, line,
+                                     [Word("apt-get"), Word("install"), package],
+                                     expressions, elsewhere)
+                    continue
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
                 continue
             if names_a_file(word):
@@ -1031,7 +1051,13 @@ def scan_command(path, line, words, expressions, defined=None):
             key = remembered(token, defined)
             end = len(words) if key[0] == "function" else command_ends(words, index)
             after = [] if key[0] == "function" else words[index:end]
-            elsewhere = {other: held for other, held in defined.items() if other != key}
+            elsewhere = {other: what for other, what in defined.items() if other != key}
+            if key[0] == "function":
+                # A function's arguments arrive as `$1`, `$2`, … rather than as
+                # more words of the command: `install_deps pkg` runs the body
+                # with pkg as `$1`.
+                for position, argument in enumerate(words[index:command_ends(words, index)], 1):
+                    elsewhere[("variable", str(position))] = ([argument], expressions)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
                          expressions, elsewhere)
             index = end if key[0] != "function" else index
@@ -1047,8 +1073,14 @@ def scan_command(path, line, words, expressions, defined=None):
             # `bash build.sh -c x` came to be read as an invocation option.
             script = script_argument(words[index - 1:command_ends(words, index - 1)])
             if script is not None:
+                # A prefix assignment goes into THIS command's environment —
+                # `COMMAND=… bash -c '$COMMAND'` is how a value reaches a child
+                # without being exported — and is gone from this shell after.
+                environment = dict(defined) if defined is not None else None
+                if environment is not None:
+                    remember(pending, environment, expressions, exported=True)
                 scan_shell(path, script.value, line, exact_lines=False,
-                           defined=child_scope(defined, script,
+                           defined=child_scope(environment, script,
                                                token.rsplit("/", 1)[-1]))
             at_command = False
         elif is_partly_assembled(token):
@@ -1323,6 +1355,7 @@ def scan_shell(path, text, first_line, exact_lines, defined=None):
             or runs_a_script(words)
             or touches_a_definition(words, defined)
             or any("`" in word.value and not word.literal_backtick for word in words)
+            or any("$(" in word.value and not word.literal_dollar for word in words)
         ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
@@ -1800,6 +1833,30 @@ def rebased(words, expressions, into):
         )
         for word in words
     ]
+
+
+def substitution_bodies(token):
+    """The text inside each `$( … )` written within one word.
+
+    Quoted, a whole substitution arrives as a SINGLE token — `"$(apt-get …)"`
+    is one word — so nothing in it lexes as apt and the line holding it would
+    never be read. Unquoted, the same construct arrives as `$`, `(` and its
+    words, which is the other branch.
+    """
+    bodies = []
+    position = token.find("$(")
+    while position != -1:
+        depth = 0
+        for at in range(position + 1, len(token)):
+            if token[at] == "(":
+                depth += 1
+            elif token[at] == ")":
+                depth -= 1
+                if not depth:
+                    bodies.append(token[position + 2:at])
+                    break
+        position = token.find("$(", position + 2)
+    return bodies
 
 
 def child_scope(defined, script, keyword):

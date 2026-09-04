@@ -4033,6 +4033,63 @@ YAML
 expect "readonly does not export" 0 readonly-does-not-export \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------------ a QUOTED substitution is one word and still runs
+# `echo "$(apt-get …)"` starts apt. Quoted, the whole substitution arrives as a
+# single token, so nothing in the line lexed as apt and the line was skipped.
+write_workflow quoted-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "$(sudo apt-get install -y codex-no-such-package)"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted substitution runs its command" 1 quoted-substitution \
+    "codex-no-such-package"
+
+# ...while a single-quoted one is text: nothing expands inside it, and apt is
+# never asked for anything. Written beside a real install, so the line is read
+# for the install's sake and the literal is reached rather than skipped.
+write_workflow literal-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          sudo apt-get install -y cmake; echo '$(sudo apt-get install -y codex-no-such-package)'
+YAML
+expect "a literal substitution runs nothing" 0 literal-substitution \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# --------------------- a prefix assignment IS in the child's environment
+# `COMMAND=… bash -c '$COMMAND'` puts the value in the environment of that one
+# command, so the child sees it — even though the assignment is gone from this
+# shell afterwards.
+write_workflow prefix-assignment-child ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package' bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a prefix assignment reaches that command's child" 1 prefix-assignment-child \
+    "codex-no-such-package"
+
+# ---------------------------- a function's arguments arrive as `$1`, `$2`, …
+# `install_deps pkg` runs the body with pkg as `$1`, so a package named there
+# is installed for real.
+write_workflow function-positional ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() { apt-get install -y "$1"; }
+          install_deps codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a function's argument reaches its body" 1 function-positional \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
