@@ -78,6 +78,12 @@ CONTROL_PREFIXES = {
 
 APT_COMMANDS = {"apt", "apt-get"}
 
+# `"${deps[@]}"` is the whole array as separate words. Only THERE do its
+# elements become a command; the initializer says what the words are, not that
+# they will ever be run.
+ARRAY_EXPANSION = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}$")
+
+
 # Shells whose `-c` argument is a script rather than an operand.
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
 
@@ -718,8 +724,12 @@ def case_pattern_end(words):
     return None
 
 
-def scan_command(path, line, words, expressions):
-    """Report the packages installed by one already-tokenised command line."""
+def scan_command(path, line, words, expressions, arrays=None):
+    """Report the packages installed by one already-tokenised command line.
+
+    `arrays` carries the arrays assigned earlier in the same block, since
+    `deps=( … )` and the `"${deps[@]}"` that runs it are two commands apart.
+    """
     state = "idle"
     # A command position: the start of the line, and again after every
     # separator. It survives the prefix material an invocation may carry, and
@@ -762,24 +772,20 @@ def scan_command(path, line, words, expressions):
             end_of_options = False
             continue
 
-        if (
-            token == "("
-            and not word.quoted
-            and not word.space_before
-            and index >= 2
-            and is_an_assignment(words[index - 2])
-        ):
+        assignment = assigned_array(words, index - 1)
+        if assignment is not None:
             # `deps=(cmake g++)` is an ARRAY assignment, not a subshell. Reading
             # the parenthesis as a command position — which is what lets
             # `( apt-get … )` work — made apt inside one a command whose last
             # package was the closing bracket, and rejected a working workflow
             # for a package called `)`.
             #
-            # Its elements are scanned as a command all the same, because that
-            # is what `"${deps[@]}"` runs later: skipping the group outright
-            # would hide a real install behind a silent pass.
-            inside, index = walk_to_closing_paren(words, index - 1)
-            scan_command(path, line, inside, expressions)
+            # Its elements are REMEMBERED rather than read as a command: an
+            # initializer says what the words are, not that they will ever be
+            # run, and `printf '%s\n' "${deps[@]}"` only prints them.
+            name, inside, index = assignment
+            if arrays is not None:
+                arrays[name] = (inside, expressions)
             continue
 
         if (
@@ -950,6 +956,17 @@ def scan_command(path, line, words, expressions):
             # a notice, which nothing fails on. Quoted it is no longer reserved:
             # bash looks for a command called `if` and never runs what follows.
             pass
+        elif arrays is not None and ARRAY_EXPANSION.match(token) and \
+                ARRAY_EXPANSION.match(token).group(1) in arrays:
+            # `"${deps[@]}"` puts the array's words HERE, at a command
+            # position, with whatever follows as their arguments.
+            name = ARRAY_EXPANSION.match(token).group(1)
+            end = command_ends(words, index)
+            elsewhere = {key: value for key, value in arrays.items() if key != name}
+            elements = rebased(*arrays[name], expressions)
+            scan_command(path, line, elements + words[index:end], expressions, elsewhere)
+            index = end
+            at_command = False
         elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS or token.rsplit("/", 1)[-1] == "eval":
             # `bash -c '…'` and `eval '…'` run their argument as a SCRIPT, and
             # apt inside one installs for real. Scanned rather than announced:
@@ -1133,6 +1150,7 @@ def scan_shell(path, text, first_line, exact_lines):
     true for a literal block or a plain scalar, false once YAML has folded the
     block, where every finding is reported against the line the block starts on.
     """
+    arrays = {}
     for offset, command, in_heredoc in shell_commands(text):
         line = first_line + offset if exact_lines else first_line
 
@@ -1165,13 +1183,14 @@ def scan_shell(path, text, first_line, exact_lines):
         if (
             any(is_apt(word.value) or is_partly_assembled(word.value) for word in words)
             or runs_a_script(words)
+            or touches_an_array(words, arrays)
         ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
             # skips it without checking a package or saying a word. A word part
             # literal and part expression may be an apt invocation too, and is
             # announced rather than passed over.
-            scan_command(path, line, words, expressions)
+            scan_command(path, line, words, expressions, arrays)
 
 
 def scalar_values(node, path=()):
@@ -1484,18 +1503,13 @@ def command_word(words):
             continue
         if is_an_assignment(word):
             index += 1
-            if (
-                index < len(words)
-                and words[index].value == "("
-                and not words[index].quoted
-                and not words[index].space_before
-            ):
+            assignment = assigned_array(words, index)
+            if assignment is not None:
                 # `deps=(a b c)` assigns an ARRAY, and the parenthesis is not
-                # the subshell a bare `(` would be. Its ELEMENTS are read as
-                # the command, because that is what `"${deps[@]}"` runs later —
-                # the same answer the literal scan gives them.
-                inside, _ = walk_to_closing_paren(words, index)
-                return command_word(inside)
+                # the subshell a bare `(` would be. Nothing here RUNS: the
+                # elements become a command only where `"${deps[@]}"` puts them
+                # at one, which is where they are read.
+                _, _, index = assignment
             continue
         if token.isdigit() and index + 1 < len(words) and words[index + 1].value in REDIRECTIONS:
             index += 1
@@ -1576,6 +1590,63 @@ def as_written(word, expressions):
     return shlex.quote(text)
 
 
+def assigned_array(words, index):
+    """The array `NAME=( … )` whose bracket is at `index`, or None.
+
+    Returns the name, the words inside, and the index after the group. The
+    bracket has to be written hard against an assignment: a spaced `(` is a
+    subshell, and the assignment is what makes this an array rather than one.
+    """
+    if (
+        index < 1
+        or index >= len(words)
+        or words[index].value != "("
+        or words[index].quoted
+        or words[index].space_before
+        or not is_an_assignment(words[index - 1])
+    ):
+        return None
+    inside, after = walk_to_closing_paren(words, index)
+    return words[index - 1].value.split("=", 1)[0].rstrip("+"), inside, after
+
+
+def rebased(words, expressions, into):
+    """Remembered words, renumbered into another command's expression list.
+
+    An array is assigned in one command and run in another, and each command
+    masks its own expressions from zero — so a sentinel a remembered word
+    carries means nothing where the array is expanded until it is moved across.
+    """
+    base = len(into)
+    into.extend(expressions)
+    return [
+        Word(
+            re.sub(EXPRESSION_PREFIX + r"(\d+)__",
+                   lambda match: EXPRESSION_SENTINEL.format(int(match.group(1)) + base),
+                   word.value),
+            word.literal_dollar, word.space_before, word.literal_backtick,
+            word.quoted, word.literal_brace,
+        )
+        for word in words
+    ]
+
+
+def touches_an_array(words, arrays):
+    """Whether these words assign an array, or run one already assigned.
+
+    Asked because the two are separate commands and neither need hold apt: the
+    assignment has to be remembered when it does not, and `"${deps[@]}"` names
+    no command of its own for the line to be read for.
+    """
+    for index, word in enumerate(words):
+        if assigned_array(words, index) is not None:
+            return True
+        match = ARRAY_EXPANSION.match(word.value)
+        if match and match.group(1) in arrays:
+            return True
+    return False
+
+
 def as_words(text):
     """A variable's value, written so it lexes to the words bash makes of it.
 
@@ -1609,11 +1680,14 @@ def script_argument(words):
         return None
     name = word.value.rsplit("/", 1)[-1]
     if name == "eval":
-        # `eval` takes its script as an OPERAND: it joins its arguments and
-        # executes the result. LIMITATION: only the first is read, which is
-        # exact for the `eval "$COMMAND"` form and short of the rest.
-        position = words.index(word)
-        return words[position + 1] if position + 1 < len(words) else None
+        # `eval` takes its script as OPERANDS: it joins them all into one
+        # string and executes that, so `eval 'apt-get install -y' pkg` runs
+        # both words. The quotes are gone by now, and joining the values with
+        # a space is what bash is left holding.
+        operands = words[words.index(word) + 1:command_ends(words, words.index(word))]
+        if not operands:
+            return None
+        return Word(" ".join(operand.value for operand in operands))
     if name not in SHELL_COMMANDS:
         return None
     saw_argument = False
@@ -1671,6 +1745,7 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
     evaluates the expression; `followed` is what stops two values that name
     each other from chasing one another for ever.
     """
+    arrays = {}
     for offset, command, in_heredoc in shell_commands(value.value):
         if in_heredoc:
             continue
@@ -1679,6 +1754,28 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
         # tears the expression in half.
         masked, all_expressions = mask_expressions(command)
         for segment in command_segments(masked):
+            # An array's elements are remembered where they are assigned and
+            # read where `"${deps[@]}"` puts them at a command position —
+            # the same rule the literal scan follows, because an initializer
+            # that is only printed runs nothing.
+            assignment = next(
+                (found for found in map(lambda at: assigned_array(segment, at),
+                                        range(len(segment)))
+                 if found is not None),
+                None,
+            )
+            if assignment is not None:
+                # Remembered, and the segment read on: an assignment can be a
+                # PREFIX — `deps=(x) cmd` sets it for that one command and runs
+                # cmd — so what follows the group is still a command.
+                arrays[assignment[0]] = (assignment[1], all_expressions)
+
+            word = command_word(segment)
+            expanded = ARRAY_EXPANSION.match(word.value) if word is not None else None
+            if expanded is not None and expanded.group(1) in arrays:
+                elements = rebased(*arrays[expanded.group(1)], all_expressions)
+                segment = elements + segment[segment.index(word) + 1:]
+
             found = [
                 (position, all_expressions[int(number)])
                 for position, word in enumerate(segment)

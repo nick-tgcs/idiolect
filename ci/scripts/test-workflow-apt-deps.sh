@@ -2880,9 +2880,9 @@ YAML
 expect "an array's elements are still checked" 1 array-assignment-bad \
     "codex-no-such-package" '!: )'
 
-# ...and a reference among those elements is followed for the same reason: the
-# array is what gets run, so its contents are read as the command whether they
-# are written out or interpolated.
+# ...and a reference among those elements is followed where the array IS run,
+# for the same reason a literal one is: what `"${deps[@]}"` puts at a command
+# position is read as the command, written out or interpolated alike.
 write_workflow array-assignment-reference ci.yml <<'YAML'
 jobs:
   build:
@@ -2895,6 +2895,23 @@ jobs:
 YAML
 expect "an array element is a command position" 1 array-assignment-reference \
     "codex-no-such-package"
+
+# ...while an array that is only printed runs nothing, so the reference inside
+# it is not a command either — the same rule as the literal case, applied on
+# the side that follows values.
+write_workflow array-reference-only-printed ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          deps=(${{ env.command }})
+          printf '%s\n' "${deps[@]}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a printed array's reference is not a command" 0 array-reference-only-printed \
+    "All 1 apt package(s)" '!codex-no-such-package'
 
 # ------------------------------------ a command held in a SHELL variable is read
 # `run: $COMMAND` runs whatever the variable holds, bash splitting it into
@@ -3442,6 +3459,81 @@ jobs:
       - run: sudo apt-get install -y cmake
 YAML
 expect "an option's argument is not the script file" 1 shell-option-argument \
+    "codex-no-such-package"
+
+# ------------------------------------------ `eval` joins ALL of its operands
+# `eval 'apt-get install -y' pkg` builds one string out of every argument and
+# runs that, so reading only the first operand found no package.
+write_workflow eval-multiple-operands ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: eval 'apt-get install -y' codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "eval joins every operand" 1 eval-multiple-operands \
+    "codex-no-such-package"
+
+# --------------------------- an array is a command only where it is EXPANDED
+# `deps=(apt-get …)` followed by `printf '%s\n' "${deps[@]}"` prints the array
+# and runs nothing: an initializer says what the words ARE, not that they will
+# ever occupy a command position. Reading every array as a command rejected a
+# workflow that only prints one.
+write_workflow array-only-printed ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          deps=(apt-get install -y codex-no-such-package)
+          printf '%s\n' "${deps[@]}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an array that is only printed is not a command" 0 array-only-printed \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the words an expanded array carries are read with what follows it.
+write_workflow array-expanded-with-arguments ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          deps=(apt-get install -y)
+          sudo "${deps[@]}" codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an expanded array takes the words after it" 1 array-expanded-with-arguments \
+    "codex-no-such-package"
+
+# ...and an array assignment can be a PREFIX: `deps=(x) cmd` sets it for that
+# one command and runs cmd, so what follows the group is still a command.
+write_workflow array-assignment-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          deps=(x) ${{ env.command }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an array assignment prefixes a command" 1 array-assignment-prefix \
+    "codex-no-such-package"
+
+# ...and an array remembered in one command keeps ITS expressions when another
+# expands it: both commands number their own from zero, so the words have to be
+# moved across rather than carried over.
+write_workflow array-expansion-renumbered ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+      extra: cmake
+    steps:
+      - run: |
+          deps=(${{ env.command }})
+          sudo "${deps[@]}" ${{ env.extra }}
+YAML
+expect "a remembered array keeps its own expressions" 1 array-expansion-renumbered \
     "codex-no-such-package"
 
 # ------------------------------------------------------------------------ done
