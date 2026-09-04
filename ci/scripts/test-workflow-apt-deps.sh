@@ -1188,6 +1188,85 @@ printf '%s\n' \
 expect "an escaped backslash does not continue the line" 1 escaped-backslash \
     "codex-no-such-package" "installs a package apt cannot resolve"
 
+
+# --------------------------------- the two comment rules, meeting each other
+# A comment holding an apostrophe AND ending in a backslash. Each half was
+# fixed on its own; the continuation test still answered "no comment" whenever
+# the line could not be lexed, so the lines were joined and the install
+# vanished into the comment above it — no error, no notice.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    "          echo ok # don't \\" \
+    '          sudo apt-get install -y codex-no-such-package' \
+    | write_workflow comment-apostrophe-continuation ci.yml
+expect "an unlexable comment still ends its line" 1 comment-apostrophe-continuation \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# A `#` may also open a comment immediately after an operator, where a new word
+# begins without any whitespace.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    "          sudo apt-get install -y codex-no-such-package;# don't" \
+    | write_workflow hash-after-separator ci.yml
+expect "a hash after a separator starts a comment" 1 hash-after-separator \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ----------------------------------- backslashes are literal in single quotes
+# Bash removes a backslash-newline pair only where the backslash is an escape.
+# Inside single quotes it is an ordinary character, so `'cma\` + `ke'` is ONE
+# argument containing a backslash and a newline — a name apt rejects. Counting
+# parity alone joins the lines into the perfectly valid `cmake` and the broken
+# install passes.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    "          sudo apt-get install -y 'cma\\" \
+    "          ke'" \
+    | write_workflow backslash-in-single-quotes ci.yml
+expect "a backslash inside single quotes continues nothing" 0 backslash-in-single-quotes \
+    "could not be tokenised"
+
+# ...and double quotes are the other half of that rule: inside them a
+# backslash-newline IS removed, so `"cma\` + `ke"` is the one word `cmake` and
+# the workflow installs correctly. Treating every unclosed quote as a stopper
+# rejects it.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y "cma\' \
+    '          ke"' \
+    | write_workflow backslash-in-double-quotes ci.yml
+expect "a backslash inside double quotes still continues" 0 backslash-in-double-quotes \
+    "All 1 apt package(s)"
+
+# A comment can hold an unterminated DOUBLE quote as well, and it still ends at
+# the newline. Here the continuation test cannot settle it — the line does not
+# end inside single quotes — so the comment test has to, using the same words
+# the lexer read before it gave up.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    '          echo # "unterminated \' \
+    '          sudo apt-get install -y codex-no-such-package' \
+    | write_workflow comment-double-quote-continuation ci.yml
+expect "a comment holding a double quote still ends its line" 1 comment-double-quote-continuation \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ------------------------------------- expressions inside a larger word
+# `lib${{ matrix.flavor }}` is one package name the workflow builds at run
+# time. Recognising the masked expression only when it IS the whole word
+# reports the sentinel as a package, and apt cannot resolve something this
+# scanner invented — a false red on a matrix-driven workflow that works.
+write_workflow expression-embedded ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y lib${{ matrix.flavor }}
+          sudo apt-get install -y ${{ matrix.prefix }}-dev
+YAML
+expect "an expression inside a word is one dynamic argument" 0 expression-embedded \
+    "All 1 apt package(s)" "lib\${{ matrix.flavor }}" "\${{ matrix.prefix }}-dev"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

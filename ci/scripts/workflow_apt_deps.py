@@ -147,6 +147,13 @@ def mask_expressions(text):
     return "".join(out), originals
 
 
+def unmask(text, expressions):
+    """Put the original `${{ ... }}` back wherever a sentinel stands in."""
+    for position, original in enumerate(expressions):
+        text = text.replace(EXPRESSION_SENTINEL.format(position), original)
+    return text
+
+
 def emit(kind, path, line, value):
     print(f"{kind}\t{path}\t{line}\t{value}")
 
@@ -225,11 +232,17 @@ class _QuoteWatchingStream(io.StringIO):
 
 
 class Unlexable(ValueError):
-    """An unbalanced quote, carrying the words read before it."""
+    """An unbalanced quote, carrying the words read before it.
 
-    def __init__(self, error, words):
+    `state` is the quote character still open when the lexer gave up, which is
+    what says whether a trailing backslash was an escape or an ordinary
+    character inside single quotes.
+    """
+
+    def __init__(self, error, words, state):
         super().__init__(str(error))
         self.words = words
+        self.state = state
 
 
 def _lex(text, commenters):
@@ -260,7 +273,7 @@ def _lex(text, commenters):
         try:
             token = lexer.get_token()
         except ValueError as error:
-            raise Unlexable(error, words) from error
+            raise Unlexable(error, words, lexer.state) from error
         if token is lexer.eof:
             return words
         if stream.quoted:
@@ -276,14 +289,25 @@ def _lex(text, commenters):
                               space_before and position == 0, stream.literal_backtick))
 
 
-def starts_a_comment(word):
+# Where a new word can begin without any whitespace: after an operator.
+WORD_BOUNDARIES = SEPARATORS | REDIRECTIONS | {"(", ")"}
+
+
+def starts_a_comment(words, index):
     """Whether this word is where bash would start a comment.
 
     `#` opens a comment only where a WORD can begin. After other characters it
     is an ordinary character — `cmake#typo` is a package name and apt rejects
-    it — and quoted it is a package name of its own.
+    it — and quoted it is a package name of its own. An operator ends a word as
+    surely as a space does, so `bad-package;#comment` is a comment too.
     """
-    return word.value.startswith("#") and not word.quoted and word.space_before
+    word = words[index]
+    if not word.value.startswith("#") or word.quoted:
+        return False
+    if word.space_before or index == 0:
+        return True
+    previous = words[index - 1]
+    return not previous.quoted and previous.value in WORD_BOUNDARIES
 
 
 def lex_words(text):
@@ -304,10 +328,10 @@ def lex_words(text):
         # Re-lexing the line under shlex's own comment rules would get past the
         # apostrophe too, and would truncate `cmake#typo` to `cmake` on the way.
         words = error.words
-        if not any(starts_a_comment(word) for word in words):
+        if not any(starts_a_comment(words, index) for index in range(len(words))):
             raise
-    for index, word in enumerate(words):
-        if starts_a_comment(word):
+    for index in range(len(words)):
+        if starts_a_comment(words, index):
             return words[:index]
     return words
 
@@ -319,8 +343,23 @@ def continues_the_line(text):
     ends there, while `foo\\\` is an escaped one followed by a continuation.
     Only an ODD number of them at the end continues anything, and testing the
     final character alone joins two commands that bash runs separately.
+
+    Parity is not the whole rule. Inside SINGLE quotes a backslash is an
+    ordinary character, so `'cma\` continues nothing — the string simply
+    carries a backslash and a newline, and apt is handed a name it rejects.
+    Whether the line ends inside single quotes is the lexer's own answer: it
+    reports the quote still open when it gives up.
     """
-    return (len(text) - len(text.rstrip("\\"))) % 2 == 1
+    if (len(text) - len(text.rstrip("\\"))) % 2 == 0:
+        return False
+    try:
+        # Without the trailing backslashes, since an escape with nothing after
+        # it is an error of its own and would mask the quote.
+        _lex(text.rstrip("\\"), commenters="")
+    except Unlexable as error:
+        if error.state == "'":
+            return False
+    return True
 
 
 def holds_a_comment(text):
@@ -332,12 +371,14 @@ def holds_a_comment(text):
     comment — and shlex is the thing that already knows about quoting.
     """
     try:
-        return any(starts_a_comment(word) for word in _lex(text, commenters=""))
-    except ValueError:
-        # An unbalanced quote is reported where the command is scanned; here it
-        # only means the question cannot be answered, so assume no comment and
-        # let the line be joined as before.
-        return False
+        words = _lex(text, commenters="")
+    except Unlexable as error:
+        # The words read BEFORE the quote still answer the question, and a
+        # comment holding an apostrophe is exactly the line where it matters:
+        # answering "no comment" here joins it to the next one and the command
+        # beneath disappears into it.
+        words = error.words
+    return any(starts_a_comment(words, index) for index in range(len(words)))
 
 
 def scan_command(path, line, words, expressions):
@@ -453,10 +494,14 @@ def scan_command(path, line, words, expressions):
                     index += 1
                 emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
                 continue
-            if token.startswith(EXPRESSION_PREFIX) and token.endswith("__"):
-                position = token[len(EXPRESSION_PREFIX):-2]
-                original = expressions[int(position)] if position.isdigit() else token
-                emit("NOTICE", path, line, f"names a package through a variable, not checked: {original}")
+            if EXPRESSION_PREFIX in token:
+                # An expression need not be the whole argument:
+                # `lib${{ matrix.flavor }}` is one package name the workflow
+                # builds at run time. Judging only whole-word expressions
+                # reports the sentinel as a package, and apt cannot resolve
+                # something this scanner invented.
+                emit("NOTICE", path, line,
+                     f"names a package through a variable, not checked: {unmask(token, expressions)}")
                 continue
             if "$" in token and not word.literal_dollar:
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
