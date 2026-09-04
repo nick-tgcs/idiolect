@@ -4555,6 +4555,70 @@ YAML
 expect "declare +x turns it off while assigning" 0 declare-plus-x-assigning \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------ `declare` inside a function is LOCAL unless it says -g
+# A declaration in a function belongs to the function, so the caller's value
+# survives the call and still runs.
+write_workflow declare-is-local ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { declare COMMAND=true; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare in a function is local" 1 declare-is-local \
+    "codex-no-such-package"
+
+# ...while `-g` says otherwise, and the caller's value is replaced.
+write_workflow declare-global ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          f() { declare -g COMMAND='apt-get install -y codex-no-such-package'; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare -g reaches the caller" 1 declare-global \
+    "codex-no-such-package"
+
+# ---------------------------- attributes may arrive as SEPARATE option words
+# `declare -x -r NAME=…` is exported and read-only, and reading only the last
+# option loses the export.
+write_workflow declare-two-options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare -x -r COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "two option words keep both attributes" 1 declare-two-options \
+    "codex-no-such-package"
+
+# ----------------- unsetting a LOCAL leaves the caller's value where it was
+# `local COMMAND; unset COMMAND` removes the local binding, and the caller's
+# own value is there again when the function returns.
+write_workflow unset-local-only ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { local COMMAND; unset COMMAND; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unsetting a local leaves the caller's value" 1 unset-local-only \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

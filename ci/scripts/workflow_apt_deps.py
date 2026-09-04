@@ -769,7 +769,7 @@ def scan_command(path, line, words, expressions, defined=None):
     parsed_install = False
     pending = []
     declaring = None
-    namespace = None
+    namespace = []
     bypassing = False
     end_of_options = False
 
@@ -789,7 +789,7 @@ def scan_command(path, line, words, expressions, defined=None):
                      declaring, namespace)
             pending = []
             declaring = None
-            namespace = None
+            namespace = []
             bypassing = False
             state = "idle"
             at_command = True
@@ -1061,7 +1061,7 @@ def scan_command(path, line, words, expressions, defined=None):
             # `-v` is the other way round. The option belongs to the builtin
             # in front of it — and `+x` is an option too: bash spells turning
             # an attribute OFF with a plus.
-            namespace = token
+            namespace.append(token)
         elif token in NAME_BUILTINS and not word.quoted:
             # `export NAME=value` sets the variable as a bare assignment does,
             # so the words after it are still assignments and the command
@@ -1074,8 +1074,7 @@ def scan_command(path, line, words, expressions, defined=None):
                 # away, so the child stops seeing it.
                 defined.pop(("exported", token), None)
                 defined.pop(("exported-function", token), None)
-            elif namespace is not None and declaring == "export" \
-                    and namespace.startswith("-") and "f" in namespace[1:]:
+            elif declaring == "export" and attribute(namespace, "-", "f"):
                 # `export -f f` puts a FUNCTION in the environment. Nothing
                 # else does: a function is not there unless it is put there.
                 defined[("exported-function", token)] = ((), expressions)
@@ -1088,9 +1087,9 @@ def scan_command(path, line, words, expressions, defined=None):
                 # bash forgets a variable if there is one and a function if
                 # there is not.
                 variables = ("variable", "array", "exported")
-                if namespace == "-f":
+                if attribute(namespace, "-", "f"):
                     kinds = ("function",)
-                elif namespace == "-v" or any(
+                elif attribute(namespace, "-", "v") or any(
                     (kind, token) in defined for kind in variables
                 ):
                     kinds = variables
@@ -1098,7 +1097,7 @@ def scan_command(path, line, words, expressions, defined=None):
                     kinds = ("function",)
                 for kind in kinds:
                     defined.pop((kind, token), None)
-            elif declaring == "local":
+            elif is_local(declaring, namespace):
                 # An EMPTY local, which shadows whatever the caller holds:
                 # `local COMMAND` then `$COMMAND` runs nothing at all. The
                 # caller's value is untouched, since a function is read in a
@@ -1172,6 +1171,9 @@ def scan_command(path, line, words, expressions, defined=None):
                     if held not in elsewhere and held != key
                     and not (held[0] == "variable" and (held[1].isdigit()
                                                         or held[1] in ("@", "*")))
+                    # `local COMMAND; unset COMMAND` removes the LOCAL binding
+                    # and leaves the caller's value where it was.
+                    and ("local", held[1]) not in elsewhere
                 ]:
                     del defined[name]
             index = end if key[0] != "function" else index
@@ -2053,6 +2055,17 @@ def remember_array(prefix, inside, defined, expressions):
     defined[("array", name)] = (before + inside, expressions)
 
 
+def attribute(namespace, sign, letter):
+    """Whether the options given carry `-letter` (or `+letter`).
+
+    Attributes ACCUMULATE: `declare -x -r NAME=…` is exported and read-only,
+    and reading only the last option word loses the first.
+    """
+    return any(
+        option.startswith(sign) and letter in option[1:] for option in namespace
+    )
+
+
 def exports(declaring, namespace):
     """Whether this declaration puts its names in the child's environment.
 
@@ -2063,8 +2076,8 @@ def exports(declaring, namespace):
     """
     if declaring == "export":
         return True
-    return declaring in ("declare", "typeset", "local") and namespace is not None \
-        and namespace.startswith("-") and "x" in namespace[1:]
+    return declaring in ("declare", "typeset", "local") \
+        and attribute(namespace, "-", "x")
 
 
 def unexports(declaring, namespace):
@@ -2074,15 +2087,25 @@ def unexports(declaring, namespace):
     turn the same attribute off. An attribute that can be given can be taken
     back, and the child stops seeing the name either way.
     """
-    if namespace is None:
-        return False
     if declaring == "export":
-        return namespace.startswith("-") and "n" in namespace[1:]
+        return attribute(namespace, "-", "n")
     return declaring in ("declare", "typeset", "local") \
-        and namespace.startswith("+") and "x" in namespace[1:]
+        and attribute(namespace, "+", "x")
 
 
-def remember(assignments, defined, expressions, declaring=None, namespace=None):
+def is_local(declaring, namespace):
+    """Whether this declaration belongs to the function it is written in.
+
+    `local` always; `declare` and `typeset` unless they say `-g`, since inside
+    a function they declare locally by default. At the top level there is no
+    function to belong to and the mark is inert.
+    """
+    if declaring == "local":
+        return True
+    return declaring in ("declare", "typeset") and not attribute(namespace, "-", "g")
+
+
+def remember(assignments, defined, expressions, declaring=None, namespace=()):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
@@ -2112,7 +2135,7 @@ def remember(assignments, defined, expressions, declaring=None, namespace=None):
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)
-        elif declaring == "local":
+        if is_local(declaring, namespace):
             # A local belongs to the function that declared it and does not
             # follow the value back out to the caller.
             defined[("local", name)] = ((), expressions)
