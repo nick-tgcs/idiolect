@@ -859,7 +859,11 @@ def scan_command(path, line, words, expressions, defined=None):
             # The command inside RUNS — `cat <(apt-get …)` installs — and what
             # the outer command receives is a /dev/fd path, which is why the
             # words are not read as packages where they stand.
-            scan_command(path, line, inside, expressions, defined)
+            #
+            # In a SUBSHELL, like a `( … )` group: what it assigns or forgets
+            # goes with it, so it reads a copy that is thrown away.
+            scan_command(path, line, inside, expressions,
+                         dict(defined) if defined is not None else None)
             if state == "packages":
                 substituted = " ".join(word.value for word in inside)
                 emit("NOTICE", path, line,
@@ -1143,6 +1147,7 @@ def scan_command(path, line, words, expressions, defined=None):
                 # are not — `$1` belongs to the call.
                 for name, what in elsewhere.items():
                     if name[0] == "variable" and (name[1].isdigit()
+                                                  or name[1] in ("@", "*")
                                                   or ("local", name[1]) in elsewhere):
                         continue
                     if name[0] != "local":
@@ -1986,9 +1991,12 @@ def child_scope(defined, keyword):
     """
     if defined is None or keyword == "eval":
         return defined
+    # The MARKER travels with the value: an exported name is in the
+    # environment of everything run afterwards, so a child that starts another
+    # child passes it on.
     return {
         key: value for key, value in defined.items()
-        if key[0] == "variable" and ("exported", key[1]) in defined
+        if key[0] in ("variable", "exported") and ("exported", key[1]) in defined
     }
 
 

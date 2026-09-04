@@ -4415,6 +4415,53 @@ YAML
 expect "local -x exports" 1 local-export \
     "codex-no-such-package"
 
+# --------------------- a process substitution is a subshell like any other
+# `cat <(unset COMMAND)` forgets nothing out here, so the `$COMMAND` after it
+# still runs what was assigned above.
+write_workflow process-substitution-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          cat <(unset COMMAND)
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a process substitution's unset does not escape" 1 process-substitution-isolated \
+    "codex-no-such-package"
+
+# ------------------------------ a call's arguments do not outlive it, either
+# `$@` after a function call is the SCRIPT's arguments, not the call's — a
+# `run:` block has none, so nothing runs there at all.
+write_workflow variadic-not-inherited ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { true; }
+          f apt-get install -y codex-no-such-package
+          "$@"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a call's arguments do not outlive it as \$@" 0 variadic-not-inherited \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------- an export survives more than one child shell
+# `export` puts the name in the environment of everything run afterwards, and a
+# child that starts another child passes it on.
+write_workflow export-through-two-children ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          bash -c "bash -c '\$COMMAND'"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an export reaches a grandchild" 1 export-through-two-children \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
