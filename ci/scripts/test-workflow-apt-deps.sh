@@ -556,12 +556,22 @@ expect "a metacharacter inside quotes is part of the name" 1 quoted-metachar \
 # so a scan that trusts the key name misses it — which is exactly what the first
 # version of the library-based scanner did, caught by comparing package counts
 # against the implementation it replaced.
+# Nested as the real file nests it, under `strategy.matrix.include`, because a
+# referenced name is scoped to its CONTEXT: a bare fragment with no `matrix`
+# ancestor is not what this claims to mirror, and would pass while proving
+# nothing about the workflow it stands for.
 write_workflow matrix-value ci.yml <<'YAML'
-      - os: linux
-        extra_deps: |
-          sudo apt-get update
-          sudo apt-get install -y libfcitx5-dev
-        run: ${{ matrix.extra_deps }}
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            extra_deps: |
+              sudo apt-get update
+              sudo apt-get install -y libfcitx5-dev
+    steps:
+      - run: ${{ matrix.extra_deps }}
 YAML
 expect "a package named in a matrix value is checked" 1 matrix-value \
     "libfcitx5-dev"
@@ -1692,6 +1702,75 @@ then
 else
     fail "only an open quote carries a line, not a dangling escape"
 fi
+
+
+# --------------------------------------- a quoted dot breaks a brace RANGE
+# `codex{1".".2}` is `codex{1..2}` with one dot quoted, and bash expands
+# nothing: the range separator is no longer literal, so apt is handed the whole
+# thing and rejects it. Tracking quoting for braces and commas but not for the
+# dots leaves it announced as dynamic and the broken install passes.
+write_workflow brace-quoted-dot ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake codex{1".".2}
+YAML
+expect "a quoted dot stops a range expanding" 1 brace-quoted-dot \
+    "installs a package apt cannot resolve"
+
+# ...and an unquoted range still expands, so it stays unresolvable here.
+write_workflow brace-range ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y codex{1..2}
+YAML
+expect "an unquoted range is a brace expansion" 0 brace-range \
+    "All 1 apt package(s)" "not checked"
+
+# ------------------------------------ every reference in a compound expression
+# `${{ matrix.primary || matrix.fallback }}` may execute either value, so both
+# have to be scanned. Taking only the LAST property access left `primary`
+# unexamined and unmentioned.
+write_workflow compound-reference ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - primary: sudo apt-get install -y codex-no-such-package
+            fallback: sudo apt-get install -y cmake
+    steps:
+      - run: ${{ matrix.primary || matrix.fallback }}
+YAML
+expect "both halves of a compound reference are scanned" 1 compound-reference \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# --------------------------------------- a referenced name is scoped to its context
+# `${{ env.command }}` puts the ENV value in scope, not every scalar in the file
+# whose key happens to be `command`. An action input under `with:` is never
+# executed as shell, and resolving it rejects a workflow that works.
+write_workflow reference-scope ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y cmake
+    steps:
+      - run: ${{ env.command }}
+      - uses: some/action
+        with:
+          command: sudo apt-get install -y codex-no-such-package
+YAML
+expect "a referenced name is scoped to its context" 0 reference-scope \
+    "All 1 apt package(s)"
+
+# ...and the value it really does name is still scanned.
+write_workflow reference-scope-hit ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y libfcitx5-dev
+    steps:
+      - run: ${{ env.command }}
+YAML
+expect "the value in the named context is scanned" 1 reference-scope-hit \
+    "libfcitx5-dev"
 
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

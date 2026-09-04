@@ -304,10 +304,18 @@ class _QuoteWatchingStream(io.StringIO):
                 self.dollar_quotes.append(self.position - 1)
             if state in ("'", '"', self.lexer.escape):
                 self.quoted = True
-                if char in "{},":
-                    # Quoting the braces or the comma suppresses the expansion;
-                    # quoting one ALTERNATIVE does not, so a word-level flag
-                    # says the wrong thing about `lib{asound2,"pulse"}-dev`.
+                if char in "{},.":
+                    # Quoting the braces, the comma, or a dot of a `..` range
+                    # suppresses the expansion; quoting one ALTERNATIVE does
+                    # not, so a word-level flag says the wrong thing about
+                    # `lib{asound2,"pulse"}-dev`.
+                    #
+                    # APPROXIMATION, and the direction matters: the flag is per
+                    # WORD, so a quoted character anywhere in it makes the whole
+                    # word literal. `lib{a,b}"."c` would be resolved verbatim
+                    # and rejected where bash expands it — a false red on an
+                    # input no workflow writes, in exchange for not excusing
+                    # `codex{1".".2}`, which bash passes to apt whole.
                     self.literal_brace = True
             if char in "$`" and self.lexer.state in ("'", self.lexer.escape):
                 # Single quotes and a backslash suppress BOTH forms of
@@ -871,15 +879,18 @@ def scan_shell(path, text, first_line, exact_lines):
         scan_one(pending, pending_offset)
 
 
-def scalar_values(node, key=None):
-    """Every scalar in a workflow, paired with the key it was stored under.
+def scalar_values(node, path=()):
+    """Every scalar in a workflow, paired with the key PATH it sits under.
 
-    A sequence passes its own key down, so the entries of `restore-keys:` are
-    still that key's, and a mapping's entries take their own.
+    The whole path, not just the nearest key, because a referenced name is
+    scoped to its context: `${{ env.command }}` names the `command` under
+    `env:`, not an action input that happens to be called `command` too. A
+    sequence passes its own path down, so the entries of `matrix.include` are
+    still the matrix's.
     """
     if isinstance(node, yaml.MappingNode):
         for name, value in node.value:
-            inner = name.value if isinstance(name, yaml.ScalarNode) else None
+            inner = path + ((name.value,) if isinstance(name, yaml.ScalarNode) else ((),))
             if isinstance(value, yaml.ScalarNode):
                 yield inner, value
             else:
@@ -887,9 +898,9 @@ def scalar_values(node, key=None):
     elif isinstance(node, yaml.SequenceNode):
         for child in node.value:
             if isinstance(child, yaml.ScalarNode):
-                yield key, child
+                yield path, child
             else:
-                yield from scalar_values(child, key)
+                yield from scalar_values(child, path)
 
 
 # The contexts whose values can hold a command a `run:` then executes. `github`
@@ -897,29 +908,38 @@ def scalar_values(node, key=None):
 # `name` in scope and drag every step's name back in.
 COMMAND_CONTEXTS = ("matrix", "env", "inputs", "vars")
 
-# `matrix.extra_deps` and `matrix['extra_deps']` select the same value.
+# `matrix.extra_deps`, `matrix['extra_deps']` and `matrix.include.extra_deps`
+# all select a value; an expression may hold several, as in
+# `${{ matrix.primary || matrix.fallback }}`.
+CONTEXT_REFERENCE = re.compile(
+    r"\b(" + "|".join(COMMAND_CONTEXTS) + r")\b"
+    r"((?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*|\s*\[\s*'[^']*'\s*\]|\s*\[\s*\"[^\"]*\"\s*\])+)"
+)
 PROPERTY_ACCESS = re.compile(
     r"""\.\s*([A-Za-z_][A-Za-z0-9_-]*)|\[\s*'([^']*)'\s*\]|\[\s*"([^"]*)"\s*\]"""
 )
 
 
-def referenced_value(expression):
-    """The value name a `${{ ... }}` selects, or None if it names no command.
+def referenced_values(expression):
+    """Every (context, value name) a `${{ ... }}` selects.
 
-    Only the LAST property access matters — `matrix.include.extra_deps` selects
-    `extra_deps` — and only within a context that can carry a command.
+    EVERY one, because `${{ matrix.primary || matrix.fallback }}` may execute
+    either. Only the LAST access of each chain is the value — `matrix.include.
+    extra_deps` names `extra_deps` — and only within a context that can carry a
+    command.
     """
-    inner = expression[3:-2].strip()
-    if not inner.startswith(COMMAND_CONTEXTS):
-        return None
-    accesses = PROPERTY_ACCESS.findall(inner)
-    if not accesses:
-        return None
-    return next((name for name in accesses[-1] if name), None)
+    found = set()
+    for context, path in CONTEXT_REFERENCE.findall(expression):
+        accesses = PROPERTY_ACCESS.findall(path)
+        if accesses:
+            name = next((part for part in accesses[-1] if part), None)
+            if name:
+                found.add((context, name))
+    return found
 
 
 def referenced_by_run(values):
-    """The value names a `run:` interpolates, as in `${{ matrix.extra_deps }}`.
+    """The (context, name) pairs a `run:` interpolates.
 
     Shell does not only live under `run:`. desktop-app-release.yml keeps an
     install in a matrix entry and executes it later through
@@ -928,33 +948,34 @@ def referenced_by_run(values):
     implementation this replaced, not by any test.
     """
     names = set()
-    for key, node in values:
-        if key != "run":
+    for path, node in values:
+        if not path or path[-1] != "run":
             continue
         _, expressions = mask_expressions(node.value)
         for expression in expressions:
-            name = referenced_value(expression)
-            if name:
-                names.add(name)
+            names |= referenced_values(expression)
     return names
 
 
 def shell_scalars(node):
     """Every scalar a workflow can EXECUTE, with the line it starts on and style.
 
-    `run:`, and whatever a `run:` interpolates. Not every scalar in the file: a
-    step's `name:` is metadata the runner never executes, and reading
-    `name: apt-get install dependencies` as an invocation rejects a workflow
-    that is perfectly correct.
+    `run:`, and whatever a `run:` interpolates — the latter matched by CONTEXT
+    as well as name, so `${{ env.command }}` reaches the `command` under `env:`
+    and not an action input of the same name that the runner never executes.
 
     LIMITATION: shell reached any other way — an action's `with:` inputs, a
     composite action's own steps — is not scanned. Nothing here uses those; a
     workflow that starts to would need this list widened.
     """
     values = list(scalar_values(node))
-    executable = {"run"} | referenced_by_run(values)
-    for key, value in values:
-        if key in executable:
+    referenced = referenced_by_run(values)
+    for path, value in values:
+        if not path:
+            continue
+        if path[-1] == "run" or any(
+            path[-1] == name and context in path for context, name in referenced
+        ):
             yield value.start_mark.line + 1, value.style, value.value
 
 
