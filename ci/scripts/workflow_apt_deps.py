@@ -64,6 +64,13 @@ OPTIONS_WITH_ARGUMENT = {
 # prefix words and their options.
 INVOCATION_PREFIXES = {"sudo", "env"}
 
+# Reserved words and pipeline prefixes that INTRODUCE a command rather than
+# being one: bash runs what comes after them, so `if ${{ env.command }}; then`
+# runs the value exactly as a bare `${{ env.command }}` would.
+CONTROL_PREFIXES = {
+    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "(",
+}
+
 APT_COMMANDS = {"apt", "apt-get"}
 
 
@@ -297,6 +304,7 @@ class _QuoteWatchingStream(io.StringIO):
         self.position = 0
         self.dollar_quotes = []
         self.dollar_quote_opened = None
+        self.dollar_quote_escaped = False
 
     def read(self, size=-1):
         char = super().read(size)
@@ -307,6 +315,11 @@ class _QuoteWatchingStream(io.StringIO):
                 and self.last_char == "$"
                 and not self.last_was_escaped
                 and state not in ("'", '"')
+                # Not while one is already open: past an escaped quote shlex's
+                # state no longer says we are inside a string, so a `$` before
+                # the real closing quote would read as a second `$'` opening
+                # and carry the span's start past the name it holds.
+                and self.dollar_quote_opened is None
             ):
                 # `$'...'` and `$"..."` are bash's own QUOTING forms, not
                 # expansions: the contents are passed WITHOUT the dollar. shlex
@@ -317,11 +330,21 @@ class _QuoteWatchingStream(io.StringIO):
             elif (
                 self.dollar_quote_opened is not None
                 and char == self.dollar_quote_opened[1]
-                and state == char
+                and not self.dollar_quote_escaped
             ):
                 # The closing quote of one: the span is `$'...'` inclusive.
                 self.dollar_quotes.append((self.dollar_quote_opened[0], self.position))
                 self.dollar_quote_opened = None
+            if self.dollar_quote_opened is not None:
+                # Inside either form a backslash escapes the next character,
+                # the closing quote included — `$'a\'b'` is one word. Asking
+                # bash's rule rather than shlex's state, because for `$'...'`
+                # the two have already parted company: ordinary single quotes
+                # have no escapes, so shlex ended the string at that quote and
+                # is lexing the rest as if it were outside one.
+                self.dollar_quote_escaped = char == "\\" and not self.dollar_quote_escaped
+            else:
+                self.dollar_quote_escaped = False
             if state in ("'", '"', self.lexer.escape):
                 self.quoted = True
                 if char in "{},.":
@@ -358,10 +381,13 @@ class Unlexable(ValueError):
     character inside single quotes.
     """
 
-    def __init__(self, error, words, state):
+    def __init__(self, error, words, state, dollar_quotes):
         super().__init__(str(error))
         self.words = words
         self.state = state
+        # The `$'...'` spans closed before the failure. One of them may BE the
+        # reason for it, so the caller can rewrite them and lex again.
+        self.dollar_quotes = list(dollar_quotes)
 
 
 def _lex(text, commenters, dollar_quotes=None):
@@ -393,7 +419,7 @@ def _lex(text, commenters, dollar_quotes=None):
         try:
             token = lexer.get_token()
         except ValueError as error:
-            raise Unlexable(error, words, lexer.state) from error
+            raise Unlexable(error, words, lexer.state, stream.dollar_quotes) from error
         if token is lexer.eof:
             if dollar_quotes is not None:
                 dollar_quotes.extend(stream.dollar_quotes)
@@ -423,6 +449,10 @@ def without_dollar_quoting(text, spans):
     `$'c\\x6dake'` is the package `cmake`. Removing the dollar alone leaves a
     literal that apt cannot resolve. `$"..."` translates rather than decodes,
     so there the dollar simply goes.
+
+    The decoded text is requoted by shlex rather than wrapped in the quote it
+    came in: it may now CONTAIN that quote — `$'a\\'b'` decodes to `a'b` — and
+    putting it back between apostrophes would produce a line no lexer can read.
     """
     rewritten = []
     end_of_last = 0
@@ -437,7 +467,9 @@ def without_dollar_quoting(text, spans):
                 # An escape python does not know: leave it as written rather
                 # than invent a name.
                 pass
-        rewritten.append(quote + content + quote)
+            rewritten.append(shlex.quote(content))
+        else:
+            rewritten.append(quote + content + quote)
         end_of_last = finish + 1
     rewritten.append(text[end_of_last:])
     return "".join(rewritten)
@@ -470,6 +502,12 @@ def lex_words(text):
     try:
         words = _lex(text, commenters="", dollar_quotes=dollar_quotes)
     except Unlexable as error:
+        if error.dollar_quotes:
+            # The apostrophe shlex gave up on may be one bash never ended a
+            # string with: `$'a\'b'` closes at the LAST quote. Rewriting the
+            # spans removes the form shlex cannot read, so the line gets a
+            # second, honest reading rather than a notice standing in for one.
+            return lex_words(without_dollar_quoting(text, error.dollar_quotes))
         # A comment may hold an apostrophe — `# don't` is an ordinary line — and
         # no lexer can read that as shell. But everything after a `#` is comment
         # anyway, so if one was reached before the quote, the words already read
@@ -1134,14 +1172,37 @@ def is_a_step_script(path):
 def written_before_the_command(words):
     """Whether this segment holds a command of its own, before any expression.
 
-    Assignments and redirections come BEFORE a command without being one:
-    `FLAG=1 ${{ env.command }}` runs the value with a variable set for it, so
-    the expression still supplies the command. Anything else written here means
-    the command is this segment's and the expression is data in it.
+    Assignments, redirections, reserved words and invocation prefixes come
+    BEFORE a command without being one: `FLAG=1 ${{ env.command }}` runs the
+    value with a variable set for it, `if ${{ env.command }}; then` runs it as
+    a condition and `sudo ${{ env.command }}` runs it as root — in each the
+    expression still supplies the command. Anything else written here means the
+    command is this segment's and the expression is data in it.
+
+    LIMITATION: only the OPTIONS of an invocation prefix are stepped over, not
+    the arguments they take, so `sudo -u root ${{ env.command }}` reads as a
+    command written here and its value is not followed. Naming which of sudo's
+    options take one is a table this file has no business holding; no workflow
+    uses that form, and the direction of being wrong is a value unread rather
+    than a package invented.
     """
     index = 0
+    saw_invocation = False
     while index < len(words):
         token = words[index].value
+        if not words[index].quoted and token in CONTROL_PREFIXES:
+            index += 1
+            continue
+        if not words[index].quoted and token in INVOCATION_PREFIXES:
+            saw_invocation = True
+            index += 1
+            continue
+        if saw_invocation and token.startswith("-") and not words[index].quoted:
+            # An option belongs to the prefix that takes it — `sudo -E` — and
+            # only to a prefix: a bare `-x` starts no command, so reading one
+            # as prefix material would follow a value nothing runs.
+            index += 1
+            continue
         if token in REDIRECTIONS and not words[index].quoted:
             index += 2
             continue

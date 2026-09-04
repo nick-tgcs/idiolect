@@ -2312,6 +2312,142 @@ YAML
 expect "ANSI-C quoting decodes its escapes" 0 ansi-c-escape \
     "All 1 apt package(s)"
 
+# ...and a shell control word is a prefix too: `if ${{ env.command }}; then`
+# RUNS the value, so the reference still has to be followed.
+write_workflow control-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: if ${{ env.command }}; then :; fi
+YAML
+expect "a control word does not hide the command" 1 control-prefix-reference \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...as is the negation that can precede a pipeline. Written as a block scalar
+# because a plain one starting `!` is a YAML TAG: `run: ! ${{ ... }}` reaches
+# the shell with the bang already eaten, and the fixture tests nothing.
+write_workflow negation-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          ! ${{ env.command }}
+YAML
+expect "a negation does not hide the command" 1 negation-prefix-reference \
+    "codex-no-such-package"
+
+# ...and so is the sudo that already prefixes every apt line in this repository.
+write_workflow sudo-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: sudo ${{ env.command }}
+YAML
+expect "sudo does not hide the command" 1 sudo-prefix-reference \
+    "codex-no-such-package"
+
+# ...and an option belongs to the prefix that takes it: `sudo -E` is the
+# documented form this repository's own comment cites, and the command after it
+# is still the value's.
+write_workflow sudo-option-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: sudo -E ${{ env.command }}
+YAML
+expect "an option after sudo does not hide the command" 1 sudo-option-prefix-reference \
+    "codex-no-such-package"
+
+# ...while an option with nothing in front of it is not prefix material: only a
+# prefix command can own one, and reading a bare `-x` as one would follow a
+# value no command runs.
+write_workflow bare-option-not-a-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: -x ${{ env.help }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a bare option is not an invocation prefix" 0 bare-option-not-a-prefix \
+    "All 1 apt package(s)"
+
+# ...while a control word used as an ARGUMENT is still ordinary text, and the
+# value after it stays data.
+write_workflow control-word-argument ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo if ${{ env.help }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a control word mid-command does not follow the value" 0 control-word-argument \
+    "All 1 apt package(s)"
+
+# --------------------------------------- ANSI-C quoting escapes its own quote
+# `$'a\'b'` is one word: inside ANSI-C quoting a backslash escapes the quote,
+# so the string does not end there. shlex has no such rule and gives up on the
+# apostrophe left over — which turned an unresolvable package into a notice
+# nobody fails on.
+write_workflow ansi-c-escaped-quote ci.yml <<'YAML'
+        run: sudo apt-get install -y $'codex-no-\'such-package'
+YAML
+expect "ANSI-C quoting escapes its own quote" 1 ansi-c-escaped-quote \
+    "codex-no-'such-package"
+
+# ...and once shlex has left the string at that escaped quote, a `$` before the
+# real closing quote looks to it like ANOTHER `$'` opening — which would move
+# the span's start past the name and lose it again.
+write_workflow ansi-c-escaped-quote-dollar ci.yml <<'YAML'
+        run: sudo apt-get install -y $'codex-no-\'such$'
+YAML
+expect "a dollar before the closing quote does not restart the span" 1 ansi-c-escaped-quote-dollar \
+    "codex-no-'such\$"
+
+# ...and a QUOTED reserved word is not one: bash looks for a command called
+# `if` and finds none, so what follows is its argument rather than a command.
+write_workflow control-word-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          "if" ${{ env.help }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted control word is not a prefix" 0 control-word-quoted \
+    "All 1 apt package(s)"
+
+# ...and the backslashes come in PAIRS, as everywhere else: `$'a\\'` holds one
+# literal backslash and the quote after it closes the string, so reading the
+# second backslash as an escape would swallow the closing quote.
+write_workflow ansi-c-double-backslash ci.yml <<'YAML'
+        run: sudo apt-get install -y $'codex-no\\'
+YAML
+expect "backslashes inside ANSI-C quoting pair up" 1 ansi-c-double-backslash \
+    'codex-no\' "installs a package apt cannot resolve"
+
+# ...and the OTHER form escapes its quote too, by shlex's rule rather than
+# bash's: `$"..."` is a translation, and shlex reads double-quoted escapes
+# correctly, so the span must close on the quote shlex says closes it.
+write_workflow dollar-double-quote-escaped ci.yml <<'YAML'
+        run: sudo apt-get install -y $"codex-no\"such-package"
+YAML
+expect 'a $"..." span closes where shlex says it does' 1 dollar-double-quote-escaped \
+    'codex-no"such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
