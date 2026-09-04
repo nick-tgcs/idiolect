@@ -61,8 +61,13 @@ OPTIONS_WITH_ARGUMENT = {
 }
 
 # `sudo -E apt-get ...` is documented sudo syntax, so the command may sit behind
-# prefix words and their options.
-INVOCATION_PREFIXES = {"sudo", "env"}
+# prefix words and their options. `command` and `exec` are the shell's own:
+# `command` runs its argument bypassing functions and aliases, `exec` replaces
+# the shell with it, and either way apt runs and the packages are its.
+#
+# `builtin` is deliberately absent — it runs BUILTINS only, so `builtin apt-get`
+# fails and checking its packages would be a red on something that cannot run.
+INVOCATION_PREFIXES = {"sudo", "env", "command", "exec"}
 
 # Reserved words and pipeline prefixes that INTRODUCE a command rather than
 # being one: bash runs what comes after them, so `if ${{ env.command }}; then`
@@ -1106,11 +1111,37 @@ def referenced_values(expression):
     return found
 
 
-# `include:` and `exclude:` are the matrix's own keywords, not dimensions: an
-# entry under `include:` contributes its keys as names of their own, so
-# `${{ matrix.extra_deps }}` reaches `matrix/include/0/extra_deps` without
-# naming `include` at all.
-MATRIX_KEYWORDS = {"include", "exclude"}
+# `include:` is the matrix's own keyword rather than a dimension: an entry under
+# it contributes its keys as names of their own, so `${{ matrix.extra_deps }}`
+# reaches `matrix/include/0/extra_deps` without naming `include` at all.
+#
+# `exclude:` is NOT here on purpose. Its entries name combinations to DROP, so
+# nothing under one is a value the workflow ever runs, and stepping over the
+# keyword made a scalar written there resolve as though it were.
+MATRIX_KEYWORDS = {"include"}
+
+
+def excluded_outright(scope, values):
+    """The (dimension, value) pairs `exclude:` removes from every combination.
+
+    An `exclude:` entry names a COMBINATION, so a value it mentions still runs
+    wherever the rest of the entry does not match — unless the entry names that
+    one dimension and nothing else, which leaves no combination holding it.
+
+    Anything finer is combination algebra this file has no business holding:
+    two entries between them may cover every value of another dimension and so
+    exclude a value outright as well. The direction of being wrong is a value
+    read that some combination still runs, which is a package checked rather
+    than a package missed.
+    """
+    entries = {}
+    for path, value in values:
+        if "matrix" not in path or path[:len(scope)] != scope:
+            continue
+        matrix = path.index("matrix")
+        if len(path) == matrix + 4 and path[matrix + 1] == "exclude":
+            entries.setdefault(path[:matrix + 3], []).append((path[-1], value.value))
+    return {members[0] for members in entries.values() if len(members) == 1}
 
 
 def selects_the_value(path, chain):
@@ -1148,10 +1179,12 @@ def resolve_reference(run_path, context, chain, values):
     scope = job_scope(run_path)
     name = chain[-1]
     if context == "matrix":
+        excluded = excluded_outright(scope, values)
         return [
             value for path, value in values
             if "matrix" in path and path[:len(scope)] == scope
             and selects_the_value(path, chain)
+            and (name, value.value) not in excluded
         ]
     if context == "env":
         # env is INHERITED, not shared: a step sees its own, then its job's,

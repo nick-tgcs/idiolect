@@ -2715,6 +2715,107 @@ YAML
 expect "a subshell still supplies its command" 1 subshell-reference \
     "codex-no-such-package"
 
+# ------------------------------------------ a VIRTUAL package has no candidate
+# `libz-dev` is provided by `zlib1g-dev` and nothing else, so `apt-get install`
+# takes it while `apt-cache policy` reports `Candidate: (none)`. Reading that as
+# "does not exist" is a red on a workflow that installs perfectly well.
+write_workflow virtual-package ci.yml <<'YAML'
+        run: sudo apt-get install -y libz-dev
+YAML
+expect "a uniquely provided virtual package resolves" 0 virtual-package \
+    "All 1 apt package(s)"
+
+# --------------------------------------------- `exclude:` names what does NOT run
+# An entry under `exclude:` is a combination to DROP. Its own scalar is not a
+# value, and when it names one dimension and nothing else the value it names
+# runs in no combination at all — so scanning either rejected a workflow for a
+# package apt is never asked for.
+write_workflow matrix-excluded-value ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        command:
+          - apt-get install -y cmake
+          - apt-get install -y codex-no-such-package
+        exclude:
+          - command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.command }}
+YAML
+expect "an excluded matrix value is not run" 0 matrix-excluded-value \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...but an exclusion of a COMBINATION removes only that combination: the value
+# still runs everywhere the entry does not match, and skipping it would lose a
+# package that really is installed.
+write_workflow matrix-excluded-combination ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - ubuntu
+          - macos
+        command:
+          - apt-get install -y codex-no-such-package
+        exclude:
+          - os: macos
+            command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.command }}
+YAML
+expect "excluding one combination keeps the value" 1 matrix-excluded-combination \
+    "codex-no-such-package"
+
+# ...and an entry under `exclude:` is not a value of anything, whether or not
+# the dimension holds what it names. An exclusion that matches nothing — a
+# typo, or a value since removed — must not become a package to check.
+write_workflow matrix-exclude-entry-scanned ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - ubuntu
+          - macos
+        command:
+          - apt-get install -y cmake
+        exclude:
+          - os: macos
+            command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.command }}
+YAML
+expect "an exclude entry is not a value" 0 matrix-exclude-entry-scanned \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------------- the shell's own way of running a command
+# `command apt-get …` and `exec apt-get …` both RUN apt — `command` bypasses
+# functions and aliases, `exec` replaces the shell — so the install happens and
+# the packages are the command's.
+write_workflow command-builtin ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          command apt-get install -y codex-no-such-package
+          sudo apt-get install -y cmake
+YAML
+expect "the command builtin runs its argument" 1 command-builtin \
+    "codex-no-such-package" '!looks like an apt install command but was not parsed'
+
+write_workflow exec-builtin ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          exec apt-get install -y codex-no-such-package
+          sudo apt-get install -y cmake
+YAML
+expect "exec runs its argument" 1 exec-builtin \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

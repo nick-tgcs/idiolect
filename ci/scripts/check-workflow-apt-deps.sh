@@ -23,9 +23,11 @@
 # with nothing to compare it against.
 #
 # This is the comparison. It is sound rather than heuristic because the runner
-# and the development machine are the same distribution (ubuntu-noble), so
-# `apt-cache policy` answers here exactly what `apt-get install` will answer
-# there.
+# and the development machine are the same distribution (ubuntu-noble), so apt
+# answers here exactly what it will answer there. `apt-cache policy` is asked
+# first because it is cheap; where it reports no candidate the install itself
+# is simulated, since a VIRTUAL name has no candidate of its own and only apt
+# can say whether one package provides it or several do.
 #
 # The two halves are split by which problem they solve. Finding the package
 # names means lexing shell and parsing YAML, and both are delegated to the
@@ -145,6 +147,24 @@ resolve_candidate() {
     CANDIDATE="$(apt-cache policy "$package" 2>/dev/null |
         sed -n 's/^  Candidate: //p' |
         grep -v '^(none)$')"
+
+    if [ -z "$CANDIDATE" ]; then
+        # A VIRTUAL package has no candidate of its own: `libz-dev` is a name
+        # `zlib1g-dev` PROVIDES, and `apt-cache policy` reports
+        # `Candidate: (none)` for it while `apt-get install libz-dev` takes it
+        # without complaint. apt accepts such a name when exactly one package
+        # provides it and refuses when several do, which is a judgement only
+        # apt makes — so the install itself is asked, in simulation.
+        #
+        # Only from here, and only in this direction: this branch can turn a
+        # rejection into an acceptance and never the reverse, so the cost of
+        # asking is bounded to the names already about to be reported. `--`
+        # because a package name is not an option, whatever it starts with.
+        if apt-get -s install -- "$package" >/dev/null 2>&1; then
+            CANDIDATE="provided by another package"
+        fi
+    fi
+
     APT_CANDIDATE["$package"]="$CANDIDATE"
 }
 
