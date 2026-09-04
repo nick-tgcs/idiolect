@@ -150,6 +150,25 @@ def expands_a_brace(token):
     return False
 
 
+# apt reads an argument holding a `/` or ending in `.deb` as a local package
+# FILE. Debian names contain neither, so a path is never a name — but
+# `pkg/stable` is the target-release form rather than a path, and stays a name.
+def names_a_file(token):
+    """Whether apt would read this argument as a local .deb rather than a name."""
+    return token.endswith(".deb") or token.startswith(("/", "./", "../", "~"))
+
+
+# `*`, `?` and `[` make a word a pattern — expanded by the shell if it matches a
+# path, and treated as a package pattern by apt itself if it does not. Either
+# way this script cannot say which names it stands for.
+GLOB_CHARACTERS = frozenset("*?[")
+
+
+def expands_a_glob(token):
+    """Whether this word is a pattern rather than a single name."""
+    return any(character in GLOB_CHARACTERS for character in token)
+
+
 EXPRESSION_PREFIX = "__GITHUB_EXPRESSION_"
 EXPRESSION_SENTINEL = EXPRESSION_PREFIX + "{}__"
 
@@ -442,6 +461,34 @@ def scan_command(path, line, words, expressions):
             at_command = True
             continue
 
+        if (
+            token in ("<", ">")
+            and not word.quoted
+            and index < len(words)
+            and words[index].value == "("
+            and not words[index].space_before
+        ):
+            # `<(cmd)` is process substitution, not a redirection: bash replaces
+            # the whole construct with a /dev/fd path. Consuming only the `(`
+            # left the command inside it being read as a package list.
+            depth = 1
+            index += 1
+            parts = []
+            while index < len(words) and depth:
+                inner = words[index].value
+                index += 1
+                if inner == "(":
+                    depth += 1
+                elif inner == ")":
+                    depth -= 1
+                    if not depth:
+                        break
+                parts.append(inner)
+            if state == "packages":
+                emit("NOTICE", path, line,
+                     f"names a package through a substitution, not checked: {token}({' '.join(parts)})")
+            continue
+
         if token in REDIRECTIONS and not word.quoted:
             # A redirection does not end an argument list — `cmd a >log b`
             # passes both a and b — so consume only its target.
@@ -538,6 +585,14 @@ def scan_command(path, line, words, expressions):
                 continue
             if expands_a_dollar(token) and not word.literal_dollar:
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
+                continue
+            if names_a_file(token):
+                emit("NOTICE", path, line,
+                     f"names a local package file, not a name to resolve: {token}")
+                continue
+            if expands_a_glob(token):
+                emit("NOTICE", path, line,
+                     f"names packages through a pattern, not checked: {token}")
                 continue
             if expands_a_brace(token) and not word.quoted:
                 # Announced rather than expanded. Expanding would check more —

@@ -32,10 +32,11 @@
 # standard library in workflow_apt_deps.py — see its header for why. What is
 # left here is apt: whether it can be consulted at all, and what it says.
 #
-# LIMITATION, deliberate: a package name carrying a version or architecture
-# suffix (`pkg=1.2`, `pkg:amd64`) is looked up verbatim and would be reported
-# unavailable. No workflow uses that form; if one ever needs to, strip the
-# suffix in the scanner rather than working around it in the workflow.
+# LIMITATION, deliberate: a package name carrying a version, architecture or
+# target-release suffix (`pkg=1.2`, `pkg:amd64`, `pkg/stable`) is looked up
+# verbatim and would be reported unavailable. No workflow uses those forms; if
+# one ever needs to, strip the suffix in the scanner rather than working around
+# it in the workflow.
 #
 # Lives in a script rather than inline in a workflow so it can be tested —
 # see test-workflow-apt-deps.sh.

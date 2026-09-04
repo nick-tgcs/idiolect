@@ -1319,6 +1319,55 @@ YAML
 expect "quoted braces are part of the name" 1 brace-quoted \
     "installs a package apt cannot resolve"
 
+
+# ------------------------------------ the rest of bash's word expansions
+# Found by working through the list of expansions bash performs on a word
+# rather than waiting for each to be reported. None of these three is a package
+# NAME, and resolving them verbatim is a false red on a workflow that works.
+
+# A path is not a name: apt reads an argument holding a `/` or ending in `.deb`
+# as a local package FILE, and Debian names cannot contain either.
+write_workflow local-deb ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y ./build/idiolect.deb
+          sudo apt-get install -y ~/downloads/idiolect.deb
+YAML
+expect "a local package file is not a name to resolve" 0 local-deb \
+    "All 1 apt package(s)" "a local package file"
+
+# ...but `pkg/stable` is the target-release form, not a path, and is still
+# looked up — the LIMITATION already recorded for version suffixes.
+write_workflow target-release ci.yml <<'YAML'
+        run: sudo apt-get install -y codex-no-such-package/stable
+YAML
+expect "a target-release suffix is still looked up" 1 target-release \
+    "installs a package apt cannot resolve"
+
+# A glob is a pattern, which apt itself also accepts — either way this script
+# cannot say which names it stands for.
+write_workflow glob-pattern ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y 'libfcitx5*'
+YAML
+expect "a glob pattern is announced, not resolved" 0 glob-pattern \
+    "All 1 apt package(s)" "not checked"
+
+# Process substitution is an operator and a command, not a package list:
+# `<(echo x)` becomes a /dev/fd path. Reading its words as packages reported
+# `echo`, `x` and `)` as missing.
+write_workflow process-substitution ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y <(echo codex-no-such-package)
+YAML
+# The BARE form on purpose: wrapped in `$( )` the substitution rule already
+# swallows it, and the case would pass without process substitution being
+# recognised at all.
+expect "a process substitution is not a package list" 0 process-substitution \
+    "All 1 apt package(s)" "not checked"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
