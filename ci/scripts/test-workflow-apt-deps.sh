@@ -2187,12 +2187,15 @@ jobs:
     env:
       command: sudo apt-get install -y codex-no-such-package
     steps:
-      - run: echo x; ${{ env.command }} ';'
+      - run: echo x; echo ';' ${{ env.command }}
       - run: sudo apt-get install -y cmake
 YAML
-# The leading `echo x;` is load-bearing: without a real separator the line is
-# never segmented at all, and the case would pass without the lexer's quoting
-# ever being consulted.
+# Two things are load-bearing here. The leading `echo x;` gives the line a real
+# separator, without which it is never segmented at all; and the `echo` before
+# the quoted `;` means the second segment holds a command of its own, so the
+# value is an argument to it and not the command. Split on the QUOTED
+# separator as well and the expression would stand alone in a segment and be
+# followed as a command.
 expect "a quoted separator does not split a segment" 0 quoted-separator-segment \
     "All 1 apt package(s)"
 
@@ -2210,6 +2213,103 @@ jobs:
       - run: sudo apt-get install -y cmake
 YAML
 expect "a job output named run is not a step's script" 0 outputs-named-run \
+    "All 1 apt package(s)"
+
+
+# --------------------------------- the WHOLE step path, not its last three keys
+# A matrix dimension may be called `steps` and hold objects with a `run:` key.
+# Checking only the last three components matches that as readily as a real
+# step, and rejects a workflow over matrix DATA.
+write_workflow matrix-named-steps ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        steps:
+          - run: apt-get install -y codex-no-such-package
+    steps:
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a matrix dimension named steps is not a step" 0 matrix-named-steps \
+    "All 1 apt package(s)"
+
+# ------------------------------- a command may be preceded by shell prefixes
+# `FLAG=1 ${{ env.command }}` runs the value with a variable set for it. The
+# assignment is not the command, so the expression still supplies one — and
+# treating the prefix as "something written here" skipped the reference.
+write_workflow assignment-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: FLAG=1 ${{ env.command }}
+YAML
+expect "an assignment prefix does not hide the command" 1 assignment-prefix-reference \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and a redirection before it is a prefix too.
+write_workflow redirect-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: 2>/dev/null ${{ env.command }}
+YAML
+expect "a redirection prefix does not hide the command" 1 redirect-prefix-reference \
+    "codex-no-such-package"
+
+# ...while real text before it still means the value is data.
+write_workflow text-prefix-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo ${{ env.help }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "text before an expression still makes it data" 0 text-prefix-reference \
+    "All 1 apt package(s)"
+
+# ...and a segment of nothing but assignments IS a command: `OUT=x.apk` sets a
+# variable and runs nothing else. Reading it as "no command written here"
+# announced two lines of this repository's own android-release.yml.
+write_workflow assignment-only-segment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          OUT="idiolect-${{ github.sha }}.apk"
+          sudo apt-get install -y cmake
+YAML
+expect "an assignment on its own is a command" 0 assignment-only-segment \
+    "All 1 apt package(s)" '!assembled at run time'
+
+# ...and a QUOTED expression is a literal argument, not a command being
+# supplied. `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test — and the
+# quoting only survives if segments keep their WORDS rather than being rebuilt
+# as strings, which is how this reached the real workflow.
+write_workflow quoted-expression-operand ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then echo tagged; fi
+          sudo apt-get install -y cmake
+YAML
+expect "a quoted expression is an argument, not a command" 0 quoted-expression-operand \
+    "All 1 apt package(s)" '!assembled at run time'
+
+# ------------------------------------------ ANSI-C quoting decodes escapes
+# `$'c\x6dake'` is bash's ANSI-C quoting and the package it installs is
+# `cmake`. Removing the dollar without decoding leaves a literal `c\x6dake`,
+# which apt cannot resolve — a false red on a workflow that works.
+write_workflow ansi-c-escape ci.yml <<'YAML'
+        run: sudo apt-get install -y $'c\x6dake'
+YAML
+expect "ANSI-C quoting decodes its escapes" 0 ansi-c-escape \
     "All 1 apt package(s)"
 
 # ------------------------------------------------------------------------ done

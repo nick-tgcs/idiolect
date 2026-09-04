@@ -296,6 +296,7 @@ class _QuoteWatchingStream(io.StringIO):
         self.last_was_escaped = False
         self.position = 0
         self.dollar_quotes = []
+        self.dollar_quote_opened = None
 
     def read(self, size=-1):
         char = super().read(size)
@@ -311,8 +312,16 @@ class _QuoteWatchingStream(io.StringIO):
                 # expansions: the contents are passed WITHOUT the dollar. shlex
                 # removes the quotes and leaves the `$` welded to the text,
                 # where it reads exactly like a parameter expansion — so the
-                # offset is recorded and the dollar removed before lexing again.
-                self.dollar_quotes.append(self.position - 1)
+                # span is recorded and rewritten before lexing again.
+                self.dollar_quote_opened = (self.position - 1, char)
+            elif (
+                self.dollar_quote_opened is not None
+                and char == self.dollar_quote_opened[1]
+                and state == char
+            ):
+                # The closing quote of one: the span is `$'...'` inclusive.
+                self.dollar_quotes.append((self.dollar_quote_opened[0], self.position))
+                self.dollar_quote_opened = None
             if state in ("'", '"', self.lexer.escape):
                 self.quoted = True
                 if char in "{},.":
@@ -407,6 +416,33 @@ def _lex(text, commenters, dollar_quotes=None):
 WORD_BOUNDARIES = SEPARATORS | REDIRECTIONS | {"(", ")"}
 
 
+def without_dollar_quoting(text, spans):
+    """Rewrite each `$'...'` / `$"..."` span as the text bash would pass on.
+
+    `$'...'` is not ordinary single quoting: it DECODES backslash escapes, so
+    `$'c\\x6dake'` is the package `cmake`. Removing the dollar alone leaves a
+    literal that apt cannot resolve. `$"..."` translates rather than decodes,
+    so there the dollar simply goes.
+    """
+    rewritten = []
+    end_of_last = 0
+    for start, finish in sorted(spans):
+        rewritten.append(text[end_of_last:start])
+        quote = text[start + 1]
+        content = text[start + 2:finish]
+        if quote == "'":
+            try:
+                content = content.encode("utf-8", "surrogateescape").decode("unicode_escape")
+            except (UnicodeDecodeError, ValueError):
+                # An escape python does not know: leave it as written rather
+                # than invent a name.
+                pass
+        rewritten.append(quote + content + quote)
+        end_of_last = finish + 1
+    rewritten.append(text[end_of_last:])
+    return "".join(rewritten)
+
+
 def starts_a_comment(words, index):
     """Whether this word is where bash would start a comment.
 
@@ -447,10 +483,7 @@ def lex_words(text):
             raise
     else:
         if dollar_quotes:
-            removed = set(dollar_quotes)
-            return lex_words("".join(
-                character for position, character in enumerate(text) if position not in removed
-            ))
+            return lex_words(without_dollar_quoting(text, dollar_quotes))
     for index in range(len(words)):
         if starts_a_comment(words, index):
             return words[:index]
@@ -1059,25 +1092,24 @@ def is_a_plain_reference(expression):
 
 
 def command_segments(line):
-    """The line split at its unquoted separators, or the whole line if it will
-    not lex.
+    """The line's WORDS, split at its unquoted separators.
 
-    Built on the lexer so a `;` inside quotes stays part of its word — the
-    distinction string splitting cannot make.
+    Words rather than strings: rebuilding a segment by joining values throws
+    away the quoting, and `"${{ github.ref }}"` then reads as a bare expression
+    supplying the command rather than as the literal argument of a `[[ ]]`
+    test. Built on the lexer so a `;` inside quotes stays part of its word.
     """
     try:
         words = lex_words(line)
     except ValueError:
-        return [line]
-    if not any(word.value in SEPARATORS and not word.quoted for word in words):
-        return [line]
+        return []
     segments = [[]]
     for word in words:
         if word.value in SEPARATORS and not word.quoted:
             segments.append([])
         else:
-            segments[-1].append(word.value)
-    return [" ".join(parts) for parts in segments if parts]
+            segments[-1].append(word)
+    return [segment for segment in segments if segment]
 
 
 def is_a_step_script(path):
@@ -1087,12 +1119,46 @@ def is_a_step_script(path):
     it publishes, and `with: {run: ...}` is an input it passes on. None of them
     are executed, and all of them end in a key called `run`.
     """
+    # The WHOLE path, not its last three keys: a matrix dimension may be called
+    # `steps` and hold objects with a `run:` in them, and that suffix is
+    # indistinguishable from a real step's.
     return (
-        len(path) >= 3
-        and path[-1] == "run"
-        and isinstance(path[-2], int)
-        and path[-3] == "steps"
+        len(path) == 5
+        and path[0] == "jobs"
+        and path[2] == "steps"
+        and isinstance(path[3], int)
+        and path[4] == "run"
     )
+
+
+def written_before_the_command(words):
+    """Whether this segment holds a command of its own, before any expression.
+
+    Assignments and redirections come BEFORE a command without being one:
+    `FLAG=1 ${{ env.command }}` runs the value with a variable set for it, so
+    the expression still supplies the command. Anything else written here means
+    the command is this segment's and the expression is data in it.
+    """
+    index = 0
+    while index < len(words):
+        token = words[index].value
+        if token in REDIRECTIONS and not words[index].quoted:
+            index += 2
+            continue
+        if "=" in token and not token.startswith("="):
+            index += 1
+            continue
+        if token.isdigit() and index + 1 < len(words) and words[index + 1].value in REDIRECTIONS:
+            index += 1
+            continue
+        # The first word that is not a prefix decides it. A QUOTED expression
+        # is a literal argument rather than a command being substituted:
+        # `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test, not a command
+        # the expression supplies.
+        return not (WHOLE_EXPRESSION.match(token) and not words[index].quoted)
+    # Nothing but prefixes: assignments alone ARE the command — `OUT=x.apk`
+    # sets a variable and runs nothing else — so the segment is written here.
+    return True
 
 
 def scalar_line(value, offset=0):
@@ -1160,10 +1226,11 @@ def scan_workflow(path, text):
             # part of the expression, not a shell separator, and splitting the
             # raw line tears the expression in half.
             masked_line, all_expressions = mask_expressions(line_text)
-            for masked in command_segments(masked_line):
+            for segment in command_segments(masked_line):
                 expressions = [
                     all_expressions[int(position)]
-                    for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", masked)
+                    for word in segment
+                    for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
                 ]
                 if not expressions:
                     continue
@@ -1171,7 +1238,7 @@ def scan_workflow(path, text):
                 # `echo ${{ github.ref }}` is an ordinary command with a value
                 # interpolated into it, and its apt is read as usual; a segment
                 # that is nothing but an expression has no command here at all.
-                if re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip():
+                if written_before_the_command(segment):
                     continue
 
                 for expression in expressions:
