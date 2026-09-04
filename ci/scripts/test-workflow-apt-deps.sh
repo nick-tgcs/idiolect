@@ -1991,6 +1991,85 @@ YAML
 expect "an interpolation inside a script is not an assembled command" 0 interpolation-in-script \
     "All 1 apt package(s)" '!assembled at run time'
 
+
+# ------------------------------- env is inherited, not shared between siblings
+# A step sees its own env, then its job's, then the workflow's. It never sees
+# another STEP's. Ranking candidates by how much path they share picks a
+# sibling — which shares `jobs/build/steps` — ahead of the job value the step
+# actually inherits.
+write_workflow env-sibling-step ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y cmake
+    steps:
+      - env:
+          command: sudo apt-get install -y codex-no-such-package
+        run: echo not-executed
+      - run: ${{ env.command }}
+YAML
+expect "a sibling step's env is not inherited" 0 env-sibling-step \
+    "All 1 apt package(s)"
+
+# ------------------------------------- an interpolation may be DATA, not command
+# `echo "install with ${{ env.help }}"` prints that text and runs nothing. The
+# value is only the command when the expression IS the command — otherwise
+# following it rejects a workflow over a string it merely echoes.
+write_workflow interpolation-as-data ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: echo "install with ${{ env.help }}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an interpolated value used as data is not a command" 0 interpolation-as-data \
+    "All 1 apt package(s)"
+
+# ------------------------------------ an expression inside the command NAME
+# `a${{ '' }}pt-get` runs apt-get, but the masked word is neither apt nor a
+# bare expression, so the command was neither checked NOR announced. A word
+# part literal and part expression is assembled at run time like any other.
+write_workflow assembled-command-name ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: a${{ '' }}pt-get install -y codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an expression inside a command name is announced" 0 assembled-command-name \
+    "All 1 apt package(s)" "assembled at run time"
+
+# ...while an expression that is the WHOLE word is a value reference and is
+# followed, not announced as an assembled name.
+write_workflow whole-word-expression ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: sudo apt-get install -y libfcitx5-dev
+    steps:
+      - run: ${{ matrix.extra_deps }}
+YAML
+expect "a whole-word expression is a reference, not an assembled name" 1 whole-word-expression \
+    "libfcitx5-dev" '!assembled at run time'
+
+# ...and an ASSIGNMENT names no command. `TAG=${{ inputs.tag }}` sets a
+# variable, and announcing those flagged two lines of this repository's own
+# workflows when the check ran before the assignment clause.
+write_workflow assignment-expression ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          TAG=${{ inputs.tag }}
+          sudo apt-get install -y cmake
+YAML
+expect "an assignment holding an expression names no command" 0 assignment-expression \
+    "All 1 apt package(s)" '!assembled at run time'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

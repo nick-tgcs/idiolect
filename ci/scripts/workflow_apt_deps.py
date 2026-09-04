@@ -182,6 +182,17 @@ def expands_a_glob(token):
 
 
 EXPRESSION_PREFIX = "__GITHUB_EXPRESSION_"
+WHOLE_EXPRESSION = re.compile(r"^__GITHUB_EXPRESSION_\d+__$")
+
+
+def is_partly_assembled(token):
+    """Whether this word is part literal and part expression.
+
+    `a${{ '' }}pt-get` runs apt-get, but the word is neither `apt-get` nor a
+    bare expression, so it was neither checked NOR announced. A word the
+    workflow builds out of both is assembled at run time like any other.
+    """
+    return EXPRESSION_PREFIX in token and not WHOLE_EXPRESSION.match(token)
 EXPRESSION_SENTINEL = EXPRESSION_PREFIX + "{}__"
 
 
@@ -718,7 +729,17 @@ def scan_command(path, line, words, expressions):
         if is_apt(token):
             state = "options"
         elif token in INVOCATION_PREFIXES or token.startswith("-") or "=" in token:
+            # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
+            # names no command, and announcing those flagged two lines of this
+            # repository's own workflows.
             pass
+        elif is_partly_assembled(token):
+            # Announced, never silent: the name of the command being run does
+            # not appear in the file.
+            emit("NOTICE", path, line,
+                 f"builds its command name with an expression, assembled at run time "
+                 f"and not checked: {unmask(token, expressions)}")
+            at_command = False
         else:
             at_command = False
 
@@ -822,10 +843,12 @@ def scan_shell(path, text, first_line, exact_lines):
             ):
                 emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
             return []
-        if any(is_apt(word.value) for word in words):
+        if any(is_apt(word.value) or is_partly_assembled(word.value) for word in words):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
-            # skips it without checking a package or saying a word.
+            # skips it without checking a package or saying a word. A word part
+            # literal and part expression may be an apt invocation too, and is
+            # announced rather than passed over.
             scan_command(path, line, words, expressions)
         # Looked for on EVERY command, not only the ones naming apt: the line
         # that opens a heredoc is usually `cat > file <<EOF`, which names
@@ -995,17 +1018,21 @@ def resolve_reference(run_path, context, name, values):
             if path[-1] == name and "matrix" in path and path[:len(scope)] == scope
         ]
     if context == "env":
-        # env may be set on the step, the job, or the workflow, and the closest
-        # one to this `run:` is the one it sees.
-        candidates = [
-            (path, value) for path, value in values
-            if path[-1] == name
-            and "env" in path
-            and (path[:len(scope)] == scope or not job_scope(path))
-        ]
+        # env is INHERITED, not shared: a step sees its own, then its job's,
+        # then the workflow's, and never another STEP's. So the block it is
+        # written in has to CONTAIN this `run:` — ranking by shared path alone
+        # picks a sibling step, which shares `jobs/<job>/steps` with it.
+        candidates = []
+        for path, value in values:
+            if path[-1] != name or "env" not in path:
+                continue
+            container = path[:path.index("env")]
+            if container == run_path[:len(container)]:
+                candidates.append((container, value))
         if not candidates:
             return []
-        return [max(candidates, key=lambda found: shared_prefix(found[0], run_path))[1]]
+        # The innermost block that contains it wins.
+        return [max(candidates, key=lambda found: len(found[0]))[1]]
     if context == "inputs":
         # A workflow input's value lives under `default:`, one level below the
         # name the expression uses.
@@ -1077,7 +1104,11 @@ def scan_workflow(path, text):
 
         for expression in expressions:
             references = referenced_values(expression)
-            for context, name in references:
+            # Followed only when the expression IS the command. `echo "install
+            # with ${{ env.help }}"` prints that text and runs none of it, so
+            # scanning the value would reject a workflow over a string it
+            # merely echoes.
+            for context, name in references if not written_here else ():
                 for referenced in resolve_reference(run_path, context, name, values):
                     if id(referenced) not in scanned:
                         scanned.add(id(referenced))
