@@ -2847,6 +2847,149 @@ YAML
 expect "a function definition is not a case arm" 0 function-definition-literal \
     "looks like an apt install command but was not parsed" '!cannot resolve'
 
+# ------------------------------------- `name=(...)` is an ARRAY, not a subshell
+# Reading the parenthesis as a command position — which is what made `( apt-get
+# … )` work — turned an array initializer into an apt invocation whose last
+# package was the closing bracket, and rejected a working workflow for a
+# package called `)`.
+write_workflow array-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          command=(apt-get install -y cmake)
+          sudo "${command[@]}"
+YAML
+expect "an array initializer is not a subshell" 0 array-assignment \
+    "All 1 apt package(s)" '!cannot resolve'
+
+# ...and its elements ARE the command that gets run, so a name apt cannot
+# resolve inside one is still caught — skipping the group outright would have
+# hidden a real install behind a silent pass.
+write_workflow array-assignment-bad ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          command=(apt-get install -y codex-no-such-package)
+          sudo "${command[@]}"
+YAML
+expect "an array's elements are still checked" 1 array-assignment-bad \
+    "codex-no-such-package" '!: )'
+
+# ...and a reference among those elements is followed for the same reason: the
+# array is what gets run, so its contents are read as the command whether they
+# are written out or interpolated.
+write_workflow array-assignment-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          deps=(${{ env.command }})
+          sudo "${deps[@]}"
+YAML
+expect "an array element is a command position" 1 array-assignment-reference \
+    "codex-no-such-package"
+
+# ------------------------------------ a command held in a SHELL variable is read
+# `run: $COMMAND` runs whatever the variable holds, bash splitting it into
+# words. When the step's own `env:` sets it, that value is in the file and is
+# read like any other reference — reaching it only through `${{ }}` left a real
+# install neither checked nor announced.
+write_workflow shell-variable-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: sudo apt-get install -y codex-no-such-package
+        run: $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a command from a shell variable is followed" 1 shell-variable-command \
+    "codex-no-such-package"
+
+# ...and one the workflow does not set is ordinary shell: nothing in the file
+# says what it holds, and announcing every `$TOOL build` would bury the notices
+# that mean something.
+write_workflow shell-variable-unknown ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          $MAKE build
+          sudo apt-get install -y cmake
+YAML
+expect "an unset shell variable says nothing" 0 shell-variable-unknown \
+    "All 1 apt package(s)" '!not checkable'
+
+# ...and a QUOTED one is a single word, so bash looks for a command whose name
+# is the whole string, finds none, and installs nothing. Following it would red
+# a workflow for a package that cannot be reached.
+#
+# Written as a block scalar because `run: "$COMMAND"` puts the quotes in YAML,
+# not in the shell: the script would read `$COMMAND` bare and the case would
+# test the opposite of what it says.
+write_workflow shell-variable-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: sudo apt-get install -y codex-no-such-package
+        run: |
+          "$COMMAND"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted variable runs no command" 0 shell-variable-quoted \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# --------------------------------------------- `bash -c` runs a script argument
+# The quoted argument of `bash -c` is a script, and apt inside it installs for
+# real. Stopping at `bash` left it neither scanned nor announced.
+write_workflow shell-dash-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "bash -c scans its script" 1 shell-dash-c \
+    "codex-no-such-package"
+
+# ...and a valid one inside is checked rather than merely announced.
+write_workflow shell-dash-c-valid ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: sh -c 'apt-get install -y cmake'
+YAML
+expect "sh -c checks what it installs" 0 shell-dash-c-valid \
+    "All 1 apt package(s)" '!not checkable'
+
+# ------------------------------------- `inputs` is a workflow's, not a matrix's
+# A matrix dimension may be CALLED inputs. Matching every path holding that word
+# resolved a matrix field for `${{ inputs.command }}`, which reaches only the
+# workflow's own declarations — and rejected the workflow for a value it never
+# interpolates.
+write_workflow inputs-vs-matrix ci.yml <<'YAML'
+on:
+  workflow_call:
+    inputs:
+      command:
+        default: apt-get install -y cmake
+jobs:
+  build:
+    strategy:
+      matrix:
+        inputs:
+          - command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ inputs.command }}
+YAML
+expect "inputs names the workflow's own declarations" 0 inputs-vs-matrix \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

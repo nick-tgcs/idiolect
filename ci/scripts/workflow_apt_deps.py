@@ -78,6 +78,36 @@ CONTROL_PREFIXES = {
 
 APT_COMMANDS = {"apt", "apt-get"}
 
+# Shells whose `-c` argument is a script rather than an operand.
+SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
+
+
+def runs_a_script(words):
+    """Whether these words hand a script to a shell, as `bash -c '…'` does.
+
+    Asked because a script arrives as ONE quoted word, so nothing in it lexes
+    as apt and the line would otherwise never be looked at.
+    """
+    return any(
+        word.value.rsplit("/", 1)[-1] in SHELL_COMMANDS and not word.quoted
+        for word in words
+    ) and any(word.value == "-c" and not word.quoted for word in words)
+
+
+# The forms a bare shell variable takes when it supplies a command: `$NAME` and
+# `${NAME}`, and nothing more — an index, a default or a substring makes the
+# value something other than what the workflow wrote down.
+SHELL_VARIABLE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+
+def is_an_assignment(word):
+    """Whether this word sets a variable rather than naming a command.
+
+    `NAME=value` and `NAME+=value`, unquoted: the `=` has to be part of the
+    word bash reads, and a word that STARTS with one assigns nothing.
+    """
+    return "=" in word.value and not word.value.startswith("=") and not word.quoted
+
 
 def is_apt(token):
     """Whether this word names apt, however it is spelled.
@@ -604,7 +634,7 @@ def walk_to_closing_paren(words, index):
     """
     depth = 1
     index += 1
-    parts = []
+    inside = []
     while index < len(words) and depth:
         word = words[index]
         index += 1
@@ -615,8 +645,8 @@ def walk_to_closing_paren(words, index):
                 depth -= 1
                 if not depth:
                     break
-        parts.append(word.value)
-    return parts, index
+        inside.append(word)
+    return inside, index
 
 
 def case_pattern_end(words):
@@ -654,6 +684,7 @@ def scan_command(path, line, words, expressions):
     at_command = True
     saw_apt = False
     saw_install = False
+    saw_shell = False
     parsed_install = False
     end_of_options = False
     pattern_end = case_pattern_end(words)
@@ -672,7 +703,16 @@ def scan_command(path, line, words, expressions):
         if token in SEPARATORS and not word.quoted:
             state = "idle"
             at_command = True
+            saw_shell = False
             end_of_options = False
+            continue
+
+        if saw_shell and token == "-c" and not word.quoted and index < len(words):
+            # `bash -c '…'` runs its argument as a SCRIPT, and apt inside one
+            # installs for real. Scanned rather than announced: it is shell,
+            # and this file already knows how to read shell.
+            scan_shell(path, words[index].value, line, exact_lines=False)
+            index += 1
             continue
 
         if index - 1 == pattern_end:
@@ -681,6 +721,26 @@ def scan_command(path, line, words, expressions):
             state = "idle"
             at_command = True
             end_of_options = False
+            continue
+
+        if (
+            token == "("
+            and not word.quoted
+            and not word.space_before
+            and index >= 2
+            and is_an_assignment(words[index - 2])
+        ):
+            # `deps=(cmake g++)` is an ARRAY assignment, not a subshell. Reading
+            # the parenthesis as a command position — which is what lets
+            # `( apt-get … )` work — made apt inside one a command whose last
+            # package was the closing bracket, and rejected a working workflow
+            # for a package called `)`.
+            #
+            # Its elements are scanned as a command all the same, because that
+            # is what `"${deps[@]}"` runs later: skipping the group outright
+            # would hide a real install behind a silent pass.
+            inside, index = walk_to_closing_paren(words, index - 1)
+            scan_command(path, line, inside, expressions)
             continue
 
         if (
@@ -693,10 +753,11 @@ def scan_command(path, line, words, expressions):
             # `<(cmd)` is process substitution, not a redirection: bash replaces
             # the whole construct with a /dev/fd path. Consuming only the `(`
             # left the command inside it being read as a package list.
-            parts, index = walk_to_closing_paren(words, index)
+            inside, index = walk_to_closing_paren(words, index)
             if state == "packages":
+                substituted = " ".join(word.value for word in inside)
                 emit("NOTICE", path, line,
-                     f"names a package through a substitution, not checked: {token}({' '.join(parts)})")
+                     f"names a package through a substitution, not checked: {token}({substituted})")
             continue
 
         if token in REDIRECTIONS and not word.quoted:
@@ -761,8 +822,8 @@ def scan_command(path, line, words, expressions):
                 # `c$(printf make)` is one word that expands to `cmake`, and
                 # apt installs it. Reporting the fragments around it as package
                 # names rejects a workflow that works.
-                parts, index = walk_to_closing_paren(words, index)
-                rendered = token[:-1] + "$(" + " ".join(parts) + ")"
+                inside, index = walk_to_closing_paren(words, index)
+                rendered = token[:-1] + "$(" + " ".join(w.value for w in inside) + ")"
                 # Whatever is written hard against the closing `)` is part of
                 # the same word — but a separator or a redirection is not, and
                 # absorbing one would discard the command after it.
@@ -850,6 +911,9 @@ def scan_command(path, line, words, expressions):
             # a notice, which nothing fails on. Quoted it is no longer reserved:
             # bash looks for a command called `if` and never runs what follows.
             pass
+        elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS:
+            saw_shell = True
+            at_command = False
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
             # not appear in the file.
@@ -1049,7 +1113,10 @@ def scan_shell(path, text, first_line, exact_lines):
             ):
                 emit("NOTICE", path, line, f"could not be tokenised ({error}), not checked: {command.strip()}")
             continue
-        if any(is_apt(word.value) or is_partly_assembled(word.value) for word in words):
+        if (
+            any(is_apt(word.value) or is_partly_assembled(word.value) for word in words)
+            or runs_a_script(words)
+        ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
             # skips it without checking a package or saying a word. A word part
@@ -1238,12 +1305,17 @@ def resolve_reference(run_path, context, chain, values):
         return [max(candidates, key=lambda found: len(found[0]))[1]]
     if context == "inputs":
         # A workflow input's value lives under `default:`, one level below the
-        # name the expression uses.
+        # name the expression uses — and under the workflow's own DECLARATION
+        # of it. A matrix dimension may be called `inputs` too, and matching
+        # every path holding the word resolved one of its fields for an
+        # expression that reaches only `on:`.
         return [
             value for path, value in values
-            if "inputs" in path
+            if len(path) >= 4 and path[0] == "on"
+            and path[1] in ("workflow_call", "workflow_dispatch")
+            and path[2] == "inputs"
             and (path[-1] == name
-                 or (len(path) >= 2 and path[-1] == "default" and path[-2] == name))
+                 or (path[-1] == "default" and path[-2] == name))
         ]
     # `vars` are repository settings; nothing in the file to scan.
     return []
@@ -1301,6 +1373,68 @@ def is_a_step_script(path):
     )
 
 
+def command_word(words):
+    """The word that supplies this segment's command, or None if there is none.
+
+    Assignments, redirections, reserved words and invocation prefixes come
+    BEFORE a command without being one: `FLAG=1 cmd` runs cmd with a variable
+    set for it, `if cmd; then` runs it as a condition, `sudo cmd` runs it as
+    root. The first word that is none of those is the command.
+
+    LIMITATION: only the OPTIONS of an invocation prefix are stepped over, not
+    the arguments they take, so `sudo -u root cmd` reads `root` as the command.
+    Naming which of sudo's options take one is a table this file has no
+    business holding; no workflow uses that form, and the direction of being
+    wrong is a value unread rather than a package invented.
+    """
+    # A case ARM's pattern is syntax; bash runs the list after it.
+    pattern_end = case_pattern_end(words)
+    if pattern_end is not None:
+        words = words[pattern_end + 1:]
+
+    index = 0
+    saw_invocation = False
+    while index < len(words):
+        word = words[index]
+        token = word.value
+        if not word.quoted and token in CONTROL_PREFIXES:
+            index += 1
+            continue
+        if not word.quoted and token in INVOCATION_PREFIXES:
+            saw_invocation = True
+            index += 1
+            continue
+        if saw_invocation and token.startswith("-") and not word.quoted:
+            # An option belongs to the prefix that takes it — `sudo -E` — and
+            # only to a prefix: a bare `-x` starts no command, so reading one
+            # as prefix material would follow a value nothing runs.
+            index += 1
+            continue
+        if token in REDIRECTIONS and not word.quoted:
+            index += 2
+            continue
+        if is_an_assignment(word):
+            index += 1
+            if (
+                index < len(words)
+                and words[index].value == "("
+                and not words[index].quoted
+                and not words[index].space_before
+            ):
+                # `deps=(a b c)` assigns an ARRAY, and the parenthesis is not
+                # the subshell a bare `(` would be. Its ELEMENTS are read as
+                # the command, because that is what `"${deps[@]}"` runs later —
+                # the same answer the literal scan gives them.
+                inside, _ = walk_to_closing_paren(words, index)
+                return command_word(inside)
+            continue
+        if token.isdigit() and index + 1 < len(words) and words[index + 1].value in REDIRECTIONS:
+            index += 1
+            continue
+        return word
+    return None
+
+
 def written_before_the_command(words):
     """Whether this segment holds a command of its own, before any expression.
 
@@ -1318,45 +1452,16 @@ def written_before_the_command(words):
     uses that form, and the direction of being wrong is a value unread rather
     than a package invented.
     """
-    # A case ARM's pattern is syntax; bash runs the list after it.
-    pattern_end = case_pattern_end(words)
-    if pattern_end is not None:
-        words = words[pattern_end + 1:]
-
-    index = 0
-    saw_invocation = False
-    while index < len(words):
-        token = words[index].value
-        if not words[index].quoted and token in CONTROL_PREFIXES:
-            index += 1
-            continue
-        if not words[index].quoted and token in INVOCATION_PREFIXES:
-            saw_invocation = True
-            index += 1
-            continue
-        if saw_invocation and token.startswith("-") and not words[index].quoted:
-            # An option belongs to the prefix that takes it — `sudo -E` — and
-            # only to a prefix: a bare `-x` starts no command, so reading one
-            # as prefix material would follow a value nothing runs.
-            index += 1
-            continue
-        if token in REDIRECTIONS and not words[index].quoted:
-            index += 2
-            continue
-        if "=" in token and not token.startswith("="):
-            index += 1
-            continue
-        if token.isdigit() and index + 1 < len(words) and words[index + 1].value in REDIRECTIONS:
-            index += 1
-            continue
-        # The first word that is not a prefix decides it. A QUOTED expression
-        # is a literal argument rather than a command being substituted:
-        # `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test, not a command
-        # the expression supplies.
-        return not (WHOLE_EXPRESSION.match(token) and not words[index].quoted)
-    # Nothing but prefixes: assignments alone ARE the command — `OUT=x.apk`
-    # sets a variable and runs nothing else — so the segment is written here.
-    return True
+    word = command_word(words)
+    if word is None:
+        # Nothing but prefixes: assignments alone ARE the command — `OUT=x.apk`
+        # sets a variable and runs nothing else — so the segment is written
+        # here.
+        return True
+    # A QUOTED expression is a literal argument rather than a command being
+    # substituted: `[[ "${{ github.ref }}" == refs/tags/* ]]` is a test, not a
+    # command the expression supplies.
+    return not (WHOLE_EXPRESSION.match(word.value) and not word.quoted)
 
 
 def scalar_line(value, offset=0):
@@ -1388,6 +1493,16 @@ def scan_scalar(path, value):
         scan_shell(path, value.value, line, exact_lines=False)
 
 
+def visit_reference(path, referenced, run_path, values, scanned, followed):
+    """Scan a value a reference reached, and follow whatever IT names."""
+    if id(referenced) not in scanned:
+        scanned.add(id(referenced))
+        scan_scalar(path, referenced)
+    if id(referenced) not in followed:
+        followed.add(id(referenced))
+        follow_references(path, referenced, run_path, values, scanned, followed)
+
+
 def follow_references(path, value, run_path, values, scanned, followed):
     """Scan the values this scalar's expressions name, and the values THOSE name.
 
@@ -1414,6 +1529,20 @@ def follow_references(path, value, run_path, values, scanned, followed):
                 for word in segment
                 for position in re.findall(EXPRESSION_PREFIX + r"(\d+)__", word.value)
             ]
+            # `$COMMAND` at a command position runs whatever the variable
+            # holds, bash splitting it into words. When the workflow's own
+            # `env:` sets it, that value is in this file and is read like any
+            # other reference; when it is set by the script, or by the runner,
+            # it is ordinary shell and there is nothing here to read.
+            word = command_word(segment)
+            if word is not None and not word.quoted:
+                variable = SHELL_VARIABLE.match(word.value)
+                if variable:
+                    for referenced in resolve_reference(
+                        run_path, "env", (variable.group(1),), values
+                    ):
+                        visit_reference(path, referenced, run_path, values, scanned, followed)
+
             if not expressions:
                 continue
             # Whether anything of the command is written HERE.
@@ -1428,13 +1557,7 @@ def follow_references(path, value, run_path, values, scanned, followed):
                 for context, chain in referenced_values(expression):
                     for referenced in resolve_reference(run_path, context, chain, values):
                         resolved += 1
-                        if id(referenced) not in scanned:
-                            scanned.add(id(referenced))
-                            scan_scalar(path, referenced)
-                        if id(referenced) not in followed:
-                            followed.add(id(referenced))
-                            follow_references(path, referenced, run_path, values,
-                                              scanned, followed)
+                        visit_reference(path, referenced, run_path, values, scanned, followed)
                 if not is_a_plain_reference(expression):
                     # The whole command is built by the expression, so it
                     # exists nowhere in the file to be checked. Announced,
