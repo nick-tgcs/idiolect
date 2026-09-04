@@ -4797,6 +4797,91 @@ YAML
 expect "a top-level declaration is not a local" 1 declare-top-level \
     "codex-no-such-package"
 
+# ------------- a conditional assignment leaves the earlier value possible
+# `false && COMMAND=true` may not run, so what COMMAND held before it is still
+# what runs afterwards — and both values are worth checking, since only the
+# runner knows which happened.
+write_workflow conditional-reassignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          false && COMMAND=true
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional assignment keeps the earlier value" 1 conditional-reassignment \
+    "codex-no-such-package"
+
+# ...and the new one is checked too, since the command may equally have run.
+write_workflow conditional-reassignment-new ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          false && COMMAND='apt-get install -y codex-no-such-package'
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional assignment's own value is checked" 1 conditional-reassignment-new \
+    "codex-no-such-package"
+
+# ...and the same where the value is the PACKAGE rather than the command, which
+# is a different reader of the same remembered value.
+write_workflow conditional-reassignment-package ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          PKG=codex-no-such-package
+          false && PKG=cmake
+          apt-get install -y $PKG
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditionally replaced package name is still checked" 1 conditional-reassignment-package \
+    "codex-no-such-package"
+
+# ...and a value displaced inside a function does not escape it either, when
+# the name was declared local. Verified against bash: `f() { local COMMAND=x;
+# false && COMMAND=y; }` leaves the caller's COMMAND untouched, so NEITHER of
+# the function's two possible values is what runs out here.
+write_workflow conditional-reassignment-local ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          f() {
+            local COMMAND='apt-get install -y codex-no-such-package'
+            false && COMMAND=true
+          }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional assignment to a local stays in the function" 0 conditional-reassignment-local \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------- a LOCAL export belongs to the function that declared it
+# `local -x COMMAND=true` exports the local binding, and the attribute goes
+# with it when the function returns — the caller's value is not exported and
+# no child receives it.
+write_workflow local-export-not-inherited ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { local -x COMMAND=true; }
+          f
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a local export does not follow the value out" 0 local-export-not-inherited \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

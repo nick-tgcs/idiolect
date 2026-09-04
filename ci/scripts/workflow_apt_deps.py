@@ -794,12 +794,13 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             remember(pending if at_command else [], defined, expressions,
                      declaring, namespace, in_function)
             # A command after `&&` or `||` may not run, so what it FORGOT is
-            # not forgotten — `false && unset COMMAND` leaves COMMAND set.
-            # What it might have assigned is kept, because it might have run
-            # and a package it names is one the workflow may install.
+            # not forgotten — `false && unset COMMAND` leaves COMMAND set — and
+            # what it REPLACED is not replaced either. What it might have
+            # assigned is kept too, because it might have run: both values are
+            # possible and a package named by either is one the workflow may
+            # install.
             if conditional is not None and defined is not None:
-                for name, what in conditional.items():
-                    defined.setdefault(name, what)
+                displaced(conditional, defined)
             conditional = dict(defined) if token in ("&&", "||") and defined is not None \
                 else None
             pending = []
@@ -1016,19 +1017,26 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                     # `apt-get install -y $PKG`, and a function's `"$1"`, name
                     # packages that are written down after all.
                     key = remembered(token, defined)
-                    elsewhere = {other: what for other, what in defined.items() if other != key}
-                    held_words = rebased(*defined[key], expressions)
-                    if word.quoted and key[1] not in ("@", "*"):
-                        # Quoted, the whole value is ONE operand: `PKG='cmake
-                        # g++'` written `"$PKG"` asks apt for a single name
-                        # with a space in it, which apt rejects. `"$@"` is the
-                        # exception bash makes, and expands to one word each.
-                        held_words = [Word(" ".join(one.value for one in held_words),
-                                           quoted=True)]
-                    for package in held_words:
-                        scan_command(path, line,
-                                     [Word("apt-get"), Word("install"), package],
-                                     expressions, elsewhere, in_function)
+                    # The name is dropped from what the expansion can see, so
+                    # a value naming itself cannot recurse — and that covers
+                    # its alternatives too, which are only ever reached through
+                    # the name.
+                    elsewhere = {other: what for other, what in defined.items()
+                                 if other != key}
+                    for possible in ([rebased(*defined[key], expressions)]
+                                     + alternatives(key, defined, expressions)):
+                        if word.quoted and key[1] not in ("@", "*"):
+                            # Quoted, the whole value is ONE operand:
+                            # `PKG='cmake g++'` written `"$PKG"` asks apt for a
+                            # single name with a space in it, which apt
+                            # rejects. `"$@"` is the exception bash makes, and
+                            # expands to one word each.
+                            possible = [Word(" ".join(one.value for one in possible),
+                                             quoted=True)]
+                        for package in possible:
+                            scan_command(path, line,
+                                         [Word("apt-get"), Word("install"), package],
+                                         expressions, elsewhere, in_function)
                     continue
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
                 continue
@@ -1180,6 +1188,13 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                     elsewhere[("variable", str(position))] = ([argument], expressions)
                 for every in ("@", "*"):
                     elsewhere[("variable", every)] = (arguments, expressions)
+            for other in alternatives(key, defined, expressions):
+                # A value a conditional command replaced may still be the one
+                # that runs. It is scanned against a COPY, because only one of
+                # the two happened and what this one would have assigned did
+                # not necessarily happen with it.
+                scan_command(path, line, other + after, expressions,
+                             dict(elsewhere), key[0] == "function" or in_function)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
                          expressions, elsewhere, key[0] == "function" or in_function)
             if key[0] == "function":
@@ -1188,8 +1203,15 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 # are not — `$1` belongs to the call.
                 for name, what in elsewhere.items():
                     if name[0] == "variable" and (name[1].isdigit()
-                                                  or name[1] in ("@", "*")
-                                                  or ("local", name[1]) in elsewhere):
+                                                  or name[1] in ("@", "*")):
+                        continue
+                    # EVERYTHING about a local binding is local, not just its
+                    # value: `local -x COMMAND=true` exports the LOCAL, and the
+                    # export goes with it when the function returns — the
+                    # caller's COMMAND is neither that value nor exported. So
+                    # the marker is read against the NAME, whatever the key
+                    # says about it.
+                    if ("local", name[1]) in elsewhere:
                         continue
                     if name[0] != "local":
                         defined[name] = what
@@ -1258,8 +1280,7 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
     remember(pending if at_command else [], defined, expressions, declaring, namespace,
              in_function)
     if conditional is not None and defined is not None:
-        for name, what in conditional.items():
-            defined.setdefault(name, what)
+        displaced(conditional, defined)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -2098,6 +2119,35 @@ def held(name, kind, defined, expressions):
     """What is remembered under this name, renumbered into `expressions`."""
     remembered_words = defined.get((kind, name))
     return rebased(*remembered_words, expressions) if remembered_words else []
+
+
+def alternatives(key, defined, expressions):
+    """The OTHER values this name may hold, renumbered into `expressions`.
+
+    A command after `&&` or `||` may not run, so a reassignment inside one
+    leaves two possible values and the runner picks between them —
+    `false && COMMAND=true` still runs whatever COMMAND held before it. Both
+    are scanned, because either may be the one that names a package.
+
+    Keyed `("alternative", name, kind)`: position 1 stays the NAME, as in every
+    other key, so a local marker read against it still matches.
+    """
+    return [rebased(*what, expressions)
+            for what in defined.get(("alternative", key[1], key[0]), [])]
+
+
+def displaced(before, defined):
+    """Record, in `defined`, the values a conditional command replaced.
+
+    `before` is what was remembered when the `&&` or `||` was reached. A name
+    it holds that `defined` no longer holds the SAME object for was reassigned
+    by a command that may not have run, so the earlier value is still possible.
+    """
+    for name, what in before.items():
+        if name not in defined:
+            defined[name] = what
+        elif defined[name] is not what:
+            defined.setdefault(("alternative", name[1], name[0]), []).append(what)
 
 
 def remember_array(prefix, inside, defined, expressions):
