@@ -1083,6 +1083,49 @@ def heredocs_opened(words):
     return opened
 
 
+# A line that is nothing but a comment. Joined into a body it would swallow
+# everything after it, since a comment runs to the end of the text it is in.
+COMMENT_ONLY = re.compile(r"^\s*#")
+
+# What a newline becomes when a line is joined into an unclosed bracket. Inside
+# a `{ … }` body or a `( … )` subshell it separates COMMANDS; inside an array
+# it separates WORDS, since an array holds words and not commands.
+BODY_SEPARATOR = " ; "
+ARRAY_SEPARATOR = " "
+
+
+def open_bracket(text):
+    """How to join the next line into an unclosed bracket, or None if there is none.
+
+    A function body, an array, a subshell and a group each span as many lines
+    as they need, and a line inside one is not a command of its own. WHICH
+    bracket is open decides how the lines join: an array holds words, and
+    everything else holds commands.
+
+    Read from the lexer's words, so a bracket inside quotes is an ordinary
+    character; and a `)` that closes nothing is ignored, because that is what a
+    case ARM's looks like.
+    """
+    try:
+        words = lex_words(text)
+    except ValueError:
+        return None
+    open_kinds = []
+    for index, word in enumerate(words):
+        if word.quoted:
+            continue
+        if word.value == "(":
+            open_kinds.append(
+                ARRAY_SEPARATOR if assigned_array(words, index) is not None
+                else BODY_SEPARATOR
+            )
+        elif word.value == "{":
+            open_kinds.append(BODY_SEPARATOR)
+        elif word.value in (")", "}") and open_kinds:
+            open_kinds.pop()
+    return open_kinds[-1] if open_kinds else None
+
+
 def heredocs_opened_by(command):
     """The heredocs one command opens, or none if it cannot be tokenised."""
     masked, _ = mask_expressions(command)
@@ -1127,6 +1170,11 @@ def shell_commands(text):
             pending_offset = offset
             pending = raw
             separator = ""
+        elif separator in (BODY_SEPARATOR, ARRAY_SEPARATOR) and COMMENT_ONLY.match(raw):
+            # Inside a body the lines are joined, and a comment runs to the end
+            # of what it is joined into — so a line that is only a comment is
+            # left out rather than allowed to swallow the rest of the body.
+            continue
         else:
             # A backslash-newline pair is removed ENTIRELY, so `cma\` followed
             # by `ke` is the one word `cmake`; the conventional layout keeps its
@@ -1149,6 +1197,17 @@ def shell_commands(text):
         # would swallow the command beneath into the comment.
         if not holds_a_comment(pending) and ends_inside_a_quote(pending):
             separator = "\n"
+            continue
+
+        # A body written across lines is still one command — `unused() {` and
+        # the lines under it are a declaration, not commands of their own. The
+        # lines are joined with a SEPARATOR rather than a space, because a
+        # newline separates commands inside a body and this lexer reads it as
+        # whitespace: joined with a space, `echo hi` would become two more
+        # words of the install beneath it.
+        joining = open_bracket(pending)
+        if joining is not None:
+            separator = joining
             continue
 
         command, pending = pending, None

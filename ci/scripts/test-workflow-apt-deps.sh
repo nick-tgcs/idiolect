@@ -3643,6 +3643,103 @@ YAML
 expect "a called function installs its body" 1 function-called \
     "codex-no-such-package"
 
+# ------------------------------ a definition written across LINES is still one
+# The conventional layout puts the body on its own lines. Read a line at a
+# time, the body of an uncalled function looked like commands of its own and
+# rejected a workflow that runs none of them.
+write_workflow function-multiline-uncalled ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          unused() {
+            apt-get install -y codex-no-such-package
+          }
+          echo ok
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a multiline function that is not called installs nothing" 0 function-multiline-uncalled \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the same one, called, still installs what its body says.
+write_workflow function-multiline-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() {
+            apt-get install -y codex-no-such-package
+          }
+          install_deps
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a multiline function that is called installs its body" 1 function-multiline-called \
+    "codex-no-such-package"
+
+# ...and an array written across lines is one command too.
+write_workflow array-multiline-printed ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          deps=(
+            apt-get
+            install
+            -y
+            codex-no-such-package
+          )
+          printf '%s\n' "${deps[@]}"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a multiline array that is only printed is not a command" 0 array-multiline-printed \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow array-multiline-expanded ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          deps=(
+            apt-get
+            install
+            -y
+            codex-no-such-package
+          )
+          sudo "${deps[@]}"
+YAML
+expect "a multiline array that is run installs its elements" 1 array-multiline-expanded \
+    "codex-no-such-package"
+
+# ...and the lines of a group are still SEPARATE commands: joining them into
+# one would make `echo hi` two package names of the install beside it.
+write_workflow group-multiline ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          {
+            echo hi
+            apt-get install -y cmake
+          }
+YAML
+expect "the lines of a group stay separate commands" 0 group-multiline \
+    "All 1 apt package(s)"
+
+# ...and a comment on its own line inside one does not hide what follows it.
+write_workflow group-multiline-comment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          install_deps() {
+            # everything the build needs
+            apt-get install -y codex-no-such-package
+          }
+          install_deps
+YAML
+expect "a comment line inside a body hides nothing" 1 group-multiline-comment \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
