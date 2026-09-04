@@ -2632,6 +2632,89 @@ YAML
 expect "a hop stops where a command is written" 0 chained-reference-argument \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ------------------------------------------- a reference names a CHAIN, not a leaf
+# `${{ matrix.target.command }}` names the `command` OF `target`. Collapsing it
+# to the leaf matched every matrix value in the job ending in that name, so a
+# second object-valued dimension with a `command` field — a help string nothing
+# runs — was checked and rejected the workflow.
+write_workflow matrix-property-chain ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - command: apt-get install -y cmake
+        metadata:
+          - command: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.target.command }}
+YAML
+expect "a property chain names one dimension" 0 matrix-property-chain \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...while an include entry still reaches the run: that names it directly, which
+# is the reason the leaf was being used in the first place.
+write_workflow matrix-include-leaf ci.yml <<'YAML'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - extra_deps: apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ matrix.extra_deps }}
+YAML
+expect "an include entry is reached by its own name" 1 matrix-include-leaf \
+    "codex-no-such-package"
+
+# ---------------------------------- a command nobody can resolve is ANNOUNCED
+# `${{ vars.COMMAND }}` is a repository setting: the value is not in the file,
+# so the whole command is unknown. Resolving to nothing and saying nothing read
+# exactly like a clean result.
+write_workflow unresolvable-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: ${{ vars.COMMAND }}
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a command with no value in the file is announced" 0 unresolvable-command \
+    "not checkable" "vars.COMMAND"
+
+# --------------------------------------------------- a case arm runs its body
+# `a) ${{ env.command }};;` executes the value: the pattern and its parenthesis
+# are syntax. The pattern word made the segment look like a command written
+# here, so the reference was never followed.
+write_workflow case-arm-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          case "$x" in
+          a) ${{ env.command }};;
+          esac
+          sudo apt-get install -y cmake
+YAML
+expect "a case arm runs its body" 1 case-arm-reference \
+    "codex-no-such-package"
+
+# ...while a subshell's closing parenthesis comes AFTER what runs, so it is not
+# a pattern's and must not carry the walk past the expression.
+write_workflow subshell-reference ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          ( ${{ env.command }} )
+          sudo apt-get install -y cmake
+YAML
+expect "a subshell still supplies its command" 1 subshell-reference \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

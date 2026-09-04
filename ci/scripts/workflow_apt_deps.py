@@ -1084,24 +1084,60 @@ def job_scope(path):
 
 
 def referenced_values(expression):
-    """Every (context, value name) a `${{ ... }}` selects.
+    """Every (context, access chain) a `${{ ... }}` selects.
 
     EVERY one, because `${{ matrix.primary || matrix.fallback }}` may execute
-    either. Only the LAST access of each chain is the value — `matrix.include.
-    extra_deps` names `extra_deps` — and only within a context that can carry a
-    command.
+    either. The WHOLE chain, not its leaf: `matrix.target.command` names the
+    `command` of `target`, and collapsing it to `command` matched every value
+    in the job spelled that way — including a field of another dimension that
+    nothing runs.
     """
     found = set()
     for context, path in CONTEXT_REFERENCE.findall(without_literals(expression)):
-        accesses = PROPERTY_ACCESS.findall(path)
-        if accesses:
-            name = next((part for part in accesses[-1] if part), None)
-            if name:
-                found.add((context, name))
+        # One access, `.name` or `['name']`, matches one of three groups, so
+        # the name is whichever of them is not empty.
+        chain = tuple(
+            next(part for part in access if part)
+            for access in PROPERTY_ACCESS.findall(path)
+            if any(access)
+        )
+        if chain:
+            found.add((context, chain))
     return found
 
 
-def resolve_reference(run_path, context, name, values):
+# `include:` and `exclude:` are the matrix's own keywords, not dimensions: an
+# entry under `include:` contributes its keys as names of their own, so
+# `${{ matrix.extra_deps }}` reaches `matrix/include/0/extra_deps` without
+# naming `include` at all.
+MATRIX_KEYWORDS = {"include", "exclude"}
+
+
+def selects_the_value(path, chain):
+    """Whether this matrix scalar is what an access chain names.
+
+    The chain's names appear IN ORDER after `matrix`, separated only by
+    sequence indices and the matrix's own keywords: `matrix.command` reaches
+    `matrix/command/0`, and `matrix.target.command` reaches
+    `matrix/target/0/command` — but not `matrix/metadata/0/command`, which
+    another dimension only happens to spell the same way.
+    """
+    remainder = list(path[path.index("matrix") + 1:])
+    for name in chain:
+        while remainder and remainder[0] != name and (
+            isinstance(remainder[0], int) or remainder[0] in MATRIX_KEYWORDS
+        ):
+            remainder.pop(0)
+        if not remainder or remainder[0] != name:
+            return False
+        remainder.pop(0)
+    # Whatever is left has to be the ENTRIES of what was named. A key left over
+    # means the chain named an object rather than a value: `${{ matrix.target }}`
+    # interpolates the object itself and runs no install.
+    return all(isinstance(part, int) for part in remainder)
+
+
+def resolve_reference(run_path, context, chain, values):
     """The scalar(s) a reference selects from where the `run:` stands.
 
     A reference names a value IN SCOPE, and the nearest definition wins: two
@@ -1110,15 +1146,12 @@ def resolve_reference(run_path, context, name, values):
     count.
     """
     scope = job_scope(run_path)
+    name = chain[-1]
     if context == "matrix":
-        # A dimension is usually a LIST — `command: [a, b]` runs a job per
-        # entry — so an entry's own path ends in its INDEX and the name is the
-        # key above it. Matching the last key alone selected none of them, and
-        # a reference to the dimension resolved to nothing at all.
         return [
             value for path, value in values
             if "matrix" in path and path[:len(scope)] == scope
-            and (path[-1] == name or (len(path) >= 2 and path[-2] == name))
+            and selects_the_value(path, chain)
         ]
     if context == "env":
         # env is INHERITED, not shared: a step sees its own, then its job's,
@@ -1218,6 +1251,22 @@ def written_before_the_command(words):
     uses that form, and the direction of being wrong is a value unread rather
     than a package invented.
     """
+    # A case ARM is `pattern ) list`, and bash runs the list: the pattern and
+    # its parenthesis are syntax. What tells one from a subshell is that the
+    # arm's `)` has no opener before it — in `( cmd )` the parenthesis closes
+    # something, and comes after what runs rather than before it.
+    depth = 0
+    for position, word in enumerate(words):
+        if word.quoted:
+            continue
+        if word.value == "(":
+            depth += 1
+        elif word.value == ")":
+            if depth == 0:
+                words = words[position + 1:]
+                break
+            depth -= 1
+
     index = 0
     saw_invocation = False
     while index < len(words):
@@ -1319,8 +1368,10 @@ def follow_references(path, value, run_path, values, scanned, followed):
                 continue
 
             for expression in expressions:
-                for context, name in referenced_values(expression):
-                    for referenced in resolve_reference(run_path, context, name, values):
+                resolved = 0
+                for context, chain in referenced_values(expression):
+                    for referenced in resolve_reference(run_path, context, chain, values):
+                        resolved += 1
                         if id(referenced) not in scanned:
                             scanned.add(id(referenced))
                             scan_scalar(path, referenced)
@@ -1335,6 +1386,14 @@ def follow_references(path, value, run_path, values, scanned, followed):
                     emit("NOTICE", path, scalar_line(value, offset),
                          f"builds its command with an expression, assembled at run time "
                          f"and not checked: {expression}")
+                elif not resolved:
+                    # `${{ vars.COMMAND }}` is a repository setting, and a
+                    # required input has no default: the command exists, but
+                    # not in this file. Resolving to nothing and saying nothing
+                    # reads exactly like a clean result.
+                    emit("NOTICE", path, scalar_line(value, offset),
+                         f"names a command this file does not hold, so it was "
+                         f"not checked: {expression}")
 
 
 def scan_workflow(path, text):
