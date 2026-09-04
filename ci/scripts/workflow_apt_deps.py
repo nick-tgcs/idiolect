@@ -1056,10 +1056,11 @@ def scan_command(path, line, words, expressions, defined=None):
 
         if is_apt(token):
             state = "options"
-        elif declaring and token.startswith("-") and not word.quoted:
+        elif declaring and token.startswith(("-", "+")) and not word.quoted:
             # `unset -f NAME` names a FUNCTION and leaves the variable alone;
             # `-v` is the other way round. The option belongs to the builtin
-            # in front of it.
+            # in front of it — and `+x` is an option too: bash spells turning
+            # an attribute OFF with a plus.
             namespace = token
         elif token in NAME_BUILTINS and not word.quoted:
             # `export NAME=value` sets the variable as a bare assignment does,
@@ -1068,7 +1069,17 @@ def scan_command(path, line, words, expressions, defined=None):
             # opposite effect.
             declaring = token
         elif declaring and NAME_ONLY.match(token) and not word.quoted and defined is not None:
-            if exports(declaring, namespace):
+            if unexports(declaring, namespace):
+                # `export -n COMMAND` leaves the value and takes the attribute
+                # away, so the child stops seeing it.
+                defined.pop(("exported", token), None)
+                defined.pop(("exported-function", token), None)
+            elif namespace is not None and declaring == "export" \
+                    and namespace.startswith("-") and "f" in namespace[1:]:
+                # `export -f f` puts a FUNCTION in the environment. Nothing
+                # else does: a function is not there unless it is put there.
+                defined[("exported-function", token)] = ((), expressions)
+            elif exports(declaring, namespace):
                 # `export COMMAND` on its own exports what is already there, so
                 # the value assigned on an earlier line is what the child sees.
                 defined[("exported", token)] = ((), expressions)
@@ -1152,6 +1163,17 @@ def scan_command(path, line, words, expressions, defined=None):
                         continue
                     if name[0] != "local":
                         defined[name] = what
+                # And what the body FORGOT is forgotten out here: `f() { unset
+                # COMMAND; }` removes the caller's variable. The function's own
+                # name is not a deletion — it was held back to stop the call
+                # recursing.
+                for name in [
+                    held for held in defined
+                    if held not in elsewhere and held != key
+                    and not (held[0] == "variable" and (held[1].isdigit()
+                                                        or held[1] in ("@", "*")))
+                ]:
+                    del defined[name]
             index = end if key[0] != "function" else index
             at_command = False
         elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS or token.rsplit("/", 1)[-1] == "eval":
@@ -1981,9 +2003,9 @@ def child_scope(defined, keyword):
     """What the script being handed over can see.
 
     `eval` runs in THIS shell, so everything is visible. A shell run as a CHILD
-    inherits only EXPORTED VARIABLES — not functions, not arrays, not anything
-    the parent merely holds: `bash -c f` looks for an external `f` and finds
-    none.
+    inherits only what was EXPORTED — not arrays, and not anything the parent
+    merely holds: `bash -c f` looks for an external `f` and finds none unless
+    `export -f` put it there.
 
     What the parent expanded INTO the script text is a separate question,
     answered before this one: the text is read in the parent's scope, and only
@@ -1996,7 +2018,9 @@ def child_scope(defined, keyword):
     # child passes it on.
     return {
         key: value for key, value in defined.items()
-        if key[0] in ("variable", "exported") and ("exported", key[1]) in defined
+        if (key[0] in ("variable", "exported") and ("exported", key[1]) in defined)
+        or (key[0] in ("function", "exported-function")
+            and ("exported-function", key[1]) in defined)
     }
 
 
@@ -2043,6 +2067,21 @@ def exports(declaring, namespace):
         and namespace.startswith("-") and "x" in namespace[1:]
 
 
+def unexports(declaring, namespace):
+    """Whether this declaration takes the export attribute AWAY.
+
+    `export -n` removes it and leaves the value; `declare +x` and its spellings
+    turn the same attribute off. An attribute that can be given can be taken
+    back, and the child stops seeing the name either way.
+    """
+    if namespace is None:
+        return False
+    if declaring == "export":
+        return namespace.startswith("-") and "n" in namespace[1:]
+    return declaring in ("declare", "typeset", "local") \
+        and namespace.startswith("+") and "x" in namespace[1:]
+
+
 def remember(assignments, defined, expressions, declaring=None, namespace=None):
     """Remember what a command's assignments set, when nothing follows them.
 
@@ -2067,7 +2106,9 @@ def remember(assignments, defined, expressions, declaring=None, namespace=None):
                       for part in value.split()],
             expressions,
         )
-        if exports(declaring, namespace):
+        if unexports(declaring, namespace):
+            defined.pop(("exported", name), None)
+        elif exports(declaring, namespace):
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)

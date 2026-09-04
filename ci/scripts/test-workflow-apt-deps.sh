@@ -4462,6 +4462,99 @@ YAML
 expect "an export reaches a grandchild" 1 export-through-two-children \
     "codex-no-such-package"
 
+# --------------------------------- `export -f` sends a FUNCTION to the child
+# A function is not in the environment unless it is put there, and `-f` is how:
+# `bash -c f` then finds it and runs the body.
+write_workflow export-function ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          export -f f
+          bash -c f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "export -f sends a function to the child" 1 export-function \
+    "codex-no-such-package"
+
+# ------------------------------ a function's FORGETTING escapes as well
+# `f() { unset COMMAND; }` removes the caller's variable, so the `$COMMAND`
+# after the call runs nothing.
+write_workflow function-unsets-caller ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { unset COMMAND; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a function's unset reaches the caller" 0 function-unsets-caller \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...but the function itself is not forgotten by being called: its own name is
+# held back during the call so it cannot recurse, and a second call still finds
+# the body.
+write_workflow function-called-twice ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y "$1"; }
+          f cmake
+          f codex-no-such-package
+YAML
+expect "a function survives being called" 1 function-called-twice \
+    "cannot resolve: codex-no-such-package"
+
+# ---------------------------------------- an export can be taken back again
+# `export -n COMMAND` removes the attribute and leaves the value, so the child
+# no longer sees it.
+write_workflow export-taken-back ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          export -n COMMAND
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "export -n takes the attribute back" 0 export-taken-back \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and `declare +x` is the same instruction spelled the other way.
+write_workflow declare-plus-x ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          declare +x COMMAND
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare +x turns the attribute off" 0 declare-plus-x \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and it can turn the attribute off while ASSIGNING at the same time, which
+# is the other place the attribute is decided.
+write_workflow declare-plus-x-assigning ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y cmake'
+          declare +x COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare +x turns it off while assigning" 0 declare-plus-x-assigning \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
