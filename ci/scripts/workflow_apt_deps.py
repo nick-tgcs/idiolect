@@ -90,6 +90,12 @@ ARRAY_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=$")
 ARRAY_EXPANSION = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}$")
 
 
+# Builtins that take an assignment as their ARGUMENT: `export NAME=value` sets
+# the variable exactly as a bare assignment does, and marks it for the child
+# shells too.
+DECLARATION_BUILTINS = {"export", "declare", "typeset", "readonly", "local"}
+
+
 # Shells whose `-c` argument is a script rather than an operand.
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
 
@@ -751,6 +757,7 @@ def scan_command(path, line, words, expressions, defined=None):
     saw_install = False
     parsed_install = False
     pending = []
+    declaring = None
     end_of_options = False
 
     index = 0
@@ -765,8 +772,10 @@ def scan_command(path, line, words, expressions, defined=None):
             saw_install = True
 
         if token in SEPARATORS and not word.quoted:
-            remember(pending if at_command else [], defined, expressions)
+            remember(pending if at_command else [], defined, expressions,
+                     declaring == "export")
             pending = []
+            declaring = None
             state = "idle"
             at_command = True
             end_of_options = False
@@ -846,6 +855,25 @@ def scan_command(path, line, words, expressions, defined=None):
         ):
             # Attached only: `2>out` redirects, while `2 >out` passes `2` as an
             # argument and apt is asked for a package called `2`.
+            continue
+
+        if "`" in token and not word.literal_backtick and state != "packages" \
+                and token.count("`") % 2:
+            # `` RESULT=`apt-get …` `` RUNS apt. Backticks mean nothing to
+            # shlex, so the substitution arrives split across whatever
+            # whitespace it holds; it is re-joined and read as the shell it is,
+            # rather than left welded to the name in front of it where nothing
+            # lexes as apt at all.
+            rendered = token
+            ticks = token.count("`")
+            while ticks % 2 and index < len(words):
+                following = words[index]
+                rendered += (" " if following.space_before else "") + following.value
+                ticks += following.value.count("`")
+                index += 1
+            if not ticks % 2:
+                scan_shell(path, rendered[rendered.index("`") + 1:rendered.rindex("`")],
+                           line, exact_lines=False, defined=defined)
             continue
 
         if state == "packages":
@@ -958,6 +986,11 @@ def scan_command(path, line, words, expressions, defined=None):
 
         if is_apt(token):
             state = "options"
+        elif token in DECLARATION_BUILTINS and not word.quoted:
+            # `export NAME=value` sets the variable as a bare assignment does,
+            # so the words after it are still assignments and the command
+            # position survives them.
+            declaring = token
         elif is_an_assignment(word):
             # Assignments first: `TAG=${{ inputs.tag }}` sets a variable and
             # names no command, and announcing those flagged two lines of this
@@ -1003,7 +1036,9 @@ def scan_command(path, line, words, expressions, defined=None):
             # `bash build.sh -c x` came to be read as an invocation option.
             script = script_argument(words[index - 1:command_ends(words, index - 1)])
             if script is not None:
-                scan_shell(path, script.value, line, exact_lines=False, defined=defined)
+                scan_shell(path, script.value, line, exact_lines=False,
+                           defined=child_scope(defined, script,
+                                               token.rsplit("/", 1)[-1]))
             at_command = False
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
@@ -1015,7 +1050,7 @@ def scan_command(path, line, words, expressions, defined=None):
         else:
             at_command = False
 
-    remember(pending if at_command else [], defined, expressions)
+    remember(pending if at_command else [], defined, expressions, declaring == "export")
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -1276,6 +1311,7 @@ def scan_shell(path, text, first_line, exact_lines, defined=None):
             any(is_apt(word.value) or is_partly_assembled(word.value) for word in words)
             or runs_a_script(words)
             or touches_a_definition(words, defined)
+            or any("`" in word.value and not word.literal_backtick for word in words)
         ):
             # Asked of the TOKENS, not the raw line: `a\pt-get` is `apt-get`
             # once the escape is gone, and a substring test on the source text
@@ -1755,6 +1791,26 @@ def rebased(words, expressions, into):
     ]
 
 
+def child_scope(defined, script, keyword):
+    """What the script being handed over can see.
+
+    `eval` runs in THIS shell, so everything is visible. A shell run as a CHILD
+    inherits only what was EXPORTED: `bash -c '$COMMAND'` hands over the
+    reference, and an unexported variable does not exist over there.
+
+    When the parent expanded the argument itself — `-c "$SCRIPT"` — the value
+    is already in the text, and it is the parent's scope that read it. The
+    quoting says which happened: a `$` under single quotes reached the child
+    unexpanded, and that is what `literal_dollar` records.
+    """
+    if defined is None or keyword == "eval" or not script.literal_dollar:
+        return defined
+    return {
+        key: value for key, value in defined.items()
+        if key[0] == "variable" and ("exported", key[1]) in defined
+    }
+
+
 def remembered(token, defined):
     """The key `defined` holds for this word, or None: an array, a variable or
     a function, whichever way the word names one."""
@@ -1784,7 +1840,7 @@ def remember_array(prefix, inside, defined, expressions):
     defined[("array", name)] = (before + inside, expressions)
 
 
-def remember(assignments, defined, expressions):
+def remember(assignments, defined, expressions, exported=False):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
@@ -1808,6 +1864,10 @@ def remember(assignments, defined, expressions):
                       for part in value.split()],
             expressions,
         )
+        if exported:
+            # Marked, not moved: an exported variable is visible HERE as well,
+            # and additionally in whatever child shell the script starts.
+            defined[("exported", name)] = ((), expressions)
 
 
 def defined_function(words, index):
@@ -1914,7 +1974,14 @@ def script_argument(words):
         operands = words[words.index(word) + 1:command_ends(words, words.index(word))]
         if not operands:
             return None
-        return Word(" ".join(operand.value for operand in operands))
+        # The joined word carries the operands' quoting, because that is what
+        # says whether the `$` in `eval '$COMMAND'` reached the script
+        # unexpanded — the same question a shell's `-c` argument answers.
+        return Word(
+            " ".join(operand.value for operand in operands),
+            literal_dollar=any(operand.literal_dollar for operand in operands),
+            quoted=any(operand.quoted for operand in operands),
+        )
     if name not in SHELL_COMMANDS:
         return None
     saw_argument = False

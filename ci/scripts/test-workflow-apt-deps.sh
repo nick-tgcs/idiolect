@@ -3900,6 +3900,94 @@ YAML
 expect "a group is not a declaration" 1 group-after-then \
     "codex-no-such-package"
 
+# ------------------- a child shell sees only what was EXPORTED into it
+# `bash -c '$COMMAND'` hands the child the reference, not the value: the quotes
+# are single, so the parent expands nothing, and an unexported variable does
+# not exist over there. Resolving it anyway rejected a workflow that installs
+# nothing at all.
+write_workflow child-shell-unexported ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an unexported variable is not in the child" 0 child-shell-unexported \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...while an EXPORTED one is, and the child runs it.
+write_workflow child-shell-exported ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          bash -c '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an exported variable reaches the child" 1 child-shell-exported \
+    "codex-no-such-package"
+
+# ...and `eval` is not a child at all: it runs in this shell, where an
+# unexported variable is perfectly visible.
+write_workflow eval-sees-unexported ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          eval '$COMMAND'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "eval sees an unexported variable" 1 eval-sees-unexported \
+    "codex-no-such-package"
+
+# ------------------------------------ `export NAME=value` assigns as well
+# The builtin takes the assignment as its argument, so the value was never
+# remembered and the `$COMMAND` beneath it ran a command nobody had read.
+write_workflow export-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "export remembers what it assigns" 1 export-assignment \
+    "codex-no-such-package"
+
+# ------------------------------------------- backticks run a command too
+# `` RESULT=`apt-get …` `` executes apt. The name is welded into the word that
+# opens the substitution, so nothing in the line lexed as apt and the line was
+# never read.
+write_workflow backtick-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          RESULT=`apt-get install -y codex-no-such-package`
+          echo "$RESULT"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a backtick substitution runs its command" 1 backtick-substitution \
+    "codex-no-such-package"
+
+# ...and one written on its own, with no assignment in front of it to make the
+# line look interesting, is what decides whether the line is READ at all.
+write_workflow backtick-alone ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          `apt-get install -y codex-no-such-package`
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a backtick command on its own is read" 1 backtick-alone \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
