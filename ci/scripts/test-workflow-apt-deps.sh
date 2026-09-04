@@ -4619,6 +4619,139 @@ YAML
 expect "unsetting a local leaves the caller's value" 1 unset-local-only \
     "codex-no-such-package"
 
+# -------------------------- a command substitution is a subshell as well
+# `echo "$(unset COMMAND)"` forgets nothing out here, so the `$COMMAND` after
+# it still runs what was assigned above.
+write_workflow substitution-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          echo "$(unset COMMAND)"
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a command substitution's unset does not escape" 1 substitution-isolated \
+    "codex-no-such-package"
+
+# ------------------- a command after `&&` or `||` may not run at all
+# `false && unset COMMAND` forgets nothing, because the forgetting never
+# happens — so the `$COMMAND` after it still runs.
+write_workflow conditional-unset ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          false && unset COMMAND
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional unset does not forget" 1 conditional-unset \
+    "codex-no-such-package"
+
+# ...and the same written on ONE line, where the command after it is reached
+# through a separator rather than at the end of the script.
+write_workflow conditional-unset-one-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          false && unset COMMAND; $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional unset on one line does not forget" 1 conditional-unset-one-line \
+    "codex-no-such-package"
+
+# ...while what it might ASSIGN is still worth checking: the command may run,
+# and a package it names is a package the workflow may install.
+write_workflow conditional-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          true && COMMAND='apt-get install -y codex-no-such-package'
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a conditional assignment is still read" 1 conditional-assignment \
+    "codex-no-such-package"
+
+# --------------- a bare local shadows the VALUE, not the environment
+# Until the local is assigned, the child's environment still holds what the
+# caller exported, so `bash -c '$COMMAND'` runs the caller's value.
+write_workflow local-keeps-environment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y codex-no-such-package'
+          f() { local COMMAND; bash -c '$COMMAND'; }
+          f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a bare local leaves the exported value for the child" 1 local-keeps-environment \
+    "codex-no-such-package"
+
+# ...and assigning the local replaces it, so the child sees the inner value.
+write_workflow local-assigned-environment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y cmake'
+          f() { local COMMAND='apt-get install -y codex-no-such-package'; bash -c '$COMMAND'; }
+          f
+YAML
+expect "an assigned local is what the child sees" 1 local-assigned-environment \
+    "codex-no-such-package"
+
+# ...including when the local is declared bare and assigned afterwards: the
+# value held back for the child is replaced by what was assigned.
+write_workflow local-then-assigned ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          export COMMAND='apt-get install -y cmake'
+          f() { local COMMAND; COMMAND='apt-get install -y codex-no-such-package'; bash -c '$COMMAND'; }
+          f
+YAML
+expect "assigning a bare local replaces what the child sees" 1 local-then-assigned \
+    "codex-no-such-package"
+
+# ------------------------- only bash imports bash's exported FUNCTIONS
+# `sh` is dash on this distribution and does not read them, so `sh -c f` finds
+# no command at all.
+write_workflow exported-function-into-sh ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          export -f f
+          sh -c f || true
+      - run: sudo apt-get install -y cmake
+YAML
+expect "sh does not import an exported function" 0 exported-function-into-sh \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ----------------------- an ESCAPED bracket inside a substitution is data
+# `"$(printf \) ; apt-get …)"` runs both commands: the escaped bracket is a
+# character, and closing the substitution there loses the install after it.
+write_workflow substitution-escaped-paren ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "$(printf \) ; sudo apt-get install -y codex-no-such-package)"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an escaped bracket does not end a substitution" 1 substitution-escaped-paren \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

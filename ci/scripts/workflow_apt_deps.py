@@ -771,6 +771,9 @@ def scan_command(path, line, words, expressions, defined=None):
     declaring = None
     namespace = []
     bypassing = False
+    # What was remembered before a `&&` or `||`, since the command after one
+    # may not run at all.
+    conditional = None
     end_of_options = False
 
     index = 0
@@ -787,6 +790,15 @@ def scan_command(path, line, words, expressions, defined=None):
         if token in SEPARATORS and not word.quoted:
             remember(pending if at_command else [], defined, expressions,
                      declaring, namespace)
+            # A command after `&&` or `||` may not run, so what it FORGOT is
+            # not forgotten — `false && unset COMMAND` leaves COMMAND set.
+            # What it might have assigned is kept, because it might have run
+            # and a package it names is one the workflow may install.
+            if conditional is not None and defined is not None:
+                for name, what in conditional.items():
+                    defined.setdefault(name, what)
+            conditional = dict(defined) if token in ("&&", "||") and defined is not None \
+                else None
             pending = []
             declaring = None
             namespace = []
@@ -906,7 +918,10 @@ def scan_command(path, line, words, expressions, defined=None):
             # stands — the unquoted form arrives split and is announced below,
             # where its words cannot be put back together reliably.
             for body in substitution_bodies(token):
-                scan_shell(path, body, line, exact_lines=False, defined=defined)
+                # In a SUBSHELL, like `( … )` and `<( … )`: what it assigns or
+                # forgets goes with it.
+                scan_shell(path, body, line, exact_lines=False,
+                           defined=dict(defined) if defined is not None else None)
 
         if "`" in token and not word.literal_backtick and state != "packages" \
                 and token.count("`") % 2:
@@ -1102,6 +1117,11 @@ def scan_command(path, line, words, expressions, defined=None):
                 # `local COMMAND` then `$COMMAND` runs nothing at all. The
                 # caller's value is untouched, since a function is read in a
                 # copy and locals are what the copy keeps to itself.
+                #
+                # The ENVIRONMENT is not shadowed with it: until the local is
+                # assigned, a child still receives what the caller exported.
+                if ("exported", token) in defined and ("variable", token) in defined:
+                    defined[("environment", token)] = defined[("variable", token)]
                 defined[("local", token)] = ((), expressions)
                 defined[("variable", token)] = ([], expressions)
         elif is_an_assignment(word):
@@ -1210,9 +1230,9 @@ def scan_command(path, line, words, expressions, defined=None):
                         if ("variable", name) in environment:
                             text = " ".join(one.value
                                             for one in environment[("variable", name)][0])
+                name = token.rsplit("/", 1)[-1]
                 scan_shell(path, text, line, exact_lines=False,
-                           defined=child_scope(environment,
-                                               token.rsplit("/", 1)[-1]))
+                           defined=child_scope(environment, name, name))
             at_command = False
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
@@ -1225,6 +1245,9 @@ def scan_command(path, line, words, expressions, defined=None):
             at_command = False
 
     remember(pending if at_command else [], defined, expressions, declaring, namespace)
+    if conditional is not None and defined is not None:
+        for name, what in conditional.items():
+            defined.setdefault(name, what)
 
     if saw_apt and saw_install and not parsed_install:
         # Not parsing a form is acceptable; not saying so is not, because a
@@ -1979,8 +2002,16 @@ def substitution_bodies(token):
     while position != -1:
         depth = 0
         quote = None
+        escaped = False
         for at in range(position + 1, len(token)):
             character = token[at]
+            if escaped:
+                # `\)` is a character, not the end of the substitution.
+                escaped = False
+                continue
+            if character == "\\" and quote != "'":
+                escaped = True
+                continue
             if quote is not None:
                 # A bracket inside quotes is a character: `$(printf ')' ; cmd)`
                 # ends at the LAST bracket, and counting the quoted one cuts
@@ -2001,7 +2032,7 @@ def substitution_bodies(token):
     return bodies
 
 
-def child_scope(defined, keyword):
+def child_scope(defined, keyword, shell=None):
     """What the script being handed over can see.
 
     `eval` runs in THIS shell, so everything is visible. A shell run as a CHILD
@@ -2018,12 +2049,21 @@ def child_scope(defined, keyword):
     # The MARKER travels with the value: an exported name is in the
     # environment of everything run afterwards, so a child that starts another
     # child passes it on.
-    return {
-        key: value for key, value in defined.items()
-        if (key[0] in ("variable", "exported") and ("exported", key[1]) in defined)
-        or (key[0] in ("function", "exported-function")
-            and ("exported-function", key[1]) in defined)
-    }
+    # An exported FUNCTION crosses into bash and nowhere else: it travels as a
+    # `BASH_FUNC_*` environment entry, which dash — `sh` on this distribution —
+    # does not read.
+    functions = shell == "bash"
+    scope = {}
+    for key, value in defined.items():
+        if key[0] in ("variable", "exported") and ("exported", key[1]) in defined:
+            # Until a shadowing local is assigned, the child's environment
+            # still holds what the caller exported.
+            scope[key] = defined.get(("environment", key[1]), value) \
+                if key[0] == "variable" else value
+        elif functions and key[0] in ("function", "exported-function") \
+                and ("exported-function", key[1]) in defined:
+            scope[key] = value
+    return scope
 
 
 def remembered(token, defined):
@@ -2129,6 +2169,9 @@ def remember(assignments, defined, expressions, declaring=None, namespace=()):
                       for part in value.split()],
             expressions,
         )
+        # Assigning replaces what a child receives, so the value held back for
+        # a bare local is no longer what the environment holds.
+        defined.pop(("environment", name), None)
         if unexports(declaring, namespace):
             defined.pop(("exported", name), None)
         elif exports(declaring, namespace):
