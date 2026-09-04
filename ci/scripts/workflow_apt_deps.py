@@ -751,12 +751,15 @@ def case_pattern_end(words):
     return None
 
 
-def scan_command(path, line, words, expressions, defined=None):
+def scan_command(path, line, words, expressions, defined=None, in_function=False):
     """Report the packages installed by one already-tokenised command line.
 
     `defined` carries what earlier commands in the same block have DEFINED —
     arrays, variables and functions — because a definition and the command
     that runs it are two commands apart, and declaring one runs none of it.
+
+    `in_function` says whether these words are a function's BODY, which is
+    what makes a bare `declare` local rather than global.
     """
     state = "idle"
     # A command position: the start of the line, and again after every
@@ -789,7 +792,7 @@ def scan_command(path, line, words, expressions, defined=None):
 
         if token in SEPARATORS and not word.quoted:
             remember(pending if at_command else [], defined, expressions,
-                     declaring, namespace)
+                     declaring, namespace, in_function)
             # A command after `&&` or `||` may not run, so what it FORGOT is
             # not forgotten — `false && unset COMMAND` leaves COMMAND set.
             # What it might have assigned is kept, because it might have run
@@ -838,7 +841,7 @@ def scan_command(path, line, words, expressions, defined=None):
             # was answered above.
             inside, index = walk_to_closing_paren(words, index - 1)
             scan_command(path, line, inside, expressions,
-                         dict(defined) if defined is not None else None)
+                         dict(defined) if defined is not None else None, in_function)
             continue
 
         assignment = assigned_array(words, index - 1)
@@ -875,7 +878,7 @@ def scan_command(path, line, words, expressions, defined=None):
             # In a SUBSHELL, like a `( … )` group: what it assigns or forgets
             # goes with it, so it reads a copy that is thrown away.
             scan_command(path, line, inside, expressions,
-                         dict(defined) if defined is not None else None)
+                         dict(defined) if defined is not None else None, in_function)
             if state == "packages":
                 substituted = " ".join(word.value for word in inside)
                 emit("NOTICE", path, line,
@@ -923,13 +926,14 @@ def scan_command(path, line, words, expressions, defined=None):
                 scan_shell(path, body, line, exact_lines=False,
                            defined=dict(defined) if defined is not None else None)
 
-        if "`" in token and not word.literal_backtick and state != "packages" \
-                and token.count("`") % 2:
+        if "`" in token and not word.literal_backtick and state != "packages":
             # `` RESULT=`apt-get …` `` RUNS apt. Backticks mean nothing to
-            # shlex, so the substitution arrives split across whatever
+            # shlex, so an unquoted substitution arrives split across whatever
             # whitespace it holds; it is re-joined and read as the shell it is,
             # rather than left welded to the name in front of it where nothing
-            # lexes as apt at all.
+            # lexes as apt at all. QUOTED, both ticks are in this one word
+            # already, which is why the count decides how far to read and not
+            # whether to read at all.
             rendered = token
             ticks = token.count("`")
             while ticks % 2 and index < len(words):
@@ -938,8 +942,15 @@ def scan_command(path, line, words, expressions, defined=None):
                 ticks += following.value.count("`")
                 index += 1
             if not ticks % 2:
+                # Only where the ticks BALANCE. An unterminated one has
+                # nothing between its first tick and its last and scans to
+                # nothing either way, so this says what is meant rather than
+                # relying on that.
+                #
+                # In a SUBSHELL, like `$( … )` and the bracket forms.
                 scan_shell(path, rendered[rendered.index("`") + 1:rendered.rindex("`")],
-                           line, exact_lines=False, defined=defined)
+                           line, exact_lines=False,
+                           defined=dict(defined) if defined is not None else None)
             continue
 
         if state == "packages":
@@ -1017,7 +1028,7 @@ def scan_command(path, line, words, expressions, defined=None):
                     for package in held_words:
                         scan_command(path, line,
                                      [Word("apt-get"), Word("install"), package],
-                                     expressions, elsewhere)
+                                     expressions, elsewhere, in_function)
                     continue
                 emit("NOTICE", path, line, f"names a package through a variable, not checked: {token}")
                 continue
@@ -1112,7 +1123,7 @@ def scan_command(path, line, words, expressions, defined=None):
                     kinds = ("function",)
                 for kind in kinds:
                     defined.pop((kind, token), None)
-            elif is_local(declaring, namespace):
+            elif is_local(declaring, namespace, in_function):
                 # An EMPTY local, which shadows whatever the caller holds:
                 # `local COMMAND` then `$COMMAND` runs nothing at all. The
                 # caller's value is untouched, since a function is read in a
@@ -1170,7 +1181,7 @@ def scan_command(path, line, words, expressions, defined=None):
                 for every in ("@", "*"):
                     elsewhere[("variable", every)] = (arguments, expressions)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
-                         expressions, elsewhere)
+                         expressions, elsewhere, key[0] == "function" or in_function)
             if key[0] == "function":
                 # What the body assigned stays assigned: a function's variables
                 # are the CALLER's unless it declared them local. Its arguments
@@ -1244,7 +1255,8 @@ def scan_command(path, line, words, expressions, defined=None):
         else:
             at_command = False
 
-    remember(pending if at_command else [], defined, expressions, declaring, namespace)
+    remember(pending if at_command else [], defined, expressions, declaring, namespace,
+             in_function)
     if conditional is not None and defined is not None:
         for name, what in conditional.items():
             defined.setdefault(name, what)
@@ -2133,19 +2145,22 @@ def unexports(declaring, namespace):
         and attribute(namespace, "+", "x")
 
 
-def is_local(declaring, namespace):
+def is_local(declaring, namespace, in_function):
     """Whether this declaration belongs to the function it is written in.
 
-    `local` always; `declare` and `typeset` unless they say `-g`, since inside
-    a function they declare locally by default. At the top level there is no
-    function to belong to and the mark is inert.
+    `local` always — it is an error anywhere else. `declare` and `typeset`
+    declare locally INSIDE a function unless they say `-g`, and globally
+    outside one, where marking them local would let the mark be inherited by
+    a function called later and suppress what that function assigns.
     """
     if declaring == "local":
         return True
-    return declaring in ("declare", "typeset") and not attribute(namespace, "-", "g")
+    return in_function and declaring in ("declare", "typeset") \
+        and not attribute(namespace, "-", "g")
 
 
-def remember(assignments, defined, expressions, declaring=None, namespace=()):
+def remember(assignments, defined, expressions, declaring=None, namespace=(),
+             in_function=False):
     """Remember what a command's assignments set, when nothing follows them.
 
     `COMMAND='apt-get install -y x'` on its own sets the variable for the rest
@@ -2178,7 +2193,7 @@ def remember(assignments, defined, expressions, declaring=None, namespace=()):
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)
-        if is_local(declaring, namespace):
+        if is_local(declaring, namespace, in_function):
             # A local belongs to the function that declared it and does not
             # follow the value back out to the caller.
             defined[("local", name)] = ((), expressions)

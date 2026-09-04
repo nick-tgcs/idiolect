@@ -4752,6 +4752,51 @@ YAML
 expect "an escaped bracket does not end a substitution" 1 substitution-escaped-paren \
     "codex-no-such-package"
 
+# --------------------- a QUOTED backtick substitution is one balanced token
+# Quoted, both backticks arrive in the same word, so the count is even — and
+# the substitution still runs.
+write_workflow backtick-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "`sudo apt-get install -y codex-no-such-package`"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a quoted backtick substitution runs" 1 backtick-quoted \
+    "codex-no-such-package"
+
+# ...and it is a subshell too: what it forgets is forgotten with it.
+write_workflow backtick-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          echo `unset COMMAND`
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a backtick substitution's unset does not escape" 1 backtick-isolated \
+    "codex-no-such-package"
+
+# ---------------------------- a declaration at the TOP LEVEL is not a local
+# `declare COMMAND=true` outside a function is global, so a function that
+# assigns to it changes what the caller runs afterwards.
+write_workflow declare-top-level ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare COMMAND=true
+          f() { COMMAND='apt-get install -y codex-no-such-package'; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a top-level declaration is not a local" 1 declare-top-level \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
