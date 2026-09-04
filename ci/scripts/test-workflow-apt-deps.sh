@@ -987,6 +987,93 @@ printf '%s\n' \
 expect "a continuation inside a word joins it up" 0 continuation-midword \
     "All 1 apt package(s)"
 
+
+# ------------------------------------------- a heredoc feeding apt ITSELF
+# `apt-get install -y cmake <<EOF` redirects a heredoc INTO apt. `<<` is an
+# operator there, not a package, and neither is the delimiter after it —
+# reporting them rejects a workflow that installs correctly.
+write_workflow heredoc-into-apt ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake <<EOF
+          EOF
+YAML
+expect "a heredoc redirected into apt is not a package" 0 heredoc-into-apt \
+    "All 1 apt package(s)"
+
+# ...and the operator's dash is part of the operator here too.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake <<- EOF' \
+    '          	EOF' \
+    | write_workflow heredoc-into-apt-dash ci.yml
+expect "a dashed heredoc into apt is not a package either" 0 heredoc-into-apt-dash \
+    "All 1 apt package(s)"
+
+# ------------------------------------------- comments end at the line, always
+# A backslash at the end of a COMMENT continues nothing: bash has already
+# discarded the rest of the line, and the command beneath it runs on its own.
+# Joining first makes the install part of the comment, and it disappears
+# without so much as a notice — silent under-coverage, which reads exactly like
+# a clean result.
+printf '%s\n' \
+    '        run: |' \
+    '          sudo apt-get install -y cmake' \
+    '          # comment \' \
+    '          sudo apt-get install -y codex-no-such-package' \
+    | write_workflow comment-continuation ci.yml
+expect "a backslash ending a comment continues nothing" 1 comment-continuation \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...while a backslash ending a line whose `#` is QUOTED is a real
+# continuation, because that `#` never started a comment.
+printf '%s\n' \
+    '        run: |' \
+    "          sudo apt-get install -y '#' \\\\" \
+    '          codex-no-such-package' \
+    | write_workflow quoted-hash-continuation ci.yml
+expect "a quoted hash does not make the line a comment" 1 quoted-hash-continuation \
+    "codex-no-such-package"
+
+# ------------------------------------------------- backtick substitutions
+# `` c`printf make` `` is one word that expands to `cmake`. shlex leaves the
+# backticks embedded in two whitespace-separated tokens, and reporting those as
+# package names blocks a workflow that works.
+# The words INSIDE it matter: `printf %s make` contains whitespace, so the
+# substitution spans three tokens and the middle one carries no backtick at
+# all. Announcing token by token would look right for the outer two and report
+# `%s` as a missing package.
+write_workflow backtick-substitution ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake c`printf %s make`
+YAML
+expect "a backtick substitution is one unresolvable argument" 0 backtick-substitution \
+    "All 1 apt package(s)" "not checked"
+
+# ...and it stops at its closing backtick. A walk that runs to the end of the
+# line swallows whatever follows the substitution, including a whole second
+# install command, and says nothing about it.
+write_workflow backtick-then-command ci.yml <<'YAML'
+        run: |
+          sudo apt-get install -y cmake
+          sudo apt-get install -y `printf make`;sudo apt-get install -y libfcitx5-dev
+YAML
+expect "a command after a backtick substitution is not swallowed" 1 backtick-then-command \
+    "libfcitx5-dev" "installs a package apt cannot resolve"
+
+# The other direction, twice over. Single quotes suppress the substitution, so
+# those backticks are characters in a package name and apt rejects it...
+write_workflow backtick-single-quoted ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake '`codex-no-such-package`'
+YAML
+expect "single-quoted backticks are part of the name" 1 backtick-single-quoted \
+    "installs a package apt cannot resolve"
+
+# ...but DOUBLE quotes do not: the shell still runs the command inside them.
+write_workflow backtick-double-quoted ci.yml <<'YAML'
+        run: sudo apt-get install -y cmake "`printf make`"
+YAML
+expect "double-quoted backticks still substitute" 0 backtick-double-quoted \
+    "All 1 apt package(s)" "not checked"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

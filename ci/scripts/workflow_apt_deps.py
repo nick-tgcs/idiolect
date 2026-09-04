@@ -64,7 +64,10 @@ INVOCATION_PREFIXES = {"sudo", "env"}
 
 SEPARATORS = {";", "|", "&&", "||", "&", "\n"}
 
-REDIRECTIONS = {">", "<", ">>", "<<<", ">&", "<&", "&>", "&>>", "<>"}
+# `<<` belongs here as well as to the heredoc tracking: `apt-get install -y
+# cmake <<EOF` redirects a heredoc INTO apt, so neither the operator nor the
+# delimiter after it is a package.
+REDIRECTIONS = {">", "<", ">>", "<<", "<<<", ">&", "<&", "&>", "&>>", "<>"}
 
 # shlex groups a RUN of punctuation into one token, so `);` and `)>` arrive
 # welded together and match neither the parenthesis nor the operator. Longest
@@ -150,16 +153,18 @@ class Word:
     fragment belongs to the word beside it.
     """
 
-    __slots__ = ("value", "literal_dollar", "space_before")
+    __slots__ = ("value", "literal_dollar", "space_before", "literal_backtick")
 
-    def __init__(self, value, literal_dollar=False, space_before=True):
+    def __init__(self, value, literal_dollar=False, space_before=True, literal_backtick=False):
         self.value = value
         self.literal_dollar = literal_dollar
         self.space_before = space_before
+        self.literal_backtick = literal_backtick
 
     def __repr__(self):
         return (f"Word({self.value!r}, literal_dollar={self.literal_dollar}, "
-                f"space_before={self.space_before})")
+                f"space_before={self.space_before}, "
+                f"literal_backtick={self.literal_backtick})")
 
 
 class _QuoteWatchingStream(io.StringIO):
@@ -179,23 +184,30 @@ class _QuoteWatchingStream(io.StringIO):
         super().__init__(text)
         self.lexer = None
         self.literal_dollar = False
+        self.literal_backtick = False
         self.last_char = None
 
     def read(self, size=-1):
         char = super().read(size)
         if char:
-            if char == "$" and self.lexer.state in ("'", self.lexer.escape):
-                self.literal_dollar = True
+            if char in "$`" and self.lexer.state in ("'", self.lexer.escape):
+                # Single quotes and a backslash suppress BOTH forms of
+                # expansion; double quotes suppress neither.
+                if char == "$":
+                    self.literal_dollar = True
+                else:
+                    self.literal_backtick = True
             self.last_char = char
         return char
 
 
-def lex_words(text):
+def lex_words(text, commenters="#"):
     """Tokenise one shell command line. Raises ValueError on an unclosed quote."""
     stream = _QuoteWatchingStream(text)
     lexer = shlex.shlex(stream, posix=True, punctuation_chars=True)
     stream.lexer = lexer
     lexer.whitespace_split = True
+    lexer.commenters = commenters
 
     words = []
     while True:
@@ -203,6 +215,7 @@ def lex_words(text):
         # this token's, since shlex consumes the whitespace that ends a word
         # before returning it and pushes punctuation back unread.
         stream.literal_dollar = False
+        stream.literal_backtick = False
         # The character last read is either the whitespace that ended the word
         # before, or — when shlex pushed one back — the first character of this
         # word. Either way, whitespace here means the two words are separated.
@@ -213,7 +226,25 @@ def lex_words(text):
         for position, part in enumerate(split_operators(token)):
             # Only the first part can have had whitespace before it; the rest
             # were welded to their predecessor by definition.
-            words.append(Word(part, stream.literal_dollar, space_before and position == 0))
+            words.append(Word(part, stream.literal_dollar,
+                              space_before and position == 0, stream.literal_backtick))
+
+
+def holds_a_comment(text):
+    """Whether an unquoted `#` starts a comment somewhere in this line.
+
+    Decided by lexing twice — once with shlex dropping comments, once with it
+    keeping them — because that is the one place the answer already exists.
+    Quoting is what makes the question hard — a `#` inside quotes starts no
+    comment — and shlex is the thing that already knows about quoting.
+    """
+    try:
+        return len(lex_words(text, commenters="")) != len(lex_words(text))
+    except ValueError:
+        # An unbalanced quote is reported where the command is scanned; here it
+        # only means the question cannot be answered, so assume no comment and
+        # let the line be joined as before.
+        return False
 
 
 def scan_command(path, line, words, expressions):
@@ -247,6 +278,15 @@ def scan_command(path, line, words, expressions):
         if token in REDIRECTIONS:
             # A redirection does not end an argument list — `cmd a >log b`
             # passes both a and b — so consume only its target.
+            if (
+                token == "<<"
+                and index < len(words)
+                and words[index].value == "-"
+                and not words[index].space_before
+            ):
+                # `<<- EOF`: the dash is the operator's, and the delimiter is
+                # the word after it.
+                index += 1
             index += 1
             continue
 
@@ -256,6 +296,21 @@ def scan_command(path, line, words, expressions):
             continue
 
         if state == "packages":
+            if "`" in token and not word.literal_backtick:
+                # `` c`printf make` `` is one word that expands to `cmake`.
+                # Backticks are not special to shlex, so the substitution
+                # arrives split across whatever whitespace it contains; it is
+                # re-joined here and announced once, rather than its fragments
+                # being reported as package names.
+                rendered = token
+                ticks = token.count("`")
+                while ticks % 2 and index < len(words):
+                    following = words[index]
+                    rendered += (" " if following.space_before else "") + following.value
+                    ticks += following.value.count("`")
+                    index += 1
+                emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
+                continue
             if (
                 token.endswith("$")
                 and not word.literal_dollar
@@ -451,7 +506,11 @@ def scan_shell(path, text, first_line, exact_lines):
             # line's indentation.
             pending = f"{pending}{raw}"
 
-        if pending.endswith("\\"):
+        # A backslash ending a COMMENT continues nothing: bash discarded the
+        # rest of that line before ever seeing it, and the command beneath runs
+        # on its own. Joining anyway makes that command part of the comment and
+        # it vanishes without even a notice.
+        if pending.endswith("\\") and not holds_a_comment(pending[:-1]):
             pending = pending[:-1]
             continue
 
