@@ -1058,6 +1058,21 @@ def is_a_plain_reference(expression):
     return re.sub(r"\|\||&&|''|\s+", "", remainder) == ""
 
 
+def scalar_line(value, offset=0):
+    """The file line a scalar's Nth line sits on.
+
+    A plain scalar sits ON its line; a literal block keeps its lines, so they
+    follow the indicator; a folded block no longer has a line-for-line mapping,
+    so everything in it is reported against the block itself.
+    """
+    line = value.start_mark.line + 1
+    if value.style == "|":
+        return line + 1 + offset
+    if value.style is None or value.style == "":
+        return line + offset
+    return line
+
+
 def scan_scalar(path, value):
     """Scan one YAML scalar as shell, honouring how its block was written."""
     line = value.start_mark.line + 1
@@ -1089,36 +1104,46 @@ def scan_workflow(path, text):
     scanned = set()
 
     for run_path, value in values:
-        if not run_path or run_path[-1] != "run":
+        # `env: {run: ...}` is a variable GitHub exports and never executes, and
+        # an action input called `run` is not a script either. A step's `run:`
+        # is not written inside one of those.
+        if (
+            not run_path
+            or run_path[-1] != "run"
+            or "env" in run_path[:-1]
+            or "with" in run_path[:-1]
+        ):
             continue
         if id(value) not in scanned:
             scanned.add(id(value))
             scan_scalar(path, value)
 
-        masked, expressions = mask_expressions(value.value)
-        # Whether anything of the command survives the masking. `echo ${{ github.ref }}`
-        # is an ordinary script with a value interpolated INTO it, and its apt
-        # lines are read as usual; a `run:` that is nothing but an expression
-        # has no command here at all.
-        written_here = re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip()
+        # Per LINE, not per scalar: a block may hold ordinary script AND a
+        # line that is nothing but an expression, and deciding once for the
+        # whole value never follows the second.
+        for offset, line_text in enumerate(value.value.splitlines()):
+            masked, expressions = mask_expressions(line_text)
+            # Whether anything of the command is written HERE. `echo ${{ github.ref }}`
+            # is an ordinary line with a value interpolated into it, and its apt
+            # is read as usual; a line that is nothing but an expression has no
+            # command here at all.
+            written_here = re.sub(EXPRESSION_PREFIX + r"\d+__", "", masked).strip()
+            if written_here or not expressions:
+                continue
 
-        for expression in expressions:
-            references = referenced_values(expression)
-            # Followed only when the expression IS the command. `echo "install
-            # with ${{ env.help }}"` prints that text and runs none of it, so
-            # scanning the value would reject a workflow over a string it
-            # merely echoes.
-            for context, name in references if not written_here else ():
-                for referenced in resolve_reference(run_path, context, name, values):
-                    if id(referenced) not in scanned:
-                        scanned.add(id(referenced))
-                        scan_scalar(path, referenced)
-            if not written_here and not is_a_plain_reference(expression):
-                # The whole command is built by the expression, so it exists
-                # nowhere in the file to be checked. Announced, never silent.
-                emit("NOTICE", path, value.start_mark.line + 1,
-                     f"builds its command with an expression, assembled at run time "
-                     f"and not checked: {expression}")
+            for expression in expressions:
+                for context, name in referenced_values(expression):
+                    for referenced in resolve_reference(run_path, context, name, values):
+                        if id(referenced) not in scanned:
+                            scanned.add(id(referenced))
+                            scan_scalar(path, referenced)
+                if not is_a_plain_reference(expression):
+                    # The whole command is built by the expression, so it
+                    # exists nowhere in the file to be checked. Announced,
+                    # never silent.
+                    emit("NOTICE", path, scalar_line(value, offset),
+                         f"builds its command with an expression, assembled at run time "
+                         f"and not checked: {expression}")
 
 
 def main(argv):

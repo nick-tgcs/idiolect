@@ -2070,6 +2070,67 @@ YAML
 expect "an assignment holding an expression names no command" 0 assignment-expression \
     "All 1 apt package(s)" '!assembled at run time'
 
+
+# ------------------------------- an expression may be one line of a script
+# A `run:` block may hold ordinary lines AND a line that is nothing but an
+# expression. Deciding once for the whole scalar means the second is never
+# followed: `echo preparing` makes the block "written here" and the command on
+# the next line is neither checked nor announced.
+write_workflow expression-own-line ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      command: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          echo preparing
+          ${{ env.command }}
+YAML
+expect "an expression on its own line is still a command" 1 expression-own-line \
+    "codex-no-such-package" "installs a package apt cannot resolve"
+
+# ...and a line with an expression IN it is still ordinary script, per line.
+write_workflow expression-in-line ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      help: sudo apt-get install -y codex-no-such-package
+    steps:
+      - run: |
+          echo "install with ${{ env.help }}"
+          sudo apt-get install -y cmake
+YAML
+expect "an expression inside a line is still data" 0 expression-in-line \
+    "All 1 apt package(s)"
+
+# ------------------------------------------ a value named `run` is not a step
+# `env: {run: ...}` is an environment variable that GitHub exports and never
+# executes. Accepting every terminal key called `run` rejected a valid
+# workflow over a string nothing runs.
+write_workflow env-named-run ci.yml <<'YAML'
+env:
+  run: apt-get install -y codex-no-such-package
+jobs:
+  build:
+    steps:
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a variable named run is not a step's script" 0 env-named-run \
+    "All 1 apt package(s)"
+
+# ...and an action input called `run` is not one either.
+write_workflow with-named-run ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - uses: some/action
+        with:
+          run: apt-get install -y codex-no-such-package
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an action input named run is not a step's script" 0 with-named-run \
+    "All 1 apt package(s)"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
