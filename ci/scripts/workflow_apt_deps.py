@@ -81,6 +81,10 @@ APT_COMMANDS = {"apt", "apt-get"}
 # Shells whose `-c` argument is a script rather than an operand.
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "ksh"}
 
+# Options a shell takes an argument for, so the word after one is not the
+# script FILE that ends the invocation's options.
+SHELL_OPTIONS_WITH_ARGUMENT = {"-o", "+o", "--rcfile", "--init-file"}
+
 
 def hands_over_a_script(word):
     """Whether this option makes the word after it a script rather than a file.
@@ -101,17 +105,22 @@ def hands_over_a_script(word):
 
 
 def runs_a_script(words):
-    """Whether these words hand a script to a shell, as `bash -c '…'` does.
+    """Whether these words hand a script to a shell — `bash -c '…'`, `eval '…'`.
 
     Asked because a script arrives as ONE quoted word, so nothing in it lexes
-    as apt and the line would otherwise never be looked at.
+    as apt and the line would otherwise never be looked at. Deliberately broad:
+    it decides only whether to READ the line, and `script_argument` decides
+    which word the script actually is.
+
+    No quoting guard on the name: `'bash' -c '…'` runs bash. Quotes take a
+    reserved word's meaning away and leave a command name as it was.
     """
-    return any(
-        # No quoting guard on the NAME: `'bash' -c '…'` runs bash. Quotes take
-        # a reserved word's meaning away and leave a command name as it was.
-        word.value.rsplit("/", 1)[-1] in SHELL_COMMANDS
-        for word in words
-    ) and any(hands_over_a_script(word) for word in words)
+    names = [word.value.rsplit("/", 1)[-1] for word in words]
+    if "eval" in names:
+        return True
+    return any(name in SHELL_COMMANDS for name in names) and any(
+        hands_over_a_script(word) for word in words
+    )
 
 
 # The forms a bare shell variable takes when it supplies a command: `$NAME` and
@@ -675,6 +684,14 @@ def walk_to_closing_paren(words, index):
     return inside, index
 
 
+def command_ends(words, start):
+    """Where the command beginning at `start` ends: the next separator, or the end."""
+    for index in range(start, len(words)):
+        if words[index].value in SEPARATORS and not words[index].quoted:
+            return index
+    return len(words)
+
+
 def case_pattern_end(words):
     """Where a case ARM's pattern ends, or None if these words are not one.
 
@@ -711,7 +728,6 @@ def scan_command(path, line, words, expressions):
     at_command = True
     saw_apt = False
     saw_install = False
-    saw_shell = False
     parsed_install = False
     end_of_options = False
 
@@ -729,16 +745,7 @@ def scan_command(path, line, words, expressions):
         if token in SEPARATORS and not word.quoted:
             state = "idle"
             at_command = True
-            saw_shell = False
             end_of_options = False
-            continue
-
-        if saw_shell and hands_over_a_script(word) and index < len(words):
-            # `bash -c '…'` runs its argument as a SCRIPT, and apt inside one
-            # installs for real. Scanned rather than announced: it is shell,
-            # and this file already knows how to read shell.
-            scan_shell(path, words[index].value, line, exact_lines=False)
-            index += 1
             continue
 
         if token == ")" and not word.quoted:
@@ -752,7 +759,6 @@ def scan_command(path, line, words, expressions):
             # reach here: those are consumed whole, above.
             state = "idle"
             at_command = True
-            saw_shell = False
             end_of_options = False
             continue
 
@@ -944,8 +950,18 @@ def scan_command(path, line, words, expressions):
             # a notice, which nothing fails on. Quoted it is no longer reserved:
             # bash looks for a command called `if` and never runs what follows.
             pass
-        elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS:
-            saw_shell = True
+        elif token.rsplit("/", 1)[-1] in SHELL_COMMANDS or token.rsplit("/", 1)[-1] == "eval":
+            # `bash -c '…'` and `eval '…'` run their argument as a SCRIPT, and
+            # apt inside one installs for real. Scanned rather than announced:
+            # it is shell, and this file already knows how to read shell.
+            #
+            # WHICH word is the script is asked of `script_argument`, the one
+            # the expression walk asks too — the options a shell reads stop at
+            # its script FILE, and holding that rule in two places is how
+            # `bash build.sh -c x` came to be read as an invocation option.
+            script = script_argument(words[index - 1:command_ends(words, index - 1)])
+            if script is not None:
+                scan_shell(path, script.value, line, exact_lines=False)
             at_command = False
         elif is_partly_assembled(token):
             # Announced, never silent: the name of the command being run does
@@ -1560,8 +1576,25 @@ def as_written(word, expressions):
     return shlex.quote(text)
 
 
+def as_words(text):
+    """A variable's value, written so it lexes to the words bash makes of it.
+
+    Bash splits the value on whitespace and stops: the metacharacters inside
+    are ordinary characters rather than operators, and nothing in it is
+    expanded a second time. Quoting each word on its own says exactly that —
+    `echo ok ; apt-get …` runs echo with `;` as an argument and never reaches
+    apt, so reading the value as fresh shell rejects a workflow for a command
+    that cannot run.
+
+    A `${{ }}` expression is the opposite case and keeps its text: GitHub
+    substitutes into the script before bash parses any of it, so a separator
+    written there really does separate.
+    """
+    return " ".join(shlex.quote(word) for word in text.split())
+
+
 def script_argument(words):
-    """The word a shell runs as a SCRIPT, or None if nothing hands one over.
+    """The word run as a SCRIPT, or None if nothing hands one over.
 
     GitHub substitutes into the `run:` text before bash sees any of it, so an
     expression written there IS the script — quoted or not, because the quotes
@@ -1572,16 +1605,34 @@ def script_argument(words):
     the quotes do matter — bash looks for a command called `if` and finds none.
     """
     word = command_word(words)
-    if word is None or word.value.rsplit("/", 1)[-1] not in SHELL_COMMANDS:
+    if word is None:
         return None
-    for index, candidate in enumerate(words):
+    name = word.value.rsplit("/", 1)[-1]
+    if name == "eval":
+        # `eval` takes its script as an OPERAND: it joins its arguments and
+        # executes the result. LIMITATION: only the first is read, which is
+        # exact for the `eval "$COMMAND"` form and short of the rest.
+        position = words.index(word)
+        return words[position + 1] if position + 1 < len(words) else None
+    if name not in SHELL_COMMANDS:
+        return None
+    saw_argument = False
+    for index, candidate in enumerate(words[words.index(word) + 1:], words.index(word) + 1):
         if hands_over_a_script(candidate) and index + 1 < len(words):
             return words[index + 1]
+        if saw_argument:
+            saw_argument = False
+        elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT and not candidate.quoted:
+            saw_argument = True
+        elif not candidate.value.startswith("-"):
+            # The first operand is the script FILE, and bash reads no more
+            # options after it: `bash build.sh -c x` hands `-c` to build.sh.
+            return None
     return None
 
 
 def visit_reference(path, referenced, run_path, values, scanned, followed,
-                    line=None, arguments=""):
+                    line=None, arguments="", split=False):
     """Scan a value a reference reached, and follow whatever IT names.
 
     `arguments` is what the call site wrote AFTER the reference. A value may
@@ -1589,10 +1640,12 @@ def visit_reference(path, referenced, run_path, values, scanned, followed,
     `run: ${{ env.COMMAND }} pkg` — and neither half holds a package on its
     own, so the two are read together or the install is never seen.
     """
-    if arguments:
-        if (id(referenced), arguments) not in scanned:
-            scanned.add((id(referenced), arguments))
-            scan_shell(path, f"{referenced.value} {arguments}", line, exact_lines=False)
+    text = as_words(referenced.value) if split else referenced.value
+    if arguments or split:
+        if (id(referenced), arguments, split) not in scanned:
+            scanned.add((id(referenced), arguments, split))
+            scan_shell(path, " ".join(part for part in (text, arguments) if part),
+                       line, exact_lines=False)
     elif id(referenced) not in scanned:
         scanned.add(id(referenced))
         scan_scalar(path, referenced)
@@ -1649,7 +1702,8 @@ def follow_references(path, value, run_path, values, scanned, followed, argument
                     carried = " ".join(part for part in (written, arguments) if part)
                     for referenced in resolve_reference(run_path, "env", (name,), values):
                         visit_reference(path, referenced, run_path, values, scanned,
-                                        followed, scalar_line(value, offset), carried)
+                                        followed, scalar_line(value, offset), carried,
+                                        split=True)
 
             # Whether anything of the command is written HERE.
             # `echo ${{ github.ref }}` is an ordinary command with a value

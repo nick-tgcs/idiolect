@@ -3372,6 +3372,78 @@ YAML
 expect "a format template is not a command" 0 literal-template \
     "assembled at run time" '!cannot resolve: {0}'
 
+# ------------------------------------------------ `eval` runs what it is given
+# `eval "$COMMAND"` joins its arguments and executes the result as shell — the
+# one construct that DOES reparse what a variable holds.
+write_workflow eval-command ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: apt-get install -y codex-no-such-package
+        run: eval "$COMMAND"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "eval runs the value it is given" 1 eval-command \
+    "codex-no-such-package"
+
+# --------------------------- a variable's contents are WORDS, not shell source
+# `$COMMAND` is split into words and run; the metacharacters inside it are
+# ordinary characters. `echo ok ; apt-get …` runs echo with `;` as an argument
+# and never reaches apt, so reading the value as fresh shell rejected a
+# workflow for a command that cannot run.
+write_workflow variable-not-reparsed ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - env:
+          COMMAND: echo ok ; apt-get install -y codex-no-such-package
+        run: |
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a variable's metacharacters are not operators" 0 variable-not-reparsed \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...while the same text written into a `${{ }}` IS shell source: GitHub
+# substitutes before bash parses, so there the separator separates.
+write_workflow expression-is-reparsed ci.yml <<'YAML'
+jobs:
+  build:
+    env:
+      COMMAND: echo ok ; apt-get install -y codex-no-such-package
+    steps:
+      - run: ${{ env.COMMAND }}
+YAML
+expect "an expression's metacharacters are operators" 1 expression-is-reparsed \
+    "codex-no-such-package"
+
+# ------------------------------------- options come before the script operand
+# `bash build.sh -c '…'` hands `-c` to build.sh: bash stopped reading options
+# at the script file. Reading it as an invocation option scanned an argument
+# the shell never runs.
+write_workflow shell-script-operand ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash build.sh -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "options stop at the script file" 0 shell-script-operand \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...but an option that TAKES an argument does not end them: `-o pipefail` is
+# two words of the invocation, and the `-c` after it is still bash's.
+write_workflow shell-option-argument ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -o pipefail -c 'sudo apt-get install -y codex-no-such-package'
+      - run: sudo apt-get install -y cmake
+YAML
+expect "an option's argument is not the script file" 1 shell-option-argument \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
