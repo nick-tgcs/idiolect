@@ -596,18 +596,19 @@ def analysed_command(words, block=""):
         operand = at + 1
         while operand < len(words) and words[operand].value.startswith(("-", "+")):
             token = words[operand].value
-            # Short options CLUSTER, and `-o` takes the word after it even at
-            # the end of one: `bash -euo pipefail script.sh` runs script.sh,
-            # while reading only an exact `-o` made `pipefail` the script
-            # (Codex, on 5fece60). The letter has to be LAST, which is where
-            # bash's own usage puts it.
-            clustered = (
-                len(token) > 1
-                and not token.startswith(("--", "++"))
-                and token[-1] in "oO"
-            )
-            if token in shell.SHELL_OPTIONS_WITH_ARGUMENT or clustered:
-                operand += 1
+            # Short options CLUSTER, and each `o` or `O` in one takes a word
+            # of its own — ANYWHERE in the cluster, not only at the end, which
+            # is what I first read into bash's usage line (Codex, on 5fece60
+            # and again on 94be871). Checked against bash 5.2.21 rather than
+            # inferred: `-oe pipefail script.sh` runs the script with both set,
+            # `-oO pipefail nullglob script.sh` consumes two, and the attached
+            # form `-opipefail` is rejected outright, so there is no case where
+            # the value comes glued on.
+            if token.startswith(("--", "++")):
+                if token in shell.SHELL_OPTIONS_WITH_ARGUMENT:
+                    operand += 1
+            else:
+                operand += sum(1 for letter in token[1:] if letter in "oO")
             operand += 1
         if operand < len(words):
             handed = SCRIPT_REFERENCE.fullmatch(words[operand].value)

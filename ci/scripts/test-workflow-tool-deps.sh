@@ -1232,6 +1232,39 @@ YAML
 expect "a cluster with no such option swallows nothing" 1 clustered-no-argument \
     "build" "ripgrep"
 
+# Codex, on 94be871, and confirmed against bash 5.2.21 rather than taken on
+# faith: `-o` ANYWHERE in a cluster consumes the word after it, not only at the
+# end. `bash -oe pipefail script.sh` runs the script with both errexit and
+# pipefail set.
+write_workflow cluster-o-first ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -oe pipefail ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "-o earlier in a cluster still takes a word" 1 cluster-o-first \
+    "build" "ripgrep"
+
+write_workflow cluster-O ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -Oe nullglob ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "-O is the same" 1 cluster-O \
+    "build" "ripgrep"
+
+# Each of them takes its OWN word: `bash -oO pipefail nullglob script.sh` runs
+# the script, which the probe confirmed by watching both settings change.
+write_workflow cluster-two-options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -oO pipefail nullglob ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "two option letters take two words" 1 cluster-two-options \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
