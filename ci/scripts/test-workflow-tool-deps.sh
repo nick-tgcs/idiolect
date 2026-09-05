@@ -341,6 +341,143 @@ YAML
 expect "a quoted command name is still the command" 1 quoted-use \
     "build" "ripgrep"
 
+# --------------------------------------------- and the forms that hide a use
+# Codex, on 03da267, all three verified against the gate before the fix. Each
+# is a job that RUNS the tool and was reported clean — the false-negative
+# direction, which is the one this gate exists to close.
+#
+# A script handed to a shell: `command_word` is `bash`, and the program is a
+# quoted word nothing looked inside.
+write_workflow shell_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c 'rg -n TODO crates'
+YAML
+expect "a script handed to bash -c is read" 1 shell_c \
+    "build" "ripgrep"
+
+# The same for a repository script run through one.
+write_workflow shell_c_script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c 'bash ci/scripts/test-real-adapter-deps.sh'
+YAML
+expect "a script run from inside bash -c is followed" 1 shell_c_script \
+    "build" "ripgrep"
+
+# An executable script run by its own relative path. `./` is how a shell is
+# told the path is a path, and the reference pattern rejected it.
+write_workflow dot_slash ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: ./ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a ./ script path is followed" 1 dot_slash \
+    "build" "ripgrep"
+
+write_workflow dot_slash_sourced ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: source ./ci/scripts/test-interface-no-backend-leakage.sh
+YAML
+expect "a sourced ./ script path is followed" 1 dot_slash_sourced \
+    "build" "ripgrep"
+
+# A tool invoked by an absolute path. The command analysis strips directories
+# — `/usr/bin/apt-get` is apt-get to the scanner — but the cheap filter in
+# front of it excluded `/` as a left boundary and skipped the block entirely.
+write_workflow absolute_tool ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: /usr/bin/rg -n TODO crates
+YAML
+expect "a tool run by absolute path is a use" 1 absolute_tool \
+    "build" "ripgrep"
+
+# ------------------------------------------- the forms probing turned up
+# Codex named three; probing every invocation form bash has for the same class
+# found three more, all reported clean before this commit. A gate that reads
+# only the shapes a reviewer happened to mention is a gate that stops at the
+# reviewer's imagination.
+write_workflow ticked ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: hits=`rg -n TODO crates`
+YAML
+expect "a backtick substitution runs its contents" 1 ticked \
+    "build" "ripgrep"
+
+# shlex gives backticks no meaning, so the opening one arrives welded to the
+# name in front of it — `hits=`rg` is one word, and nothing looks for a command
+# inside a word. Quoted, the whole substitution is one token instead.
+write_workflow ticked-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: hits="`rg -n TODO crates`"
+YAML
+expect "a quoted backtick substitution runs its contents" 1 ticked-quoted \
+    "build" "ripgrep"
+
+write_workflow substituted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: hits="$(rg -n TODO crates)"
+YAML
+expect "a quoted \$() substitution runs its contents" 1 substituted \
+    "build" "ripgrep"
+
+# A command whose ARGUMENT is the command that runs.
+write_workflow wrapped ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs rg -n TODO
+YAML
+expect "xargs runs its argument" 1 wrapped \
+    "build" "ripgrep"
+
+# ...and past an option's value, which is why a bare number is stepped over.
+write_workflow wrapped-numeric ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 rg -n TODO crates
+YAML
+expect "timeout runs its argument past the duration" 1 wrapped-numeric \
+    "build" "ripgrep"
+
+# A function declared and called in the same block runs its body here.
+write_workflow function-body ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          search() { rg -n TODO crates; }
+          search
+YAML
+expect "a function body is shell that runs" 1 function-body \
+    "build" "ripgrep"
+
+# Both brackets: `f() ( … )` is a function whose body is a subshell.
+write_workflow function-subshell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          search() ( rg -n TODO crates )
+          search
+YAML
+expect "a subshell function body is read too" 1 function-subshell \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

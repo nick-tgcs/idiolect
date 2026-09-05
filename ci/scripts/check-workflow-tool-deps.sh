@@ -105,10 +105,16 @@ TOOLS = {
 # every verdict, so a match here that turns out to be a word inside an echo
 # costs a parse and changes nothing.
 #
-# The word boundaries are spelled out rather than using \b because `.`, `/` and
-# `-` are word characters to a shell reader and are not to \b: without this,
-# `rg` matches inside `target/rg-out` and inside `cargo-rg`.
-EDGE = r"(?:^|[^\w./-])%s(?![\w./-])"
+# The word boundaries are spelled out rather than using \b because `.` and `-`
+# are word characters to a shell reader and are not to \b: without this, `rg`
+# matches inside `target/rg-out` and inside `cargo-rg`.
+#
+# A `/` before the name is NOT a boundary to exclude: `/usr/bin/rg` runs
+# ripgrep, and the analysis behind this filter strips directories exactly as
+# the scanner does for `/usr/bin/apt-get`. Excluding it made the filter
+# narrower than the thing it filters for, so the block was never even looked at
+# (Codex, on 03da267).
+EDGE = r"(?:^|[^\w.-])%s(?![\w./-])"
 CANDIDATES = [re.compile(EDGE % re.escape(name), re.M) for name in TOOLS]
 
 REPO_ROOT = os.environ["REPO_ROOT"]
@@ -130,21 +136,37 @@ except BaseException as error:  # SystemExit included: a scanner that exits on i
     print("::error::the apt scanner failed — the workflow tool check could not run")
     print(error)
     sys.exit(1)
-SCRIPT_REFERENCE = re.compile(r"ci/scripts/[\w.-]+\.sh")
+SCRIPT_REFERENCE = re.compile(r"(?:\./)?ci/scripts/[\w.-]+\.sh")
 
 # `source x` and `. x` run a script in the current shell rather than a new one.
 SOURCING = {"source", "."}
+
+# Commands whose ARGUMENT is the command that runs.
+WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
+
+# The body of a backtick substitution, which shlex does not tokenise as one.
+TICKED = re.compile(r"`([^`]*)`")
 
 
 script_cache = {}
 
 
-def commands_of(text):
-    """Every command in `text`, as the scanner's already-lexed words.
+def commands_in(words):
+    """Every command among these already-lexed words.
 
-    A command, not a line and not a segment: `printf … | rg …` is two of them,
-    and the second is how test-real-adapter-deps.sh calls rg.
+    A command, not a segment: `printf … | rg …` is two of them, and the second
+    is how test-real-adapter-deps.sh calls rg.
     """
+    index = 0
+    while index <= len(words):
+        stop = shell.command_ends(words, index)
+        if stop > index:
+            yield words[index:stop]
+        index = stop + 1
+
+
+def commands_of(text):
+    """Every command in a block of shell, heredoc bodies excluded."""
     for _, block, in_heredoc in shell.shell_commands(text):
         if in_heredoc:
             continue
@@ -156,12 +178,88 @@ def commands_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
-        index = 0
-        while index <= len(words):
-            end = shell.command_ends(words, index)
-            if end > index:
-                yield words[index:end]
-            index = end + 1
+        yield from commands_in(words)
+
+
+def analysed_command(words):
+    """(packages this one command runs, the repo scripts it runs)."""
+    packages = set()
+    references = set()
+
+    # A substitution is shell of its own, in either spelling. `$( … )` comes
+    # from the scanner, which reads it out of a single quoted token as well as
+    # a split one; the backtick form is taken from the rejoined command,
+    # because shlex gives backticks no meaning and leaves the opening one
+    # welded to the name in front of it — `hits=`rg …`` lexes with `rg` inside
+    # the first word, where nothing looks for a command.
+    inner = [body for word in words for body in shell.substitution_bodies(word.value)]
+    inner += TICKED.findall(" ".join(word.value for word in words))
+    for body in inner:
+        found, referenced = analysed(body)
+        packages |= found
+        references |= referenced
+
+    # Declaring a function runs none of it, but the body is shell that runs
+    # WHERE IT IS CALLED, and a workflow that declares and calls one in the
+    # same block runs it here. Read rather than tracked: over-approximating a
+    # call costs an install this gate would have asked for anyway, while
+    # missing one is a job that dies on a tool nobody said it needed.
+    definition = shell.defined_function(words, 0) if words else None
+    if definition is not None:
+        for command in commands_in(definition[1]):
+            found, referenced = analysed_command(command)
+            packages |= found
+            references |= referenced
+        return packages, references
+
+    if shell.runs_a_script(words):
+        # `bash -c 'rg …'` runs rg, and the program is ONE quoted word that
+        # nothing here would otherwise look inside — the shell is the command
+        # and the tool is a character in a string (Codex, on 03da267). The
+        # scanner reads these because a script handed over this way can install
+        # packages; it is read here for the same reason.
+        script = shell.script_argument(words)
+        if script is not None:
+            found, referenced = analysed(script.value)
+            return packages | found, references | referenced
+
+    word = shell.command_word(words)
+    if word is None:
+        return packages, references
+
+    named = [word]
+    if word.value.rsplit("/", 1)[-1] in WRAPPERS:
+        # `xargs rg …` and `timeout 30 rg …` run their argument. Which word
+        # that is cannot be known without a table of every option's arity —
+        # the scanner declines to hold one for `sudo -u`, and this declines
+        # for the same reason — so the first argument that is neither an
+        # option nor a bare number is taken. Being wrong here leaves a use
+        # unseen; it never invents one.
+        for argument in words[words.index(word) + 1:]:
+            if argument.value.startswith("-") or argument.value.isdigit():
+                continue
+            named.append(argument)
+            break
+
+    for candidate in named:
+        name = candidate.value.rsplit("/", 1)[-1]
+        package = TOOLS.get(name)
+        if package is not None:
+            packages.add(package)
+        if SCRIPT_REFERENCE.fullmatch(candidate.value):
+            # An executable script run by its own path.
+            references.add(candidate.value)
+        elif name in shell.SHELL_COMMANDS or name in SOURCING:
+            # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
+            # command that runs one. Taking the path from any word at all
+            # followed what a `coverage_gate="ci/scripts/test-all.sh"` merely
+            # NAMES, and through it every script in the suite.
+            references.update(
+                argument.value
+                for argument in words[words.index(candidate) + 1:]
+                if SCRIPT_REFERENCE.fullmatch(argument.value)
+            )
+    return packages, references
 
 
 def analysed(text):
@@ -172,31 +270,15 @@ def analysed(text):
         return packages, references
 
     for words in commands_of(text):
-        word = shell.command_word(words)
-        if word is None:
-            continue
-        name = word.value.rsplit("/", 1)[-1]
-        package = TOOLS.get(name)
-        if package is not None:
-            packages.add(package)
-        if SCRIPT_REFERENCE.fullmatch(word.value):
-            # An executable script run by its own path.
-            references.add(word.value)
-        elif name in shell.SHELL_COMMANDS or name in SOURCING:
-            # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
-            # command that runs one. Taking the path from any word at all
-            # followed what a `coverage_gate="ci/scripts/test-all.sh"` merely
-            # NAMES, and through it every script in the suite.
-            references.update(
-                argument.value
-                for argument in words[1:]
-                if SCRIPT_REFERENCE.fullmatch(argument.value)
-            )
+        found, referenced = analysed_command(words)
+        packages |= found
+        references |= referenced
     return packages, references
 
 
 def script_analysis(reference):
     """`analysed` for a repo script, read once however many jobs reach it."""
+    reference = reference.removeprefix("./")
     if reference not in script_cache:
         path = os.path.join(REPO_ROOT, reference)
         try:
@@ -215,7 +297,7 @@ def tools_used(text):
     needed, queue = analysed(text)
     seen = set()
     while queue:
-        reference = queue.pop()
+        reference = queue.pop().removeprefix("./")
         if reference in seen:
             continue
         seen.add(reference)
