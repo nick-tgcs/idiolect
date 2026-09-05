@@ -20,6 +20,15 @@
 # case being real: test-all.sh calls test-coverage-map.sh, so a job invoking
 # only test-all.sh still needs ripgrep.
 #
+# LIMITATION: a command carried by a VARIABLE — `S='rg …'; $S`, or
+# `bash -c "$S"` — is not followed. The scanner tracks assignments through
+# conditionals, subshells, functions and namerefs to answer the same question
+# about apt, and a second, weaker copy of that here would be a second answer to
+# it. The direction is a use unseen rather than one invented, and it is not the
+# only line of defence: every script that uses ripgrep now refuses to start
+# without it, so a job that reaches one this way fails loudly on its first run
+# instead of passing silently, which is the defect this gate exists for.
+#
 # LIMITATION: the gate reads a job as a set, not a sequence, so it cannot tell
 # an install that comes AFTER the step needing it, nor an install behind an
 # `if:` that turns out false. Both fail loudly on the job's first run now that
@@ -144,8 +153,14 @@ SOURCING = {"source", "."}
 # Commands whose ARGUMENT is the command that runs.
 WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 
+# Options that introduce a command rather than a file — `find … -exec rg … +`.
+RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
+
 # The body of a backtick substitution, which shlex does not tokenise as one.
 TICKED = re.compile(r"`([^`]*)`")
+
+# The openers of a process substitution, `<( … )` and `>( … )`.
+PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
 
 
 script_cache = {}
@@ -192,8 +207,38 @@ def analysed_command(words):
     # because shlex gives backticks no meaning and leaves the opening one
     # welded to the name in front of it — `hits=`rg …`` lexes with `rg` inside
     # the first word, where nothing looks for a command.
-    inner = [body for word in words for body in shell.substitution_bodies(word.value)]
-    inner += TICKED.findall(" ".join(word.value for word in words))
+    inner = []
+    for word in words:
+        if word.literal_dollar:
+            # Single-quoted: `echo '$(rg …)'` runs nothing, and the lexer
+            # already carries that. Discarding it read a job's own
+            # documentation as a dependency (Codex, on f9efff8).
+            continue
+        inner += shell.substitution_bodies(word.value)
+
+    # The rest is asked of the REJOINED command rather than of single words,
+    # because shlex gives neither construct any meaning: `<(` arrives as `<`
+    # and `(`, and a backtick stays welded to the name in front of it. The
+    # words are rejoined the way they were written, so `< (` — a redirection
+    # and a subshell — cannot become a process substitution on the way.
+    rendered = "".join(
+        (" " if word.space_before else "") + word.value
+        for word in words
+        if not word.literal_dollar
+    )
+    # `<( … )` and `>( … )` run their contents in a process of their own, and
+    # the command word in front of them is something else entirely. Spelled as
+    # `$( … )` for the scanner's reader rather than balanced again here: the
+    # brackets, quotes and escapes are the same, and a second implementation of
+    # them is a second answer.
+    inner += shell.substitution_bodies(PROCESS_SUBSTITUTION.sub("$(", rendered))
+    inner += TICKED.findall(
+        "".join(
+            (" " if word.space_before else "") + word.value
+            for word in words
+            if not word.literal_backtick
+        )
+    )
     for body in inner:
         found, referenced = analysed(body)
         packages |= found
@@ -227,38 +272,64 @@ def analysed_command(words):
     if word is None:
         return packages, references
 
-    named = [word]
-    if word.value.rsplit("/", 1)[-1] in WRAPPERS:
-        # `xargs rg …` and `timeout 30 rg …` run their argument. Which word
-        # that is cannot be known without a table of every option's arity —
-        # the scanner declines to hold one for `sudo -u`, and this declines
-        # for the same reason — so the first argument that is neither an
-        # option nor a bare number is taken. Being wrong here leaves a use
-        # unseen; it never invents one.
-        for argument in words[words.index(word) + 1:]:
-            if argument.value.startswith("-") or argument.value.isdigit():
-                continue
-            named.append(argument)
+    at = next(
+        (position for position, other in enumerate(words) if other is word),
+        len(words),
+    )
+
+    # `xargs rg …`, `timeout 30 rg …` and `timeout 30 nice rg …`: a wrapper
+    # runs its argument, and that argument may be another wrapper (Codex, on
+    # f9efff8). Which word the command is cannot be known without a table of
+    # every option's arity — the scanner declines to hold one for `sudo -u`,
+    # and this declines for the same reason — so the first argument that is
+    # neither an option nor a bare number is taken. Being wrong here leaves a
+    # use unseen; it never invents one.
+    while words[at].value.rsplit("/", 1)[-1] in WRAPPERS:
+        following = next(
+            (
+                position
+                for position in range(at + 1, len(words))
+                if not words[position].value.startswith("-")
+                and not words[position].value.isdigit()
+            ),
+            None,
+        )
+        if following is None:
+            break
+        at = following
+
+    # `find crates -exec rg -n TODO {} +` runs rg once per match. The option
+    # says so; the command is simply the word after it.
+    for position in range(at, len(words) - 1):
+        if words[position].value in RUNS_WHAT_FOLLOWS and not words[position].quoted:
+            at = position + 1
             break
 
-    for candidate in named:
-        name = candidate.value.rsplit("/", 1)[-1]
-        package = TOOLS.get(name)
-        if package is not None:
-            packages.add(package)
-        if SCRIPT_REFERENCE.fullmatch(candidate.value):
-            # An executable script run by its own path.
-            references.add(candidate.value)
-        elif name in shell.SHELL_COMMANDS or name in SOURCING:
-            # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
-            # command that runs one. Taking the path from any word at all
-            # followed what a `coverage_gate="ci/scripts/test-all.sh"` merely
-            # NAMES, and through it every script in the suite.
-            references.update(
-                argument.value
-                for argument in words[words.index(candidate) + 1:]
-                if SCRIPT_REFERENCE.fullmatch(argument.value)
-            )
+    command = words[at]
+    name = command.value.rsplit("/", 1)[-1]
+    package = TOOLS.get(name)
+    if package is not None:
+        packages.add(package)
+
+    if SCRIPT_REFERENCE.fullmatch(command.value):
+        # An executable script run by its own path.
+        references.add(command.value)
+    elif name in shell.SHELL_COMMANDS or name in SOURCING:
+        # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
+        # command that runs one. Taking the path from any word at all followed
+        # what a `coverage_gate="ci/scripts/test-all.sh"` merely NAMES, and
+        # through it every script in the suite.
+        #
+        # ONE operand, the first: `bash driver.sh other.sh` runs driver.sh and
+        # hands the second path to it as `$1`, so following both rejected a
+        # driver for what its argument does.
+        operand = at + 1
+        while operand < len(words) and words[operand].value.startswith("-"):
+            if words[operand].value in shell.SHELL_OPTIONS_WITH_ARGUMENT:
+                operand += 1
+            operand += 1
+        if operand < len(words) and SCRIPT_REFERENCE.fullmatch(words[operand].value):
+            references.add(words[operand].value)
     return packages, references
 
 
@@ -324,13 +395,18 @@ def installed_packages(jobs):
     installed = {index: set() for index in range(len(jobs))}
     with tempfile.TemporaryDirectory() as work:
         paths = []
-        for index, (_, job_name, run_texts) in enumerate(jobs):
+        for index, (_, job_name, job, document) in enumerate(jobs):
             path = os.path.join(work, f"{index}.yml")
-            document = {
-                "jobs": {job_name: {"steps": [{"run": text} for text in run_texts]}}
-            }
+            # The whole workflow, with every OTHER job removed. Keeping only
+            # the `run:` strings left the scanner unable to resolve a
+            # `${{ env.INSTALL }}` — the value it names lives in the document
+            # around the step — so a job was failed for an install it makes
+            # (Codex, on f9efff8). What has to go is the sibling jobs, whose
+            # packages are not this job's.
+            alone = {key: value for key, value in document.items() if key != "jobs"}
+            alone["jobs"] = {job_name: job}
             with open(path, "w", encoding="utf-8") as handle:
-                yaml.safe_dump(document, handle)
+                yaml.safe_dump(alone, handle)
             paths.append(path)
 
         if not paths:
@@ -383,21 +459,17 @@ for path in sys.argv[1:]:
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        run_texts = [
-            step["run"]
-            for step in steps_of(job)
-            if isinstance(step, dict) and isinstance(step.get("run"), str)
-        ]
-        jobs_found.append((path, job_name, run_texts))
+        jobs_found.append((path, job_name, job, document))
 
 jobs_checked = len(jobs_found)
 failures = 0
 installed_by_job = installed_packages(jobs_found)
 
-for index, (path, job_name, run_texts) in enumerate(jobs_found):
+for index, (path, job_name, job, _) in enumerate(jobs_found):
     needed = set()
-    for text in run_texts:
-        needed |= tools_used(text)
+    for step in steps_of(job):
+        if isinstance(step, dict) and isinstance(step.get("run"), str):
+            needed |= tools_used(step["run"])
 
     for package in sorted(needed - installed_by_job[index]):
         print(

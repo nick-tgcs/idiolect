@@ -478,6 +478,108 @@ YAML
 expect "a subshell function body is read too" 1 function-subshell \
     "build" "ripgrep"
 
+# --------------------------------------------------- round four, both ways
+# Codex, on f9efff8. Single quotes make a substitution literal text: bash runs
+# nothing inside `echo '$(rg …)'`, and the lexer already carries that as
+# `literal_dollar` — which this gate was discarding before recursing.
+write_workflow literal-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo '$(rg -n TODO crates)'
+YAML
+expect "a single-quoted substitution runs nothing" 0 literal-substitution \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow literal-backticks ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo '`rg -n TODO crates`'
+YAML
+expect "single-quoted backticks run nothing" 0 literal-backticks \
+    "All 1 workflow job(s)" "!::error::"
+
+# Process substitution runs its contents in a process of its own, and the
+# command word in front of it is something else entirely.
+write_workflow process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: mapfile -t hits < <(rg -n TODO crates)
+YAML
+expect "a process substitution runs its contents" 1 process-substitution \
+    "build" "ripgrep"
+
+# `timeout 30 nice rg …`: timeout's operand is a COMMAND, and that command is
+# another wrapper. Taking one step and stopping reads `nice` and never rg.
+write_workflow nested-wrappers ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 nice rg -n TODO crates
+YAML
+expect "wrappers nest" 1 nested-wrappers \
+    "build" "ripgrep"
+
+# `bash driver.sh other.sh` runs driver.sh and hands the second path to it as
+# `$1`. Following every path that looks like a script rejects a driver for what
+# its ARGUMENT does.
+write_workflow script-operand ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/driver.sh ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "only the shell's own script operand is followed" 0 script-operand \
+    "All 1 workflow job(s)" "!::error::"
+
+# The install may be somewhere only the workflow's own context knows. Handing
+# the scanner a job stripped of everything but its `run:` strings leaves it
+# unable to resolve the reference, and the job is failed for an install it
+# makes.
+write_workflow job-context ci.yml <<'YAML'
+env:
+  INSTALL: sudo apt-get install -y ripgrep
+jobs:
+  build:
+    steps:
+      - run: ${{ env.INSTALL }}
+      - run: rg -n TODO crates
+YAML
+expect "an install reached through workflow context counts" 0 job-context \
+    "All 1 workflow job(s)" "!::error::"
+
+# `find … -exec` names a command in an option rather than at the front.
+write_workflow find-exec ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -exec rg -n TODO {} +
+YAML
+expect "find -exec runs what follows it" 1 find-exec \
+    "build" "ripgrep"
+
+# The stated limitation, pinned so it is a decision and not a surprise: a
+# command carried by a variable is not followed. The scanner tracks assignments
+# through conditionals, subshells, functions and namerefs to answer this for
+# apt, and a weaker copy of that here would be a second answer to the same
+# question. The backstop is that the script itself refuses to run without its
+# tool, so a job reaching one this way fails loudly rather than silently.
+#
+# If this case ever goes red, the limitation has been fixed and the comment
+# above it is what needs deleting.
+write_workflow command-in-a-variable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          SEARCH="rg -n TODO crates"
+          $SEARCH
+YAML
+expect "a command carried by a variable is not followed" 0 command-in-a-variable \
+    "All 1 workflow job(s)"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
