@@ -760,6 +760,67 @@ YAML
 expect "a find with no action runs nothing" 0 find-plain \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on dcf9333: quoting a word INSIDE a process substitution is not
+# quoting the substitution. Dropping every quoted word before the rewrite threw
+# away the command name and left `<( … )` running nothing.
+write_workflow quoted-inside-process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: mapfile -t hits < <("rg" -n TODO crates)
+YAML
+expect "a quoted command inside a process substitution runs" 1 quoted-inside-process-substitution \
+    "build" "ripgrep"
+
+write_workflow single-quoted-inside-process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: mapfile -t hits < <('rg' -n TODO crates)
+YAML
+expect "single quotes inside one do not stop it either" 1 single-quoted-inside-process-substitution \
+    "build" "ripgrep"
+
+# Found by probing the fix above rather than by review: an unquoted `$( … )`
+# in ARGUMENT position. shlex splits it into `$` and `(`, so no word holds it,
+# and `command_word` stops at `echo` long before reaching the tool. It was seen
+# in `hits=$(rg …)` only because an assignment has no command word to stop at.
+write_workflow substitution-as-argument ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo $(rg -n TODO crates)
+YAML
+expect "an unquoted substitution in argument position runs" 1 substitution-as-argument \
+    "build" "ripgrep"
+
+write_workflow substitution-inside-process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: mapfile -t x < <(echo $(rg -n TODO crates))
+YAML
+expect "a substitution inside a process substitution runs" 1 substitution-inside-process-substitution \
+    "build" "ripgrep"
+
+write_workflow nested-substitutions ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo $(echo $(rg -n TODO crates))
+YAML
+expect "substitutions nest" 1 nested-substitutions \
+    "build" "ripgrep"
+
+write_workflow ticks-as-argument ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo `rg -n TODO crates`
+YAML
+expect "backticks in argument position run" 1 ticks-as-argument \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

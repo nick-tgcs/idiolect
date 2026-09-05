@@ -166,6 +166,10 @@ TICKED = re.compile(r"`([^`]*)`")
 # The openers of a process substitution, `<( … )` and `>( … )`.
 PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
 
+# Stands in for a `$` while process substitutions are being read. A NUL cannot
+# appear in a shell word — bash drops it — so nothing real can collide with it.
+MARKER = "\0"
+
 
 script_cache = {}
 
@@ -252,21 +256,49 @@ def analysed_command(words, block=""):
     # words are rejoined the way they were written, so `< (` — a redirection
     # and a subshell — cannot become a process substitution on the way.
     #
-    # QUOTED words are left out of it: bash performs no process substitution
-    # inside quotes of either kind, so `echo '<(rg …)'` prints text. Rewriting
-    # it to `$( … )` undid, for this construct, the very check the same commit
-    # added for `$( … )` itself (Codex, on 5fd4cef).
+    # A word holding a QUOTED `<(` is left out of it: bash performs no process
+    # substitution inside quotes of either kind, so `echo '<(rg …)'` prints
+    # text. Rewriting it to `$( … )` undid, for this construct, the very check
+    # the same commit added for `$( … )` itself (Codex, on 5fd4cef).
+    #
+    # Only a word holding the OPENER, though. Dropping every quoted word threw
+    # away the command name in `< <("rg" …)`, where the quotes are around a
+    # word INSIDE a substitution that is itself unquoted and runs (Codex, on
+    # dcf9333). Which is the same distinction as the line above, one level in:
+    # quoting an argument is not quoting the construct.
     rendered = "".join(
         (" " if word.space_before else "") + word.value
         for word in words
-        if not word.quoted
+        if not (word.quoted and PROCESS_SUBSTITUTION.search(word.value))
     )
     # `<( … )` and `>( … )` run their contents in a process of their own, and
     # the command word in front of them is something else entirely. Spelled as
     # `$( … )` for the scanner's reader rather than balanced again here: the
     # brackets, quotes and escapes are the same, and a second implementation of
     # them is a second answer.
-    inner += shell.substitution_bodies(PROCESS_SUBSTITUTION.sub("$(", rendered))
+    #
+    # `$(` is hidden first, so what comes back is only what the rewrite put
+    # there. Without that, the rendered line — which now keeps quoted words,
+    # for the reason above — hands its own `'$(rg …)'` straight to a reader
+    # that cannot tell it was quoted. The bracket stays where it is, so
+    # nothing's balance changes, and the marker is put back in whatever is
+    # extracted in case a process substitution holds a command substitution.
+    # An unquoted `$( … )` splits into `$` and `(` too, so it is read from the
+    # same rejoined line — from the UNQUOTED words only, since a quoted one is
+    # the per-word reader's business above, where the literal case is settled.
+    inner += shell.substitution_bodies(
+        "".join(
+            (" " if word.space_before else "") + word.value
+            for word in words
+            if not word.quoted
+        )
+    )
+
+    hidden = rendered.replace("$(", MARKER + "(")
+    inner += [
+        body.replace(MARKER + "(", "$(")
+        for body in shell.substitution_bodies(PROCESS_SUBSTITUTION.sub("$(", hidden))
+    ]
     inner += TICKED.findall(
         "".join(
             (" " if word.space_before else "") + word.value
