@@ -84,6 +84,11 @@ CONTROL_PREFIXES = {
 # none. All four were checked against bash. `{ … }` and `( … )` are absent
 # because they always run — the subshell's own copy is a separate question,
 # answered where its bracket is read.
+# What a function's BODY may be wrapped in, and what closes each. Both are
+# bash's: `f() { … }` groups in this shell, `f() ( … )` groups in a subshell,
+# and either way declaring the function runs none of it.
+BODY_BRACKETS = {"{": "}", "(": ")"}
+
 REGION_OPENERS = {"if", "while", "until", "for", "select", "case"}
 REGION_CLOSERS = {"fi", "done", "esac"}
 
@@ -903,6 +908,27 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         # a word and not a closer, and only for an unquoted token, since
         # `'fi'` is a command bash goes looking for.
         if at_command and not word.quoted and defined is not None:
+            if token == "for":
+                # Each value the loop is given is a value the body sees, one
+                # iteration at a time — which is exactly what the alternatives
+                # machinery already holds: `for pkg in a b` runs the body once
+                # with `pkg` as a and once as b, and both are packages the
+                # workflow installs.
+                #
+                # Bound BEFORE the region is pushed, so the value the loop
+                # variable held beforehand is restored as one more possibility
+                # at `done` — which is conservative in the right direction,
+                # bash leaving the LAST value in place after the loop ends.
+                binding = loop_values(words, index)
+                if binding is not None:
+                    name, values = binding
+                    defined[("variable", name)] = ([values[0]], expressions)
+                    defined.pop(("alternative", name, "variable"), None)
+                    for other in values[1:]:
+                        defined.setdefault(
+                            ("alternative", name, "variable"), []
+                        ).append(([other], expressions))
+
             if token in REGION_OPENERS:
                 # The second entry is whether a CONDITION is still to come.
                 # `case x in` runs no commands between the opener and the first
@@ -1016,6 +1042,50 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 scan_shell(path, body, line, exact_lines=False,
                            defined=dict(defined) if defined is not None else None)
 
+        if (
+            token.endswith("$")
+            and not word.literal_dollar
+            and index < len(words)
+            and words[index].value == "("
+            and not words[index].space_before
+        ):
+            # The SAME substitution, arriving differently. Unquoted it reaches
+            # here as `$`, `(`, its words and `)`, because shlex splits it;
+            # quoted it is one word and is read just above. Only the
+            # reassembly differs — both RUN, and apt inside either installs for
+            # real, so both are read as the shell they are.
+            #
+            # Reading only the quoted form is what let
+            # `echo $(apt-get install -y pkg)` past with a notice nothing fails
+            # on, while `echo "$(apt-get install -y pkg)"` was checked.
+            inside, index = walk_to_closing_paren(words, index)
+            rendered = token[:-1] + "$(" + " ".join(w.value for w in inside) + ")"
+            # Whatever is written hard against the closing `)` is part of the
+            # same word — but a separator or a redirection is not, and
+            # absorbing one would discard the command after it.
+            while (
+                index < len(words)
+                and not words[index].space_before
+                and words[index].value not in SEPARATORS
+                and words[index].value not in REDIRECTIONS
+            ):
+                rendered += words[index].value
+                index += 1
+            # In a SUBSHELL, like the quoted form and the bracket forms.
+            scan_shell(path, " ".join(w.value for w in inside), line,
+                       exact_lines=False,
+                       defined=dict(defined) if defined is not None else None)
+            if state == "packages":
+                # What it PRINTS is a package name this scanner cannot resolve,
+                # which is a separate fact from what it RAN. Announced once
+                # rather than word by word: the substitution need not be the
+                # whole argument, and `c$(printf make)` expands to `cmake`, so
+                # reporting the fragments around it rejects a workflow that
+                # works.
+                emit("NOTICE", path, line,
+                     f"names a package through a substitution, not checked: {rendered}")
+            continue
+
         if "`" in token and not word.literal_backtick and state != "packages":
             # `` RESULT=`apt-get …` `` RUNS apt. Backticks mean nothing to
             # shlex, so an unquoted substitution arrives split across whatever
@@ -1056,38 +1126,6 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                     following = words[index]
                     rendered += (" " if following.space_before else "") + following.value
                     ticks += following.value.count("`")
-                    index += 1
-                emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
-                continue
-            if (
-                token.endswith("$")
-                and not word.literal_dollar
-                and index < len(words)
-                and words[index].value == "("
-                and not words[index].space_before
-            ):
-                # `$( ... )` arrives as `$`, `(`, its words, `)`. It is one
-                # expansion and none of it can be resolved here, so it is
-                # announced once rather than word by word. Quoted, it would not
-                # be an expansion at all and would arrive as a single word —
-                # which is why this branch cannot be reached by `'$(x)'`.
-                #
-                # The substitution need not be the whole argument, either:
-                # `c$(printf make)` is one word that expands to `cmake`, and
-                # apt installs it. Reporting the fragments around it as package
-                # names rejects a workflow that works.
-                inside, index = walk_to_closing_paren(words, index)
-                rendered = token[:-1] + "$(" + " ".join(w.value for w in inside) + ")"
-                # Whatever is written hard against the closing `)` is part of
-                # the same word — but a separator or a redirection is not, and
-                # absorbing one would discard the command after it.
-                while (
-                    index < len(words)
-                    and not words[index].space_before
-                    and words[index].value not in SEPARATORS
-                    and words[index].value not in REDIRECTIONS
-                ):
-                    rendered += words[index].value
                     index += 1
                 emit("NOTICE", path, line, f"names a package through a substitution, not checked: {rendered}")
                 continue
@@ -1514,6 +1552,33 @@ def open_bracket(text):
     return open_kinds[-1] if open_kinds else None
 
 
+def awaits_a_body(text):
+    """Whether this line declares a function whose BODY has not begun yet.
+
+    `f()` is not a command bash can run — it is a declaration, and the `{` or
+    `(` on the line under it is its body. Read as two commands, the second is a
+    group or a subshell that RUNS where it is written, so a function nobody
+    calls installs its packages there. The one-line forms were already read
+    correctly, which is what made the split ones worth finding.
+
+    The whole line has to BE the declaration head, so `foo bar ()` — which is
+    not one — does not swallow whatever follows it. Joined with a SPACE rather
+    than a separator, because the bracket beneath belongs to the same command.
+    """
+    try:
+        words = lex_words(text)
+    except ValueError:
+        return False
+    if any(word.quoted for word in words):
+        return False
+    spelling = [word.value for word in words]
+    if spelling[:1] == ["function"]:
+        spelling = spelling[1:]
+        return len(spelling) == 1 and bool(NAME_ONLY.match(spelling[0])) \
+            or spelling[1:] == ["(", ")"] and bool(NAME_ONLY.match(spelling[0]))
+    return spelling[1:] == ["(", ")"] and bool(NAME_ONLY.match(spelling[0]))
+
+
 def heredocs_opened_by(command):
     """The heredocs one command opens, or none if it cannot be tokenised."""
     masked, _ = mask_expressions(command)
@@ -1594,6 +1659,10 @@ def shell_commands(text):
         # whitespace: joined with a space, `echo hi` would become two more
         # words of the install beneath it.
         joining = open_bracket(pending)
+        if joining is None and awaits_a_body(pending):
+            # A declaration head and the bracket under it are ONE command, and
+            # the bracket is what the next `open_bracket` will see.
+            joining = ARRAY_SEPARATOR
         if joining is not None:
             separator = joining
             continue
@@ -2243,6 +2312,58 @@ def held(name, kind, defined, expressions):
     return rebased(*remembered_words, expressions) if remembered_words else []
 
 
+def written_down(word):
+    """Whether this word IS the value it spells, with nothing left to expand.
+
+    A `for` loop's values are only usable when the file says what they are.
+    `$LIST`, a substitution, an expression and a glob each stand for something
+    the runner works out, and inventing a package name out of one would fail a
+    workflow over a name nobody wrote.
+
+    A bare `$` counts as one of those, because an unquoted substitution arrives
+    SPLIT — `$`, `(`, its words, `)` — and the `$` is all that is left to
+    recognise it by. Its remaining pieces are ordinary words and are caught by
+    the caller stopping here rather than by this test.
+    """
+    return not (
+        word.value.endswith("$")
+        or (expands_a_dollar(word.value) and not word.literal_dollar)
+        or ("`" in word.value and not word.literal_backtick)
+        or EXPRESSION_PREFIX in word.value
+        or any(character in word.value for character in "*?[")
+    )
+
+
+def loop_values(words, index):
+    """`for NAME in value …`: the name and the values written down, or None.
+
+    `index` is the word after `for`. The list ends where the body begins — at
+    a separator or at `do` — and `for NAME` with no `in` iterates the
+    positional parameters, which are not written down here either.
+    """
+    if index + 1 >= len(words):
+        return None
+    name = words[index]
+    if name.quoted or not NAME_ONLY.match(name.value):
+        return None
+    if words[index + 1].value != "in" or words[index + 1].quoted:
+        return None
+    values = []
+    for word in words[index + 2:]:
+        if (word.value in SEPARATORS or word.value == "do") and not word.quoted:
+            break
+        if not written_down(word):
+            # STOP, rather than skip. A substitution is several words and only
+            # its first is recognisable as one, so skipping that first word
+            # binds `printf` and `cmake` out of `$(printf cmake)` as though the
+            # file had named them. What follows something unreadable cannot be
+            # read either — while the literals BEFORE it are values the loop is
+            # certainly given.
+            break
+        values.append(word)
+    return (name.value, values) if values else None
+
+
 def bounds_a_region(words):
     """Whether these words open, close, or divide a region bash may skip.
 
@@ -2444,6 +2565,12 @@ def defined_function(words, index):
     brackets have to be next to each other, since `foo (cmd)` is the command
     foo followed by a subshell — `foo ()`, `foo()` and `foo ( )` all declare —
     and after the keyword they are optional.
+
+    Two BODIES as well. `NAME () ( … )` is a function whose body is a subshell,
+    which bash accepts and `type` reports as a function like any other. Reading
+    only the brace form ran such a body where it was written, so a workflow
+    whose function is never called was rejected for a package that never
+    installs.
     """
     keyword = words[index].value == "function" and not words[index].quoted
     at = index + 2 if keyword else index + 1
@@ -2458,16 +2585,18 @@ def defined_function(words, index):
         at += 2
     elif not keyword:
         return None
-    if at >= len(words) or words[at].value != "{" or words[at].quoted:
+    if at >= len(words) or words[at].quoted or words[at].value not in BODY_BRACKETS:
         return None
     body_start = at
+    opener = words[at].value
+    closer = BODY_BRACKETS[opener]
     depth = 0
     for position in range(body_start, len(words)):
         if words[position].quoted:
             continue
-        if words[position].value == "{":
+        if words[position].value == opener:
             depth += 1
-        elif words[position].value == "}":
+        elif words[position].value == closer:
             depth -= 1
             if not depth:
                 return name, words[body_start + 1:position], position + 1

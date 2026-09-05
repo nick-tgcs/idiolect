@@ -5478,6 +5478,210 @@ YAML
 expect "a command after a pipeline is not isolated" 0 after-pipeline-not-isolated \
     "All 1 apt package(s)" '!codex-no-such-package'
 
+# ---------------- an unquoted substitution runs exactly like a quoted one
+# `echo "$(apt-get …)"` was read as the shell it is and `echo $(apt-get …)`
+# was not, because shlex hands the second one back split into `$`, `(`, its
+# words and `)`. Both start apt.
+write_workflow substitution-unquoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo $(apt-get install -y codex-no-such-package)
+YAML
+expect "an unquoted substitution as an argument is scanned" 1 substitution-unquoted \
+    "codex-no-such-package"
+
+# ...including where it stands in a package position. What it PRINTS is still
+# unresolvable and still announced, but what it RUNS is apt.
+write_workflow substitution-in-package-position ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: apt-get install -y cmake $(apt-get install -y codex-no-such-package)
+YAML
+expect "a substitution in a package position still runs" 1 substitution-in-package-position \
+    "codex-no-such-package"
+
+write_workflow substitution-package-announced ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: apt-get install -y cmake $(printf make)
+YAML
+expect "what a substitution prints is still announced" 0 substitution-package-announced \
+    "names a package through a substitution" "All 1 apt package(s)"
+
+# -------------------------- a for loop hands its literal values to the body
+# `for pkg in name; do apt-get install -y "$pkg"; done` installs name. The
+# values are written down, so the package is too.
+write_workflow for-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package; do
+            apt-get install -y "$pkg"
+          done
+YAML
+expect "a for loop's literal value reaches the body" 1 for-literal \
+    "codex-no-such-package"
+
+write_workflow for-literal-several ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in cmake codex-no-such-package; do
+            apt-get install -y "$pkg"
+          done
+YAML
+expect "every literal value of a for loop is checked" 1 for-literal-several \
+    "codex-no-such-package"
+
+# ...but a value the file does not spell out is still announced, not invented.
+write_workflow for-not-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in $LIST; do
+            apt-get install -y "$pkg"
+          done
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a for loop over an unwritten list is announced" 0 for-not-literal \
+    "names a package through a variable" "All 1 apt package(s)"
+
+# ------------------------------- a function body may be a subshell as well
+# `unused() ( … )` DECLARES; bash runs none of it until the name is called.
+# The brace form was already read that way and this one was being executed on
+# the spot, failing a workflow whose function is never invoked.
+write_workflow function-subshell-body ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          unused() ( apt-get install -y codex-no-such-package )
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a subshell-bodied function is a definition, not a run" 0 function-subshell-body \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow function-subshell-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          used() ( apt-get install -y codex-no-such-package )
+          used
+YAML
+expect "...and its body is read where it is called" 1 function-subshell-called \
+    "codex-no-such-package"
+
+# ...and a body that begins on the NEXT line is still a body, either bracket.
+# `f()` alone is not a command bash can run — it is a declaration waiting for
+# the `{` or `(` under it — so the two are one command and neither is executed
+# where it is written.
+write_workflow function-body-next-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          unused()
+          {
+            apt-get install -y codex-no-such-package
+          }
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a brace body on the next line is still a definition" 0 function-body-next-line \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow function-subshell-next-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          unused()
+          (
+            apt-get install -y codex-no-such-package
+          )
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a subshell body on the next line is still a definition" 0 function-subshell-next-line \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow function-body-next-line-called ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          used()
+          {
+            apt-get install -y codex-no-such-package
+          }
+          used
+YAML
+expect "...and it is read where it is called" 1 function-body-next-line-called \
+    "codex-no-such-package"
+
+# ...and a GROUP that is not a function body still runs where it is written.
+write_workflow group-next-line-runs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          {
+            apt-get install -y codex-no-such-package
+          }
+YAML
+expect "a group is not a function body and still runs" 1 group-next-line-runs \
+    "codex-no-such-package"
+
+# ...and a loop whose `do` sits on its own line binds its values just the same.
+write_workflow for-do-own-line ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package
+          do
+            apt-get install -y "$pkg"
+          done
+YAML
+expect "a for loop with do on its own line binds the same" 1 for-do-own-line \
+    "codex-no-such-package"
+
+# ...and it STOPS at the first value it cannot read, rather than skipping it.
+# A substitution arrives split — `$`, `(`, its words, `)` — so skipping only
+# the parts that look like expansions binds `printf` as a package name and
+# fails a workflow over a word nobody wrote. What follows something unreadable
+# is unreadable too.
+write_workflow for-substitution-values ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in $(printf cmake); do
+            apt-get install -y "$pkg"
+          done
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a for loop stops at a value it cannot read" 0 for-substitution-values \
+    "All 1 apt package(s)" '!printf'
+
+# ...but the literals BEFORE it are still values the loop is given.
+write_workflow for-literal-then-unreadable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package $(printf x); do
+            apt-get install -y "$pkg"
+          done
+YAML
+expect "a literal before an unreadable value is still checked" 1 for-literal-then-unreadable \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
