@@ -43,3 +43,7 @@ keystore.properties
 # Android Studio / IntelliJ project files
 android/.idea/
 android/**/*.iml
+
+# Python bytecode from ci/scripts helpers
+__pycache__/
+*.pyc

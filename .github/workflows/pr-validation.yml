@@ -349,7 +349,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev ripgrep
+          sudo apt-get install -y cmake g++ libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev ripgrep python3-yaml
 
       - name: Build FCITX5 (for ctest index)
         run: |
@@ -359,6 +359,17 @@ jobs:
 
       - name: Run coverage map validation
         run: bash ci/scripts/test-coverage-map.sh
+
+      # Here rather than in a job of its own because the check resolves package
+      # names against apt, and this job has already run `apt-get update` — a
+      # fresh job would have to repeat it just to populate the lists the check
+      # reads. Runs after the self-test, so a broken checker is reported as a
+      # broken checker rather than as broken workflows.
+      - name: Self-test the workflow dependency check
+        run: bash ci/scripts/test-workflow-apt-deps.sh
+
+      - name: Check workflow apt dependencies
+        run: bash ci/scripts/check-workflow-apt-deps.sh
 
   # =========================================================================
   # DESKTOP APP CROSS-PLATFORM CHECK (idiolect-app on macOS)
