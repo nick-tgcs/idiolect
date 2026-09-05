@@ -280,6 +280,67 @@ YAML
 expect "a commented-out use needs nothing" 0 commented-use \
     "All 1 workflow job(s)" "!::error::"
 
+# --------------------------------------------------- a use is an INVOCATION
+# Codex, on d6df5fd: the tool scan read raw text, so text merely MENTIONING the
+# tool demanded the package — a false red on a workflow that never runs it.
+write_workflow echoed-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo "use rg to search the crates"
+YAML
+expect "a tool named inside an echo is not a use" 0 echoed-use \
+    "All 1 workflow job(s)" "!::error::"
+
+# A heredoc body is data the shell runs none of — and this suite is itself full
+# of them, so the gate was demanding ripgrep on account of its own fixtures.
+write_workflow heredoc-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'NOTE'
+          rg -n TODO crates
+          bash ci/scripts/test-real-adapter-deps.sh
+          NOTE
+YAML
+expect "a heredoc body is data, not commands" 0 heredoc-use \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...while the real invocations must survive the narrowing. A pipeline element
+# is a command, and reading only the first word of the segment would miss it —
+# which is exactly how test-real-adapter-deps.sh calls rg.
+write_workflow piped-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf '%s\n' "$tree" | rg -n '^pyo3'
+YAML
+expect "a tool run as a pipeline element is a use" 1 piped-use \
+    "build" "ripgrep"
+
+# An invocation prefix comes before a command without being one.
+write_workflow prefixed-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: sudo rg -n TODO crates
+YAML
+expect "a tool behind sudo is a use" 1 prefixed-use \
+    "build" "ripgrep"
+
+# A quoted command name still names the command: quotes take a reserved word's
+# meaning away and leave a command as it was.
+write_workflow quoted-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          "rg" -n TODO crates
+YAML
+expect "a quoted command name is still the command" 1 quoted-use \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
@@ -318,9 +379,10 @@ else
     ok "the gate refuses to run without the apt scanner"
 fi
 
-# ...and a scanner that RUNS but fails is the same hole one step further in: an
-# empty record stream is indistinguishable from a set of jobs that install
-# nothing, so the gate would report every one of them as broken.
+# ...and a scanner that is THERE but broken is the same hole one step further
+# in. It is now both imported (for its lexer) and run (for its records), so
+# this fixture kills it at import; either way an empty answer must not read as
+# a repository that installs nothing and uses nothing.
 mkdir -p "$WORK/brokenscanner"
 cp "$CHECK" "$WORK/brokenscanner/gate.sh"
 cat >"$WORK/brokenscanner/workflow_apt_deps.py" <<'BROKEN'
@@ -352,6 +414,37 @@ expect "a workflow with no jobs is not a pass" 1 jobless \
 
 expect "a path that does not exist is an error" 1 "no-such-dir/ci.yml" \
     "does not exist"
+
+# A file that is not YAML is not a file with no jobs in it. Ending in a
+# traceback says the same thing far less usefully, and this fixture was written
+# by accident: a `run: "rg" -n TODO` that YAML rejects.
+write_workflow not-yaml ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: "rg" -n TODO crates
+YAML
+expect "a file that is not YAML says so" 1 not-yaml \
+    "is not valid YAML"
+
+# A script NAMED by a command that does not run one is not a script run. It is
+# an argument to `echo` here; in test-coverage-map.sh it is
+# `coverage_gate="ci/scripts/test-all.sh"`, held so the suite can be checked
+# for listing its scripts. Following those pulled in the whole suite — a
+# 6,000-line self-test among them, minutes of lexing — and would demand
+# ripgrep of any job that so much as printed a path.
+#
+# The mutation that made this case worth rewriting: taking references from
+# every word of every command left the ASSIGNMENT form green either way, since
+# an assignment has no command word to reach the rule at all.
+write_workflow named-not-run ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo ci/scripts/test-coverage-map.sh
+YAML
+expect "a script named but not run is not followed" 0 named-not-run \
+    "All 1 workflow job(s)" "!::error::"
 
 mkdir -p "$WORK/empty"
 expect "a directory with no workflows is an error" 1 empty \

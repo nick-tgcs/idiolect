@@ -93,60 +93,135 @@ import tempfile
 
 import yaml
 
-# tool -> (apt package, pattern matching a use of the tool in shell text)
+# command name -> apt package that provides it
+TOOLS = {
+    "rg": "ripgrep",
+}
+
+# A cheap over-approximating filter, asked before the lexer is. Lexing costs
+# real time on a large file — this repository has a 6,000-line self-test, which
+# takes minutes — and text holding neither a tool name nor a script path cannot
+# contribute either. The regex decides only whether to LOOK; the lexer decides
+# every verdict, so a match here that turns out to be a word inside an echo
+# costs a parse and changes nothing.
 #
 # The word boundaries are spelled out rather than using \b because `.`, `/` and
 # `-` are word characters to a shell reader and are not to \b: without this,
 # `rg` matches inside `target/rg-out` and inside `cargo-rg`.
 EDGE = r"(?:^|[^\w./-])%s(?![\w./-])"
-TOOLS = {
-    "rg": ("ripgrep", re.compile(EDGE % "rg", re.M)),
-}
+CANDIDATES = [re.compile(EDGE % re.escape(name), re.M) for name in TOOLS]
 
 REPO_ROOT = os.environ["REPO_ROOT"]
 SCANNER = os.environ["SCANNER"]
+
+# The apt scanner as a MODULE, for the question this gate asks of shell text:
+# which words are commands. It already answers that — it has to, to tell an
+# `apt-get` from the word `apt-get` inside an echo — and it models heredoc
+# bodies, quoting, continuations, pipelines and invocation prefixes to do it.
+# A second reader here would be a second answer: reading raw text called
+# `echo "use rg to search"` a use of rg and demanded the package for it
+# (Codex, on d6df5fd), and this suite's own fixtures did the same.
+sys.path.insert(0, os.path.dirname(os.path.abspath(SCANNER)))
+try:
+    import workflow_apt_deps as shell  # noqa: E402
+except BaseException as error:  # SystemExit included: a scanner that exits on import
+    # A scanner that cannot be loaded must not read as a repository with no
+    # tool uses in it, which is what an empty analysis would look like.
+    print("::error::the apt scanner failed — the workflow tool check could not run")
+    print(error)
+    sys.exit(1)
 SCRIPT_REFERENCE = re.compile(r"ci/scripts/[\w.-]+\.sh")
 
+# `source x` and `. x` run a script in the current shell rather than a new one.
+SOURCING = {"source", "."}
 
-def active(text):
-    """`text` without its comment lines.
-
-    A `#` line is not a command, in a `run:` block or in a script. Without this
-    the guard comment added to each rg-using script — which quotes `if rg ...`
-    to explain itself — reads as a use of the tool, and so does an install
-    someone commented out. Only whole-line comments: a `#` mid-line may be
-    inside quotes, a URL fragment or a parameter expansion, and deciding which
-    is shell lexing, which is what the apt scanner below is for.
-    """
-    return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
 
 script_cache = {}
 
 
-def tools_used(text, seen):
-    """Packages `text` needs, following the repo scripts it invokes."""
-    text = active(text)
-    needed = {package for package, pattern in TOOLS.values() if pattern.search(text)}
-    for reference in SCRIPT_REFERENCE.findall(text):
+def commands_of(text):
+    """Every command in `text`, as the scanner's already-lexed words.
+
+    A command, not a line and not a segment: `printf … | rg …` is two of them,
+    and the second is how test-real-adapter-deps.sh calls rg.
+    """
+    for _, block, in_heredoc in shell.shell_commands(text):
+        if in_heredoc:
+            continue
+        masked, _ = shell.mask_expressions(block)
+        try:
+            words = shell.lex_words(masked)
+        except ValueError:
+            # An unfinished quote. The apt scanner announces these; here the
+            # cost of passing over one is a tool use unseen, which the script
+            # itself now reports the moment it runs without its tool.
+            continue
+        index = 0
+        while index <= len(words):
+            end = shell.command_ends(words, index)
+            if end > index:
+                yield words[index:end]
+            index = end + 1
+
+
+def analysed(text):
+    """(packages this shell text RUNS, the repo scripts it RUNS)."""
+    packages = set()
+    references = set()
+    if not any(candidate.search(text) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(text):
+        return packages, references
+
+    for words in commands_of(text):
+        word = shell.command_word(words)
+        if word is None:
+            continue
+        name = word.value.rsplit("/", 1)[-1]
+        package = TOOLS.get(name)
+        if package is not None:
+            packages.add(package)
+        if SCRIPT_REFERENCE.fullmatch(word.value):
+            # An executable script run by its own path.
+            references.add(word.value)
+        elif name in shell.SHELL_COMMANDS or name in SOURCING:
+            # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
+            # command that runs one. Taking the path from any word at all
+            # followed what a `coverage_gate="ci/scripts/test-all.sh"` merely
+            # NAMES, and through it every script in the suite.
+            references.update(
+                argument.value
+                for argument in words[1:]
+                if SCRIPT_REFERENCE.fullmatch(argument.value)
+            )
+    return packages, references
+
+
+def script_analysis(reference):
+    """`analysed` for a repo script, read once however many jobs reach it."""
+    if reference not in script_cache:
+        path = os.path.join(REPO_ROOT, reference)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                body = handle.read()
+        except OSError:
+            # A workflow naming a script that is not there is a different fault,
+            # and one the job reports loudly at `bash:` the first time it runs.
+            body = ""
+        script_cache[reference] = analysed(body)
+    return script_cache[reference]
+
+
+def tools_used(text):
+    """Packages `text` needs, following the repo scripts it runs."""
+    needed, queue = analysed(text)
+    seen = set()
+    while queue:
+        reference = queue.pop()
         if reference in seen:
             continue
         seen.add(reference)
-        if reference not in script_cache:
-            path = os.path.join(REPO_ROOT, reference)
-            try:
-                with open(path, encoding="utf-8") as handle:
-                    script_cache[reference] = handle.read()
-            except OSError:
-                # Not every match is an invocation — this pattern finds script
-                # paths inside heredocs and test fixtures too, and the self-test
-                # for this gate contains several that do not exist. A workflow
-                # naming a script that really is missing is a different fault,
-                # and one the job reports loudly at `bash:` the first time it
-                # runs, so passing over it here hides nothing.
-                script_cache[reference] = ""
-        needed |= tools_used(script_cache[reference], seen)
+        packages, references = script_analysis(reference)
+        needed |= packages
+        queue |= references - seen
     return needed
 
 
@@ -210,10 +285,14 @@ jobs_found = []
 
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
-        # A workflow's `on:` key is parsed by YAML 1.1 as the boolean True.
-        # Irrelevant here — only `jobs` is read — but it is the reason this
-        # does not assert on the document's shape.
-        document = yaml.safe_load(handle)
+        try:
+            # A workflow's `on:` key is parsed by YAML 1.1 as the boolean True.
+            # Irrelevant here — only `jobs` is read — but it is the reason this
+            # does not assert on the document's shape.
+            document = yaml.safe_load(handle)
+        except yaml.YAMLError as error:
+            print(f"::error::{path} is not valid YAML ({error})")
+            sys.exit(1)
 
     jobs = (document or {}).get("jobs")
     if not isinstance(jobs, dict):
@@ -236,7 +315,7 @@ installed_by_job = installed_packages(jobs_found)
 for index, (path, job_name, run_texts) in enumerate(jobs_found):
     needed = set()
     for text in run_texts:
-        needed |= tools_used(text, set())
+        needed |= tools_used(text)
 
     for package in sorted(needed - installed_by_job[index]):
         print(
