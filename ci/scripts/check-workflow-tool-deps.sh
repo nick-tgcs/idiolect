@@ -594,8 +594,19 @@ def analysed_command(words, block=""):
         # hands the second path to it as `$1`, so following both rejected a
         # driver for what its argument does.
         operand = at + 1
-        while operand < len(words) and words[operand].value.startswith("-"):
-            if words[operand].value in shell.SHELL_OPTIONS_WITH_ARGUMENT:
+        while operand < len(words) and words[operand].value.startswith(("-", "+")):
+            token = words[operand].value
+            # Short options CLUSTER, and `-o` takes the word after it even at
+            # the end of one: `bash -euo pipefail script.sh` runs script.sh,
+            # while reading only an exact `-o` made `pipefail` the script
+            # (Codex, on 5fece60). The letter has to be LAST, which is where
+            # bash's own usage puts it.
+            clustered = (
+                len(token) > 1
+                and not token.startswith(("--", "++"))
+                and token[-1] in "oO"
+            )
+            if token in shell.SHELL_OPTIONS_WITH_ARGUMENT or clustered:
                 operand += 1
             operand += 1
         if operand < len(words):

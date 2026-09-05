@@ -1201,6 +1201,37 @@ YAML
 expect "blanking an escape cannot create a substitution" 0 escape-closing-up \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 5fece60: bash's short options CLUSTER, and `-o` takes its argument
+# from the next word even at the end of one — so `pipefail` was read as the
+# script and the real one never followed.
+write_workflow clustered-options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -euo pipefail ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a clustered -o takes the word after it" 1 clustered-options \
+    "build" "ripgrep"
+
+write_workflow plus-options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash +o posix ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "+o takes one too" 1 plus-options \
+    "build" "ripgrep"
+
+# ...and a cluster WITHOUT one must not swallow the script.
+write_workflow clustered-no-argument ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -eu ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a cluster with no such option swallows nothing" 1 clustered-no-argument \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
