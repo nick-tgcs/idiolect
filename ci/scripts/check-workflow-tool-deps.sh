@@ -163,6 +163,10 @@ FIND_ACTION_ENDS = {";", "+"}
 # The body of a backtick substitution, which shlex does not tokenise as one.
 TICKED = re.compile(r"`([^`]*)`")
 
+# A heredoc opener, with the quoting of its delimiter — the thing that decides
+# whether the body is expanded or passed on as it was written.
+HEREDOC_OPENER = re.compile(r"""<<-?\s*(['"]?)[A-Za-z_][\w-]*\1""")
+
 # The openers of a process substitution, `<( … )` and `>( … )`.
 PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
 
@@ -195,9 +199,25 @@ def commands_of(text):
     shlex strips the quotes, and one question below can only be answered by
     looking at the line again.
     """
+    expanding = False
     for _, block, in_heredoc in shell.shell_commands(text):
         if in_heredoc:
+            # A heredoc body is data the shell runs none of — unless its
+            # delimiter was UNQUOTED, in which case bash expands the data
+            # first, and a substitution written there runs (Codex, on
+            # d3039b5). The delimiter decides, and it is on the opening line
+            # this loop has already been past.
+            if expanding:
+                for body in shell.substitution_bodies(block) + TICKED.findall(block):
+                    yield from commands_of(body)
             continue
+
+        # `<<EOF` expands, `<<'EOF'` and `<<"EOF"` do not. Read from the
+        # opener rather than from the scanner's delimiter, which keeps the
+        # NAME and drops the quotes that are the whole question here.
+        expanding = any(
+            not opener.group(1) for opener in HEREDOC_OPENER.finditer(block)
+        )
         masked, _ = shell.mask_expressions(block)
         try:
             words = shell.lex_words(masked)

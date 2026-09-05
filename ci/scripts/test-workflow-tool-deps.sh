@@ -834,6 +834,59 @@ YAML
 expect "a quoted parenthesis opens no substitution" 0 quoted-opener \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on d3039b5: a heredoc body is data, but an UNQUOTED delimiter means
+# bash expands that data first — so a substitution written in one runs. The
+# delimiter decides, and it is written on the opening line.
+write_workflow expanding-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          found: $(rg -n TODO crates)
+          EOF
+YAML
+expect "a substitution in an expanding heredoc runs" 1 expanding-heredoc \
+    "build" "ripgrep"
+
+write_workflow expanding-heredoc-ticks ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          found: `rg -n TODO crates`
+          EOF
+YAML
+expect "backticks in an expanding heredoc run" 1 expanding-heredoc-ticks \
+    "build" "ripgrep"
+
+# Quoted, nothing in the body is expanded and the same text is inert. Both
+# spellings of quoting the delimiter, since either one stops it.
+write_workflow quoted-heredoc-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'EOF'
+          found: $(rg -n TODO crates)
+          EOF
+YAML
+expect "a quoted delimiter leaves the body literal" 0 quoted-heredoc-substitution \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow double-quoted-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<"EOF"
+          found: $(rg -n TODO crates)
+          EOF
+YAML
+expect "double-quoting the delimiter stops it too" 0 double-quoted-heredoc \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
