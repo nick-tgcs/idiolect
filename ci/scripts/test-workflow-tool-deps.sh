@@ -580,6 +580,101 @@ YAML
 expect "a command carried by a variable is not followed" 0 command-in-a-variable \
     "All 1 workflow job(s)"
 
+# ------------------------------------------- round five, my own last commit
+# Codex, on 5fd4cef. Every one of these is a consequence of the commit before
+# it: a wrapper that resolves to a shell, an option given find's meaning
+# everywhere, and a rewrite that dropped the quoting it had just learned to
+# respect.
+write_workflow wrapped-shell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 bash -c 'rg -n TODO crates'
+YAML
+expect "a shell reached through a wrapper is still a shell" 1 wrapped-shell \
+    "build" "ripgrep"
+
+write_workflow wrapped-shell-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: xargs bash ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a script reached through a wrapper is followed" 1 wrapped-shell-script \
+    "build" "ripgrep"
+
+# `-exec` is find's word. To `echo` it is an argument like any other.
+write_workflow exec-elsewhere ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo -exec rg
+YAML
+expect "-exec means nothing to a command that is not find" 0 exec-elsewhere \
+    "All 1 workflow job(s)" "!::error::"
+
+# Quoted, a process substitution is text: bash performs none inside quotes of
+# either kind. The rewrite to `$( … )` was undoing the quoting check that the
+# same commit added for `$( … )` itself.
+write_workflow quoted-process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo '<(rg -n TODO crates)'
+YAML
+expect "a quoted process substitution runs nothing" 0 quoted-process-substitution \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow double-quoted-process-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo "<(rg -n TODO crates)"
+YAML
+expect "double quotes stop one too" 0 double-quoted-process-substitution \
+    "All 1 workflow job(s)" "!::error::"
+
+# The quoting rule above must stop at PROCESS substitution. Bash still expands
+# `$( … )` and still runs backticks inside DOUBLE quotes, so a fix that reads
+# "quoted means inert" for every construct would take these two with it.
+write_workflow double-quoted-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: hits="$(rg -n TODO crates)"
+YAML
+expect "double quotes do not stop \$( )" 1 double-quoted-substitution \
+    "build" "ripgrep"
+
+write_workflow double-quoted-ticks ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: hits="`rg -n TODO crates`"
+YAML
+expect "double quotes do not stop backticks" 1 double-quoted-ticks \
+    "build" "ripgrep"
+
+# Composites, because each fix in this file was found by a form built out of
+# two rules that were each correct on their own.
+write_workflow wrapper-wrapper-shell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: xargs timeout 30 bash -c 'rg -n TODO crates'
+YAML
+expect "a wrapper behind a wrapper behind a shell" 1 wrapper-wrapper-shell \
+    "build" "ripgrep"
+
+write_workflow find-exec-shell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -exec bash -c 'rg -n TODO' {} \;
+YAML
+expect "find -exec reaching a shell program" 1 find-exec-shell \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

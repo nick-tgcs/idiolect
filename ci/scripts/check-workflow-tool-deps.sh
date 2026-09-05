@@ -221,10 +221,15 @@ def analysed_command(words):
     # and `(`, and a backtick stays welded to the name in front of it. The
     # words are rejoined the way they were written, so `< (` — a redirection
     # and a subshell — cannot become a process substitution on the way.
+    #
+    # QUOTED words are left out of it: bash performs no process substitution
+    # inside quotes of either kind, so `echo '<(rg …)'` prints text. Rewriting
+    # it to `$( … )` undid, for this construct, the very check the same commit
+    # added for `$( … )` itself (Codex, on 5fd4cef).
     rendered = "".join(
         (" " if word.space_before else "") + word.value
         for word in words
-        if not word.literal_dollar
+        if not word.quoted
     )
     # `<( … )` and `>( … )` run their contents in a process of their own, and
     # the command word in front of them is something else entirely. Spelled as
@@ -257,17 +262,6 @@ def analysed_command(words):
             references |= referenced
         return packages, references
 
-    if shell.runs_a_script(words):
-        # `bash -c 'rg …'` runs rg, and the program is ONE quoted word that
-        # nothing here would otherwise look inside — the shell is the command
-        # and the tool is a character in a string (Codex, on 03da267). The
-        # scanner reads these because a script handed over this way can install
-        # packages; it is read here for the same reason.
-        script = shell.script_argument(words)
-        if script is not None:
-            found, referenced = analysed(script.value)
-            return packages | found, references | referenced
-
     word = shell.command_word(words)
     if word is None:
         return packages, references
@@ -298,12 +292,29 @@ def analysed_command(words):
             break
         at = following
 
-    # `find crates -exec rg -n TODO {} +` runs rg once per match. The option
-    # says so; the command is simply the word after it.
-    for position in range(at, len(words) - 1):
-        if words[position].value in RUNS_WHAT_FOLLOWS and not words[position].quoted:
-            at = position + 1
-            break
+    # `find crates -exec rg -n TODO {} +` runs rg once per match. FIND's
+    # option, and only find's: to `echo` a `-exec` is an argument like any
+    # other, and giving it this meaning everywhere demanded ripgrep of a job
+    # that prints the word (Codex, on 5fd4cef).
+    if words[at].value.rsplit("/", 1)[-1] == "find":
+        for position in range(at, len(words) - 1):
+            if words[position].value in RUNS_WHAT_FOLLOWS and not words[position].quoted:
+                at = position + 1
+                break
+
+    # Asked HERE rather than of the whole command, because a wrapper hides the
+    # shell behind it: with `timeout 30 bash -c 'rg …'` the command is still
+    # `timeout` at the top of this function, so nothing looked inside the
+    # program bash was handed (Codex, on 5fd4cef).
+    if shell.runs_a_script(words[at:]):
+        # The program is ONE quoted word that nothing here would otherwise look
+        # inside — the shell is the command and the tool is a character in a
+        # string. The scanner reads these because a script handed over this way
+        # can install packages; it is read here for the same reason.
+        script = shell.script_argument(words[at:])
+        if script is not None:
+            found, referenced = analysed(script.value)
+            return packages | found, references | referenced
 
     command = words[at]
     name = command.value.rsplit("/", 1)[-1]
