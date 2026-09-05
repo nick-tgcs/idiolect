@@ -211,6 +211,9 @@ def ticked(text):
 # operators that would end it.
 HEREDOC_OPENER = re.compile(r"""<<-?\s*([^\s;&|<>()]+)""")
 
+# A backslash and the character it quotes, anywhere.
+ESCAPED = re.compile(r"\\.", re.S)
+
 # What makes a delimiter quoted, and so its body literal: not only a pair
 # around the whole word. `<<\EOF` and `<<E"OF"` are both quoted to bash, which
 # strips the quoting and stops expanding the body (Codex, on d32dd1d).
@@ -250,7 +253,12 @@ def expanded(body):
     written somewhere, and this suite's own fixtures are heredocs full of `rg`
     lines that run nothing.
     """
-    joined = "\n".join(body)
+    # A backslash still quotes in an expanded body: `\$(rg …)` is written out
+    # rather than run, and so is `` \` `` (Codex, on 06f621c). Each escaped
+    # pair is blanked before anything is read out, two spaces for two
+    # characters so the rest of the line stays where it was — and `\\` blanks
+    # to nothing that opens anything, leaving a substitution after it live.
+    joined = ESCAPED.sub("  ", "\n".join(body))
     for inner in shell.substitution_bodies(joined) + ticked(joined):
         yield from commands_of(inner)
 

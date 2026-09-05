@@ -1144,6 +1144,63 @@ YAML
 expect "an apostrophe inside double quotes stops nothing" 1 apostrophe-in-double \
     "build" "ripgrep"
 
+# Codex, on 06f621c: inside an expanding heredoc a backslash still quotes, so
+# `\$(rg …)` is written out rather than run. The same goes for a backtick.
+write_workflow escaped-dollar-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          literally: \$(rg -n TODO crates)
+          EOF
+YAML
+expect "an escaped dollar in a heredoc runs nothing" 0 escaped-dollar-heredoc \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow escaped-tick-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          literally: \`rg -n TODO crates\`
+          EOF
+YAML
+expect "an escaped backtick in a heredoc runs nothing" 0 escaped-tick-heredoc \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and the unescaped one beside it still runs, so the blanking cannot simply
+# swallow the body.
+write_workflow escaped-and-live-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          literally: \$(echo nothing)
+          really: $(rg -n TODO crates)
+          EOF
+YAML
+expect "a live substitution beside an escaped one still runs" 1 escaped-and-live-heredoc \
+    "build" "ripgrep"
+
+# The escaped pair is blanked rather than deleted, and this is the case that
+# says why: delete it from `$\$(rg …)` and the two halves close up into a
+# `$(` nobody wrote. Bash runs nothing here — a `$` before a backslash is a
+# dollar, and the escaped one after it is another.
+write_workflow escape-closing-up ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          literally: $\$(rg -n TODO crates)
+          EOF
+YAML
+expect "blanking an escape cannot create a substitution" 0 escape-closing-up \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
