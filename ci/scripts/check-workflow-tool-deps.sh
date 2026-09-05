@@ -153,6 +153,27 @@ SOURCING = {"source", "."}
 # Commands whose ARGUMENT is the command that runs.
 WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 
+# Their own options that take a value, and how many bare operands of their own
+# come before the command. Held per wrapper rather than guessed: the scanner
+# declines to hold such a table for `sudo -u` and says so, but there the cost
+# was a value unread, while here it is the command itself.
+WRAPPER_OPTIONS_WITH_ARGUMENT = {
+    "xargs": frozenset({
+        "-I", "-i", "-n", "-P", "-L", "-l", "-s", "-a", "-d", "-E", "-e",
+        "--replace", "--max-args", "--max-procs", "--max-lines", "--arg-file",
+        "--delimiter", "--eof", "--process-slot-var",
+    }),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "-n", "-p", "-P", "-u", "--class", "--classdata",
+                         "--pid", "--pgid", "--uid"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+}
+
+# `timeout DURATION COMMAND …` — the duration is timeout's, and it may carry a
+# suffix, so it is not recognised by looking like a number.
+WRAPPER_OPERANDS = {"timeout": 1}
+
 # Options that introduce a command rather than a file — `find … -exec rg … +`.
 RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
 
@@ -215,9 +236,23 @@ def commands_of(text):
         # `<<EOF` expands, `<<'EOF'` and `<<"EOF"` do not. Read from the
         # opener rather than from the scanner's delimiter, which keeps the
         # NAME and drops the quotes that are the whole question here.
-        expanding = any(
-            not opener.group(1) for opener in HEREDOC_OPENER.finditer(block)
-        )
+        #
+        # One command may open SEVERAL, and each delimiter answers for its own
+        # body (Codex, on 4e02d11). Attributing bodies to openers needs the
+        # TERMINATOR lines, and those are what the scanner consumes to know a
+        # body ended — so where a command's delimiters disagree, this says so
+        # instead of applying one of them to everything.
+        # ...and where they DISAGREE, the bodies are left alone. Attributing
+        # one to its own opener needs the terminator lines, and those are what
+        # the scanner consumes to know a body ended. Announcing it was tried
+        # first and withdrawn: the notice fired on this repository, because a
+        # file of fixtures that quote both spellings lexes as one block, and it
+        # printed that whole block. So this is a LIMITATION rather than a
+        # notice — the direction is a use unseen in a construct no workflow
+        # here writes, and the script that needs the tool still refuses to run
+        # without it.
+        openers = [bool(opener.group(1)) for opener in HEREDOC_OPENER.finditer(block)]
+        expanding = bool(openers) and not any(openers)
         masked, _ = shell.mask_expressions(block)
         try:
             words = shell.lex_words(masked)
@@ -266,7 +301,10 @@ def analysed_command(words, block=""):
             # case and decided. Anything else is announced. Being wrong about
             # this costs a notice, never a verdict.
             if shell.substitution_bodies(word.value) and f"'{word.value}'" not in block:
-                undecided.add(word.value)
+                undecided.add(
+                    f"cannot tell which substitution in {word.value!r} is "
+                    "literal and which runs"
+                )
             continue
         inner += shell.substitution_bodies(word.value)
 
@@ -366,18 +404,30 @@ def analysed_command(words, block=""):
     # neither an option nor a bare number is taken. Being wrong here leaves a
     # use unseen; it never invents one.
     while words[at].value.rsplit("/", 1)[-1] in WRAPPERS:
-        following = next(
-            (
-                position
-                for position in range(at + 1, len(words))
-                if not words[position].value.startswith("-")
-                and not words[position].value.isdigit()
-            ),
-            None,
-        )
-        if following is None:
+        wrapper = words[at].value.rsplit("/", 1)[-1]
+        takes_argument = WRAPPER_OPTIONS_WITH_ARGUMENT.get(wrapper, frozenset())
+        operands = WRAPPER_OPERANDS.get(wrapper, 0)
+        position = at + 1
+        while position < len(words):
+            token = words[position].value
+            if token.startswith("-") and not words[position].quoted:
+                # `xargs -I '{}' rg …`: the replacement string is the OPTION's,
+                # and reading the first non-option word made it the command
+                # (Codex, on 4e02d11).
+                if token in takes_argument:
+                    position += 1
+                position += 1
+                continue
+            if operands:
+                # `timeout 30s rg …`: a duration is an operand of timeout's
+                # own, and it is not always a bare number.
+                operands -= 1
+                position += 1
+                continue
             break
-        at = following
+        if position >= len(words):
+            break
+        at = position
 
     # `find crates -exec rg -n TODO {} +` runs rg once per match. FIND's
     # option, and only find's: to `echo` a `-exec` is an argument like any
@@ -593,11 +643,8 @@ for index, (path, job_name, job, _) in enumerate(jobs_found):
         )
         failures += 1
 
-for word in sorted(undecided):
-    print(
-        f"notice: cannot tell which substitution in {word!r} is literal and "
-        "which runs — not checked"
-    )
+for what in sorted(undecided):
+    print(f"notice: {what} — not checked")
 
 if jobs_checked == 0:
     print("::error::no jobs found in the paths given — the workflow tool check found nothing to check")

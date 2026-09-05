@@ -887,6 +887,98 @@ YAML
 expect "double-quoting the delimiter stops it too" 0 double-quoted-heredoc \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 4e02d11: one command may open SEVERAL heredocs, and each
+# delimiter answers the question for its own body. Attributing a body to its
+# own opener needs the terminator lines, which the scanner consumes — so where
+# a command's delimiters disagree, neither body is read.
+#
+# Announcing it instead was tried and withdrawn: the notice fired on this
+# repository's own workflows, because THIS file — fixtures quoting both
+# spellings — lexes as a single block, and the notice printed all of it. A
+# limitation whose direction is a use unseen, in a construct no workflow here
+# writes, with the script's own guard still behind it.
+write_workflow mixed-heredocs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'LITERAL' <<EXPANDING
+          one $(rg -n one crates)
+          LITERAL
+          two $(rg -n two crates)
+          EXPANDING
+YAML
+expect "disagreeing delimiters read neither body" 0 mixed-heredocs \
+    "All 1 workflow job(s)" "!::error::" "!notice"
+
+# Agreeing ones are still decided, in both directions.
+write_workflow two-expanding-heredocs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<A <<B
+          one $(rg -n one crates)
+          A
+          two
+          B
+YAML
+expect "two expanding heredocs are read" 1 two-expanding-heredocs \
+    "build" "ripgrep"
+
+write_workflow two-literal-heredocs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'A' <<'B'
+          one $(rg -n one crates)
+          A
+          two
+          B
+YAML
+expect "two literal heredocs stay literal" 0 two-literal-heredocs \
+    "All 1 workflow job(s)" "!::error::"
+
+# Codex, on 4e02d11: a wrapper's own operands are not its command. `-I` takes
+# a replacement string, and timeout takes a DURATION which may carry a suffix,
+# so neither `{}` nor `30s` is the thing being run.
+write_workflow xargs-replace ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -I '{}' rg -n TODO '{}'
+YAML
+expect "an option's own argument is not the command" 1 xargs-replace \
+    "build" "ripgrep"
+
+write_workflow timeout-suffix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30s rg -n TODO crates
+YAML
+expect "a duration with a suffix is not the command" 1 timeout-suffix \
+    "build" "ripgrep"
+
+write_workflow timeout-signal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout -k 5s 30s rg -n TODO crates
+YAML
+expect "an option, its argument, and then the duration" 1 timeout-signal \
+    "build" "ripgrep"
+
+write_workflow nice-adjustment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: nice -n 5 rg -n TODO crates
+YAML
+expect "nice takes an adjustment before its command" 1 nice-adjustment \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
