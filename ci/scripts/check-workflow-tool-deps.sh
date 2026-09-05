@@ -266,10 +266,15 @@ def analysed_command(words, block=""):
     # word INSIDE a substitution that is itself unquoted and runs (Codex, on
     # dcf9333). Which is the same distinction as the line above, one level in:
     # quoting an argument is not quoting the construct.
+    #
+    # And the opener may be a word of its OWN: `<"("` redirects from a file
+    # named `(`, so rejoining without the quoting produced a `<(` nobody wrote
+    # (Codex, on e9866ba). Any quoted word holding a bracket is left out,
+    # rather than only one already spelled `<(`.
     rendered = "".join(
         (" " if word.space_before else "") + word.value
         for word in words
-        if not (word.quoted and PROCESS_SUBSTITUTION.search(word.value))
+        if not (word.quoted and "(" in word.value)
     )
     # `<( … )` and `>( … )` run their contents in a process of their own, and
     # the command word in front of them is something else entirely. Spelled as

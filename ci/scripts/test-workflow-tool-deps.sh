@@ -821,6 +821,19 @@ YAML
 expect "backticks in argument position run" 1 ticks-as-argument \
     "build" "ripgrep"
 
+# Codex, on e9866ba: a QUOTED parenthesis opens nothing. `<"("` redirects from
+# a file named `(`, and rejoining the words without their quoting produced a
+# `<(` that was never written. The word carrying the opener decides, which is
+# the same rule as the two above it — only now the opener is a word of its own.
+write_workflow quoted-opener ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo hi <"(" rg -n TODO crates ")"
+YAML
+expect "a quoted parenthesis opens no substitution" 0 quoted-opener \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
