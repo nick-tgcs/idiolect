@@ -156,6 +156,10 @@ WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 # Options that introduce a command rather than a file — `find … -exec rg … +`.
 RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
 
+# What terminates one of those actions, after which find's own expression
+# continues.
+FIND_ACTION_ENDS = {";", "+"}
+
 # The body of a backtick substitution, which shlex does not tokenise as one.
 TICKED = re.compile(r"`([^`]*)`")
 
@@ -181,7 +185,12 @@ def commands_in(words):
 
 
 def commands_of(text):
-    """Every command in a block of shell, heredoc bodies excluded."""
+    """Every command in a block of shell, with the block it was written in.
+
+    The block comes along because quoting is a property of what was WRITTEN:
+    shlex strips the quotes, and one question below can only be answered by
+    looking at the line again.
+    """
     for _, block, in_heredoc in shell.shell_commands(text):
         if in_heredoc:
             continue
@@ -193,10 +202,16 @@ def commands_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
-        yield from commands_in(words)
+        for command in commands_in(words):
+            yield command, block
 
 
-def analysed_command(words):
+# Words this run could not decide about, announced once at the end rather than
+# resolved. A set because the same line reaches here once per job that runs it.
+undecided = set()
+
+
+def analysed_command(words, block=""):
     """(packages this one command runs, the repo scripts it runs)."""
     packages = set()
     references = set()
@@ -213,6 +228,21 @@ def analysed_command(words):
             # Single-quoted: `echo '$(rg …)'` runs nothing, and the lexer
             # already carries that. Discarding it read a job's own
             # documentation as a dependency (Codex, on f9efff8).
+            #
+            # ...but the flag describes the WORD, and a word can be part
+            # literal and part live: `'$literal'"$(rg …)"` runs its second
+            # half, and by the time quoting is stripped both dollars look the
+            # same (Codex, on a6bf836). Neither answer is safe, so this one is
+            # not given — announced instead, the way the apt scanner announces
+            # what it cannot resolve, because a skip nobody can see is a skip
+            # nobody can audit.
+            #
+            # Whether it is one or the other is asked of the LINE: a word that
+            # appears in it wrapped in single quotes, whole, is the literal
+            # case and decided. Anything else is announced. Being wrong about
+            # this costs a notice, never a verdict.
+            if shell.substitution_bodies(word.value) and f"'{word.value}'" not in block:
+                undecided.add(word.value)
             continue
         inner += shell.substitution_bodies(word.value)
 
@@ -257,7 +287,7 @@ def analysed_command(words):
     definition = shell.defined_function(words, 0) if words else None
     if definition is not None:
         for command in commands_in(definition[1]):
-            found, referenced = analysed_command(command)
+            found, referenced = analysed_command(command, block)
             packages |= found
             references |= referenced
         return packages, references
@@ -296,11 +326,28 @@ def analysed_command(words):
     # option, and only find's: to `echo` a `-exec` is an argument like any
     # other, and giving it this meaning everywhere demanded ripgrep of a job
     # that prints the word (Codex, on 5fd4cef).
+    #
+    # Three things about an action, all of them found the hard way (Codex, on
+    # a6bf836). Quoting it changes nothing, because the quotes are the SHELL's
+    # and find is handed `-exec` either way. An action is a COMMAND, so
+    # everything known about commands — wrappers, shells, tools — applies
+    # inside it, which is why it is read by recursion rather than by moving a
+    # cursor. And `-and` is implicit between adjacent expressions, so a find
+    # may hold SEVERAL, of which the first is not the interesting one.
     if words[at].value.rsplit("/", 1)[-1] == "find":
-        for position in range(at, len(words) - 1):
-            if words[position].value in RUNS_WHAT_FOLLOWS and not words[position].quoted:
-                at = position + 1
-                break
+        position = at + 1
+        while position < len(words):
+            if words[position].value not in RUNS_WHAT_FOLLOWS:
+                position += 1
+                continue
+            action = position + 1
+            end = action
+            while end < len(words) and words[end].value not in FIND_ACTION_ENDS:
+                end += 1
+            found, referenced = analysed_command(words[action:end], block)
+            packages |= found
+            references |= referenced
+            position = end + 1
 
     # Asked HERE rather than of the whole command, because a wrapper hides the
     # shell behind it: with `timeout 30 bash -c 'rg …'` the command is still
@@ -351,8 +398,8 @@ def analysed(text):
     if not any(candidate.search(text) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(text):
         return packages, references
 
-    for words in commands_of(text):
-        found, referenced = analysed_command(words)
+    for words, block in commands_of(text):
+        found, referenced = analysed_command(words, block)
         packages |= found
         references |= referenced
     return packages, references
@@ -488,6 +535,12 @@ for index, (path, job_name, job, _) in enumerate(jobs_found):
             f"{package}, which it never installs"
         )
         failures += 1
+
+for word in sorted(undecided):
+    print(
+        f"notice: cannot tell which substitution in {word!r} is literal and "
+        "which runs — not checked"
+    )
 
 if jobs_checked == 0:
     print("::error::no jobs found in the paths given — the workflow tool check found nothing to check")

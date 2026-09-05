@@ -489,7 +489,7 @@ jobs:
       - run: echo '$(rg -n TODO crates)'
 YAML
 expect "a single-quoted substitution runs nothing" 0 literal-substitution \
-    "All 1 workflow job(s)" "!::error::"
+    "All 1 workflow job(s)" "!::error::" "!notice"
 
 write_workflow literal-backticks ci.yml <<'YAML'
 jobs:
@@ -674,6 +674,91 @@ jobs:
 YAML
 expect "find -exec reaching a shell program" 1 find-exec-shell \
     "build" "ripgrep"
+
+# ------------------------------------------------ round six: find, and a word
+# Codex, on a6bf836. Quotes are the SHELL's, and find never sees them.
+write_workflow quoted-exec ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates '-exec' rg -n TODO '{}' +
+YAML
+expect "quoting does not hide find's own action" 1 quoted-exec \
+    "build" "ripgrep"
+
+# An action is a COMMAND, so everything known about commands applies inside it.
+write_workflow exec-wrapper ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -exec timeout 30 rg -n TODO {} +
+YAML
+expect "an action's own wrapper resolves" 1 exec-wrapper \
+    "build" "ripgrep"
+
+# `-and` is implicit between adjacent expressions, so BOTH actions run. Reading
+# the first and stopping reports a job clean on the strength of its `echo`.
+write_workflow two-actions ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -exec echo {} \; -exec rg -n TODO {} +
+YAML
+expect "every action in a find expression is read" 1 two-actions \
+    "build" "ripgrep"
+
+# A word can be part literal and part live: `'$literal'"$(rg …)"` runs the
+# second half. The lexer's flag describes the WORD, so it cannot say which
+# dollar is which — and a gate that cannot tell says so rather than deciding.
+write_workflow mixed-quoting ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo '$literal'"$(rg -n TODO crates)"
+YAML
+expect "a part-literal word is announced, not decided" 0 mixed-quoting \
+    "notice:" "cannot tell"
+
+# The action that matters may be the FIRST one as easily as the second, and
+# `-execdir` is the same action from another directory.
+write_workflow two-actions-first ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -exec rg -n TODO {} \; -exec echo {} +
+YAML
+expect "an action before another is read too" 1 two-actions-first \
+    "build" "ripgrep"
+
+write_workflow execdir ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -execdir rg -n TODO {} +
+YAML
+expect "-execdir is the same action" 1 execdir \
+    "build" "ripgrep"
+
+# find itself reached through a wrapper, with the tool inside its action: three
+# rules composed, which is how every hole in this file has been found.
+write_workflow wrapped-find ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: xargs find crates -exec rg -n TODO {} +
+YAML
+expect "a wrapper, a find, and an action" 1 wrapped-find \
+    "build" "ripgrep"
+
+# find with no action at all names no command.
+write_workflow find-plain ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: find crates -name "*.rs"
+YAML
+expect "a find with no action runs nothing" 0 find-plain \
+    "All 1 workflow job(s)" "!::error::"
 
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
