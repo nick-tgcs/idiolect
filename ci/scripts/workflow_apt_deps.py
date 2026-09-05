@@ -908,38 +908,54 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         # a word and not a closer, and only for an unquoted token, since
         # `'fi'` is a command bash goes looking for.
         if at_command and not word.quoted and defined is not None:
-            if token == "for":
-                # Each value the loop is given is a value the body sees, one
+            if token in REGION_OPENERS:
+                # Each value a loop is given is a value the body sees, one
                 # iteration at a time — which is exactly what the alternatives
                 # machinery already holds: `for pkg in a b` runs the body once
                 # with `pkg` as a and once as b, and both are packages the
                 # workflow installs.
                 #
-                # Bound BEFORE the region is pushed, so the value the loop
-                # variable held beforehand is restored as one more possibility
-                # at `done` — which is conservative in the right direction,
-                # bash leaving the LAST value in place after the loop ends.
-                binding = loop_values(words, index)
+                # Read HERE, in the same statement that pushes the region, so
+                # the binding can only ever belong to its own loop. Held in a
+                # variable spanning the token walk it outlived the `for` and
+                # was applied by the next region to close — a branch inside the
+                # body ending the loop's values early.
+                binding = loop_values(words, index) if token == "for" else None
+                # The second entry is whether a CONDITION is still to come.
+                # `case x in` runs no commands between the opener and the first
+                # arm, so it has none; every other opener does. The third is
+                # what the loop variable holds once the loop is OVER, applied
+                # where the region closes.
+                regions.append([dict(defined), token != "case", binding])
                 if binding is not None:
-                    name, values = binding
+                    name, values, _ = binding
                     defined[("variable", name)] = ([values[0]], expressions)
                     defined.pop(("alternative", name, "variable"), None)
                     for other in values[1:]:
                         defined.setdefault(
                             ("alternative", name, "variable"), []
                         ).append(([other], expressions))
-
-            if token in REGION_OPENERS:
-                # The second entry is whether a CONDITION is still to come.
-                # `case x in` runs no commands between the opener and the first
-                # arm, so it has none; every other opener does.
-                regions.append([dict(defined), token != "case"])
             elif token in REGION_BRANCHES:
                 branched(regions, defined,
                          ran=bool(regions) and regions[-1][1]
                          and token in ("then", "do"))
             elif token in REGION_CLOSERS and regions:
-                displaced(regions.pop()[0], defined)
+                snapshot, _, binding = regions.pop()
+                displaced(snapshot, defined)
+                if binding is not None:
+                    # Every value was a package while the body ran; out here
+                    # bash has left only the LAST one behind, so keeping the
+                    # earlier ones alive fails a workflow that works. Where the
+                    # list was cut short the last value is not written down at
+                    # all, and the name goes rather than being guessed — it is
+                    # certainly not what it held before the loop, since a list
+                    # with a literal in it runs at least once.
+                    name, values, truncated = binding
+                    defined.pop(("alternative", name, "variable"), None)
+                    if truncated:
+                        defined.pop(("variable", name), None)
+                    else:
+                        defined[("variable", name)] = ([values[-1]], expressions)
 
         if (
             token == "("
@@ -1071,9 +1087,14 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             ):
                 rendered += words[index].value
                 index += 1
-            # In a SUBSHELL, like the quoted form and the bracket forms.
-            scan_shell(path, " ".join(w.value for w in inside), line,
-                       exact_lines=False,
+            # In a SUBSHELL, like the quoted form and the bracket forms —
+            # and written back out with its QUOTING, since the words are being
+            # handed to a lexer again. `$(printf '%s' ';' apt-get install -y
+            # pkg)` runs printf and nothing else; rebuilt from the bare values
+            # the `;` stops being an argument and becomes a separator, and an
+            # apt command appears that the file never wrote.
+            scan_shell(path, " ".join(as_written(w, expressions) for w in inside),
+                       line, exact_lines=False,
                        defined=dict(defined) if defined is not None else None)
             if state == "packages":
                 # What it PRINTS is a package name this scanner cannot resolve,
@@ -1310,8 +1331,16 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         elif defined is not None and defined_function(words, index - 1) is not None:
             # Declaring a function runs none of it: the body is remembered and
             # read where the name is CALLED.
-            name, body, index = defined_function(words, index - 1)
+            name, body, index, bracket = defined_function(words, index - 1)
             defined[("function", name)] = (body, expressions)
+            # The bracket is an ATTRIBUTE of the binding, kept the way every
+            # other one is: `f() ( … )` runs its body in a subshell, so what it
+            # assigns or forgets never reaches the caller, while `f() { … }`
+            # runs here and does.
+            if bracket == "(":
+                defined[("subshell", name)] = ((), expressions)
+            else:
+                defined.pop(("subshell", name), None)
             at_command = True
         elif (
             defined is not None
@@ -1351,7 +1380,12 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                              dict(elsewhere), key[0] == "function" or in_function)
             scan_command(path, line, rebased(*defined[key], expressions) + after,
                          expressions, elsewhere, key[0] == "function" or in_function)
-            if key[0] == "function":
+            if key[0] == "function" and ("subshell", key[1]) in defined:
+                # A subshell body changed a COPY: bash throws the whole scope
+                # away when the function returns, so nothing merges back —
+                # neither what it assigned nor what it forgot.
+                pass
+            elif key[0] == "function":
                 # What the body assigned stays assigned: a function's variables
                 # are the CALLER's unless it declared them local. Its arguments
                 # are not — `$1` belongs to the call.
@@ -2284,7 +2318,7 @@ def child_scope(defined, keyword, shell=None):
             # still holds what the caller exported.
             scope[key] = defined.get(("environment", key[1]), value) \
                 if key[0] == "variable" else value
-        elif functions and key[0] in ("function", "exported-function") \
+        elif functions and key[0] in ("function", "exported-function", "subshell") \
                 and ("exported-function", key[1]) in defined:
             scope[key] = value
     return scope
@@ -2340,6 +2374,11 @@ def loop_values(words, index):
     `index` is the word after `for`. The list ends where the body begins — at
     a separator or at `do` — and `for NAME` with no `in` iterates the
     positional parameters, which are not written down here either.
+
+    Also reports whether the list was CUT SHORT, because that decides what the
+    variable holds AFTER the loop: with the whole list in view bash leaves the
+    last value behind, and with something unreadable in it the last value is
+    not written down anywhere.
     """
     if index + 1 >= len(words):
         return None
@@ -2349,6 +2388,7 @@ def loop_values(words, index):
     if words[index + 1].value != "in" or words[index + 1].quoted:
         return None
     values = []
+    truncated = False
     for word in words[index + 2:]:
         if (word.value in SEPARATORS or word.value == "do") and not word.quoted:
             break
@@ -2359,9 +2399,12 @@ def loop_values(words, index):
             # file had named them. What follows something unreadable cannot be
             # read either — while the literals BEFORE it are values the loop is
             # certainly given.
+            truncated = True
             break
         values.append(word)
-    return (name.value, values) if values else None
+    else:
+        truncated = False
+    return (name.value, values, truncated) if values else None
 
 
 def bounds_a_region(words):
@@ -2557,9 +2600,12 @@ def remember(assignments, defined, expressions, declaring=None, namespace=(),
 def defined_function(words, index):
     """The function `NAME () { … }` beginning at `index`, or None.
 
-    Returns the name, the words of its body, and the index after it. Declaring
-    a function RUNS none of it, so the body is remembered rather than read
-    where it is written — the same rule an array's elements follow.
+    Returns the name, the words of its body, the index after it, and WHICH
+    bracket wrapped the body — because the two brackets do different things
+    when the function is called, and dropping that told the call site a
+    subshell body was a brace one. Declaring a function RUNS none of it, so the
+    body is remembered rather than read where it is written — the same rule an
+    array's elements follow.
 
     Two spellings, both bash's: `NAME () { … }` and `function NAME { … }`. The
     brackets have to be next to each other, since `foo (cmd)` is the command
@@ -2599,8 +2645,8 @@ def defined_function(words, index):
         elif words[position].value == closer:
             depth -= 1
             if not depth:
-                return name, words[body_start + 1:position], position + 1
-    return name, words[body_start + 1:], len(words)
+                return name, words[body_start + 1:position], position + 1, opener
+    return name, words[body_start + 1:], len(words), opener
 
 
 def touches_a_definition(words, defined):

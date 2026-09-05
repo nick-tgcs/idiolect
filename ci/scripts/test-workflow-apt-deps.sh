@@ -5682,6 +5682,100 @@ YAML
 expect "a literal before an unreadable value is still checked" 1 for-literal-then-unreadable \
     "codex-no-such-package"
 
+# ------------- a subshell BODY keeps the function's changes to itself
+# `f() ( unset COMMAND )` runs its body in a subshell, so the caller's COMMAND
+# survives the call — verified against bash, where the brace form is the one
+# that changes the caller.
+write_workflow function-subshell-isolated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() ( unset COMMAND )
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a subshell-bodied function keeps its unset to itself" 1 function-subshell-isolated \
+    "codex-no-such-package"
+
+# ...and the brace form is still the one that DOES change the caller.
+write_workflow function-brace-escapes ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          f() { unset COMMAND; }
+          f
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a brace-bodied function's unset does reach the caller" 0 function-brace-escapes \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------- after a loop, the variable holds its LAST value only
+# Every value is a package while the body runs; afterwards bash has left only
+# the last one behind. Keeping the earlier ones alive out there fails a
+# workflow that works.
+write_workflow for-after-loop ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package cmake; do
+            :
+          done
+          apt-get install -y "$pkg"
+YAML
+expect "only the loop's last value survives it" 0 for-after-loop \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and where the list was cut short, the last value is not written down at
+# all, so what the variable holds afterwards is unknown rather than the last
+# literal.
+write_workflow for-after-truncated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in cmake $(printf x); do
+            :
+          done
+          apt-get install -y "$pkg"
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a cut-short list leaves the variable unknown" 0 for-after-truncated \
+    "names a package through a variable" "All 1 apt package(s)"
+
+# ---------------- a substitution is re-read as WRITTEN, quoting included
+# `$(printf '%s' ';' apt-get install -y pkg)` runs printf and nothing else —
+# the `;` is an argument. Rebuilt from the bare word values the quoting is
+# gone, the `;` becomes a separator, and apt appears out of nowhere.
+write_workflow substitution-quoting-kept ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo $(printf '%s' ';' apt-get install -y codex-no-such-package)
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a substitution is re-read with its quoting" 0 substitution-quoting-kept \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the binding belongs to the LOOP's region, not to whatever region is
+# opened next. A branch closing inside the body must not end the loop's values
+# early.
+write_workflow for-nested-region ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: for pkg in codex-no-such-package cmake; do if true; then :; fi; apt-get install -y "$pkg"; done
+YAML
+expect "a region inside the body does not end the loop's values" 1 for-nested-region \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
