@@ -979,6 +979,106 @@ YAML
 expect "nice takes an adjustment before its command" 1 nice-adjustment \
     "build" "ripgrep"
 
+# ------------------------------------------------ round eleven, all missed uses
+# Codex, on 951f419. `--replace[=R]` and `--eof[=END]` take an ATTACHED value,
+# so a bare one consumes nothing — listing them as options with a separate
+# argument ate the command itself.
+write_workflow xargs-optional-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --replace rg -n TODO
+YAML
+expect "an optional attached value consumes nothing" 1 xargs-optional-value \
+    "build" "ripgrep"
+
+# Quoting an option does not stop it being one: the quotes are the shell's and
+# xargs is handed `-I` either way. Same lesson as find's own `-exec`.
+write_workflow quoted-wrapper-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs "-I" "{}" rg -n TODO "{}"
+YAML
+expect "a quoted wrapper option is still an option" 1 quoted-wrapper-option \
+    "build" "ripgrep"
+
+# A wrapper may resolve onto an invocation PREFIX, which the command reader
+# handles at the front of a command and nothing re-applied after the walk.
+write_workflow wrapper-then-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 env rg -n TODO crates
+YAML
+expect "a prefix reached through a wrapper is still a prefix" 1 wrapper-then-prefix \
+    "build" "ripgrep"
+
+write_workflow wrapper-then-sudo ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs sudo rg -n TODO
+YAML
+expect "sudo behind a wrapper is stepped over too" 1 wrapper-then-sudo \
+    "build" "ripgrep"
+
+# A heredoc delimiter is a WORD, not an identifier: `<<123` is legal and
+# unquoted, so its body expands.
+write_workflow numeric-delimiter ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<123
+          found: $(rg -n TODO crates)
+          123
+YAML
+expect "a numeric heredoc delimiter is a delimiter" 1 numeric-delimiter \
+    "build" "ripgrep"
+
+# ...and quoting one still stops the expansion.
+write_workflow quoted-numeric-delimiter ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'123'
+          found: $(rg -n TODO crates)
+          123
+YAML
+expect "a quoted numeric delimiter stays literal" 0 quoted-numeric-delimiter \
+    "All 1 workflow job(s)" "!::error::"
+
+# The spelling GitHub's own documentation uses for a repository path.
+write_workflow workspace-prefixed ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ${{ github.workspace }}/ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a workspace-prefixed script path is followed" 1 workspace-prefixed \
+    "build" "ripgrep"
+
+write_workflow absolute-script-path ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash /home/runner/work/idiolect/idiolect/ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "an absolute script path is followed" 1 absolute-script-path \
+    "build" "ripgrep"
+
+# ...but a path that merely ENDS in those characters is a different file.
+write_workflow lookalike-path ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash vendor/notci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a path ending in the same letters is not the script" 0 lookalike-path \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

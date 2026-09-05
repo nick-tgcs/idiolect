@@ -145,7 +145,11 @@ except BaseException as error:  # SystemExit included: a scanner that exits on i
     print("::error::the apt scanner failed — the workflow tool check could not run")
     print(error)
     sys.exit(1)
-SCRIPT_REFERENCE = re.compile(r"(?:\./)?ci/scripts/[\w.-]+\.sh")
+# A repository script, however it is spelled: bare, `./`-prefixed, absolute, or
+# behind `${{ github.workspace }}` — which masking leaves as a prefix on the
+# word (Codex, on 951f419). The prefix must END at a slash, so a `notci/scripts`
+# is a different directory and not this one.
+SCRIPT_REFERENCE = re.compile(r"(?:\S*/)?(ci/scripts/[\w.-]+\.sh)")
 
 # `source x` and `. x` run a script in the current shell rather than a new one.
 SOURCING = {"source", "."}
@@ -158,10 +162,13 @@ WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 # declines to hold such a table for `sudo -u` and says so, but there the cost
 # was a value unread, while here it is the command itself.
 WRAPPER_OPTIONS_WITH_ARGUMENT = {
+    # `--replace[=R]` and `--eof[=END]` take their value ATTACHED, so a bare
+    # one consumes nothing and the word after it is the command (Codex, on
+    # 951f419). Same for their short spellings `-i` and `-e`.
     "xargs": frozenset({
-        "-I", "-i", "-n", "-P", "-L", "-l", "-s", "-a", "-d", "-E", "-e",
-        "--replace", "--max-args", "--max-procs", "--max-lines", "--arg-file",
-        "--delimiter", "--eof", "--process-slot-var",
+        "-I", "-n", "-P", "-L", "-l", "-s", "-a", "-d", "-E",
+        "--max-args", "--max-procs", "--max-lines", "--arg-file",
+        "--delimiter", "--process-slot-var",
     }),
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
     "nice": frozenset({"-n", "--adjustment"}),
@@ -186,7 +193,10 @@ TICKED = re.compile(r"`([^`]*)`")
 
 # A heredoc opener, with the quoting of its delimiter — the thing that decides
 # whether the body is expanded or passed on as it was written.
-HEREDOC_OPENER = re.compile(r"""<<-?\s*(['"]?)[A-Za-z_][\w-]*\1""")
+# The delimiter is a WORD — `<<123` is legal, and `<<'123'` is the literal
+# form of it (Codex, on 951f419) — so it is anything up to whitespace or the
+# operators that would end it.
+HEREDOC_OPENER = re.compile(r"""<<-?\s*(['"]?)[^\s;&|<>()'"]+\1""")
 
 # The openers of a process substitution, `<( … )` and `>( … )`.
 PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
@@ -410,10 +420,12 @@ def analysed_command(words, block=""):
         position = at + 1
         while position < len(words):
             token = words[position].value
-            if token.startswith("-") and not words[position].quoted:
+            if token.startswith("-"):
                 # `xargs -I '{}' rg …`: the replacement string is the OPTION's,
                 # and reading the first non-option word made it the command
-                # (Codex, on 4e02d11).
+                # (Codex, on 4e02d11). No quoting guard: the quotes are the
+                # SHELL's, and xargs is handed `-I` either way (Codex, on
+                # 951f419) — the same lesson as find's own `-exec`.
                 if token in takes_argument:
                     position += 1
                 position += 1
@@ -428,6 +440,16 @@ def analysed_command(words, block=""):
         if position >= len(words):
             break
         at = position
+        # `timeout 30 env rg …`: what a wrapper resolves to may be a PREFIX,
+        # which the command reader steps over at the FRONT of a command and
+        # nothing re-applied here (Codex, on 951f419). Asking it again, of what
+        # is left, is what makes the two rules compose.
+        following = shell.command_word(words[at:])
+        if following is None:
+            break
+        at += next(
+            position for position, other in enumerate(words[at:]) if other is following
+        )
 
     # `find crates -exec rg -n TODO {} +` runs rg once per match. FIND's
     # option, and only find's: to `echo` a `-exec` is an argument like any
@@ -476,9 +498,13 @@ def analysed_command(words, block=""):
     if package is not None:
         packages.add(package)
 
-    if SCRIPT_REFERENCE.fullmatch(command.value):
-        # An executable script run by its own path.
-        references.add(command.value)
+    named = SCRIPT_REFERENCE.fullmatch(command.value)
+    if named:
+        # An executable script run by its own path. The PREFIX is dropped
+        # here rather than at the far end: a reference is a repository path,
+        # and `./x.sh`, `/abs/…/x.sh` and a `${{ }}`-masked one are all the
+        # same file, which must not become three cache entries.
+        references.add(named.group(1))
     elif name in shell.SHELL_COMMANDS or name in SOURCING:
         # `bash ci/scripts/x.sh`: the script is an ARGUMENT, and only of a
         # command that runs one. Taking the path from any word at all followed
@@ -493,8 +519,10 @@ def analysed_command(words, block=""):
             if words[operand].value in shell.SHELL_OPTIONS_WITH_ARGUMENT:
                 operand += 1
             operand += 1
-        if operand < len(words) and SCRIPT_REFERENCE.fullmatch(words[operand].value):
-            references.add(words[operand].value)
+        if operand < len(words):
+            handed = SCRIPT_REFERENCE.fullmatch(words[operand].value)
+            if handed:
+                references.add(handed.group(1))
     return packages, references
 
 
@@ -514,7 +542,6 @@ def analysed(text):
 
 def script_analysis(reference):
     """`analysed` for a repo script, read once however many jobs reach it."""
-    reference = reference.removeprefix("./")
     if reference not in script_cache:
         path = os.path.join(REPO_ROOT, reference)
         try:
@@ -533,7 +560,7 @@ def tools_used(text):
     needed, queue = analysed(text)
     seen = set()
     while queue:
-        reference = queue.pop().removeprefix("./")
+        reference = queue.pop()
         if reference in seen:
             continue
         seen.add(reference)
