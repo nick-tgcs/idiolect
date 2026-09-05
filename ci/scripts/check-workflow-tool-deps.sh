@@ -50,6 +50,12 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+SCANNER="$SCRIPT_DIR/workflow_apt_deps.py"
+if [ ! -f "$SCANNER" ]; then
+    echo "::error::$SCANNER is missing — the workflow tool check could not run"
+    exit 1
+fi
+
 if ! python3 -c "import yaml" 2>/dev/null; then
     echo "::error::PyYAML not available — the workflow tool check could not run"
     echo "Install python3-yaml; without it the workflow files cannot be parsed and"
@@ -78,10 +84,12 @@ for target in "$@"; do
     fi
 done
 
-REPO_ROOT="$REPO_ROOT" python3 - "${files[@]}" <<'PYTHON'
+REPO_ROOT="$REPO_ROOT" SCANNER="$SCANNER" python3 - "${files[@]}" <<'PYTHON'
 import os
 import re
+import subprocess
 import sys
+import tempfile
 
 import yaml
 
@@ -96,14 +104,31 @@ TOOLS = {
 }
 
 REPO_ROOT = os.environ["REPO_ROOT"]
+SCANNER = os.environ["SCANNER"]
 SCRIPT_REFERENCE = re.compile(r"ci/scripts/[\w.-]+\.sh")
+
+
+def active(text):
+    """`text` without its comment lines.
+
+    A `#` line is not a command, in a `run:` block or in a script. Without this
+    the guard comment added to each rg-using script — which quotes `if rg ...`
+    to explain itself — reads as a use of the tool, and so does an install
+    someone commented out. Only whole-line comments: a `#` mid-line may be
+    inside quotes, a URL fragment or a parameter expansion, and deciding which
+    is shell lexing, which is what the apt scanner below is for.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
 
 script_cache = {}
 
 
 def tools_used(text, seen):
     """Packages `text` needs, following the repo scripts it invokes."""
-    needed = {package for _, (package, pattern) in TOOLS.items() if pattern.search(text)}
+    text = active(text)
+    needed = {package for package, pattern in TOOLS.values() if pattern.search(text)}
     for reference in SCRIPT_REFERENCE.findall(text):
         if reference in seen:
             continue
@@ -125,21 +150,55 @@ def tools_used(text, seen):
     return needed
 
 
-def installed_packages(text):
-    """Packages an `apt-get install` line in `text` names."""
-    packages = set()
-    # A trailing backslash continues the command onto the next line, and two of
-    # these workflows already write their package lists that way. Reading the
-    # lines separately drops every package after the first line — a false red on
-    # a job that installs exactly what it should.
-    for line in text.replace("\\\n", " ").splitlines():
-        if "apt-get install" not in line:
-            continue
-        # Everything after the subcommand; options are dropped, and so is the
-        # `-y` that every one of these lines carries.
-        words = line.split("apt-get install", 1)[1].split()
-        packages.update(word for word in words if not word.startswith("-"))
-    return packages
+def installed_packages(jobs):
+    """Packages each job installs, keyed by its index in `jobs`.
+
+    Delegated to workflow_apt_deps.py rather than scanned here. Searching raw
+    text for `apt-get install` credited a job with a package it had COMMENTED
+    OUT, and with one merely echoed or quoted in a heredoc — a false negative
+    in the gate written to stop false negatives (Codex, on a5517fa). Knowing
+    which words are a command and which are text is shell lexing, and this
+    repository already has a lexer for exactly this question, with 420 cases
+    behind it.
+
+    Each job is handed over as a workflow of its own so the records come back
+    attributable to it; the packages of a sibling job are not this job's.
+    """
+    installed = {index: set() for index in range(len(jobs))}
+    with tempfile.TemporaryDirectory() as work:
+        paths = []
+        for index, (_, job_name, run_texts) in enumerate(jobs):
+            path = os.path.join(work, f"{index}.yml")
+            document = {
+                "jobs": {job_name: {"steps": [{"run": text} for text in run_texts]}}
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(document, handle)
+            paths.append(path)
+
+        if not paths:
+            return installed
+
+        result = subprocess.run(
+            [sys.executable, SCANNER, *paths],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            # A scanner that could not run must not read as a job that installs
+            # nothing — that would report every job on the list as broken.
+            print("::error::the apt scanner failed — the workflow tool check could not run")
+            print(result.stderr.strip())
+            sys.exit(1)
+
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 4 or fields[0] != "PKG":
+                continue
+            index = int(os.path.basename(fields[1]).removesuffix(".yml"))
+            installed[index].add(fields[3])
+    return installed
 
 
 def steps_of(job):
@@ -147,8 +206,7 @@ def steps_of(job):
     return steps if isinstance(steps, list) else []
 
 
-failures = 0
-jobs_checked = 0
+jobs_found = []
 
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as handle:
@@ -164,28 +222,28 @@ for path in sys.argv[1:]:
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        jobs_checked += 1
-
         run_texts = [
             step["run"]
             for step in steps_of(job)
             if isinstance(step, dict) and isinstance(step.get("run"), str)
         ]
+        jobs_found.append((path, job_name, run_texts))
 
-        needed = set()
-        for text in run_texts:
-            needed |= tools_used(text, set())
+jobs_checked = len(jobs_found)
+failures = 0
+installed_by_job = installed_packages(jobs_found)
 
-        installed = set()
-        for text in run_texts:
-            installed |= installed_packages(text)
+for index, (path, job_name, run_texts) in enumerate(jobs_found):
+    needed = set()
+    for text in run_texts:
+        needed |= tools_used(text, set())
 
-        for package in sorted(needed - installed):
-            print(
-                f"::error::{path}: job '{job_name}' runs a script that needs "
-                f"{package}, which it never installs"
-            )
-            failures += 1
+    for package in sorted(needed - installed_by_job[index]):
+        print(
+            f"::error::{path}: job '{job_name}' runs a script that needs "
+            f"{package}, which it never installs"
+        )
+        failures += 1
 
 if jobs_checked == 0:
     print("::error::no jobs found in the paths given — the workflow tool check found nothing to check")

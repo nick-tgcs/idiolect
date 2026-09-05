@@ -238,6 +238,48 @@ YAML
 expect "options alone install nothing" 1 options-only \
     "build" "ripgrep"
 
+# ------------------------------------------------------ what is not a command
+# Codex, on a5517fa: a COMMENTED-OUT install credited the job with the package,
+# so the gate passed a job that had no ripgrep. This is the dangerous direction
+# — a false negative in the gate written to stop false negatives.
+write_workflow commented-install ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          # sudo apt-get install -y ripgrep
+          echo skipped
+      - run: bash ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a commented-out install installs nothing" 1 commented-install \
+    "build" "ripgrep"
+
+# The same fault with the text merely being printed rather than run.
+write_workflow echoed-install ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo "run sudo apt-get install -y ripgrep first"
+      - run: bash ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "an install inside an echo installs nothing" 1 echoed-install \
+    "build" "ripgrep"
+
+# ...and the mirror image, which the same defect produces in the other
+# direction: a commented-out USE is not a use, and reporting it makes a correct
+# job red.
+write_workflow commented-use ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          # rg -n TODO crates
+          cargo build
+YAML
+expect "a commented-out use needs nothing" 0 commented-use \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
@@ -259,6 +301,43 @@ jobs:
 YAML
 expect "steps without a run block are skipped" 0 uses-steps \
     "All 1 workflow job(s)"
+
+# The apt scanner is now load-bearing — the gate reads a job's installs through
+# it. A copy of the gate with no scanner beside it must refuse to run rather
+# than report every job as installing nothing, which is what an empty record
+# stream would look like.
+cp "$CHECK" "$WORK/lonely-gate.sh"
+mkdir -p "$WORK/jobless-dir"
+out="$("$WORK/lonely-gate.sh" "$WORK/real/ci.yml" 2>&1)"
+got=$?
+if [ "$got" -eq 0 ]; then
+    fail "the gate ran without the apt scanner beside it"
+elif ! printf '%s' "$out" | grep -qF "workflow_apt_deps.py is missing"; then
+    fail "the gate failed without the scanner but not for that reason: $out"
+else
+    ok "the gate refuses to run without the apt scanner"
+fi
+
+# ...and a scanner that RUNS but fails is the same hole one step further in: an
+# empty record stream is indistinguishable from a set of jobs that install
+# nothing, so the gate would report every one of them as broken.
+mkdir -p "$WORK/brokenscanner"
+cp "$CHECK" "$WORK/brokenscanner/gate.sh"
+cat >"$WORK/brokenscanner/workflow_apt_deps.py" <<'BROKEN'
+import sys
+
+print("scanner exploded", file=sys.stderr)
+sys.exit(2)
+BROKEN
+out="$("$WORK/brokenscanner/gate.sh" "$WORK/inline/ci.yml" 2>&1)"
+got=$?
+if [ "$got" -eq 0 ]; then
+    fail "the gate reported a verdict on records the scanner never produced"
+elif ! printf '%s' "$out" | grep -qF "the apt scanner failed"; then
+    fail "the gate failed on a broken scanner but not for that reason: $out"
+else
+    ok "a scanner that fails is not a job that installs nothing"
+fi
 
 # ------------------------------------------------------------ it must have run
 # A file with no jobs is not a clean file; it is a file the gate could not read
