@@ -189,14 +189,32 @@ RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
 FIND_ACTION_ENDS = {";", "+"}
 
 # The body of a backtick substitution, which shlex does not tokenise as one.
-TICKED = re.compile(r"`([^`]*)`")
+# A backslash escapes a backtick, and that is how the legacy form NESTS:
+# `` `echo \`rg …\`` `` is one substitution holding another, so the outer
+# pair must not close on the inner opener (Codex, on d32dd1d).
+TICKED = re.compile(r"`((?:[^`\\]|\\.)*)`", re.S)
+
+
+def ticked(text):
+    """The body of each backtick substitution in `text`, one level down.
+
+    The escapes come off what is returned: inside a substitution bash reads
+    `\\`` as the delimiter of a nested one, so the body is what the shell would
+    see, and the same reader finds the next level in it.
+    """
+    return [found.replace("\\`", "`") for found in TICKED.findall(text)]
 
 # A heredoc opener, with the quoting of its delimiter — the thing that decides
 # whether the body is expanded or passed on as it was written.
 # The delimiter is a WORD — `<<123` is legal, and `<<'123'` is the literal
 # form of it (Codex, on 951f419) — so it is anything up to whitespace or the
 # operators that would end it.
-HEREDOC_OPENER = re.compile(r"""<<-?\s*(['"]?)[^\s;&|<>()'"]+\1""")
+HEREDOC_OPENER = re.compile(r"""<<-?\s*([^\s;&|<>()]+)""")
+
+# What makes a delimiter quoted, and so its body literal: not only a pair
+# around the whole word. `<<\EOF` and `<<E"OF"` are both quoted to bash, which
+# strips the quoting and stops expanding the body (Codex, on d32dd1d).
+QUOTING = ("'", '"', "\\")
 
 # The openers of a process substitution, `<( … )` and `>( … )`.
 PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
@@ -223,6 +241,20 @@ def commands_in(words):
         index = stop + 1
 
 
+def expanded(body):
+    """The commands an EXPANDING heredoc body runs.
+
+    A body is data the shell runs none of — unless its delimiter was unquoted,
+    in which case bash expands the data first, and a substitution written there
+    runs (Codex, on d3039b5). Only substitutions: the body is still text being
+    written somewhere, and this suite's own fixtures are heredocs full of `rg`
+    lines that run nothing.
+    """
+    joined = "\n".join(body)
+    for inner in shell.substitution_bodies(joined) + ticked(joined):
+        yield from commands_of(inner)
+
+
 def commands_of(text):
     """Every command in a block of shell, with the block it was written in.
 
@@ -231,18 +263,19 @@ def commands_of(text):
     looking at the line again.
     """
     expanding = False
+    body = []
     for _, block, in_heredoc in shell.shell_commands(text):
         if in_heredoc:
-            # A heredoc body is data the shell runs none of — unless its
-            # delimiter was UNQUOTED, in which case bash expands the data
-            # first, and a substitution written there runs (Codex, on
-            # d3039b5). The delimiter decides, and it is on the opening line
-            # this loop has already been past.
+            # Collected rather than read line by line: a substitution may be
+            # written across several of them, and neither the line holding
+            # `$(` nor the one holding `)` is a substitution on its own (Codex,
+            # on d32dd1d).
             if expanding:
-                for body in shell.substitution_bodies(block) + TICKED.findall(block):
-                    yield from commands_of(body)
+                body.append(block)
             continue
-
+        if body:
+            yield from expanded(body)
+            body = []
         # `<<EOF` expands, `<<'EOF'` and `<<"EOF"` do not. Read from the
         # opener rather than from the scanner's delimiter, which keeps the
         # NAME and drops the quotes that are the whole question here.
@@ -261,7 +294,10 @@ def commands_of(text):
         # notice — the direction is a use unseen in a construct no workflow
         # here writes, and the script that needs the tool still refuses to run
         # without it.
-        openers = [bool(opener.group(1)) for opener in HEREDOC_OPENER.finditer(block)]
+        openers = [
+            any(quote in opener.group(1) for quote in QUOTING)
+            for opener in HEREDOC_OPENER.finditer(block)
+        ]
         expanding = bool(openers) and not any(openers)
         masked, _ = shell.mask_expressions(block)
         try:
@@ -274,10 +310,45 @@ def commands_of(text):
         for command in commands_in(words):
             yield command, block
 
+    if body:
+        yield from expanded(body)
+
 
 # Words this run could not decide about, announced once at the end rather than
 # resolved. A set because the same line reaches here once per job that runs it.
 undecided = set()
+
+
+def outside_single_quotes(text):
+    """`text` with everything inside single quotes blanked out.
+
+    Offsets are kept, so what is left reads as it was written. Only single
+    quotes: they are the one thing that stops a backtick or a `$`, and inside
+    them nothing escapes, which is what makes this exact rather than a second
+    lexer.
+    """
+    kept = []
+    quote = None
+    escaped = False
+    for character in text:
+        if escaped:
+            kept.append(" " if quote == "'" else character)
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            kept.append(character)
+            escaped = True
+            continue
+        if quote is None and character in "'\"":
+            quote = character
+            kept.append(" ")
+            continue
+        if character == quote:
+            quote = None
+            kept.append(" " if character == "'" else character)
+            continue
+        kept.append(" " if quote == "'" else character)
+    return "".join(kept)
 
 
 def analysed_command(words, block=""):
@@ -372,13 +443,13 @@ def analysed_command(words, block=""):
         body.replace(MARKER + "(", "$(")
         for body in shell.substitution_bodies(PROCESS_SUBSTITUTION.sub("$(", hidden))
     ]
-    inner += TICKED.findall(
-        "".join(
-            (" " if word.space_before else "") + word.value
-            for word in words
-            if not word.literal_backtick
-        )
-    )
+    # Backticks are read from the LINE, not from the words. shlex marks an
+    # escaped backtick and a single-quoted one alike — `\`rg` and `'`rg …`'`
+    # both arrive quoted with `literal_backtick` set — so no word-level test
+    # can tell the nested substitution from the inert one (Codex, on d32dd1d).
+    # What separates them is where they sit, and single quotes are the only
+    # thing that stops a backtick: double quotes do not.
+    inner += ticked(outside_single_quotes(block))
     for body in inner:
         found, referenced = analysed(body)
         packages |= found

@@ -1079,6 +1079,71 @@ YAML
 expect "a path ending in the same letters is not the script" 0 lookalike-path \
     "All 1 workflow job(s)" "!::error::"
 
+# ------------------------------------------------------------ round twelve
+# Codex, on d32dd1d. A heredoc body arrives a line at a time, so a
+# substitution written across lines was never whole in any of them.
+write_workflow multiline-heredoc-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          found: $(
+            rg -n TODO crates
+          )
+          EOF
+YAML
+expect "a substitution spanning heredoc lines runs" 1 multiline-heredoc-substitution \
+    "build" "ripgrep"
+
+# Escaped backticks nest a legacy substitution inside another.
+write_workflow escaped-backticks ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo `echo \`rg -n TODO crates\``
+YAML
+expect "escaped backticks nest a substitution" 1 escaped-backticks \
+    "build" "ripgrep"
+
+# Quoting ANY part of a delimiter disables expansion in its body, and a
+# backslash is quoting too.
+write_workflow backslash-delimiter ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<\EOF
+          found: $(rg -n TODO crates)
+          EOF
+YAML
+expect "a backslash-quoted delimiter stays literal" 0 backslash-delimiter \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow part-quoted-delimiter ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<E"OF"
+          found: $(rg -n TODO crates)
+          EOF
+YAML
+expect "a part-quoted delimiter stays literal" 0 part-quoted-delimiter \
+    "All 1 workflow job(s)" "!::error::"
+
+# A single quote inside DOUBLE quotes is a literal character, not a quote, so
+# the backticks between them still run. Written down because I expected the
+# opposite while probing and the gate was right.
+write_workflow apostrophe-in-double ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo "outer '`rg -n TODO crates`'"
+YAML
+expect "an apostrophe inside double quotes stops nothing" 1 apostrophe-in-double \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
