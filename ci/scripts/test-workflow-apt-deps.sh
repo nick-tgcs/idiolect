@@ -5776,6 +5776,238 @@ YAML
 expect "a region inside the body does not end the loop's values" 1 for-nested-region \
     "codex-no-such-package"
 
+# ------------------ a loop left EARLY leaves an early value behind
+# `break` and `return` stop the loop where they stand, so the variable holds
+# whichever value that iteration had — not the last one. `continue` does not:
+# it goes on to the next value. All three checked against bash.
+write_workflow for-break ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package cmake; do
+            break
+          done
+          apt-get install -y "$pkg"
+YAML
+expect "a break leaves an early value behind" 1 for-break \
+    "codex-no-such-package"
+
+write_workflow for-return ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() {
+            for pkg in codex-no-such-package cmake; do
+              return
+            done
+          }
+          f
+          apt-get install -y "$pkg"
+YAML
+expect "a return out of a loop does the same" 1 for-return \
+    "codex-no-such-package"
+
+write_workflow for-continue ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          for pkg in codex-no-such-package cmake; do
+            continue
+          done
+          apt-get install -y "$pkg"
+YAML
+expect "a continue still finishes the loop" 0 for-continue \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# --------------------- exporting a function has more than one spelling
+# `declare -fx f` and `typeset -fx f` export a function exactly as `export -f`
+# does — `-f` restricts the operation to functions and `-x` exports. Reading
+# only the literal `export -f` marked the name as an exported VARIABLE, and
+# `child_scope` then handed the child nothing.
+write_workflow declare-fx ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          declare -fx f
+          bash -c f
+YAML
+expect "declare -fx exports a function" 1 declare-fx \
+    "codex-no-such-package"
+
+write_workflow typeset-fx ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          typeset -fx f
+          bash -c f
+YAML
+expect "typeset -fx does the same" 1 typeset-fx \
+    "codex-no-such-package"
+
+# ...but `-f` WITHOUT `-x` only prints the definition, and exports nothing.
+write_workflow declare-f-only ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          declare -f f
+          bash -c f
+      - run: sudo apt-get install -y cmake
+YAML
+expect "declare -f alone exports nothing" 0 declare-f-only \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------- every invocation prefix that looks a command UP bypasses it
+# `command`, `env`, `sudo` and `exec` each find an external program; none of
+# them runs a shell function. Checked against bash, where all four report the
+# name as not found.
+write_workflow prefix-env ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          env f || true
+      - run: sudo apt-get install -y cmake
+YAML
+expect "env does not run a shell function" 0 prefix-env \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow prefix-sudo ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          sudo f || true
+      - run: sudo apt-get install -y cmake
+YAML
+expect "sudo does not run a shell function" 0 prefix-sudo \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow prefix-exec ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          f() { apt-get install -y codex-no-such-package; }
+          exec f || true
+      - run: sudo apt-get install -y cmake
+YAML
+expect "exec does not run a shell function" 0 prefix-exec \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ------------------------------- a nameref stands for the name it was given
+# `declare -n REF=COMMAND` makes `$REF` the value of COMMAND, and bash resolves
+# it when it is EXPANDED, not when it is declared — verified against bash,
+# where an assignment made after the declaration is what comes back.
+write_workflow nameref ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          declare -n REF=COMMAND
+          $REF
+YAML
+expect "a nameref stands for its target" 1 nameref \
+    "codex-no-such-package"
+
+write_workflow nameref-later ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare -n REF=COMMAND
+          COMMAND='apt-get install -y codex-no-such-package'
+          $REF
+YAML
+expect "a nameref is resolved where it is expanded" 1 nameref-later \
+    "codex-no-such-package"
+
+# ...and a nameref is a name, not a value, in every direction. Assigning
+# through one writes what it NAMES and leaves the reference in place; `unset
+# -n` takes the reference away and leaves the target; a plain `unset` takes the
+# TARGET away. All four checked against bash.
+write_workflow nameref-assign-through ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          declare -n REF=COMMAND
+          REF='apt-get install -y codex-no-such-package'
+          $COMMAND
+YAML
+expect "an assignment through a nameref reaches its target" 1 nameref-assign-through \
+    "codex-no-such-package"
+
+write_workflow nameref-survives-assignment ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND=true
+          declare -n REF=COMMAND
+          REF=true
+          COMMAND='apt-get install -y codex-no-such-package'
+          $REF
+YAML
+expect "the reference survives an assignment through it" 1 nameref-survives-assignment \
+    "codex-no-such-package"
+
+write_workflow nameref-unset-n ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          declare -n REF=COMMAND
+          unset -n REF
+          $REF
+      - run: sudo apt-get install -y cmake
+YAML
+expect "unset -n takes the reference and leaves the target" 0 nameref-unset-n \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+write_workflow nameref-unset-target ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          declare -n REF=COMMAND
+          unset REF
+          $COMMAND
+      - run: sudo apt-get install -y cmake
+YAML
+expect "a plain unset through a nameref takes the target" 0 nameref-unset-target \
+    "All 1 apt package(s)" '!codex-no-such-package'
+
+# ...and the half of `unset -n` that matters is what it LEAVES: the target is
+# untouched and still runs. Checking only that the reference is gone passes
+# just as well when the target was forgotten instead, which is the opposite
+# behaviour.
+write_workflow nameref-unset-n-target-lives ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          COMMAND='apt-get install -y codex-no-such-package'
+          declare -n REF=COMMAND
+          unset -n REF
+          $COMMAND
+YAML
+expect "unset -n leaves the target still running" 1 nameref-unset-n-target-lives \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

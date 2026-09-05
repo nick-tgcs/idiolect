@@ -104,6 +104,20 @@ REGION_CLOSERS = {"fi", "done", "esac"}
 # a condition that is itself reached only when the tests before it failed.
 REGION_BRANCHES = {"then", "elif", "else", "do"}
 
+# Words that leave a loop where they stand rather than at its end. `break` and
+# `return` both do — checked against bash, where a loop broken on its first
+# value leaves that value behind and not the last — and `exit` leaves
+# everything. `continue` is NOT one: it goes on to the next value, so the loop
+# still finishes on the last.
+ESCAPES_A_LOOP = {"break", "return", "exit"}
+
+# Every word above, in one set, because `scan_shell` reads only the lines that
+# could matter and each of these matters on a line that names no package and
+# touches no definition. Derived rather than restated: adding a word to any set
+# above and not to the filter has now shipped a rule that could never fire
+# three separate times — `fi`, then `else`, then `break`.
+REGION_WORDS = REGION_OPENERS | REGION_CLOSERS | REGION_BRANCHES | ESCAPES_A_LOOP
+
 APT_COMMANDS = {"apt", "apt-get"}
 
 # What an array's bracket is written against: `deps=(` or `deps+=(`. A word
@@ -926,7 +940,10 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 # arm, so it has none; every other opener does. The third is
                 # what the loop variable holds once the loop is OVER, applied
                 # where the region closes.
-                regions.append([dict(defined), token != "case", binding])
+                # The fourth entry is whether anything inside left early,
+                # which decides whether the loop can be said to have finished
+                # on its last value.
+                regions.append([dict(defined), token != "case", binding, False])
                 if binding is not None:
                     name, values, _ = binding
                     defined[("variable", name)] = ([values[0]], expressions)
@@ -939,10 +956,22 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 branched(regions, defined,
                          ran=bool(regions) and regions[-1][1]
                          and token in ("then", "do"))
+            elif token in ESCAPES_A_LOOP:
+                # Marked on EVERY open region, because the loop this leaves is
+                # not necessarily the innermost one: a `break` inside an `if`
+                # inside a loop leaves the loop. A region with no binding is
+                # unaffected either way, so marking too many costs nothing.
+                for region in regions:
+                    region[3] = True
             elif token in REGION_CLOSERS and regions:
-                snapshot, _, binding = regions.pop()
+                snapshot, _, binding, escaped = regions.pop()
                 displaced(snapshot, defined)
-                if binding is not None:
+                if binding is not None and escaped:
+                    # Left early, so the variable holds whichever value that
+                    # iteration had. Every one of them stays possible, which is
+                    # what it already holds.
+                    pass
+                elif binding is not None:
                     # Every value was a package while the body ran; out here
                     # bash has left only the LAST one behind, so keeping the
                     # earlier ones alive fails a workflow that works. Where the
@@ -1269,15 +1298,27 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
                 # away, so the child stops seeing it.
                 defined.pop(("exported", token), None)
                 defined.pop(("exported-function", token), None)
-            elif declaring == "export" and attribute(namespace, "-", "f"):
-                # `export -f f` puts a FUNCTION in the environment. Nothing
-                # else does: a function is not there unless it is put there.
+            elif attribute(namespace, "-", "f") and exports(declaring, namespace):
+                # `export -f f` puts a FUNCTION in the environment, and so do
+                # `declare -fx f` and `typeset -fx f`: `-f` restricts the
+                # operation to functions and `-x` is what exports. Asked as
+                # those two facts rather than as the one spelling I had a test
+                # for, since `exports` already knows every way to say the
+                # second. `-f` WITHOUT `-x` only prints the definition.
                 defined[("exported-function", token)] = ((), expressions)
             elif exports(declaring, namespace):
                 # `export COMMAND` on its own exports what is already there, so
                 # the value assigned on an earlier line is what the child sees.
                 defined[("exported", token)] = ((), expressions)
+            elif declaring == "unset" and attribute(namespace, "-", "n"):
+                # `unset -n REF` takes the REFERENCE away and leaves what it
+                # pointed at exactly where it was — checked against bash.
+                defined.pop(("nameref", token), None)
             elif declaring == "unset":
+                # A plain `unset REF` goes THROUGH the reference and forgets
+                # the target, which is the other half of a nameref being a name
+                # rather than a value.
+                token = named(token, defined)
                 # `-f` names functions, `-v` names variables, and with neither
                 # bash forgets a variable if there is one and a function if
                 # there is not.
@@ -1320,7 +1361,14 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
         elif token in INVOCATION_PREFIXES or token.startswith("-"):
             # `command` exists to bypass shell functions: `command f` looks for
             # an external `f` and never reads the body of one declared here.
-            bypassing = bypassing or token == "command"
+            # ALL of them, not just `command`. Each of these looks a program
+            # up: `command` by definition, `env` and `sudo` because they are
+            # separate programs that exec what they are given, and `exec`
+            # because it replaces the shell with a FILE. Bash reports
+            # `f: not found` for every one of the four. Reading only the
+            # first ran a function that never runs and rejected a workflow
+            # that works.
+            bypassing = bypassing or token in INVOCATION_PREFIXES
         elif token in CONTROL_PREFIXES and not word.quoted:
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
             # then` installs x, and so does `( apt-get ... )`. Ending the
@@ -2324,15 +2372,36 @@ def child_scope(defined, keyword, shell=None):
     return scope
 
 
+def named(name, defined):
+    """The name this one stands for, following any namerefs.
+
+    `declare -n REF=COMMAND` makes REF another way of saying COMMAND, and a
+    chain of them is another way of saying the last. Followed here, at the
+    lookup, because that is where bash resolves it. A chain that comes back to
+    a name already seen stops there rather than going round for ever — bash
+    rejects such a declaration outright, so there is nothing to be right about
+    beyond not hanging.
+    """
+    seen = {name}
+    reference = defined.get(("nameref", name))
+    while reference is not None and reference[0]:
+        name = reference[0][0].value
+        if name in seen:
+            break
+        seen.add(name)
+        reference = defined.get(("nameref", name))
+    return name
+
+
 def remembered(token, defined):
     """The key `defined` holds for this word, or None: an array, a variable or
     a function, whichever way the word names one."""
     expansion = ARRAY_EXPANSION.match(token)
-    if expansion and ("array", expansion.group(1)) in defined:
-        return "array", expansion.group(1)
+    if expansion and ("array", named(expansion.group(1), defined)) in defined:
+        return "array", named(expansion.group(1), defined)
     variable = SHELL_VARIABLE.match(token)
     if variable:
-        name = variable.group(1) or variable.group(2)
+        name = named(variable.group(1) or variable.group(2), defined)
         if ("variable", name) in defined:
             return "variable", name
     if ("function", token) in defined:
@@ -2408,7 +2477,7 @@ def loop_values(words, index):
 
 
 def bounds_a_region(words):
-    """Whether these words open, close, or divide a region bash may skip.
+    """Whether these words open, close, divide or leave a region bash may skip.
 
     A FILTER, and deliberately permissive: `scan_shell` reads only the lines
     that could matter, and a bare `fi` matters even though it names no package
@@ -2416,14 +2485,13 @@ def bounds_a_region(words):
     command position, unquoted — is asked in `scan_command`, where the answer
     is known.
 
-    All THREE sets, not just the two that bound a region: a bare `else` divides
-    one, and leaving it out here left the boundary keywords unreachable for the
-    reader that acts on them, so a multi-line `if`/`else` lost a branch while
-    the one-line form did not.
+    Asked of `REGION_WORDS`, which is the UNION of the sets the reader
+    consults, so a word added to one of them cannot be left out here. It was
+    left out three times — `fi`, `else` and `break` — and each time the rule
+    that read it could never fire, which looks exactly like a rule that found
+    nothing.
     """
-    return any(word.value in REGION_OPENERS or word.value in REGION_CLOSERS
-               or word.value in REGION_BRANCHES
-               for word in words if not word.quoted)
+    return any(word.value in REGION_WORDS for word in words if not word.quoted)
 
 
 def alternatives(key, defined, expressions):
@@ -2575,6 +2643,12 @@ def remember(assignments, defined, expressions, declaring=None, namespace=(),
         name, _, value = word.value.partition("=")
         appending = name.endswith("+")
         name = name.rstrip("+")
+        if not attribute(namespace, "-", "n"):
+            # A nameref is a NAME, in both directions: `REF=value` writes what
+            # REF names and leaves the reference in place, so the next `$REF`
+            # still goes through it. Skipped for the declaration itself, which
+            # is the one assignment that is about REF.
+            name = named(name, defined)
         before = held(name, "variable", defined, expressions) if appending else []
         defined[("variable", name)] = (
             before + [Word(part, quoted=True, literal_dollar=True, literal_backtick=True,
@@ -2591,6 +2665,13 @@ def remember(assignments, defined, expressions, declaring=None, namespace=(),
             # Marked, not moved: an exported variable is visible HERE as well,
             # and additionally in whatever child shell the script starts.
             defined[("exported", name)] = ((), expressions)
+        if attribute(namespace, "-", "n"):
+            # `declare -n REF=COMMAND` does not give REF a value; it makes REF
+            # another way of saying COMMAND. Recorded as a marker beside the
+            # name, and followed where the name is EXPANDED rather than here,
+            # because bash resolves it then: an assignment made after the
+            # declaration is what comes back, which was checked.
+            defined[("nameref", name)] = ([Word(value)], expressions)
         if is_local(declaring, namespace, in_function):
             # A local belongs to the function that declared it and does not
             # follow the value back out to the caller.
