@@ -2230,6 +2230,63 @@ YAML
 expect "a redirection before a script file hides nothing" 1 redirect-before-script \
     "build" "ripgrep"
 
+# ------------------------------------------ round thirty-five, both probed
+# Codex, on 2ce03cc: a shell may receive its script through descriptor
+# DUPLICATION. `bash 3<x.sh 0<&3` opens the file on fd 3 and then points fd 0
+# at it, and bash runs the file.
+write_workflow duplicated-descriptor ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash 3< ci/scripts/test-real-adapter-deps.sh 0<&3
+YAML
+expect "a duplicated descriptor carries the script" 1 duplicated-descriptor \
+    "build" "ripgrep"
+
+# ...and a number is a descriptor only when it is attached to the operator.
+# Detached it is an operand: `bash 0 </dev/null -c '…'` reports `0: No such
+# file or directory` and runs no string.
+write_workflow detached-io-number ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash 0 </dev/null -c 'rg -n TODO crates'
+YAML
+expect "a detached number is an operand, not a descriptor" 0 detached-io-number \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and the attachment decides which of two things a heredoc is. Probed:
+#
+#   bash 0 <<'S'   bash: 0: No such file or directory   (0 is the script FILE)
+#   bash 0<<'S'    the body runs                        (0 is the descriptor)
+#
+# Both cases exist because the mutations that dropped the attachment test from
+# this gate's own readers survived without them — the `-c` spelling beside them
+# is decided by the apt scanner, so nothing here depended on either.
+write_workflow detached-number-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash 0 <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a detached number makes the heredoc data" 0 detached-number-heredoc \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow attached-number-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash 0<<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "an attached one leaves it the script" 1 attached-number-heredoc \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

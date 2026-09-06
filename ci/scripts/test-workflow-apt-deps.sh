@@ -6113,6 +6113,24 @@ YAML
 expect "a redirection among the options hides no script" 1 redirect_before_options \
     "codex-no-such-package"
 
+# A number is a DESCRIPTOR only when it is unquoted and attached to the
+# operator. Detached, it is an operand: `bash 0 </dev/null -c '…'` reports
+# `bash: 0: No such file or directory` and runs no string at all, so reporting
+# the install in it is reporting one that never happens. Probed, plain and
+# quoted.
+# A real install rides along, because a workflow with NO packages at all trips
+# the gate's own "found nothing to check" guard — which is a different failure
+# and would hide this one.
+write_workflow detached_io_number ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: sudo apt-get install -y cmake
+      - run: bash 0 </dev/null -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a detached number is an operand, not a descriptor" 0 detached_io_number \
+    "All 1 apt package(s)" "!codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

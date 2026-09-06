@@ -2864,10 +2864,16 @@ def script_argument(words):
             continue
         if (
             candidate.value.isdigit()
+            and not candidate.quoted
             and index + 1 < len(words)
             and words[index + 1].value in REDIRECTIONS
+            and not words[index + 1].space_before
         ):
-            # An explicit descriptor, written before the operator.
+            # An explicit descriptor, written before the operator and ATTACHED
+            # to it. Detached it is an operand: `bash 0 </dev/null -c '…'`
+            # reports `0: No such file or directory` and runs no string, so
+            # reading the number as a descriptor reported an install that never
+            # happens (Codex, on 2ce03cc; probed, plain and quoted).
             skipping = 2
             continue
         if hands_over_a_script(candidate):

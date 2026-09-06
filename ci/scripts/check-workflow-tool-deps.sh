@@ -368,6 +368,27 @@ def commands_in(words):
         index = stop + 1
 
 
+def names_a_descriptor(words, position):
+    """Whether this word is an I/O number belonging to the operator after it.
+
+    Attached and unquoted, or it is an operand: `bash 0 </dev/null -c '…'`
+    reports `0: No such file or directory` and runs no string, while
+    `bash 0</dev/null -c '…'` runs it (Codex, on 2ce03cc; both probed).
+
+    Asked in one place because it was written in three — the option walk, the
+    stdin reader and the stdin TEST each had their own, and the third had no
+    attachment check at all, which is what let a detached number turn a
+    heredoc into a script.
+    """
+    return (
+        words[position].value.isdigit()
+        and not words[position].quoted
+        and position + 1 < len(words)
+        and words[position + 1].value in shell.REDIRECTIONS
+        and not words[position + 1].space_before
+    )
+
+
 def stdin_source(words):
     """What ends up on a command's standard input: a heredoc, a file, or None.
 
@@ -377,29 +398,42 @@ def stdin_source(words):
     written before the operator makes it someone else's: `bash 3< x.sh` opens
     the file on fd 3 and runs nothing from it.
     """
-    source = None
+    sources = {}
     position = 0
     while position < len(words):
         token = words[position].value
         descriptor = "0"
-        if token.isdigit() and position + 1 < len(words) and words[position + 1].value.startswith("<"):
+        if names_a_descriptor(words, position):
             descriptor = token
             position += 1
             token = words[position].value
         if not words[position].quoted and token in ("<<", "<<-"):
-            if descriptor == "0":
-                source = ("heredoc", None)
+            sources[descriptor] = ("heredoc", None)
+            position += 2
+            continue
+        if not words[position].quoted and token == "<&" and position + 1 < len(words):
+            # `0<&3` points a descriptor at another one, so a script opened on
+            # fd 3 arrives on stdin after it (Codex, on 2ce03cc; probed). `<&-`
+            # closes instead.
+            target = words[position + 1].value
+            if target == "-":
+                sources.pop(descriptor, None)
+            else:
+                sources[descriptor] = sources.get(target)
             position += 2
             continue
         if not words[position].quoted and token in ("<", "<>", "<<<"):
-            if descriptor == "0" and position + 1 < len(words):
+            if position + 1 < len(words):
                 # `<>` opens the file read-write on fd 0, and a shell runs what
                 # is there (Codex, on 1397e7b; probed).
-                source = ("string" if token == "<<<" else "file", words[position + 1].value)
+                sources[descriptor] = (
+                    "string" if token == "<<<" else "file",
+                    words[position + 1].value,
+                )
             position += 2
             continue
         position += 1
-    return source
+    return sources.get("0")
 
 
 def past_shell_options(words, at):
@@ -414,7 +448,7 @@ def past_shell_options(words, at):
     operand = at + 1
     while operand < len(words):
         token = words[operand].value
-        if token.isdigit() and operand + 1 < len(words) and words[operand + 1].value in shell.REDIRECTIONS:
+        if names_a_descriptor(words, operand):
             operand += 1
             token = words[operand].value
         if token in shell.REDIRECTIONS and not words[operand].quoted:
@@ -471,7 +505,7 @@ def feeds_a_shell(words):
         token = words[position].value
         if token in ("<<", "<<-", "<<<"):
             break
-        if token.isdigit() and position + 1 < len(words) and words[position + 1].value.startswith("<"):
+        if names_a_descriptor(words, position):
             # An explicit file descriptor: `bash 0< x.sh` writes the number
             # before the operator, and the lexer hands it over as a word of its
             # own (Codex, on acf87bb).
