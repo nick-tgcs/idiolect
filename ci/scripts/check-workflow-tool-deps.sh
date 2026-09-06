@@ -246,6 +246,9 @@ def ticked(text):
 # operators that would end it.
 HEREDOC_OPENER = re.compile(r"""<<-?\s*([^\s;&|<>()]+)""")
 
+# What a shell removes on its way to a command name.
+QUOTING_CHARACTERS = re.compile(r"""[\\'"]""")
+
 # A backslash and the character it quotes, anywhere.
 ESCAPED = re.compile(r"\\.", re.S)
 
@@ -681,7 +684,15 @@ def analysed(text):
     """(packages this shell text RUNS, the repo scripts it RUNS)."""
     packages = set()
     references = set()
-    if not any(candidate.search(text) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(text):
+    # The quoting comes off before the filter looks. A name can be ASSEMBLED —
+    # `r\g`, `r"g"` and `'r'g` all run rg, and `ci/scripts/"x.sh"` names the
+    # same file — and the lexer behind this normalises every one of them, so a
+    # filter reading the raw line was narrower than the reader it stands in
+    # front of (Codex, on 07344b4). That is the same defect as excluding `/`
+    # from the boundary five rounds ago; removing the characters rather than
+    # widening a pattern fixes the class instead of the instance.
+    bare = QUOTING_CHARACTERS.sub("", text)
+    if not any(candidate.search(bare) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(bare):
         return packages, references
 
     for block, words in blocks_of(text):

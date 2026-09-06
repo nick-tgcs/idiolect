@@ -1519,6 +1519,53 @@ YAML
 expect "a bare -i takes nothing either" 1 optional-replacement \
     "build" "ripgrep"
 
+# Codex, on 07344b4: a command name can be ASSEMBLED out of quoting — `r\g`,
+# `r"g"` and `'r'g` all run rg, each confirmed against a proxy on PATH. The
+# lexer normalises them; the cheap filter in front of it was looking at the raw
+# line and saw no `rg` at all, so nothing was ever lexed.
+#
+# The same class as `/usr/bin/rg` five rounds ago: a filter narrower than the
+# reader behind it decides the verdict by itself. Fixed generally — quoting
+# characters are removed before the filter looks — rather than by widening one
+# pattern.
+write_workflow escaped-name ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: r\g -n TODO crates
+YAML
+expect "a backslash inside the command name" 1 escaped-name \
+    "build" "ripgrep"
+
+write_workflow quoted-half-name ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: r"g" -n TODO crates
+YAML
+expect "half the name in quotes" 1 quoted-half-name \
+    "build" "ripgrep"
+
+write_workflow other-half-quoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          'r'g -n TODO crates
+YAML
+expect "the other half in quotes" 1 other-half-quoted \
+    "build" "ripgrep"
+
+# A script path assembles the same way, and the same filter hid it.
+write_workflow assembled-path ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/"test-real-adapter-deps.sh"
+YAML
+expect "a script path assembled out of quotes is followed" 1 assembled-path \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
