@@ -990,7 +990,21 @@ def piped_into_a_shell(words):
         at = past_wrappers(segment)
         if at is None or not feeds_a_shell(segment[at:]):
             continue
+        if stdin_source(segment) is not None:
+            # An explicit redirect on the consumer REPLACES the pipe, so
+            # nothing written before it arrives: `printf 'rg …' | bash
+            # </dev/null` runs none of the text (Codex, on d940f84; probed).
+            continue
+
+        # Only the command immediately before the pipe produces. A pipeline may
+        # follow another command on the same line — `echo preparing && printf
+        # 'rg …' | bash` — and taking the whole segment read `echo` as the
+        # producer and missed the literal (Codex, on d940f84).
         producer = segments[index - 1]
+        for boundary in range(len(producer) - 1, -1, -1):
+            if producer[boundary].value in shell.SEPARATORS and not producer[boundary].quoted:
+                producer = producer[boundary + 1:]
+                break
         command = shell.command_word(producer)
         if command is None:
             continue

@@ -2506,6 +2506,28 @@ YAML
 expect "a formatted producer is left alone" 0 formatted-producer \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on d940f84, both probed. A pipeline may follow another command on the
+# same line, and only the command right before the pipe produces.
+write_workflow producer-after-a-list ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo preparing && printf 'rg -n TODO crates\n' | bash
+YAML
+expect "the producer is the command before the pipe" 1 producer-after-a-list \
+    "build" "ripgrep"
+
+# ...and an explicit redirect on the consumer replaces the pipe, so nothing
+# written before it reaches the shell.
+write_workflow pipe-replaced-by-redirect ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | bash </dev/null
+YAML
+expect "a redirect on the consumer replaces the pipe" 0 pipe-replaced-by-redirect \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
