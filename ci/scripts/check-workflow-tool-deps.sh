@@ -368,6 +368,29 @@ def commands_in(words):
         index = stop + 1
 
 
+def past_shell_options(words, at):
+    """Where a shell's first OPERAND begins, or None if nothing will run.
+
+    One walk, asked by both readers: the one looking for the script FILE and
+    the one deciding whether the shell reads its script from stdin. They had
+    separate walks, and the simpler one took `nullglob` — the argument of
+    `-O` — for a script operand, so `bash -O nullglob <<'X'` was read as a
+    shell with a file and its heredoc as data (Codex, on 0114610).
+    """
+    operand = at + 1
+    while operand < len(words) and words[operand].value.startswith(("-", "+")):
+        token = words[operand].value
+        if token in TERMINAL_OPTIONS:
+            return None
+        if token.startswith(("--", "++")):
+            if token in shell.SHELL_OPTIONS_WITH_ARGUMENT:
+                operand += 1
+        else:
+            operand += sum(1 for letter in token[1:] if letter in "oO")
+        operand += 1
+    return operand
+
+
 def feeds_a_shell(words):
     """Whether this command hands its STANDARD INPUT to a shell.
 
@@ -379,13 +402,16 @@ def feeds_a_shell(words):
     word = shell.command_word(words)
     if word is None or word.value.rsplit("/", 1)[-1] not in shell.SHELL_COMMANDS:
         return False
-    for other in words[words.index(word) + 1:]:
+    operand = past_shell_options(words, words.index(word))
+    if operand is None:
+        return False
+    for other in words[operand:]:
         token = other.value
-        if token in ("<<", "<<-"):
+        if token in ("<<", "<<-", "<<<"):
             break
-        if token.startswith(("-", "+")):
-            continue
         if not token.startswith("<"):
+            # A script FILE: the shell reads that, and what arrives on stdin
+            # is input for it rather than code.
             return False
     return True
 
@@ -778,6 +804,17 @@ def analysed_command(words, block=""):
     # shell behind it: with `timeout 30 bash -c 'rg …'` the command is still
     # `timeout` at the top of this function, so nothing looked inside the
     # program bash was handed (Codex, on 5fd4cef).
+    if feeds_a_shell(words[at:]):
+        # `bash <<< 'rg …'` runs the here-string as its script (Codex, on
+        # 0114610; probed, with and without `-s`). The word after the operator
+        # is the script — a heredoc's body arrives elsewhere, since the scanner
+        # hands those over as their own blocks.
+        for position, other in enumerate(words):
+            if other.value == "<<<" and not other.quoted and position + 1 < len(words):
+                found, referenced = analysed(words[position + 1].value)
+                packages |= found
+                references |= referenced
+
     if shell.runs_a_script(words[at:]):
         # The program is ONE quoted word that nothing here would otherwise look
         # inside — the shell is the command and the tool is a character in a
@@ -810,27 +847,19 @@ def analysed_command(words, block=""):
         # ONE operand, the first: `bash driver.sh other.sh` runs driver.sh and
         # hands the second path to it as `$1`, so following both rejected a
         # driver for what its argument does.
-        operand = at + 1
-        while operand < len(words) and words[operand].value.startswith(("-", "+")):
-            token = words[operand].value
-            if token in TERMINAL_OPTIONS:
-                # `bash --help script.sh` prints help and runs no script
-                # (Codex, on e9ab98e; probed).
-                return packages, references
-            # Short options CLUSTER, and each `o` or `O` in one takes a word
-            # of its own — ANYWHERE in the cluster, not only at the end, which
-            # is what I first read into bash's usage line (Codex, on 5fece60
-            # and again on 94be871). Checked against bash 5.2.21 rather than
-            # inferred: `-oe pipefail script.sh` runs the script with both set,
-            # `-oO pipefail nullglob script.sh` consumes two, and the attached
-            # form `-opipefail` is rejected outright, so there is no case where
-            # the value comes glued on.
-            if token.startswith(("--", "++")):
-                if token in shell.SHELL_OPTIONS_WITH_ARGUMENT:
-                    operand += 1
-            else:
-                operand += sum(1 for letter in token[1:] if letter in "oO")
-            operand += 1
+        # Short options CLUSTER, and each `o` or `O` in one takes a word of its
+        # own — ANYWHERE in the cluster, not only at the end, which is what I
+        # first read into bash's usage line (Codex, on 5fece60 and again on
+        # 94be871). Checked against bash 5.2.21 rather than inferred:
+        # `-oe pipefail script.sh` runs the script with both set,
+        # `-oO pipefail nullglob script.sh` consumes two, and the attached form
+        # `-opipefail` is rejected outright. All of that lives in
+        # `past_shell_options`, which the stdin reader asks as well.
+        operand = past_shell_options(words, at)
+        if operand is None:
+            # `bash --help script.sh` prints help and runs no script (Codex, on
+            # e9ab98e; probed).
+            return packages, references
         if operand < len(words):
             handed = SCRIPT_REFERENCE.fullmatch(words[operand].value)
             if handed:

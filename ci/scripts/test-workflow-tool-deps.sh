@@ -1951,6 +1951,39 @@ YAML
 expect "a heredoc past a script operand is data" 0 heredoc-past-a-script \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 0114610, both probed and both consequences of the commit before:
+# a here-STRING is a stdin script too, and an option's own argument is not a
+# script operand.
+write_workflow here-string-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash <<< 'rg -n TODO crates'
+YAML
+expect "a here-string fed to a shell is a script" 1 here-string-script \
+    "build" "ripgrep"
+
+write_workflow here-string-with-s ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -s <<< 'rg -n TODO crates'
+YAML
+expect "with -s as well" 1 here-string-with-s \
+    "build" "ripgrep"
+
+write_workflow option-operand-then-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -O nullglob <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "an option's argument is not a script operand" 1 option-operand-then-heredoc \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
