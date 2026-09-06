@@ -1868,6 +1868,89 @@ YAML
 expect "-p after another reserved word is a command" 0 dash-p-elsewhere \
     "All 1 workflow job(s)" "!::error::"
 
+# ------------------------------------------- round twenty-eight, both probed
+# Codex, on 34a9c61: a heredoc fed to `bash -s` is the child shell's SCRIPT,
+# not data. Probed — the body runs. The apt scanner announces this case as a
+# heredoc it cannot check; this gate was silently blind to it, which is the
+# false green it exists to prevent.
+write_workflow shell-stdin-heredoc ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -s <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a heredoc fed to a shell is a script" 1 shell-stdin-heredoc \
+    "build" "ripgrep"
+
+write_workflow shell-stdin-unquoted ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash <<SCRIPT
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "with no -s and an unquoted delimiter either" 1 shell-stdin-unquoted \
+    "build" "ripgrep"
+
+# ...but a heredoc fed to something that is NOT a shell is still data.
+write_workflow cat-heredoc-still-data ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a heredoc fed to cat is still data" 0 cat-heredoc-still-data \
+    "All 1 workflow job(s)" "!::error::"
+
+# `$(( … ))` is ARITHMETIC: bash reads `rg` there as a variable and runs no
+# command. Reading the outer `$(` as a substitution demanded ripgrep for
+# `echo $((rg + 1))`, which prints a number.
+write_workflow arithmetic ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          rg=41
+          echo $((rg + 1))
+YAML
+expect "arithmetic is not a command substitution" 0 arithmetic \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and a real substitution INSIDE arithmetic still runs.
+write_workflow arithmetic-with-substitution ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo $(( $(rg -c TODO crates) + 1 ))
+YAML
+expect "a substitution inside arithmetic still runs" 1 arithmetic-with-substitution \
+    "build" "ripgrep"
+
+# ...and a heredoc fed to a shell that HAS a script operand is data for that
+# script, not code. Probed: `bash reads-stdin.sh <<EOF` prints the body as its
+# standard input and runs none of it. This case exists because the mutation
+# that dropped the operand test survived without it.
+write_workflow heredoc-past-a-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash ci/scripts/test-not-a-real-script.sh <<'EOF'
+          rg -n TODO crates
+          EOF
+YAML
+expect "a heredoc past a script operand is data" 0 heredoc-past-a-script \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

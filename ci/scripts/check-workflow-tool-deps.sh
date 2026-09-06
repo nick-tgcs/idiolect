@@ -368,6 +368,33 @@ def commands_in(words):
         index = stop + 1
 
 
+def feeds_a_shell(words):
+    """Whether this command hands its STANDARD INPUT to a shell.
+
+    `bash -s <<'X'` and a bare `bash <<X` both run the body as the child
+    shell's script — probed — so it is code rather than the data a heredoc
+    usually is (Codex, on 34a9c61). A script FILE operand means the opposite:
+    the shell reads that instead, and the heredoc is data for it.
+    """
+    word = shell.command_word(words)
+    if word is None or word.value.rsplit("/", 1)[-1] not in shell.SHELL_COMMANDS:
+        return False
+    for other in words[words.index(word) + 1:]:
+        token = other.value
+        if token in ("<<", "<<-"):
+            break
+        if token.startswith(("-", "+")):
+            continue
+        if not token.startswith("<"):
+            return False
+    return True
+
+
+def as_a_script(body):
+    """The commands a heredoc body holds when it IS a script."""
+    yield from blocks_of("\n".join(body))
+
+
 def expanded(body):
     """The commands an EXPANDING heredoc body runs.
 
@@ -393,7 +420,7 @@ def expanded(body):
     # its own quote removal and runs rg (Codex, on 631fa9f; probed). Blanking
     # every pair turned that name into `r`.
     joined = HEREDOC_ESCAPED.sub("  ", CONTINUED.sub("", "\n".join(body)))
-    for inner in shell.substitution_bodies(joined) + ticked(joined):
+    for inner in command_substitutions(joined) + ticked(joined):
         yield from blocks_of(inner)
 
 
@@ -405,6 +432,7 @@ def blocks_of(text):
     looking at the line again.
     """
     expanding = False
+    feeding = False
     body = []
     for _, block, in_heredoc in shell.shell_commands(text):
         if in_heredoc:
@@ -412,11 +440,11 @@ def blocks_of(text):
             # written across several of them, and neither the line holding
             # `$(` nor the one holding `)` is a substitution on its own (Codex,
             # on d32dd1d).
-            if expanding:
+            if expanding or feeding:
                 body.append(block)
             continue
         if body:
-            yield from expanded(body)
+            yield from (as_a_script(body) if feeding else expanded(body))
             body = []
         # `<<EOF` expands, `<<'EOF'` and `<<"EOF"` do not. Read from the
         # opener rather than from the scanner's delimiter, which keeps the
@@ -449,15 +477,32 @@ def blocks_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
+        feeding = bool(openers) and feeds_a_shell(words)
         yield block, words
 
     if body:
-        yield from expanded(body)
+        yield from (as_a_script(body) if feeding else expanded(body))
 
 
 # Words this run could not decide about, announced once at the end rather than
 # resolved. A set because the same line reaches here once per job that runs it.
 undecided = set()
+
+
+def command_substitutions(text):
+    """The bodies of the `$( … )` in `text`, arithmetic excluded.
+
+    `$(( … ))` is arithmetic: bash reads its words as variables and runs no
+    command, so `echo $((rg + 1))` prints a number and needs nothing (Codex, on
+    34a9c61). The opener is hidden before the scanner's reader sees it and put
+    back in whatever comes out, so a real substitution written INSIDE
+    arithmetic — `$(( $(rg -c x) + 1 ))` — is still found.
+    """
+    hidden = text.replace("$((", MARKER + "((")
+    return [
+        body.replace(MARKER + "((", "$((")
+        for body in shell.substitution_bodies(hidden)
+    ]
 
 
 def outside_single_quotes(text):
@@ -528,7 +573,7 @@ def substitutions_in(words, block):
                     "literal and which runs"
                 )
             continue
-        inner += shell.substitution_bodies(word.value)
+        inner += command_substitutions(word.value)
 
     # An unquoted `$( … )` splits into `$` and `(` too, so it is read from the
     # same rejoined line — leaving out the words whose DOLLAR is literal, which
@@ -536,7 +581,7 @@ def substitutions_in(words, block):
     # instead lost `echo \\$(rg …)`, where two backslashes are one literal
     # backslash and the substitution after them still runs (Codex, on 92bf47b):
     # the word is quoted, and its dollar is not literal.
-    inner += shell.substitution_bodies(
+    inner += command_substitutions(
         "".join(
             (" " if word.space_before else "") + word.value
             for word in words
