@@ -172,7 +172,49 @@ SCRIPT_REFERENCE = re.compile(r"(?:\S*/)?(ci/scripts/[\w.-]+\.sh)")
 SOURCING = {"source", "."}
 
 # Options that make a command print something and exit, whatever follows.
-TERMINAL_OPTIONS = frozenset({"--help", "--version", "--usage", "--show-limits"})
+# Probed, every one: `--show-limits` and `--usage` were in here on the strength
+# of their names alone, and xargs RUNS the command after the first while it has
+# never heard of the second (Codex, on e9ab98e). The short spellings belong to
+# util-linux — `ionice -h rg` prints usage, `setsid -V rg` prints a version —
+# and are kept per wrapper, since `-V` means something else elsewhere.
+TERMINAL_OPTIONS = frozenset({"--help", "--version"})
+WRAPPER_TERMINAL_LETTERS = {
+    "ionice": "hV",
+    "setsid": "hV",
+}
+
+# Every long option each wrapper has, so an unambiguous ABBREVIATION can be
+# resolved to it: GNU accepts `xargs --max-a 1 rg …` and consumes the `1`
+# (Codex, on e9ab98e). Ambiguous prefixes resolve to nothing, which is what
+# getopt does with them.
+WRAPPER_LONG_OPTIONS = {
+    "xargs": (
+        "--null", "--arg-file", "--delimiter", "--eof", "--replace",
+        "--max-lines", "--max-args", "--open-tty", "--max-procs",
+        "--interactive", "--process-slot-var", "--no-run-if-empty",
+        "--max-chars", "--show-limits", "--verbose", "--exit", "--help",
+        "--version",
+    ),
+    "timeout": (
+        "--preserve-status", "--foreground", "--kill-after", "--signal",
+        "--verbose", "--help", "--version",
+    ),
+    "nice": ("--adjustment", "--help", "--version"),
+    "ionice": (
+        "--class", "--classdata", "--pid", "--pgid", "--uid", "--ignore",
+        "--help", "--version",
+    ),
+    "stdbuf": ("--input", "--output", "--error", "--help", "--version"),
+}
+
+
+def resolved(token, wrapper):
+    """A long option's full spelling, if `token` abbreviates exactly one."""
+    known = WRAPPER_LONG_OPTIONS.get(wrapper, ())
+    if token in known:
+        return token
+    matches = [option for option in known if option.startswith(token)]
+    return matches[0] if len(matches) == 1 else token
 
 # Commands whose ARGUMENT is the command that runs.
 WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
@@ -577,6 +619,18 @@ def analysed_command(words, block=""):
         position = at + 1
         while position < len(words):
             token = words[position].value
+            if token.startswith("--"):
+                token = resolved(token, wrapper)
+            elif (
+                len(token) > 1
+                and token[0] == "-"
+                and any(
+                    letter in WRAPPER_TERMINAL_LETTERS.get(wrapper, "")
+                    for letter in token[1:]
+                )
+            ):
+                # `ionice -h rg`: a short help or version letter ends it too.
+                return packages, references
             if token in TERMINAL_OPTIONS:
                 # `xargs --help rg` prints usage and exits: the option ENDS the
                 # invocation, and reading past it invented a command that never
@@ -589,6 +643,8 @@ def analysed_command(words, block=""):
                 # SHELL's, and xargs is handed `-I` either way (Codex, on
                 # 951f419) — the same lesson as find's own `-exec`.
                 if token.startswith("--"):
+                    # `token` is the resolved spelling by now, so an
+                    # abbreviation takes its value like the full one.
                     if token in takes_argument:
                         position += 1
                 else:
@@ -696,6 +752,10 @@ def analysed_command(words, block=""):
         operand = at + 1
         while operand < len(words) and words[operand].value.startswith(("-", "+")):
             token = words[operand].value
+            if token in TERMINAL_OPTIONS:
+                # `bash --help script.sh` prints help and runs no script
+                # (Codex, on e9ab98e; probed).
+                return packages, references
             # Short options CLUSTER, and each `o` or `O` in one takes a word
             # of its own — ANYWHERE in the cluster, not only at the end, which
             # is what I first read into bash's usage line (Codex, on 5fece60

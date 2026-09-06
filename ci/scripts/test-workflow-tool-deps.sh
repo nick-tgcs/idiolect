@@ -1688,6 +1688,72 @@ YAML
 expect "a name hidden in a hex escape" 1 ansi-c-hex \
     "build" "ripgrep"
 
+# ------------------------------------------ round twenty-four, all probed
+# Codex, on e9ab98e. Three of these four are mine: I added `--show-limits` and
+# `--usage` to the terminal set last round without running either. The probe
+# says `xargs --show-limits rg …` RUNS rg, and `--usage` is not an xargs option
+# at all. Nothing goes in these tables now without a probe beside it.
+write_workflow show-limits ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --show-limits rg -n TODO
+YAML
+expect "--show-limits does not end the invocation" 1 show-limits \
+    "build" "ripgrep"
+
+# GNU accepts an unambiguous abbreviation of a long option, and it takes its
+# value the same way: `xargs --max-a 1 rg …` runs rg with `1` consumed.
+write_workflow abbreviated-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --max-a 1 rg -n TODO
+YAML
+expect "an abbreviated long option takes its value" 1 abbreviated-option \
+    "build" "ripgrep"
+
+# ...and an AMBIGUOUS abbreviation is not resolved to one of them.
+write_workflow ambiguous-abbreviation ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --max rg -n TODO
+YAML
+expect "an ambiguous abbreviation takes nothing" 1 ambiguous-abbreviation \
+    "build" "ripgrep"
+
+# util-linux spells help and version short: `ionice -h rg` prints usage and
+# `setsid -V rg` prints a version, and neither runs rg.
+write_workflow ionice-help ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: ionice -h rg -n TODO crates
+YAML
+expect "a short help option ends it too" 0 ionice-help \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow setsid-version ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: setsid -V rg -n TODO crates
+YAML
+expect "a short version option ends it too" 0 setsid-version \
+    "All 1 workflow job(s)" "!::error::"
+
+# A shell has them as well: `bash --help script.sh` prints help and runs no
+# script.
+write_workflow bash-help ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash --help ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a shell's terminal option runs no script" 0 bash-help \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
