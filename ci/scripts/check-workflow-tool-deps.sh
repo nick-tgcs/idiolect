@@ -389,6 +389,19 @@ def names_a_descriptor(words, position):
     )
 
 
+def past_redirections(words, position):
+    """The next word that is not part of a redirection, from `position`."""
+    while position < len(words):
+        if names_a_descriptor(words, position):
+            position += 3
+            continue
+        if words[position].value in shell.REDIRECTIONS and not words[position].quoted:
+            position += 2
+            continue
+        break
+    return position
+
+
 def stdin_source(words):
     """What ends up on a command's standard input: a heredoc, a file, or None.
 
@@ -837,6 +850,17 @@ def past_wrappers(words):
         position = at + 1
         while position < len(words):
             token = words[position].value
+            stepped = past_redirections(words, position)
+            if stepped != position:
+                # A redirection may sit among a wrapper's own operands, and the
+                # wrapper never sees it: `timeout </dev/null 30 rg …` still
+                # takes 30 as its duration (Codex, on 6b57fb5; probed). This
+                # walk is the one that does NOT go through the scanner's
+                # command reader, so it steps over them itself — which is why
+                # the general stripping helper deleted last round was the wrong
+                # shape for the same problem.
+                position = stepped
+                continue
             if token.startswith("--"):
                 token = resolved(token, wrapper)
             elif (
@@ -862,9 +886,11 @@ def past_wrappers(words):
                 # 951f419) — the same lesson as find's own `-exec`.
                 if token.startswith("--"):
                     # `token` is the resolved spelling by now, so an
-                    # abbreviation takes its value like the full one.
+                    # abbreviation takes its value like the full one — and a
+                    # redirection may sit between the two: `xargs -n </dev/null
+                    # 1 rg …` still takes 1 as the value (Codex, on 6b57fb5).
                     if token in takes_argument:
-                        position += 1
+                        position = past_redirections(words, position + 1)
                 else:
                     # Short options cluster here as they do for a shell, but
                     # these are getopt's: a letter that takes a value takes it
@@ -879,7 +905,7 @@ def past_wrappers(words):
                         if letter not in takes_letters:
                             continue
                         if index + 1 == len(letters):
-                            position += 1
+                            position = past_redirections(words, position + 1)
                         break
                 position += 1
                 continue

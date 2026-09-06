@@ -2329,6 +2329,39 @@ YAML
 expect "a redirection between a wrapper and its tool" 1 wrapper-redirect-then-tool \
     "build" "ripgrep"
 
+# Codex, on 6b57fb5: a redirection may sit inside a WRAPPER's own operands,
+# and this walk is the one place that does not go through the scanner's command
+# reader — so here the skipping really is needed. Both probed.
+write_workflow redirect-before-duration ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout </dev/null 30 rg -n TODO crates
+YAML
+expect "a redirection before timeout's duration" 1 redirect-before-duration \
+    "build" "ripgrep"
+
+write_workflow redirect-inside-option-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -n </dev/null 1 rg -n TODO
+YAML
+expect "a redirection between an option and its value" 1 redirect-inside-option-value \
+    "build" "ripgrep"
+
+# ...and the LONG spelling of the same option, because the short one exercised
+# only half the code: the mutation that made the long branch take the next word
+# regardless survived until this case existed.
+write_workflow redirect-inside-long-option-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --max-args </dev/null 1 rg -n TODO
+YAML
+expect "a redirection between a long option and its value" 1 redirect-inside-long-option-value \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
