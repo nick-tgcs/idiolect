@@ -1380,8 +1380,15 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # reach no other line.
             timing = False
             after_separator = True
-        elif after_separator and not is_apt(token):
-            # That command is not apt, so this segment installs nothing.
+        elif (
+            after_separator
+            and not is_apt(token)
+            and token not in INVOCATION_PREFIXES
+        ):
+            # That command is not apt, so this segment installs nothing. A
+            # PREFIX is not the command, though — `time -- command apt-get
+            # install …` installs (Codex, on f6d3a23; probed) — so the question
+            # is asked again of the word after it.
             after_separator = False
             at_command = False
         elif token in INVOCATION_PREFIXES or token.startswith("-"):

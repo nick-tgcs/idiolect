@@ -6157,6 +6157,18 @@ YAML
 expect "-- ends time's options" 0 time_separator_ends_options \
     "All 1 apt package(s)" "!codex-no-such-package"
 
+# An invocation prefix may stand between `time --` and the command it times:
+# `time -- command apt-get install …` installs. Ending the command position on
+# the prefix left the install unread. Probed.
+write_workflow time_separator_then_prefix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -- command apt-get install -y codex-no-such-package
+YAML
+expect "a prefix after -- still leads to the command" 1 time_separator_then_prefix \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

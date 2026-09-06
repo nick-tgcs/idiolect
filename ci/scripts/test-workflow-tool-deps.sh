@@ -2550,6 +2550,38 @@ YAML
 expect "a producer redirected away feeds nothing" 0 producer-redirected-away \
     "All 1 workflow job(s)" "!::error::"
 
+# ------------------------------------------- round forty-two, all probed
+# Codex, on f6d3a23. A consumer may be followed by a list operator, and the
+# rest of the line is not its operand.
+write_workflow consumer-then-list ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | bash && echo done
+YAML
+expect "a list after the consumer is not its operand" 1 consumer-then-list \
+    "build" "ripgrep"
+
+# ...and a producer that redirects only its STDERR still feeds the pipe.
+write_workflow producer-stderr-only ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' 2>/dev/null | bash
+YAML
+expect "redirecting stderr leaves the pipe connected" 1 producer-stderr-only \
+    "build" "ripgrep"
+
+write_workflow time-separator-then-prefix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          time -- command rg -n TODO crates
+YAML
+expect "a prefix after -- still leads to the command" 1 time-separator-then-prefix \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

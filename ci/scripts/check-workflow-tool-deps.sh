@@ -939,9 +939,32 @@ def past_wrappers(words):
 # it is reading a script this gate can see.
 LITERAL_PRODUCERS = {"echo", "printf"}
 
-# Redirections that send a producer's standard output somewhere other than the
-# pipe, leaving the shell after it reading EOF.
-WRITES_ELSEWHERE = {">", ">>", "&>", "&>>", ">&", "1>", "1>>"}
+# Redirections that can take standard output away from the pipe. `&>` takes
+# both streams; the rest depend on the descriptor written before them.
+WRITES_ELSEWHERE = {">", ">>", "&>", "&>>", ">&"}
+
+
+def writes_elsewhere(words):
+    """Whether these words send standard output somewhere other than the pipe.
+
+    Descriptor-aware: `printf 'rg …' 2>/dev/null | bash` redirects only stderr
+    and the pipe stays connected, so the shell after it does run the text
+    (Codex, on f6d3a23; probed). A blind search for `>` called that inert.
+    """
+    position = 0
+    while position < len(words):
+        descriptor = "1"
+        if names_a_descriptor(words, position):
+            descriptor = words[position].value
+            position += 1
+        word = words[position]
+        if word.value in WRITES_ELSEWHERE and not word.quoted:
+            if descriptor == "1" or word.value.startswith("&"):
+                return True
+            position += 2
+            continue
+        position += 1
+    return False
 
 
 def piped_into_a_shell(words):
@@ -991,6 +1014,15 @@ def piped_into_a_shell(words):
     for index, segment in enumerate(segments):
         if index == 0 or not segment:
             continue
+        # A list operator ends the consumer: `printf … | bash && echo done`
+        # pipes into bash alone, and passing the rest made `&&` look like the
+        # shell's script operand (Codex, on f6d3a23).
+        for boundary, word in enumerate(segment):
+            if word.value in shell.SEPARATORS and not word.quoted:
+                segment = segment[:boundary]
+                break
+        if not segment:
+            continue
         at = past_wrappers(segment)
         if at is None or not feeds_a_shell(segment[at:]):
             continue
@@ -1009,10 +1041,7 @@ def piped_into_a_shell(words):
             if producer[boundary].value in shell.SEPARATORS and not producer[boundary].quoted:
                 producer = producer[boundary + 1:]
                 break
-        if any(
-            other.value in WRITES_ELSEWHERE and not other.quoted
-            for other in producer
-        ):
+        if writes_elsewhere(producer):
             # The producer's output goes somewhere else, so the shell reads
             # EOF: `printf 'rg …' >/dev/null | bash` runs nothing (Codex, on
             # 9e4b857; probed).
