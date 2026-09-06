@@ -1801,6 +1801,28 @@ else
     ok "a wrapper with no option list is refused"
 fi
 
+# Codex, on 4967f33: `coproc rg …` runs rg asynchronously, and reading
+# `coproc` as the command missed it. Fixed in the apt scanner's `command_word`,
+# where the same gap hid an install. Both forms probed by reading the
+# coprocess's pipe — the output does not reach the terminal on its own.
+write_workflow coproc-simple ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc rg -n TODO crates
+YAML
+expect "coproc introduces a command" 1 coproc-simple \
+    "build" "ripgrep"
+
+write_workflow coproc-named ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc FOO { rg -n TODO crates; }
+YAML
+expect "a named coproc runs what is in its braces" 1 coproc-named \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

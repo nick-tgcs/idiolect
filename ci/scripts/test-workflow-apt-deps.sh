@@ -6065,6 +6065,30 @@ YAML
 expect "a quoted option still takes its value" 1 quoted_option_with_value \
     "codex-no-such-package"
 
+# `coproc` introduces a command the way `time` and `!` do — bash runs it
+# asynchronously and `help coproc` spells the syntax `coproc [NAME] command`.
+# Reading `coproc` as the command left the install unexamined. Both forms were
+# run against a proxy, reading the coprocess's own pipe to see the output.
+write_workflow coproc_simple ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc apt-get install -y codex-no-such-package
+YAML
+expect "coproc introduces a command" 1 coproc_simple \
+    "codex-no-such-package"
+
+# ...and with a NAME, where the command is inside the braces and the word after
+# `coproc` is the coprocess's name rather than anything that runs.
+write_workflow coproc_named ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc FOO { apt-get install -y codex-no-such-package; }
+YAML
+expect "a named coproc runs what is in its braces" 1 coproc_named \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

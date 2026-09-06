@@ -74,6 +74,11 @@ INVOCATION_PREFIXES = {"sudo", "env", "command", "exec"}
 # runs the value exactly as a bare `${{ env.command }}` would.
 CONTROL_PREFIXES = {
     "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "(",
+    # `coproc [NAME] command` introduces one the same way `time` does, and runs
+    # it asynchronously. Probed by reading the coprocess's own pipe, since its
+    # output does not reach the terminal: both `coproc cmd` and
+    # `coproc NAME { cmd; }` execute what follows.
+    "coproc",
 }
 
 # A region bash may SKIP ENTIRELY, and the words that end one. Taken from the
@@ -1372,6 +1377,10 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # first ran a function that never runs and rejected a workflow
             # that works.
             bypassing = bypassing or token in INVOCATION_PREFIXES
+        elif names_a_coprocess(words, index - 1):
+            # The NAME of a coprocess is not a command; its body is, and the
+            # bracket after this word introduces one.
+            pass
         elif token in CONTROL_PREFIXES and not word.quoted:
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
             # then` installs x, and so does `( apt-get ... )`. Ending the
@@ -2123,6 +2132,24 @@ def is_a_step_script(path):
     )
 
 
+def names_a_coprocess(words, position):
+    """Whether this word is the NAME of a `coproc NAME { … }`.
+
+    `help coproc` gives the syntax as `coproc [NAME] command`, and a NAME is
+    what stands between the keyword and a body. It runs nothing, so reading it
+    as the command left the body unexamined — in the literal walk below as well
+    as in `command_word`, which is why both ask this rather than each carrying
+    its own copy of the rule.
+    """
+    return (
+        position > 0
+        and words[position - 1].value == "coproc"
+        and not words[position - 1].quoted
+        and position + 1 < len(words)
+        and words[position + 1].value in BODY_BRACKETS
+    )
+
+
 def command_word(words):
     """The word that supplies this segment's command, or None if there is none.
 
@@ -2147,6 +2174,9 @@ def command_word(words):
     while index < len(words):
         word = words[index]
         token = word.value
+        if names_a_coprocess(words, index):
+            index += 1
+            continue
         if not word.quoted and token in CONTROL_PREFIXES:
             index += 1
             continue
