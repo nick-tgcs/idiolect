@@ -2184,6 +2184,52 @@ YAML
 expect "a heredoc after a redirect is still the script" 1 heredoc-after-redirect \
     "build" "ripgrep"
 
+# ------------------------------------------ round thirty-four, all probed
+# Codex, on 1397e7b. A redirection may come BEFORE the options, and the shell
+# still sees them: `bash </dev/null -c 'rg …'` runs the string.
+write_workflow redirect-before-options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash </dev/null -c 'rg -n TODO crates'
+YAML
+expect "a redirection before the options hides nothing" 1 redirect-before-options \
+    "build" "ripgrep"
+
+# `<>` opens the file read-write on fd 0, and a shell runs what is there.
+write_workflow read-write-redirect ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash <> ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a read-write redirect is a script source too" 1 read-write-redirect \
+    "build" "ripgrep"
+
+# ...and a here-string is superseded like anything else on fd 0.
+write_workflow here-string-superseded ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash <<< 'rg -n TODO crates' </dev/null
+YAML
+expect "a superseded here-string runs nothing" 0 here-string-superseded \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and the same redirection must not hide a script FILE either: `bash
+# </dev/null ci/scripts/x.sh` runs x.sh (probed). This case exists because the
+# mutation that stopped this gate's own option walk at a redirect survived —
+# the `-c` form beside it is answered by the apt scanner, so nothing here
+# depended on the walk until now.
+write_workflow redirect-before-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash </dev/null ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a redirection before a script file hides nothing" 1 redirect-before-script \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

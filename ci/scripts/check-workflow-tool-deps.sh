@@ -391,9 +391,11 @@ def stdin_source(words):
                 source = ("heredoc", None)
             position += 2
             continue
-        if not words[position].quoted and token in ("<", "<<<"):
+        if not words[position].quoted and token in ("<", "<>", "<<<"):
             if descriptor == "0" and position + 1 < len(words):
-                source = ("file" if token == "<" else "string", words[position + 1].value)
+                # `<>` opens the file read-write on fd 0, and a shell runs what
+                # is there (Codex, on 1397e7b; probed).
+                source = ("string" if token == "<<<" else "file", words[position + 1].value)
             position += 2
             continue
         position += 1
@@ -410,8 +412,20 @@ def past_shell_options(words, at):
     shell with a file and its heredoc as data (Codex, on 0114610).
     """
     operand = at + 1
-    while operand < len(words) and words[operand].value.startswith(("-", "+")):
+    while operand < len(words):
         token = words[operand].value
+        if token.isdigit() and operand + 1 < len(words) and words[operand + 1].value in shell.REDIRECTIONS:
+            operand += 1
+            token = words[operand].value
+        if token in shell.REDIRECTIONS and not words[operand].quoted:
+            # A redirection may be written anywhere among the options, and the
+            # shell never sees it — `bash </dev/null -c '…'` runs the string
+            # (Codex, on 1397e7b; probed). Stopping at one read it as the end
+            # of the options, and then no script was found at all.
+            operand += 2
+            continue
+        if not token.startswith(("-", "+")):
+            break
         if token in TERMINAL_OPTIONS:
             return None
         if token.startswith(("--", "++")):
@@ -918,14 +932,14 @@ def analysed_command(words, block=""):
                 references.add(redirected.group(1))
 
         # `bash <<< 'rg …'` runs the here-string as its script (Codex, on
-        # 0114610; probed, with and without `-s`). The word after the operator
-        # is the script — a heredoc's body arrives elsewhere, since the scanner
-        # hands those over as their own blocks.
-        for position, other in enumerate(words):
-            if other.value == "<<<" and not other.quoted and position + 1 < len(words):
-                found, referenced = analysed(words[position + 1].value)
-                packages |= found
-                references |= referenced
+        # 0114610; probed, with and without `-s`) — but only while it is still
+        # what fd 0 holds: `bash <<< '…' </dev/null` runs nothing (Codex, on
+        # 1397e7b). A heredoc's body arrives elsewhere, since the scanner hands
+        # those over as their own blocks.
+        if source is not None and source[0] == "string":
+            found, referenced = analysed(source[1])
+            packages |= found
+            references |= referenced
 
     if shell.runs_a_script(words[at:]):
         # The program is ONE quoted word that nothing here would otherwise look

@@ -2850,7 +2850,26 @@ def script_argument(words):
     if name not in SHELL_COMMANDS:
         return None
     saw_argument = False
+    skipping = 0
     for index, candidate in enumerate(words[words.index(word) + 1:], words.index(word) + 1):
+        if skipping:
+            skipping -= 1
+            continue
+        if candidate.value in REDIRECTIONS and not candidate.quoted:
+            # A redirection is written among the options as often as after
+            # them, and the shell never sees it: `bash </dev/null -c '…'` runs
+            # the string. Reading the operand of one as the script FILE ended
+            # the search and found nothing.
+            skipping = 1
+            continue
+        if (
+            candidate.value.isdigit()
+            and index + 1 < len(words)
+            and words[index + 1].value in REDIRECTIONS
+        ):
+            # An explicit descriptor, written before the operator.
+            skipping = 2
+            continue
         if hands_over_a_script(candidate):
             # A cluster may hold BOTH: `bash -oc pipefail '…'` sets pipefail
             # from the next word and runs the one after it. Each `o` or `O` in

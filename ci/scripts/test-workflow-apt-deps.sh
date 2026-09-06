@@ -6100,6 +6100,19 @@ YAML
 expect "time's own option is not the command" 1 time_portable \
     "codex-no-such-package"
 
+# A redirection may be written among a shell's options, and the shell never
+# sees it: `bash </dev/null -c '…'` runs the string. Reading the redirect's
+# operand as the script FILE stopped the search and left the install
+# unexamined. Probed against bash 5.2.21.
+write_workflow redirect_before_options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash </dev/null -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a redirection among the options hides no script" 1 redirect_before_options \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
