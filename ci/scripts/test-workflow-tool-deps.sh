@@ -2582,6 +2582,40 @@ YAML
 expect "a prefix after -- still leads to the command" 1 time-separator-then-prefix \
     "build" "ripgrep"
 
+# ------------------------------------------- round forty-three, all probed
+# Codex, on 7aa43f4. A wrapper may stand in front of the producer too.
+write_workflow wrapped-producer ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 printf 'rg -n TODO crates\n' | bash
+YAML
+expect "a wrapped producer still produces" 1 wrapped-producer \
+    "build" "ripgrep"
+
+# Redirections are a sequence, and one may put standard output BACK on the
+# pipe: `3>&1 >/dev/null 1>&3` saves it, points it away, and restores it.
+write_workflow stdout-restored ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' 3>&1 >/dev/null 1>&3 | bash
+YAML
+expect "standard output restored to the pipe still feeds it" 1 stdout-restored \
+    "build" "ripgrep"
+
+# ...and `--` is not one of echo's options — `help echo` lists `-n`, `-e` and
+# `-E` — so it is PRINTED, and the shell after the pipe tries to run it:
+# `bash: --: command not found`.
+write_workflow echo-double-dash ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo -- 'rg -n TODO crates' | bash
+YAML
+expect "-- is printed by echo, not consumed" 0 echo-double-dash \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

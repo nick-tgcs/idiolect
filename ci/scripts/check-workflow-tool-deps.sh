@@ -939,18 +939,28 @@ def past_wrappers(words):
 # it is reading a script this gate can see.
 LITERAL_PRODUCERS = {"echo", "printf"}
 
+# What `help echo` lists, and nothing more.
+ECHO_OPTIONS = {"-n", "-e", "-E", "-ne", "-en", "-nE", "-En"}
+
 # Redirections that can take standard output away from the pipe. `&>` takes
 # both streams; the rest depend on the descriptor written before them.
 WRITES_ELSEWHERE = {">", ">>", "&>", "&>>", ">&"}
 
 
 def writes_elsewhere(words):
-    """Whether these words send standard output somewhere other than the pipe.
+    """Whether standard output ends up somewhere other than the pipe.
 
-    Descriptor-aware: `printf 'rg …' 2>/dev/null | bash` redirects only stderr
-    and the pipe stays connected, so the shell after it does run the text
-    (Codex, on f6d3a23; probed). A blind search for `>` called that inert.
+    Descriptor-aware, because `printf 'rg …' 2>/dev/null | bash` redirects only
+    stderr and the pipe stays connected (Codex, on f6d3a23). And a SEQUENCE,
+    because redirections are applied in order and one may put fd 1 back:
+    `3>&1 >/dev/null 1>&3` saves the pipe, points output away, and restores it,
+    and the shell after it does run the text (Codex, on 7aa43f4). Both probed.
+
+    The same shape as `stdin_source`, one descriptor over: a map from
+    descriptor to where it currently points, `PIPE` being where it started.
     """
+    PIPE = object()
+    destination = {"1": PIPE, "2": None}
     position = 0
     while position < len(words):
         descriptor = "1"
@@ -958,13 +968,23 @@ def writes_elsewhere(words):
             descriptor = words[position].value
             position += 1
         word = words[position]
-        if word.value in WRITES_ELSEWHERE and not word.quoted:
-            if descriptor == "1" or word.value.startswith("&"):
-                return True
+        if word.value in WRITES_ELSEWHERE and not word.quoted and position + 1 < len(words):
+            target = words[position + 1].value
+            if word.value.startswith("&"):
+                # `&>` takes both streams away at once.
+                destination["1"] = target
+                destination["2"] = target
+            elif word.value == ">&":
+                destination[descriptor] = destination.get(target.rstrip("-"))
+            else:
+                destination[descriptor] = target
+            position += 2
+            continue
+        if word.value == ">" and not word.quoted:
             position += 2
             continue
         position += 1
-    return False
+    return destination["1"] is not PIPE
 
 
 def piped_into_a_shell(words):
@@ -1046,17 +1066,28 @@ def piped_into_a_shell(words):
             # EOF: `printf 'rg …' >/dev/null | bash` runs nothing (Codex, on
             # 9e4b857; probed).
             continue
+        # A wrapper may stand in front of the producer as it may in front of
+        # the consumer: `timeout 30 printf 'rg …' | bash` still produces
+        # (Codex, on 7aa43f4; probed).
+        produced_at = past_wrappers(producer)
+        if produced_at is None:
+            continue
+        producer = producer[produced_at:]
         command = shell.command_word(producer)
         if command is None:
             continue
         name = command.value.rsplit("/", 1)[-1]
         if name not in LITERAL_PRODUCERS:
             continue
-        arguments = [
-            other.value
-            for other in producer[producer.index(command) + 1:]
-            if not other.value.startswith("-")
-        ]
+        # `help echo` lists `-n`, `-e` and `-E` and nothing else, so `--` is
+        # PRINTED and the shell after the pipe tries to run it (Codex, on
+        # 7aa43f4; probed — `bash: --: command not found`). Stripping every
+        # dash-prefixed word rebuilt a script bash never sees.
+        arguments = []
+        for other in producer[producer.index(command) + 1:]:
+            if not arguments and other.value in ECHO_OPTIONS and not other.quoted:
+                continue
+            arguments.append(other.value)
         if not arguments:
             continue
         if name == "printf":
