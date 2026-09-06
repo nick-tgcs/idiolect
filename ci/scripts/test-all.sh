@@ -17,5 +17,7 @@ bash ci/scripts/test-package-lifecycle.sh
 bash ci/scripts/test-conventional-commits.sh
 bash ci/scripts/test-workflow-apt-deps.sh
 bash ci/scripts/check-workflow-apt-deps.sh
+bash ci/scripts/test-workflow-tool-deps.sh
+bash ci/scripts/check-workflow-tool-deps.sh
 bash ci/scripts/test-coverage-map.sh
 bash ci/scripts/test-coverage.sh

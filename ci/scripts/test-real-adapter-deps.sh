@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Without this, a missing `rg` is INVISIBLE: every check below is written as
+# `if rg ...; then fail; fi`, so the 127 from a command that is not there is
+# read as "no matches" and the gate reports a clean pass having examined
+# nothing. That is not hypothetical — the ubuntu-24.04 runner image does not
+# ship ripgrep, and this script printed `rg: command not found` and exited 0
+# in CI.
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ripgrep (rg) is required by this check but is not installed" >&2
+  exit 1
+fi
+
 found=0
 
 while IFS= read -r manifest; do

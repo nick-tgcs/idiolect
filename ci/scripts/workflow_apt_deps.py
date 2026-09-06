@@ -72,8 +72,17 @@ INVOCATION_PREFIXES = {"sudo", "env", "command", "exec"}
 # Reserved words and pipeline prefixes that INTRODUCE a command rather than
 # being one: bash runs what comes after them, so `if ${{ env.command }}; then`
 # runs the value exactly as a bare `${{ env.command }}` would.
+# What `time` takes before its pipeline, and nothing else does — a bare `--`
+# means end-of-options to most commands, so this is asked only after `time`.
+TIME_OPTIONS = {"-p", "--"}
+
 CONTROL_PREFIXES = {
     "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "(",
+    # `coproc [NAME] command` introduces one the same way `time` does, and runs
+    # it asynchronously. Probed by reading the coprocess's own pipe, since its
+    # output does not reach the terminal: both `coproc cmd` and
+    # `coproc NAME { cmd; }` execute what follows.
+    "coproc",
 }
 
 # A region bash may SKIP ENTIRELY, and the words that end one. Taken from the
@@ -166,8 +175,11 @@ def hands_over_a_script(word):
     """
     token = word.value
     return (
-        not word.quoted
-        and len(token) > 1
+        # No quoting guard: the quotes belong to the shell that READS the line,
+        # and bash is handed `-c` either way — `bash "-c" '…'` and
+        # `bash '-ec' '…'` both run the string, checked against 5.2.21. The
+        # command NAME above already followed this rule; the option did not.
+        len(token) > 1
         and token[0] == "-"
         and token[1] != "-"
         and "c" in token[1:]
@@ -810,6 +822,8 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
     # dies on the first token that is none of it — which is what stops "the apt
     # install step" in prose from being read as a command.
     at_command = True
+    timing = False
+    after_separator = False
     saw_apt = False
     saw_install = False
     parsed_install = False
@@ -1358,6 +1372,25 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # repository's own workflows. Remembered only if nothing runs after
             # it in this command: `FLAG=1 cmd` sets it for cmd alone.
             pending.append(word)
+        elif timing and token == "--" and not word.quoted:
+            # `--` ENDS time's options, and the next word is the pipeline's
+            # command whatever it looks like: `time -- -p apt-get install …`
+            # reports `-p: command not found` and installs nothing (Codex, on
+            # 9e4b857; probed). Guarded by `time` having been seen, so it can
+            # reach no other line.
+            timing = False
+            after_separator = True
+        elif (
+            after_separator
+            and not is_apt(token)
+            and token not in INVOCATION_PREFIXES
+        ):
+            # That command is not apt, so this segment installs nothing. A
+            # PREFIX is not the command, though — `time -- command apt-get
+            # install …` installs (Codex, on f6d3a23; probed) — so the question
+            # is asked again of the word after it.
+            after_separator = False
+            at_command = False
         elif token in INVOCATION_PREFIXES or token.startswith("-"):
             # `command` exists to bypass shell functions: `command f` looks for
             # an external `f` and never reads the body of one declared here.
@@ -1369,7 +1402,12 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # first ran a function that never runs and rejected a workflow
             # that works.
             bypassing = bypassing or token in INVOCATION_PREFIXES
+        elif names_a_coprocess(words, index - 1):
+            # The NAME of a coprocess is not a command; its body is, and the
+            # bracket after this word introduces one.
+            pass
         elif token in CONTROL_PREFIXES and not word.quoted:
+            timing = token == "time"
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
             # then` installs x, and so does `( apt-get ... )`. Ending the
             # command position here left a real install announced as unparsed —
@@ -2120,6 +2158,24 @@ def is_a_step_script(path):
     )
 
 
+def names_a_coprocess(words, position):
+    """Whether this word is the NAME of a `coproc NAME { … }`.
+
+    `help coproc` gives the syntax as `coproc [NAME] command`, and a NAME is
+    what stands between the keyword and a body. It runs nothing, so reading it
+    as the command left the body unexamined — in the literal walk below as well
+    as in `command_word`, which is why both ask this rather than each carrying
+    its own copy of the rule.
+    """
+    return (
+        position > 0
+        and words[position - 1].value == "coproc"
+        and not words[position - 1].quoted
+        and position + 1 < len(words)
+        and words[position + 1].value in BODY_BRACKETS
+    )
+
+
 def command_word(words):
     """The word that supplies this segment's command, or None if there is none.
 
@@ -2141,10 +2197,29 @@ def command_word(words):
 
     index = 0
     saw_invocation = False
+    timing = False
     while index < len(words):
         word = words[index]
         token = word.value
+        if names_a_coprocess(words, index):
+            index += 1
+            continue
         if not word.quoted and token in CONTROL_PREFIXES:
+            timing = token == "time"
+            index += 1
+            continue
+        if timing and not word.quoted and token == "--":
+            # `--` ENDS the options, so what follows is the pipeline even when
+            # it looks like one: `time -- -p rg` reports `-p: command not
+            # found` (Codex, on 9e4b857; probed).
+            timing = False
+            index += 1
+            continue
+        if timing and not word.quoted and token in TIME_OPTIONS:
+            # `help time` gives the syntax as `time [-p] pipeline`, and bash
+            # takes a `--` as well: both were run, and each times the pipeline
+            # and runs it. Skipping the reserved word and stopping at `-p` read
+            # the OPTION as the command.
             index += 1
             continue
         if token in INVOCATION_PREFIXES:
@@ -2804,12 +2879,62 @@ def script_argument(words):
     if name not in SHELL_COMMANDS:
         return None
     saw_argument = False
+    skipping = 0
     for index, candidate in enumerate(words[words.index(word) + 1:], words.index(word) + 1):
-        if hands_over_a_script(candidate) and index + 1 < len(words):
-            return words[index + 1]
+        if skipping:
+            skipping -= 1
+            continue
+        if candidate.value in REDIRECTIONS and not candidate.quoted:
+            # A redirection is written among the options as often as after
+            # them, and the shell never sees it: `bash </dev/null -c '…'` runs
+            # the string. Reading the operand of one as the script FILE ended
+            # the search and found nothing.
+            skipping = 1
+            continue
+        if (
+            candidate.value.isdigit()
+            and not candidate.quoted
+            and index + 1 < len(words)
+            and words[index + 1].value in REDIRECTIONS
+            and not words[index + 1].space_before
+        ):
+            # An explicit descriptor, written before the operator and ATTACHED
+            # to it. Detached it is an operand: `bash 0 </dev/null -c '…'`
+            # reports `0: No such file or directory` and runs no string, so
+            # reading the number as a descriptor reported an install that never
+            # happens (Codex, on 2ce03cc; probed, plain and quoted).
+            skipping = 2
+            continue
+        if hands_over_a_script(candidate):
+            # A redirection may sit between `-c` and its string, and the shell
+            # never sees it: `bash -c </dev/null '…'` runs the string (Codex,
+            # on 1151e45; probed). The script is the first word after the
+            # option that is not one.
+            following = index + 1
+            while following < len(words):
+                if words[following].value in REDIRECTIONS and not words[following].quoted:
+                    following += 2
+                    continue
+                if (
+                    words[following].value.isdigit()
+                    and not words[following].quoted
+                    and following + 1 < len(words)
+                    and words[following + 1].value in REDIRECTIONS
+                    and not words[following + 1].space_before
+                ):
+                    following += 3
+                    continue
+                break
+            taken = sum(1 for letter in candidate.value[1:] if letter in "oO")
+            if following + taken < len(words):
+                return words[following + taken]
+            return None
         if saw_argument:
             saw_argument = False
-        elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT and not candidate.quoted:
+        elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT:
+            # No quoting guard, for the reason the option ABOVE lost one:
+            # `bash "-O" nullglob -c '…'` consumes nullglob and runs the
+            # string, because the quotes belong to the shell reading the line.
             saw_argument = True
         elif not candidate.value.startswith("-"):
             # The first operand is the script FILE, and bash reads no more
