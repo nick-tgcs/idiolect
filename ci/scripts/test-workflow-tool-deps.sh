@@ -2287,6 +2287,48 @@ YAML
 expect "an attached one leaves it the script" 1 attached-number-heredoc \
     "build" "ripgrep"
 
+# ------------------------------------------ round thirty-six, all probed
+# Codex, on 1151e45, three placements of the same thing: a redirection may sit
+# ANYWHERE among a command's words, and the command never sees it.
+write_workflow redirect-inside-dash-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c </dev/null 'rg -n TODO crates'
+YAML
+expect "a redirection between -c and its script" 1 redirect-inside-dash-c \
+    "build" "ripgrep"
+
+write_workflow moving-descriptor ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash 3< ci/scripts/test-real-adapter-deps.sh 0<&3-
+YAML
+expect "a moving descriptor carries the script" 1 moving-descriptor \
+    "build" "ripgrep"
+
+write_workflow redirect-inside-wrapper ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout 30 < ci/scripts/test-real-adapter-deps.sh bash
+YAML
+expect "a redirection between a wrapper and its command" 1 redirect-inside-wrapper \
+    "build" "ripgrep"
+
+# A redirection between a wrapper and its command is stepped over by the
+# scanner's own command reader, which is why nothing here strips them: the
+# stripping helper I wrote for this changed no verdict and was deleted.
+write_workflow wrapper-redirect-then-tool ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs < /dev/null rg -n TODO
+YAML
+expect "a redirection between a wrapper and its tool" 1 wrapper-redirect-then-tool \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

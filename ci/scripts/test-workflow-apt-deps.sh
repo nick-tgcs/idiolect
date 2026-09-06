@@ -6131,6 +6131,18 @@ YAML
 expect "a detached number is an operand, not a descriptor" 0 detached_io_number \
     "All 1 apt package(s)" "!codex-no-such-package"
 
+# A redirection may sit between `-c` and its string, and the shell never sees
+# it: `bash -c </dev/null 'apt-get install …'` runs the install. Taking the
+# word straight after `-c` selected the operator instead. Probed.
+write_workflow redirect_inside_dash_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c </dev/null 'apt-get install -y codex-no-such-package'
+YAML
+expect "a redirection between -c and its script" 1 redirect_inside_dash_c \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -2877,14 +2877,28 @@ def script_argument(words):
             skipping = 2
             continue
         if hands_over_a_script(candidate):
-            # A cluster may hold BOTH: `bash -oc pipefail '…'` sets pipefail
-            # from the next word and runs the one after it. Each `o` or `O` in
-            # the cluster takes a word of its own before the script, and the
-            # letters' ORDER does not change that — bash 5.2.21 runs the same
-            # script for `-co` as for `-oc`.
+            # A redirection may sit between `-c` and its string, and the shell
+            # never sees it: `bash -c </dev/null '…'` runs the string (Codex,
+            # on 1151e45; probed). The script is the first word after the
+            # option that is not one.
+            following = index + 1
+            while following < len(words):
+                if words[following].value in REDIRECTIONS and not words[following].quoted:
+                    following += 2
+                    continue
+                if (
+                    words[following].value.isdigit()
+                    and not words[following].quoted
+                    and following + 1 < len(words)
+                    and words[following + 1].value in REDIRECTIONS
+                    and not words[following + 1].space_before
+                ):
+                    following += 3
+                    continue
+                break
             taken = sum(1 for letter in candidate.value[1:] if letter in "oO")
-            if index + 1 + taken < len(words):
-                return words[index + 1 + taken]
+            if following + taken < len(words):
+                return words[following + taken]
             return None
         if saw_argument:
             saw_argument = False

@@ -416,10 +416,17 @@ def stdin_source(words):
             # fd 3 arrives on stdin after it (Codex, on 2ce03cc; probed). `<&-`
             # closes instead.
             target = words[position + 1].value
+            moving = target.endswith("-") and target != "-"
+            if moving:
+                # `0<&3-` moves rather than copies: fd 3's source becomes fd
+                # 0's and fd 3 is closed (Codex, on 1151e45; probed).
+                target = target[:-1]
             if target == "-":
                 sources.pop(descriptor, None)
             else:
                 sources[descriptor] = sources.get(target)
+                if moving:
+                    sources.pop(target, None)
             position += 2
             continue
         if not words[position].quoted and token in ("<", "<>", "<<<"):
@@ -917,6 +924,17 @@ def analysed_command(words, block=""):
             references |= referenced
         return packages, references
 
+    # Asked of the WHOLE command, before anything resolves wrappers or options:
+    # a redirection may sit anywhere among the words, and once the command word
+    # has been resolved past it the operator is no longer in view — which is how
+    # `timeout 30 <x.sh bash` lost its script (Codex, on 1151e45).
+    #
+    # Nothing strips the redirections out first, though I wrote that and took it
+    # out again: every walk here goes through the scanner's `command_word`,
+    # which already steps over them, and a mutation showed the stripping was
+    # changing no verdict at all.
+    redirected_stdin = stdin_source(words)
+
     at = past_wrappers(words)
     if at is None:
         return packages, references
@@ -959,7 +977,7 @@ def analysed_command(words, block=""):
         # Redirections apply left to right and the LAST one on a descriptor
         # wins, so `bash < x.sh </dev/null` runs nothing from x.sh (Codex, on
         # acf87bb; probed). Only the final stdin source is followed.
-        source = stdin_source(words[at:])
+        source = redirected_stdin
         if source is not None and source[0] == "file":
             redirected = SCRIPT_REFERENCE.fullmatch(source[1])
             if redirected:
