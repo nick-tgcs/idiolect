@@ -6089,6 +6089,17 @@ YAML
 expect "a named coproc runs what is in its braces" 1 coproc_named \
     "codex-no-such-package"
 
+# `time [-p] pipeline`, and bash accepts a `--` as well. Both were run: each
+# form times the pipeline and runs it.
+write_workflow time_portable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -p apt-get install -y codex-no-such-package
+YAML
+expect "time's own option is not the command" 1 time_portable \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

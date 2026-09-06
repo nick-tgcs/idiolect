@@ -1823,6 +1823,51 @@ YAML
 expect "a named coproc runs what is in its braces" 1 coproc-named \
     "build" "ripgrep"
 
+# Codex, on bcf9cab: `time -p rg …` runs rg, and skipping the reserved word
+# left `-p` as the command. `help time` gives the syntax as `time [-p]
+# pipeline`, and bash takes a `--` too — all three forms probed.
+write_workflow time-portable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -p rg -n TODO crates
+YAML
+expect "time's own option is not the command" 1 time-portable \
+    "build" "ripgrep"
+
+write_workflow time-separator ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -- rg -n TODO crates
+YAML
+expect "and neither is its separator" 1 time-separator \
+    "build" "ripgrep"
+
+write_workflow time-both ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -p -- rg -n TODO crates
+YAML
+expect "nor both of them together" 1 time-both \
+    "build" "ripgrep"
+
+# ...and `-p` is `time`'s alone. After any other reserved word it is a command
+# name of its own — `{ -p rg …; }` reports `-p: command not found` and never
+# reaches rg, so requiring ripgrep there would be a false red. This case exists
+# because the mutation that widened the rule to every reserved word survived
+# without it.
+write_workflow dash-p-elsewhere ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          { -p rg -n TODO crates; }
+YAML
+expect "-p after another reserved word is a command" 0 dash-p-elsewhere \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

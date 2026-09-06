@@ -72,6 +72,10 @@ INVOCATION_PREFIXES = {"sudo", "env", "command", "exec"}
 # Reserved words and pipeline prefixes that INTRODUCE a command rather than
 # being one: bash runs what comes after them, so `if ${{ env.command }}; then`
 # runs the value exactly as a bare `${{ env.command }}` would.
+# What `time` takes before its pipeline, and nothing else does — a bare `--`
+# means end-of-options to most commands, so this is asked only after `time`.
+TIME_OPTIONS = {"-p", "--"}
+
 CONTROL_PREFIXES = {
     "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "(",
     # `coproc [NAME] command` introduces one the same way `time` does, and runs
@@ -2171,6 +2175,7 @@ def command_word(words):
 
     index = 0
     saw_invocation = False
+    timing = False
     while index < len(words):
         word = words[index]
         token = word.value
@@ -2178,6 +2183,14 @@ def command_word(words):
             index += 1
             continue
         if not word.quoted and token in CONTROL_PREFIXES:
+            timing = token == "time"
+            index += 1
+            continue
+        if timing and not word.quoted and token in TIME_OPTIONS:
+            # `help time` gives the syntax as `time [-p] pipeline`, and bash
+            # takes a `--` as well: both were run, and each times the pipeline
+            # and runs it. Skipping the reserved word and stopping at `-p` read
+            # the OPTION as the command.
             index += 1
             continue
         if token in INVOCATION_PREFIXES:
