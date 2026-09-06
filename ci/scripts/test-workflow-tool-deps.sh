@@ -2027,6 +2027,57 @@ YAML
 expect "another option leaves the operand a script" 0 other-option-then-script \
     "All 1 workflow job(s)" "!::error::"
 
+# --------------------------------------------- round thirty-one, all probed
+# Codex, on 5040c5e. `-c` beats `-s`: the string is the script and the heredoc
+# is only its input. Probed — the body does not run.
+write_workflow dash-s-and-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -sc 'cat >/dev/null' <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "-c beats -s, so the body is data" 0 dash-s-and-c \
+    "All 1 workflow job(s)" "!::error::"
+
+# A wrapper hides the shell, and the body still reaches it.
+write_workflow wrapped-stdin-shell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          timeout 30 bash <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a wrapped shell still reads its heredoc" 1 wrapped-stdin-shell \
+    "build" "ripgrep"
+
+# ...and so does a shell that is not the first command of the line.
+write_workflow piped-stdin-shell ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo ignored | bash <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a shell later in a pipeline reads it too" 1 piped-stdin-shell \
+    "build" "ripgrep"
+
+# `bash < script` runs the file as the shell's stdin script.
+write_workflow redirected-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash < ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a script redirected into a shell is followed" 1 redirected-script \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

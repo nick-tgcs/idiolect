@@ -412,16 +412,29 @@ def feeds_a_shell(words):
         # and `positional` arrives as `$*` (Codex, on df5d0f1; probed, plain
         # and clustered).
         token = other.value
-        if token.startswith("-") and not token.startswith("--") and "s" in token[1:]:
-            return True
-    for other in words[operand:]:
-        token = other.value
+        if token.startswith("-") and not token.startswith("--"):
+            if "c" in token[1:]:
+                # `-c` beats `-s`: the STRING is the script and whatever
+                # arrives on stdin is only its input — `bash -sc 'cat' <<'X'`
+                # runs none of the body (Codex, on 5040c5e; probed).
+                return False
+            if "s" in token[1:]:
+                return True
+    position = operand
+    while position < len(words):
+        token = words[position].value
         if token in ("<<", "<<-", "<<<"):
             break
-        if not token.startswith("<"):
-            # A script FILE: the shell reads that, and what arrives on stdin
-            # is input for it rather than code.
-            return False
+        if token.startswith("<"):
+            # A redirection, and the word after it is the redirection's — not
+            # the shell's script operand. Reading it as one said `bash < x.sh`
+            # had a script FILE and so was not reading stdin, which is the
+            # opposite of what it does.
+            position += 2
+            continue
+        # A script FILE: the shell reads that, and what arrives on stdin is
+        # input for it rather than code.
+        return False
     return True
 
 
@@ -512,7 +525,12 @@ def blocks_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
-        feeding = bool(openers) and feeds_a_shell(words)
+        feeding = bool(openers) and any(
+            feeds_a_shell(command[at:])
+            for command in commands_in(words)
+            for at in [past_wrappers(command)]
+            if at is not None
+        )
         yield block, words
 
     if body:
@@ -673,27 +691,17 @@ def substitutions_in(words, block):
     return packages, references
 
 
-def analysed_command(words, block=""):
-    """(packages this one command runs, the repo scripts it runs)."""
-    packages = set()
-    references = set()
+def past_wrappers(words):
+    """Where the command a wrapper resolves to begins, or None if nothing runs.
 
-    # Declaring a function runs none of it, but the body is shell that runs
-    # WHERE IT IS CALLED, and a workflow that declares and calls one in the
-    # same block runs it here. Read rather than tracked: over-approximating a
-    # call costs an install this gate would have asked for anyway, while
-    # missing one is a job that dies on a tool nobody said it needed.
-    definition = shell.defined_function(words, 0) if words else None
-    if definition is not None:
-        for command in commands_in(definition[1]):
-            found, referenced = analysed_command(command, block)
-            packages |= found
-            references |= referenced
-        return packages, references
-
+    Asked by `analysed_command` and by the reader deciding whether a heredoc
+    is a shell's script: `timeout 30 bash <<'X'` runs the body, and asking
+    the unresolved command called it `timeout` and the body data (Codex, on
+    5040c5e).
+    """
     word = shell.command_word(words)
     if word is None:
-        return packages, references
+        return None
 
     at = next(
         (position for position, other in enumerate(words) if other is word),
@@ -726,12 +734,12 @@ def analysed_command(words, block=""):
                 )
             ):
                 # `ionice -h rg`: a short help or version letter ends it too.
-                return packages, references
+                return None
             if token in TERMINAL_OPTIONS:
                 # `xargs --help rg` prints usage and exits: the option ENDS the
                 # invocation, and reading past it invented a command that never
                 # runs (Codex, on 92bf47b).
-                return packages, references
+                return None
             if token.startswith("-"):
                 # `xargs -I '{}' rg …`: the replacement string is the OPTION's,
                 # and reading the first non-option word made it the command
@@ -781,6 +789,30 @@ def analysed_command(words, block=""):
         at += next(
             position for position, other in enumerate(words[at:]) if other is following
         )
+    return at
+
+
+def analysed_command(words, block=""):
+    """(packages this one command runs, the repo scripts it runs)."""
+    packages = set()
+    references = set()
+
+    # Declaring a function runs none of it, but the body is shell that runs
+    # WHERE IT IS CALLED, and a workflow that declares and calls one in the
+    # same block runs it here. Read rather than tracked: over-approximating a
+    # call costs an install this gate would have asked for anyway, while
+    # missing one is a job that dies on a tool nobody said it needed.
+    definition = shell.defined_function(words, 0) if words else None
+    if definition is not None:
+        for command in commands_in(definition[1]):
+            found, referenced = analysed_command(command, block)
+            packages |= found
+            references |= referenced
+        return packages, references
+
+    at = past_wrappers(words)
+    if at is None:
+        return packages, references
 
     # `find crates -exec rg -n TODO {} +` runs rg once per match. FIND's
     # option, and only find's: to `echo` a `-exec` is an argument like any
@@ -814,6 +846,15 @@ def analysed_command(words, block=""):
     # `timeout` at the top of this function, so nothing looked inside the
     # program bash was handed (Codex, on 5fd4cef).
     if feeds_a_shell(words[at:]):
+        # `bash < ci/scripts/x.sh` runs the FILE as the shell's script (Codex,
+        # on 5040c5e; probed). The path is the redirection's operand, and the
+        # shell's own operand walk never reaches it.
+        for position, other in enumerate(words):
+            if other.value == "<" and not other.quoted and position + 1 < len(words):
+                redirected = SCRIPT_REFERENCE.fullmatch(words[position + 1].value)
+                if redirected:
+                    references.add(redirected.group(1))
+
         # `bash <<< 'rg …'` runs the here-string as its script (Codex, on
         # 0114610; probed, with and without `-s`). The word after the operator
         # is the script — a heredoc's body arrives elsewhere, since the scanner
