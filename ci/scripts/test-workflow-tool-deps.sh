@@ -1441,6 +1441,38 @@ YAML
 expect "a quoted cluster hands one over too" 1 quoted-cluster-c \
     "build" "ripgrep"
 
+# Codex, on e08e4a1, confirmed against bash 5.2.21: in an EXPANDING heredoc a
+# backslash-newline is removed before expansion, so a `$` at the end of one
+# line and a `(` at the start of the next are one substitution and it runs.
+# Blanking the pair like any other escape left `$  (rg …)`, which is nothing.
+write_workflow heredoc-continuation ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          found: $\
+          (rg -n TODO crates)
+          EOF
+YAML
+expect "a continuation inside a heredoc joins the line" 1 heredoc-continuation \
+    "build" "ripgrep"
+
+# The same body under a quoted delimiter is printed as written — the probe
+# showed bash leaving both the backslash and the newline in place.
+write_workflow heredoc-continuation-literal ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'EOF'
+          found: $\
+          (rg -n TODO crates)
+          EOF
+YAML
+expect "a quoted delimiter keeps the continuation literal" 0 heredoc-continuation-literal \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

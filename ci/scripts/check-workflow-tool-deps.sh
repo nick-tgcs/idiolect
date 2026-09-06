@@ -242,6 +242,9 @@ HEREDOC_OPENER = re.compile(r"""<<-?\s*([^\s;&|<>()]+)""")
 # A backslash and the character it quotes, anywhere.
 ESCAPED = re.compile(r"\\.", re.S)
 
+# A line continuation: the one escaped pair bash removes outright.
+CONTINUED = re.compile(r"\\\n")
+
 # What makes a delimiter quoted, and so its body literal: not only a pair
 # around the whole word. `<<\EOF` and `<<E"OF"` are both quoted to bash, which
 # strips the quoting and stops expanding the body (Codex, on d32dd1d).
@@ -287,7 +290,12 @@ def expanded(body):
     # pair is blanked before anything is read out, two spaces for two
     # characters so the rest of the line stays where it was — and `\\` blanks
     # to nothing that opens anything, leaving a substitution after it live.
-    joined = ESCAPED.sub("  ", "\n".join(body))
+    # A backslash-NEWLINE is removed rather than blanked: bash drops the pair
+    # before expanding, so a `$` at the end of one line and a `(` at the start
+    # of the next are one substitution (Codex, on e08e4a1, and the probe agrees
+    # — `$\` + `(echo …)` in an unquoted heredoc runs it). Every other escaped
+    # pair is blanked, for the reason the case below it gives.
+    joined = ESCAPED.sub("  ", CONTINUED.sub("", "\n".join(body)))
     for inner in shell.substitution_bodies(joined) + ticked(joined):
         yield from blocks_of(inner)
 
