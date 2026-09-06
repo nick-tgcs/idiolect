@@ -2078,6 +2078,71 @@ YAML
 expect "a script redirected into a shell is followed" 1 redirected-script \
     "build" "ripgrep"
 
+# ------------------------------------------- round thirty-two, all probed
+# Codex, on acf87bb: a heredoc belongs to the command that OPENED it. In
+# `cat <<'DOC'; bash </dev/null` the body is cat's — it prints, and the shell
+# beside it reads /dev/null. Asking whether ANY command on the line reads a
+# script from stdin made the body code.
+write_workflow heredoc-belongs-to-cat ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'DOC'; bash </dev/null
+          rg -n TODO crates
+          DOC
+YAML
+expect "a heredoc belongs to the command that opened it" 0 heredoc-belongs-to-cat \
+    "All 1 workflow job(s)" "!::error::"
+
+# An explicit file descriptor is written before the operator, and the lexer
+# hands it over as a word of its own.
+write_workflow explicit-fd ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash 0< ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "an explicit fd number is not a script operand" 1 explicit-fd \
+    "build" "ripgrep"
+
+# Redirections apply left to right, so the LAST one wins: with `</dev/null`
+# after it the repository script never runs, and demanding ripgrep for it is a
+# false red.
+write_workflow last-redirect-wins ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash < ci/scripts/test-real-adapter-deps.sh </dev/null
+YAML
+expect "the last stdin redirection is the one that counts" 0 last-redirect-wins \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and where ONE line opens two heredocs with different owners, neither body
+# is read. Probed: `cat <<'DOC'; bash -s <<'S'` prints the first body and RUNS
+# the second, so the right answer needs each body bound to its own opener —
+# and the bodies arrive without their terminators, which is what the scanner
+# consumes to know one ended.
+#
+# So this is a stated LIMITATION in the missing direction, with the script's
+# own guard behind it, and it is pinned: reading the bodies whenever ANY owner
+# is a shell would make cat's body code, which is a false red on a line that
+# only prints. If this case ever fails, the binding has been solved and this
+# comment goes with it.
+write_workflow heredocs-with-two-owners ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<'DOC'; bash -s <<'S'
+          printed by cat
+          DOC
+          rg -n TODO crates
+          S
+YAML
+expect "two heredocs with different owners are left alone" 0 heredocs-with-two-owners \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

@@ -425,6 +425,12 @@ def feeds_a_shell(words):
         token = words[position].value
         if token in ("<<", "<<-", "<<<"):
             break
+        if token.isdigit() and position + 1 < len(words) and words[position + 1].value.startswith("<"):
+            # An explicit file descriptor: `bash 0< x.sh` writes the number
+            # before the operator, and the lexer hands it over as a word of its
+            # own (Codex, on acf87bb).
+            position += 1
+            continue
         if token.startswith("<"):
             # A redirection, and the word after it is the redirection's — not
             # the shell's script operand. Reading it as one said `bash < x.sh`
@@ -525,11 +531,24 @@ def blocks_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
-        feeding = bool(openers) and any(
-            feeds_a_shell(command[at:])
+        # A heredoc belongs to the command that OPENED it, and the opener is
+        # the command whose words hold the operator. Asking whether ANY command
+        # on the line reads a script from stdin made `cat <<'DOC'; bash <…`
+        # into code (Codex, on acf87bb) — the body is cat's, and it prints.
+        #
+        # Where a line opens SEVERAL, they must agree, for the reason the
+        # delimiters must: the bodies arrive without their terminators, so
+        # there is nothing to tell one from the next.
+        owners = [
+            command
             for command in commands_in(words)
-            for at in [past_wrappers(command)]
-            if at is not None
+            if any(other.value in ("<<", "<<-") and not other.quoted for other in command)
+        ]
+        feeding = bool(owners) and all(
+            (lambda at: at is not None and feeds_a_shell(command[at:]))(
+                past_wrappers(command)
+            )
+            for command in owners
         )
         yield block, words
 
@@ -849,11 +868,17 @@ def analysed_command(words, block=""):
         # `bash < ci/scripts/x.sh` runs the FILE as the shell's script (Codex,
         # on 5040c5e; probed). The path is the redirection's operand, and the
         # shell's own operand walk never reaches it.
+        # Redirections apply left to right and the LAST one on a descriptor
+        # wins, so `bash < x.sh </dev/null` runs nothing from x.sh (Codex, on
+        # acf87bb; probed). Only the final stdin source is followed.
+        source = None
         for position, other in enumerate(words):
             if other.value == "<" and not other.quoted and position + 1 < len(words):
-                redirected = SCRIPT_REFERENCE.fullmatch(words[position + 1].value)
-                if redirected:
-                    references.add(redirected.group(1))
+                source = words[position + 1].value
+        if source is not None:
+            redirected = SCRIPT_REFERENCE.fullmatch(source)
+            if redirected:
+                references.add(redirected.group(1))
 
         # `bash <<< 'rg …'` runs the here-string as its script (Codex, on
         # 0114610; probed, with and without `-s`). The word after the operator
