@@ -1265,6 +1265,54 @@ YAML
 expect "two option letters take two words" 1 cluster-two-options \
     "build" "ripgrep"
 
+# ----------------------------------------------------------- round sixteen
+# Codex, on c1c9438, each verified against the tool itself first.
+#
+# `bash -oc pipefail 'rg …'` sets pipefail from the next word and runs the one
+# after it. The fix is in the apt scanner, whose `script_argument` this gate
+# asks — the same defect would have hidden an apt install written that way.
+write_workflow cluster-o-and-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -oc pipefail 'rg -n TODO crates'
+YAML
+expect "an -o operand before a -c script is consumed" 1 cluster-o-and-c \
+    "build" "ripgrep"
+
+# `cat <(echo ")"; rg …)` runs rg: the quoted bracket is data. Dropping only
+# quoted OPENERS left the quoted closer in the rejoined line, where it closed
+# the substitution early and left the tool outside it.
+write_workflow quoted-closer ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: cat <(echo ")"; rg -n TODO crates)
+YAML
+expect "a quoted closing bracket closes nothing" 1 quoted-closer \
+    "build" "ripgrep"
+
+# `xargs -rn 1 rg …` — a wrapper's short options cluster too, and `-n` takes
+# its value from the next word.
+write_workflow wrapper-cluster ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -rn 1 rg -n TODO
+YAML
+expect "a clustered wrapper option takes its value" 1 wrapper-cluster \
+    "build" "ripgrep"
+
+# ...and one whose letters take nothing must not eat the command.
+write_workflow wrapper-cluster-plain ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -rt rg -n TODO
+YAML
+expect "a cluster of valueless options eats nothing" 1 wrapper-cluster-plain \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

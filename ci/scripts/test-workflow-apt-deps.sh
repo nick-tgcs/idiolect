@@ -6008,6 +6008,29 @@ YAML
 expect "unset -n leaves the target still running" 1 nameref-unset-n-target-lives \
     "codex-no-such-package"
 
+# A cluster may hold BOTH an option that takes a word and the `-c` that hands
+# over a script: `bash -oc pipefail '…'` sets pipefail from the next word and
+# runs the one after it. Reading the word straight after the cluster took
+# `pipefail` for the script and left the install unexamined. Checked against
+# bash 5.2.21, which runs the same script for `-co` as for `-oc`.
+write_workflow cluster-with-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -oc pipefail 'apt-get install -y codex-no-such-package'
+YAML
+expect "an option taking a word before -c does not become the script" 1 cluster-with-c \
+    "codex-no-such-package"
+
+write_workflow cluster-c-first ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -co pipefail 'apt-get install -y codex-no-such-package'
+YAML
+expect "the letters may come in either order" 1 cluster-c-first \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -2805,8 +2805,16 @@ def script_argument(words):
         return None
     saw_argument = False
     for index, candidate in enumerate(words[words.index(word) + 1:], words.index(word) + 1):
-        if hands_over_a_script(candidate) and index + 1 < len(words):
-            return words[index + 1]
+        if hands_over_a_script(candidate):
+            # A cluster may hold BOTH: `bash -oc pipefail '…'` sets pipefail
+            # from the next word and runs the one after it. Each `o` or `O` in
+            # the cluster takes a word of its own before the script, and the
+            # letters' ORDER does not change that — bash 5.2.21 runs the same
+            # script for `-co` as for `-oc`.
+            taken = sum(1 for letter in candidate.value[1:] if letter in "oO")
+            if index + 1 + taken < len(words):
+                return words[index + 1 + taken]
+            return None
         if saw_argument:
             saw_argument = False
         elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT and not candidate.quoted:

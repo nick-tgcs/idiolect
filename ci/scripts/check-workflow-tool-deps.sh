@@ -161,6 +161,17 @@ WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 # come before the command. Held per wrapper rather than guessed: the scanner
 # declines to hold such a table for `sudo -u` and says so, but there the cost
 # was a value unread, while here it is the command itself.
+# Their short option LETTERS that take a value, for the clustered spelling:
+# `xargs -rn 1 rg …` is the same as `xargs -r -n 1 rg …`, and matching whole
+# tokens skipped `-rn` without consuming the `1` (Codex, on c1c9438).
+WRAPPER_LETTERS_WITH_ARGUMENT = {
+    "xargs": "InPLlsadE",
+    "timeout": "sk",
+    "nice": "n",
+    "ionice": "cnpPu",
+    "stdbuf": "ioe",
+}
+
 WRAPPER_OPTIONS_WITH_ARGUMENT = {
     # `--replace[=R]` and `--eof[=END]` take their value ATTACHED, so a bare
     # one consumes nothing and the word after it is the command (Codex, on
@@ -260,14 +271,14 @@ def expanded(body):
     # to nothing that opens anything, leaving a substitution after it live.
     joined = ESCAPED.sub("  ", "\n".join(body))
     for inner in shell.substitution_bodies(joined) + ticked(joined):
-        yield from commands_of(inner)
+        yield from blocks_of(inner)
 
 
-def commands_of(text):
-    """Every command in a block of shell, with the block it was written in.
+def blocks_of(text):
+    """Every line of shell, with the words it lexes to.
 
-    The block comes along because quoting is a property of what was WRITTEN:
-    shlex strips the quotes, and one question below can only be answered by
+    The line comes along because quoting is a property of what was WRITTEN:
+    shlex strips the quotes, and two questions below can only be answered by
     looking at the line again.
     """
     expanding = False
@@ -315,8 +326,7 @@ def commands_of(text):
             # cost of passing over one is a tool use unseen, which the script
             # itself now reports the moment it runs without its tool.
             continue
-        for command in commands_in(words):
-            yield command, block
+        yield block, words
 
     if body:
         yield from expanded(body)
@@ -359,17 +369,17 @@ def outside_single_quotes(text):
     return "".join(kept)
 
 
-def analysed_command(words, block=""):
-    """(packages this one command runs, the repo scripts it runs)."""
+def substitutions_in(words, block):
+    """(packages, references) from every substitution written in one line.
+
+    Asked of the LINE and not of a command, because splitting at separators can
+    cut a substitution in two: `cat <(echo ")"; rg …)` becomes `cat <(echo )`
+    and `rg … )`, and the second is read as a case arm's pattern rather than a
+    command (Codex, on c1c9438).
+    """
     packages = set()
     references = set()
 
-    # A substitution is shell of its own, in either spelling. `$( … )` comes
-    # from the scanner, which reads it out of a single quoted token as well as
-    # a split one; the backtick form is taken from the rejoined command,
-    # because shlex gives backticks no meaning and leaves the opening one
-    # welded to the name in front of it — `hits=`rg …`` lexes with `rg` inside
-    # the first word, where nothing looks for a command.
     inner = []
     for word in words:
         if word.literal_dollar:
@@ -397,44 +407,6 @@ def analysed_command(words, block=""):
             continue
         inner += shell.substitution_bodies(word.value)
 
-    # The rest is asked of the REJOINED command rather than of single words,
-    # because shlex gives neither construct any meaning: `<(` arrives as `<`
-    # and `(`, and a backtick stays welded to the name in front of it. The
-    # words are rejoined the way they were written, so `< (` — a redirection
-    # and a subshell — cannot become a process substitution on the way.
-    #
-    # A word holding a QUOTED `<(` is left out of it: bash performs no process
-    # substitution inside quotes of either kind, so `echo '<(rg …)'` prints
-    # text. Rewriting it to `$( … )` undid, for this construct, the very check
-    # the same commit added for `$( … )` itself (Codex, on 5fd4cef).
-    #
-    # Only a word holding the OPENER, though. Dropping every quoted word threw
-    # away the command name in `< <("rg" …)`, where the quotes are around a
-    # word INSIDE a substitution that is itself unquoted and runs (Codex, on
-    # dcf9333). Which is the same distinction as the line above, one level in:
-    # quoting an argument is not quoting the construct.
-    #
-    # And the opener may be a word of its OWN: `<"("` redirects from a file
-    # named `(`, so rejoining without the quoting produced a `<(` nobody wrote
-    # (Codex, on e9866ba). Any quoted word holding a bracket is left out,
-    # rather than only one already spelled `<(`.
-    rendered = "".join(
-        (" " if word.space_before else "") + word.value
-        for word in words
-        if not (word.quoted and "(" in word.value)
-    )
-    # `<( … )` and `>( … )` run their contents in a process of their own, and
-    # the command word in front of them is something else entirely. Spelled as
-    # `$( … )` for the scanner's reader rather than balanced again here: the
-    # brackets, quotes and escapes are the same, and a second implementation of
-    # them is a second answer.
-    #
-    # `$(` is hidden first, so what comes back is only what the rewrite put
-    # there. Without that, the rendered line — which now keeps quoted words,
-    # for the reason above — hands its own `'$(rg …)'` straight to a reader
-    # that cannot tell it was quoted. The bracket stays where it is, so
-    # nothing's balance changes, and the marker is put back in whatever is
-    # extracted in case a process substitution holds a command substitution.
     # An unquoted `$( … )` splits into `$` and `(` too, so it is read from the
     # same rejoined line — from the UNQUOTED words only, since a quoted one is
     # the per-word reader's business above, where the literal case is settled.
@@ -446,11 +418,40 @@ def analysed_command(words, block=""):
         )
     )
 
+    # The rest is asked of the REJOINED line, because shlex gives neither
+    # construct any meaning: `<(` arrives as `<` and `(`, and a backtick stays
+    # welded to the name in front of it. The words are rejoined the way they
+    # were written, so `< (` — a redirection and a subshell — cannot become a
+    # process substitution on the way.
+    #
+    # A word holding a QUOTED bracket is left out: bash performs no process
+    # substitution inside quotes of either kind, so `echo '<(rg …)'` prints
+    # text (Codex, on 5fece60). EITHER bracket, because a quoted closer is data
+    # too — in `cat <(echo ")"; rg …)` the substitution runs to the LAST
+    # bracket, and keeping the quoted one closed it early and left the tool
+    # outside (Codex, on c1c9438).
+    #
+    # Only a word holding a bracket, though. Dropping every quoted word threw
+    # away the command name in `< <("rg" …)`, where the quotes are around a
+    # word INSIDE a substitution that is itself unquoted and runs (Codex, on
+    # dcf9333): quoting an argument is not quoting the construct.
+    rendered = "".join(
+        (" " if word.space_before else "") + word.value
+        for word in words
+        if not (word.quoted and any(bracket in word.value for bracket in "()"))
+    )
+    # `$(` is hidden first, so what comes back is only what the rewrite put
+    # there. Without that, the rendered line — which keeps quoted words, for
+    # the reason above — hands its own `'$(rg …)'` straight to a reader that
+    # cannot tell it was quoted. The bracket stays where it is, so nothing's
+    # balance changes, and the marker is put back in whatever is extracted in
+    # case a process substitution holds a command substitution.
     hidden = rendered.replace("$(", MARKER + "(")
     inner += [
         body.replace(MARKER + "(", "$(")
         for body in shell.substitution_bodies(PROCESS_SUBSTITUTION.sub("$(", hidden))
     ]
+
     # Backticks are read from the LINE, not from the words. shlex marks an
     # escaped backtick and a single-quoted one alike — `\`rg` and `'`rg …`'`
     # both arrive quoted with `literal_backtick` set — so no word-level test
@@ -458,10 +459,18 @@ def analysed_command(words, block=""):
     # What separates them is where they sit, and single quotes are the only
     # thing that stops a backtick: double quotes do not.
     inner += ticked(outside_single_quotes(block))
+
     for body in inner:
         found, referenced = analysed(body)
         packages |= found
         references |= referenced
+    return packages, references
+
+
+def analysed_command(words, block=""):
+    """(packages this one command runs, the repo scripts it runs)."""
+    packages = set()
+    references = set()
 
     # Declaring a function runs none of it, but the body is shell that runs
     # WHERE IT IS CALLED, and a workflow that declares and calls one in the
@@ -495,6 +504,7 @@ def analysed_command(words, block=""):
     while words[at].value.rsplit("/", 1)[-1] in WRAPPERS:
         wrapper = words[at].value.rsplit("/", 1)[-1]
         takes_argument = WRAPPER_OPTIONS_WITH_ARGUMENT.get(wrapper, frozenset())
+        takes_letters = WRAPPER_LETTERS_WITH_ARGUMENT.get(wrapper, "")
         operands = WRAPPER_OPERANDS.get(wrapper, 0)
         position = at + 1
         while position < len(words):
@@ -505,8 +515,15 @@ def analysed_command(words, block=""):
                 # (Codex, on 4e02d11). No quoting guard: the quotes are the
                 # SHELL's, and xargs is handed `-I` either way (Codex, on
                 # 951f419) — the same lesson as find's own `-exec`.
-                if token in takes_argument:
-                    position += 1
+                if token.startswith("--"):
+                    if token in takes_argument:
+                        position += 1
+                else:
+                    # Short options cluster here as they do for a shell, and
+                    # each letter that takes a value takes its own word.
+                    position += sum(
+                        1 for letter in token[1:] if letter in takes_letters
+                    )
                 position += 1
                 continue
             if operands:
@@ -624,10 +641,14 @@ def analysed(text):
     if not any(candidate.search(text) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(text):
         return packages, references
 
-    for words, block in commands_of(text):
-        found, referenced = analysed_command(words, block)
+    for block, words in blocks_of(text):
+        found, referenced = substitutions_in(words, block)
         packages |= found
         references |= referenced
+        for command in commands_in(words):
+            found, referenced = analysed_command(command, block)
+            packages |= found
+            references |= referenced
     return packages, references
 
 
