@@ -2362,6 +2362,98 @@ YAML
 expect "a redirection between a long option and its value" 1 redirect-inside-long-option-value \
     "build" "ripgrep"
 
+# ------------------------------------------ round thirty-eight, all probed
+# Codex, on bd6c3e9: a shell may be given its script through a PIPE, and the
+# producer is a different command in the same line. `printf 'rg …' | bash` runs
+# rg.
+write_workflow piped-literal-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | bash
+YAML
+expect "a literal piped into a shell is a script" 1 piped-literal-script \
+    "build" "ripgrep"
+
+write_workflow piped-echo-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo 'rg -n TODO crates' | sh
+YAML
+expect "an echoed one as well" 1 piped-echo-script \
+    "build" "ripgrep"
+
+# ...but only into a SHELL: `printf 'rg …' | cat` prints the text.
+write_workflow piped-into-cat ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | cat
+YAML
+expect "a literal piped into cat is printed" 0 piped-into-cat \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and only from a producer whose output is written down. What `cat` or
+# `curl` would emit is not knowable here, and a job that pipes one into a shell
+# is a stated limitation rather than a guess — the direction is a use unseen,
+# with the scripts' own guards behind it.
+write_workflow piped-unknowable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: cat some-file | bash
+YAML
+expect "an unknowable producer is left alone" 0 piped-unknowable \
+    "All 1 workflow job(s)" "!::error::"
+
+# A script under the bound is read, and one over it is not. The bound exists
+# because the lexer is superlinear in block size and this gate's OWN self-test
+# had grown to 2,558 lines and 99.5 seconds — the whole of the gate's runtime,
+# rising about five seconds a round, to read a file whose every `rg` is a
+# fixture inside a heredoc.
+mkdir -p "$WORK/sized-repo/ci/scripts"
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '# padding %s\n' $(seq 1 200)
+    printf 'rg -n TODO crates\n'
+} > "$WORK/sized-repo/ci/scripts/small.sh"
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '# padding %s\n' $(seq 1 1600)
+    printf 'rg -n TODO crates\n'
+} > "$WORK/sized-repo/ci/scripts/large.sh"
+
+write_workflow small-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/small.sh
+YAML
+out="$(REPO_ROOT="$WORK/sized-repo" "$CHECK" "$WORK/small-script/ci.yml" 2>&1)"
+if [ $? -eq 0 ]; then
+    fail "a script under the bound was not read"
+elif ! printf '%s' "$out" | grep -qF "ripgrep"; then
+    fail "the small-script case failed for another reason: $out"
+else
+    ok "a script under the bound is read"
+fi
+
+write_workflow large-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/large.sh
+YAML
+out="$(REPO_ROOT="$WORK/sized-repo" "$CHECK" "$WORK/large-script/ci.yml" 2>&1)"
+if [ $? -ne 0 ]; then
+    fail "a script over the bound was read after all: $out"
+elif ! printf '%s' "$out" | grep -qF "All 1 workflow job(s)"; then
+    fail "the large-script case did not report a clean run: $out"
+else
+    ok "a script over the bound is left alone (stated limitation)"
+fi
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

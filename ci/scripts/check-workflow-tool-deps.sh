@@ -124,6 +124,9 @@ TOOLS = {
     "rg": "ripgrep",
 }
 
+# How much of a script is read before it is left alone. See `worth_lexing`.
+READABLE_LINES = 1500
+
 # A cheap over-approximating filter, asked before the lexer is. Lexing costs
 # real time on a large file — this repository has a 6,000-line self-test, which
 # takes minutes — and text holding neither a tool name nor a script path cannot
@@ -932,6 +935,50 @@ def past_wrappers(words):
     return at
 
 
+# Commands whose output is written down in the line itself, so a shell reading
+# it is reading a script this gate can see.
+LITERAL_PRODUCERS = {"echo", "printf"}
+
+
+def piped_into_a_shell(words):
+    """The scripts a line pipes into a stdin-reading shell.
+
+    `printf 'rg …' | bash` runs rg, and the producer is a different command
+    from the shell (Codex, on bd6c3e9; probed with `printf` and `echo`). Only
+    producers whose output is WRITTEN DOWN — what `cat` or `curl` would emit is
+    not knowable from the workflow, and guessing at it is how a gate starts
+    inventing dependencies.
+    """
+    segments = []
+    current = []
+    for word in words:
+        if word.value == "|" and not word.quoted:
+            segments.append(current)
+            current = []
+            continue
+        current.append(word)
+    segments.append(current)
+    if len(segments) < 2:
+        return []
+
+    consumer = segments[-1]
+    at = past_wrappers(consumer)
+    if at is None or not feeds_a_shell(consumer[at:]):
+        return []
+
+    scripts = []
+    for segment in segments[:-1]:
+        command = shell.command_word(segment)
+        if command is None or command.value.rsplit("/", 1)[-1] not in LITERAL_PRODUCERS:
+            continue
+        scripts.extend(
+            other.value
+            for other in segment[segment.index(command) + 1:]
+            if not other.value.startswith("-")
+        )
+    return scripts
+
+
 def analysed_command(words, block=""):
     """(packages this one command runs, the repo scripts it runs)."""
     packages = set()
@@ -1080,6 +1127,10 @@ def analysed(text):
         found, referenced = substitutions_in(words, block)
         packages |= found
         references |= referenced
+        for script in piped_into_a_shell(words):
+            found, referenced = analysed(script)
+            packages |= found
+            references |= referenced
         for command in commands_in(words):
             found, referenced = analysed_command(command, block)
             packages |= found
@@ -1103,6 +1154,24 @@ def worth_lexing(text):
     quoting inside a SCRIPT would not be. Nothing here writes one, and the
     alternative is a gate too slow to run.
     """
+    if text.count("\n") > READABLE_LINES:
+        # LIMITATION, measured rather than guessed: the scanner's lexer is
+        # superlinear in the size of a block, and blocks grow when heredocs and
+        # quotes glue lines together. This repository's own suites are the only
+        # files anywhere near the bound —
+        #
+        #     test-coverage-map.sh          407 lines   0.6s
+        #     test-workflow-tool-deps.sh   2558 lines  99.5s
+        #
+        # — and the second is THIS gate's self-test, whose every `rg` is a
+        # fixture inside a heredoc that the lexer correctly finds nothing in.
+        # Reading it cost the whole of the gate's runtime and grew by about
+        # five seconds a round.
+        #
+        # So a script this large is not read, in the direction of a use unseen,
+        # with the script's own `command -v` guard behind it. Both sides are
+        # pinned by cases against a fixture repository.
+        return False
     bare = QUOTING_CHARACTERS.sub("", text)
     return bool(
         any(candidate.search(bare) for candidate in CANDIDATES)
