@@ -1754,6 +1754,53 @@ YAML
 expect "a shell's terminal option runs no script" 0 bash-help \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 707d953: `setsid` and `nohup` are wrappers with no entry in the
+# long-option map, so their abbreviations resolved to nothing and the command
+# after them was read as one. Probed: `setsid --ver rg` prints a version and
+# `nohup --he rg` prints usage; neither runs rg.
+write_workflow setsid-abbreviated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: setsid --ver rg -n TODO crates
+YAML
+expect "an abbreviation of a wrapper's own version option" 0 setsid-abbreviated \
+    "All 1 workflow job(s)" "!::error::"
+
+write_workflow nohup-abbreviated ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: nohup --he rg -n TODO crates
+YAML
+expect "and of its help option" 0 nohup-abbreviated \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and the reason this keeps happening is a table filled in one entry at a
+# time. A wrapper with no option list is now refused outright rather than
+# quietly resolving nothing, so the next one added cannot be forgotten.
+mkdir -p "$WORK/short-table"
+cp "$CHECK" "$WORK/short-table/gate.sh"
+cp "$SCRIPT_DIR/workflow_apt_deps.py" "$WORK/short-table/"
+python3 - "$WORK/short-table/gate.sh" <<'PYTHON'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = '    "nohup": ("--help", "--version"),\n'
+assert text.count(old) == 1, "the map entry this case removes has moved"
+open(path, "w").write(text.replace(old, "", 1))
+PYTHON
+out="$("$WORK/short-table/gate.sh" "$WORK/setsid-abbreviated/ci.yml" 2>&1)"
+got=$?
+if [ "$got" -eq 0 ]; then
+    fail "a wrapper with no option list was accepted in silence"
+elif ! printf '%s' "$out" | grep -qF "no option list"; then
+    fail "the short-table copy failed for another reason: $out"
+else
+    ok "a wrapper with no option list is refused"
+fi
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

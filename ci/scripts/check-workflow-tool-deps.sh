@@ -205,7 +205,10 @@ WRAPPER_LONG_OPTIONS = {
         "--help", "--version",
     ),
     "stdbuf": ("--input", "--output", "--error", "--help", "--version"),
+    "nohup": ("--help", "--version"),
+    "setsid": ("--ctty", "--fork", "--wait", "--help", "--version"),
 }
+
 
 
 def resolved(token, wrapper):
@@ -265,6 +268,19 @@ WRAPPER_OPTIONS_WITH_ARGUMENT = {
 # `timeout DURATION COMMAND …` — the duration is timeout's, and it may carry a
 # suffix, so it is not recognised by looking like a number.
 WRAPPER_OPERANDS = {"timeout": 1}
+
+# Every wrapper needs an entry, and this is the third round in which a table
+# filled in one entry at a time was wrong (Codex, on 707d953: `setsid` and
+# `nohup` were wrappers with no options listed, so their abbreviations resolved
+# to nothing and the command after one was read as the wrapped command). Making
+# the omission impossible is cheaper than noticing it again.
+_unlisted = sorted(set(WRAPPERS) - set(WRAPPER_LONG_OPTIONS))
+if _unlisted:
+    print(
+        f"::error::wrapper(s) with no option list: {', '.join(_unlisted)}"
+        " — the workflow tool check could not run"
+    )
+    sys.exit(1)
 
 # Options that introduce a command rather than a file — `find … -exec rg … +`.
 RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
