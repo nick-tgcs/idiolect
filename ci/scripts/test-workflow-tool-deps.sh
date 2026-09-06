@@ -2454,6 +2454,58 @@ else
     ok "a script over the bound is left alone (stated limitation)"
 fi
 
+# ------------------------------------------ round thirty-nine, all probed
+# Codex, on 928ada1, four against the pipeline reading added the round before.
+# A shell need not be the LAST segment.
+write_workflow shell-mid-pipeline ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | bash | cat
+YAML
+expect "a shell in the middle of a pipeline" 1 shell-mid-pipeline \
+    "build" "ripgrep"
+
+# `|&` pipes both streams, and the lexer splits it into two words.
+write_workflow ampersand-pipe ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' |& bash
+YAML
+expect "|& is one operator" 1 ampersand-pipe \
+    "build" "ripgrep"
+
+# ...and what reaches the shell is what the segment BEFORE it produced. An
+# intervening stage rewrites it, so the original literal is not the script:
+# `printf 'rg …' | sed 's/rg/echo/' | bash` runs echo, and probing shows it.
+write_workflow rewritten-in-transit ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' | sed 's/rg/echo/' | bash
+YAML
+expect "a literal rewritten in transit is not the script" 0 rewritten-in-transit \
+    "All 1 workflow job(s)" "!::error::"
+
+# A FORMAT is not a literal, and this is a LIMITATION rather than a fix:
+# `printf 'rg -n TODO %s\n' crates | bash` really does run rg (probed), and
+# assembling that text would be implementing printf. A format holding
+# directives is left alone, in the direction of a use unseen, with the scripts'
+# own guards behind it.
+#
+# The case is written on the form that WOULD be found if the format were read
+# as a literal, because the obvious fixture — `printf 'r%s …' g` — passes
+# whether the rule exists or not, and a mutation said so.
+write_workflow formatted-producer ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO %s\n' crates | bash
+YAML
+expect "a formatted producer is left alone" 0 formatted-producer \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

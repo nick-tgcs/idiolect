@@ -944,38 +944,73 @@ def piped_into_a_shell(words):
     """The scripts a line pipes into a stdin-reading shell.
 
     `printf 'rg …' | bash` runs rg, and the producer is a different command
-    from the shell (Codex, on bd6c3e9; probed with `printf` and `echo`). Only
-    producers whose output is WRITTEN DOWN — what `cat` or `curl` would emit is
-    not knowable from the workflow, and guessing at it is how a gate starts
-    inventing dependencies.
+    from the shell (Codex, on bd6c3e9; probed with `printf` and `echo`).
+
+    Three things that took a second round to get right (Codex, on 928ada1,
+    each probed):
+
+    * the shell need not be the LAST segment — `printf … | bash | cat` runs it;
+    * only the segment IMMEDIATELY before it feeds it, since anything between
+      rewrites what arrives: `printf 'rg …' | sed 's/rg/echo/' | bash` runs
+      echo, and reading the original literal invented a dependency;
+    * `|&` is one operator, which the lexer hands over as `|` and `&`.
+
+    Only producers whose output is WRITTEN DOWN: what `cat` or `curl` would
+    emit is not knowable from the workflow. A printf FORMAT is not written down
+    either — `printf 'r%s …' g` prints `rg …`, and assembling that would be
+    implementing printf — so a format holding directives is left alone, in the
+    direction of a use unseen.
     """
     segments = []
     current = []
-    for word in words:
+    position = 0
+    while position < len(words):
+        word = words[position]
         if word.value == "|" and not word.quoted:
+            # `|&` arrives as two words, and the `&` belongs to the operator
+            # rather than to the command after it.
+            if (
+                position + 1 < len(words)
+                and words[position + 1].value == "&"
+                and not words[position + 1].space_before
+            ):
+                position += 1
             segments.append(current)
             current = []
+            position += 1
             continue
         current.append(word)
+        position += 1
     segments.append(current)
-    if len(segments) < 2:
-        return []
-
-    consumer = segments[-1]
-    at = past_wrappers(consumer)
-    if at is None or not feeds_a_shell(consumer[at:]):
-        return []
 
     scripts = []
-    for segment in segments[:-1]:
-        command = shell.command_word(segment)
-        if command is None or command.value.rsplit("/", 1)[-1] not in LITERAL_PRODUCERS:
+    for index, segment in enumerate(segments):
+        if index == 0 or not segment:
             continue
-        scripts.extend(
+        at = past_wrappers(segment)
+        if at is None or not feeds_a_shell(segment[at:]):
+            continue
+        producer = segments[index - 1]
+        command = shell.command_word(producer)
+        if command is None:
+            continue
+        name = command.value.rsplit("/", 1)[-1]
+        if name not in LITERAL_PRODUCERS:
+            continue
+        arguments = [
             other.value
-            for other in segment[segment.index(command) + 1:]
+            for other in producer[producer.index(command) + 1:]
             if not other.value.startswith("-")
-        )
+        ]
+        if not arguments:
+            continue
+        if name == "printf":
+            if "%" in arguments[0]:
+                continue
+            scripts.append(arguments[0])
+        else:
+            # `echo` prints its arguments separated by spaces.
+            scripts.append(" ".join(arguments))
     return scripts
 
 
