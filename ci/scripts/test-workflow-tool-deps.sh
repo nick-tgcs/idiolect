@@ -2143,6 +2143,47 @@ YAML
 expect "two heredocs with different owners are left alone" 0 heredocs-with-two-owners \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 62208e2: the last fd-0 redirection wins over a heredoc as well —
+# `bash <<'S' </dev/null` runs nothing of the body (probed).
+write_workflow heredoc-superseded ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash <<'SCRIPT' </dev/null
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a later redirect supersedes the heredoc" 0 heredoc-superseded \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and a redirection onto another descriptor is not stdin at all: `bash 3<
+# x.sh` opens the file on fd 3 and runs none of it.
+write_workflow other-descriptor ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash 3< ci/scripts/test-real-adapter-deps.sh
+YAML
+expect "a redirect onto another descriptor is not a script" 0 other-descriptor \
+    "All 1 workflow job(s)" "!::error::"
+
+# ...and the other order runs: `bash </dev/null <<'S'` ends with the heredoc
+# as the fd-0 source, so the body IS the script (probed). This case exists
+# because the mutation that let the FIRST redirection win survived without it —
+# with only the case above, "last wins" and "first wins" agree.
+write_workflow heredoc-after-redirect ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash </dev/null <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "a heredoc after a redirect is still the script" 1 heredoc-after-redirect \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

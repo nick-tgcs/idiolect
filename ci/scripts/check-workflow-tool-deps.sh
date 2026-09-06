@@ -368,6 +368,38 @@ def commands_in(words):
         index = stop + 1
 
 
+def stdin_source(words):
+    """What ends up on a command's standard input: a heredoc, a file, or None.
+
+    Redirections apply left to right and the last one on a descriptor wins, so
+    `bash <<'X' </dev/null` runs none of the body and `bash < a < b` reads only
+    b (Codex, on 62208e2 and again on acf87bb; both probed). A descriptor
+    written before the operator makes it someone else's: `bash 3< x.sh` opens
+    the file on fd 3 and runs nothing from it.
+    """
+    source = None
+    position = 0
+    while position < len(words):
+        token = words[position].value
+        descriptor = "0"
+        if token.isdigit() and position + 1 < len(words) and words[position + 1].value.startswith("<"):
+            descriptor = token
+            position += 1
+            token = words[position].value
+        if not words[position].quoted and token in ("<<", "<<-"):
+            if descriptor == "0":
+                source = ("heredoc", None)
+            position += 2
+            continue
+        if not words[position].quoted and token in ("<", "<<<"):
+            if descriptor == "0" and position + 1 < len(words):
+                source = ("file" if token == "<" else "string", words[position + 1].value)
+            position += 2
+            continue
+        position += 1
+    return source
+
+
 def past_shell_options(words, at):
     """Where a shell's first OPERAND begins, or None if nothing will run.
 
@@ -442,6 +474,12 @@ def feeds_a_shell(words):
         # input for it rather than code.
         return False
     return True
+
+
+def reads_a_heredoc(words):
+    """Whether this command's standard input is still its heredoc."""
+    source = stdin_source(words)
+    return source is not None and source[0] == "heredoc"
 
 
 def as_a_script(body):
@@ -545,9 +583,11 @@ def blocks_of(text):
             if any(other.value in ("<<", "<<-") and not other.quoted for other in command)
         ]
         feeding = bool(owners) and all(
-            (lambda at: at is not None and feeds_a_shell(command[at:]))(
-                past_wrappers(command)
-            )
+            (
+                lambda at: at is not None
+                and feeds_a_shell(command[at:])
+                and reads_a_heredoc(command[at:])
+            )(past_wrappers(command))
             for command in owners
         )
         yield block, words
@@ -871,12 +911,9 @@ def analysed_command(words, block=""):
         # Redirections apply left to right and the LAST one on a descriptor
         # wins, so `bash < x.sh </dev/null` runs nothing from x.sh (Codex, on
         # acf87bb; probed). Only the final stdin source is followed.
-        source = None
-        for position, other in enumerate(words):
-            if other.value == "<" and not other.quoted and position + 1 < len(words):
-                source = words[position + 1].value
-        if source is not None:
-            redirected = SCRIPT_REFERENCE.fullmatch(source)
+        source = stdin_source(words[at:])
+        if source is not None and source[0] == "file":
+            redirected = SCRIPT_REFERENCE.fullmatch(source[1])
             if redirected:
                 references.add(redirected.group(1))
 
