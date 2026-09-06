@@ -6053,6 +6053,18 @@ YAML
 expect "a quoted cluster hands one over too" 1 quoted_cluster_c \
     "codex-no-such-package"
 
+# ...and an option that takes a VALUE keeps its meaning when quoted too:
+# `bash "-O" nullglob -c '…'` consumes nullglob and runs the string. Reading
+# the quoted `-O` as an ordinary word made `nullglob` look like the script.
+write_workflow quoted_option_with_value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-O" nullglob -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted option still takes its value" 1 quoted_option_with_value \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

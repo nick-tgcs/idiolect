@@ -200,10 +200,15 @@ WRAPPER_OPTIONS_WITH_ARGUMENT = {
     # `--replace[=R]` and `--eof[=END]` take their value ATTACHED, so a bare
     # one consumes nothing and the word after it is the command (Codex, on
     # 951f419). Same for their short spellings `-i` and `-e`.
+    # The long spellings come from each tool's own `--help`, in full rather
+    # than as they were needed: `--max-chars` was missing and swallowed the
+    # command (Codex, on 631fa9f), and a table copied in part is a table that
+    # will be wrong again. `--eof` and `--replace` are absent for the reason
+    # their short forms are: their value is optional and must be attached.
     "xargs": frozenset({
-        "-I", "-n", "-P", "-L", "-l", "-s", "-a", "-d", "-E",
-        "--max-args", "--max-procs", "--max-lines", "--arg-file",
-        "--delimiter", "--process-slot-var",
+        "-I", "-n", "-P", "-L", "-s", "-a", "-d", "-E",
+        "--max-args", "--max-procs", "--max-lines", "--max-chars",
+        "--arg-file", "--delimiter", "--process-slot-var",
     }),
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
     "nice": frozenset({"-n", "--adjustment"}),
@@ -224,10 +229,15 @@ RUNS_WHAT_FOLLOWS = {"-exec", "-execdir", "-ok", "-okdir"}
 FIND_ACTION_ENDS = {";", "+"}
 
 # The body of a backtick substitution, which shlex does not tokenise as one.
+# The opener cannot be an ESCAPED backtick: in ``echo \`literal `rg …` `` the
+# first one is data and the live pair after it runs, while starting there
+# paired it with the live opener and left the real closer unmatched (Codex, on
+# 631fa9f).
+#
 # A backslash escapes a backtick, and that is how the legacy form NESTS:
 # `` `echo \`rg …\`` `` is one substitution holding another, so the outer
 # pair must not close on the inner opener (Codex, on d32dd1d).
-TICKED = re.compile(r"`((?:[^`\\]|\\.)*)`", re.S)
+TICKED = re.compile(r"(?<!\\)`((?:[^`\\]|\\.)*)`", re.S)
 
 
 def ticked(text):
@@ -251,6 +261,10 @@ QUOTING_CHARACTERS = re.compile(r"""[\\'"]""")
 
 # A backslash and the character it quotes, anywhere.
 ESCAPED = re.compile(r"\\.", re.S)
+
+# The pairs a HEREDOC body reads: bash gives a backslash meaning there only
+# before `$`, a backtick, another backslash, or a newline.
+HEREDOC_ESCAPED = re.compile(r"\\[$`\\]")
 
 # A line continuation: the one escaped pair bash removes outright.
 CONTINUED = re.compile(r"\\\n")
@@ -303,9 +317,14 @@ def expanded(body):
     # A backslash-NEWLINE is removed rather than blanked: bash drops the pair
     # before expanding, so a `$` at the end of one line and a `(` at the start
     # of the next are one substitution (Codex, on e08e4a1, and the probe agrees
-    # — `$\` + `(echo …)` in an unquoted heredoc runs it). Every other escaped
-    # pair is blanked, for the reason the case below it gives.
-    joined = ESCAPED.sub("  ", CONTINUED.sub("", "\n".join(body)))
+    # — `$\` + `(echo …)` in an unquoted heredoc runs it).
+    #
+    # And only the pairs bash actually reads are blanked. In a body a backslash
+    # is special before `$`, a backtick and another backslash, and NOWHERE
+    # else: `$(r\g …)` keeps its backslash into the substitution, which does
+    # its own quote removal and runs rg (Codex, on 631fa9f; probed). Blanking
+    # every pair turned that name into `r`.
+    joined = HEREDOC_ESCAPED.sub("  ", CONTINUED.sub("", "\n".join(body)))
     for inner in shell.substitution_bodies(joined) + ticked(joined):
         yield from blocks_of(inner)
 

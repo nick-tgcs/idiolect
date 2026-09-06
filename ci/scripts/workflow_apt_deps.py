@@ -2820,7 +2820,10 @@ def script_argument(words):
             return None
         if saw_argument:
             saw_argument = False
-        elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT and not candidate.quoted:
+        elif candidate.value in SHELL_OPTIONS_WITH_ARGUMENT:
+            # No quoting guard, for the reason the option ABOVE lost one:
+            # `bash "-O" nullglob -c '…'` consumes nullglob and runs the
+            # string, because the quotes belong to the shell reading the line.
             saw_argument = True
         elif not candidate.value.startswith("-"):
             # The first operand is the script FILE, and bash reads no more

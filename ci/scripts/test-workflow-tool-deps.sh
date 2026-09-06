@@ -1566,6 +1566,58 @@ YAML
 expect "a script path assembled out of quotes is followed" 1 assembled-path \
     "build" "ripgrep"
 
+# --------------------------------------------- round twenty-two, all probed
+# Codex, on 631fa9f. The long spelling of an option takes its value the same
+# way the short one does, and `--max-chars` was simply missing.
+write_workflow long-option-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --max-chars 100 rg -n TODO
+YAML
+expect "a long option takes its value too" 1 long-option-value \
+    "build" "ripgrep"
+
+# In an expanding heredoc a backslash is special only before `$`, a backtick,
+# another backslash, or a newline. Everywhere else it survives into the
+# substitution, which does its own quote removal — `$(r\g …)` runs rg, checked
+# against a proxy on PATH.
+write_workflow heredoc-ordinary-backslash ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          cat <<EOF
+          out: $(r\g -n TODO crates)
+          EOF
+YAML
+expect "an ordinary backslash survives into a substitution" 1 heredoc-ordinary-backslash \
+    "build" "ripgrep"
+
+# An escaped backtick is data, and the LIVE pair after it still runs. Pairing
+# the escaped one with the live opener left the real closer unmatched.
+write_workflow escaped-then-live-tick ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo \`literal `rg -n TODO crates`
+YAML
+expect "a live backtick pair after an escaped one" 1 escaped-then-live-tick \
+    "build" "ripgrep"
+
+# A quoted option that takes a value is still one: `bash "-O" nullglob -c '…'`
+# consumes nullglob and runs the string. Fixed in the apt scanner, where the
+# same reading would hide an install.
+write_workflow quoted-option-with-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-O" nullglob -c 'rg -n TODO crates'
+YAML
+expect "a quoted option still takes its value" 1 quoted-option-with-value \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
