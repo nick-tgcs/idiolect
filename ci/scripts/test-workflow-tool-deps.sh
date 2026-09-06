@@ -1984,6 +1984,49 @@ YAML
 expect "an option's argument is not a script operand" 1 option-operand-then-heredoc \
     "build" "ripgrep"
 
+# Codex, on df5d0f1: with `-s` the operands are POSITIONAL, not a script file,
+# so the heredoc is still the script. Probed — the body runs and the operand
+# arrives as `$*`.
+write_workflow dash-s-positional ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -s positional <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "-s makes later words positional, not a script" 1 dash-s-positional \
+    "build" "ripgrep"
+
+write_workflow dash-s-clustered ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -es positional <<'SCRIPT'
+          rg -n TODO crates
+          SCRIPT
+YAML
+expect "and it may be inside a cluster" 1 dash-s-clustered \
+    "build" "ripgrep"
+
+# ...and it has to be `-s` in particular. Any OTHER option leaves the operand
+# a script file, so the heredoc is that script's input and runs nothing — this
+# case exists because the mutation that accepted any short option survived
+# without it.
+write_workflow other-option-then-script ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          bash -e ci/scripts/test-not-a-real-script.sh <<'EOF'
+          rg -n TODO crates
+          EOF
+YAML
+expect "another option leaves the operand a script" 0 other-option-then-script \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

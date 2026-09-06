@@ -402,9 +402,18 @@ def feeds_a_shell(words):
     word = shell.command_word(words)
     if word is None or word.value.rsplit("/", 1)[-1] not in shell.SHELL_COMMANDS:
         return False
-    operand = past_shell_options(words, words.index(word))
+    at = words.index(word)
+    operand = past_shell_options(words, at)
     if operand is None:
         return False
+    for other in words[at + 1:operand]:
+        # `-s` says the script comes from standard input, and then the words
+        # after it are POSITIONAL — `bash -s positional <<'X'` runs the body
+        # and `positional` arrives as `$*` (Codex, on df5d0f1; probed, plain
+        # and clustered).
+        token = other.value
+        if token.startswith("-") and not token.startswith("--") and "s" in token[1:]:
+            return True
     for other in words[operand:]:
         token = other.value
         if token in ("<<", "<<-", "<<<"):
