@@ -519,11 +519,21 @@ def analysed_command(words, block=""):
                     if token in takes_argument:
                         position += 1
                 else:
-                    # Short options cluster here as they do for a shell, and
-                    # each letter that takes a value takes its own word.
-                    position += sum(
-                        1 for letter in token[1:] if letter in takes_letters
-                    )
+                    # Short options cluster here as they do for a shell, but
+                    # these are getopt's: a letter that takes a value takes it
+                    # ATTACHED if anything follows it in the token, and only
+                    # otherwise from the next word (Codex, on 1c9cf3e).
+                    # `xargs -n1`, `xargs -rn1`, `xargs -I{}`, `timeout -k5`
+                    # and `nice -n5` were each run to confirm it — bash's own
+                    # `-o` is the exception, since it rejects the attached form
+                    # outright, which is why that stays a count.
+                    letters = token[1:]
+                    for index, letter in enumerate(letters):
+                        if letter not in takes_letters:
+                            continue
+                        if index + 1 == len(letters):
+                            position += 1
+                        break
                 position += 1
                 continue
             if operands:

@@ -1313,6 +1313,55 @@ YAML
 expect "a cluster of valueless options eats nothing" 1 wrapper-cluster-plain \
     "build" "ripgrep"
 
+# Codex, on 1c9cf3e: a short option's value may be ATTACHED, and then it takes
+# no word at all. Confirmed against the tools themselves — `xargs -n1`,
+# `xargs -rn1`, `xargs -I{}`, `timeout -k5` and `nice -n5` all work, and each
+# runs the command that follows.
+write_workflow attached-value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -n1 rg -n TODO
+YAML
+expect "an attached value takes no word" 1 attached-value \
+    "build" "ripgrep"
+
+write_workflow attached-in-cluster ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -rn1 rg -n TODO
+YAML
+expect "attached inside a cluster too" 1 attached-in-cluster \
+    "build" "ripgrep"
+
+write_workflow attached-replacement ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -I{} rg -n TODO {}
+YAML
+expect "a replacement string may be attached" 1 attached-replacement \
+    "build" "ripgrep"
+
+write_workflow attached-kill-after ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: timeout -k5 30 rg -n TODO crates
+YAML
+expect "an attached option value before a duration" 1 attached-kill-after \
+    "build" "ripgrep"
+
+write_workflow attached-nice ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: nice -n5 rg -n TODO crates
+YAML
+expect "nice takes its adjustment attached" 1 attached-nice \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.
