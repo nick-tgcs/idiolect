@@ -6143,6 +6143,20 @@ YAML
 expect "a redirection between -c and its script" 1 redirect_inside_dash_c \
     "codex-no-such-package"
 
+# `--` ENDS `time`'s options, so what follows is the pipeline even when it
+# looks like one of them: `time -- -p rg` reports `-p: command not found`.
+# Skipping a second `-p` read the wrong word as the command. Probed.
+write_workflow time_separator_ends_options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          sudo apt-get install -y cmake
+          time -- -p apt-get install -y codex-no-such-package
+YAML
+expect "-- ends time's options" 0 time_separator_ends_options \
+    "All 1 apt package(s)" "!codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

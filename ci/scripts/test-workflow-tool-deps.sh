@@ -2528,6 +2528,28 @@ YAML
 expect "a redirect on the consumer replaces the pipe" 0 pipe-replaced-by-redirect \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 9e4b857, both probed. `--` ends `time`'s options, so a `-p` after
+# it is the command bash tries to run — and fails to.
+write_workflow time-separator-then-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          time -- -p rg -n TODO crates
+YAML
+expect "-- ends time's options" 0 time-separator-then-option \
+    "All 1 workflow job(s)" "!::error::"
+
+# A producer whose output is redirected away sends the shell nothing.
+write_workflow producer-redirected-away ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: printf 'rg -n TODO crates\n' >/dev/null | bash
+YAML
+expect "a producer redirected away feeds nothing" 0 producer-redirected-away \
+    "All 1 workflow job(s)" "!::error::"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

@@ -822,6 +822,8 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
     # dies on the first token that is none of it — which is what stops "the apt
     # install step" in prose from being read as a command.
     at_command = True
+    timing = False
+    after_separator = False
     saw_apt = False
     saw_install = False
     parsed_install = False
@@ -1370,6 +1372,18 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # repository's own workflows. Remembered only if nothing runs after
             # it in this command: `FLAG=1 cmd` sets it for cmd alone.
             pending.append(word)
+        elif timing and token == "--" and not word.quoted:
+            # `--` ENDS time's options, and the next word is the pipeline's
+            # command whatever it looks like: `time -- -p apt-get install …`
+            # reports `-p: command not found` and installs nothing (Codex, on
+            # 9e4b857; probed). Guarded by `time` having been seen, so it can
+            # reach no other line.
+            timing = False
+            after_separator = True
+        elif after_separator and not is_apt(token):
+            # That command is not apt, so this segment installs nothing.
+            after_separator = False
+            at_command = False
         elif token in INVOCATION_PREFIXES or token.startswith("-"):
             # `command` exists to bypass shell functions: `command f` looks for
             # an external `f` and never reads the body of one declared here.
@@ -1386,6 +1400,7 @@ def scan_command(path, line, words, expressions, defined=None, in_function=False
             # bracket after this word introduces one.
             pass
         elif token in CONTROL_PREFIXES and not word.quoted:
+            timing = token == "time"
             # A reserved word INTRODUCES a command: `if apt-get install -y x;
             # then` installs x, and so does `( apt-get ... )`. Ending the
             # command position here left a real install announced as unparsed —
@@ -2184,6 +2199,13 @@ def command_word(words):
             continue
         if not word.quoted and token in CONTROL_PREFIXES:
             timing = token == "time"
+            index += 1
+            continue
+        if timing and not word.quoted and token == "--":
+            # `--` ENDS the options, so what follows is the pipeline even when
+            # it looks like one: `time -- -p rg` reports `-p: command not
+            # found` (Codex, on 9e4b857; probed).
+            timing = False
             index += 1
             continue
         if timing and not word.quoted and token in TIME_OPTIONS:

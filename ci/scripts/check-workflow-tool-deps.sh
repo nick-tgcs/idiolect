@@ -939,6 +939,10 @@ def past_wrappers(words):
 # it is reading a script this gate can see.
 LITERAL_PRODUCERS = {"echo", "printf"}
 
+# Redirections that send a producer's standard output somewhere other than the
+# pipe, leaving the shell after it reading EOF.
+WRITES_ELSEWHERE = {">", ">>", "&>", "&>>", ">&", "1>", "1>>"}
+
 
 def piped_into_a_shell(words):
     """The scripts a line pipes into a stdin-reading shell.
@@ -1005,6 +1009,14 @@ def piped_into_a_shell(words):
             if producer[boundary].value in shell.SEPARATORS and not producer[boundary].quoted:
                 producer = producer[boundary + 1:]
                 break
+        if any(
+            other.value in WRITES_ELSEWHERE and not other.quoted
+            for other in producer
+        ):
+            # The producer's output goes somewhere else, so the shell reads
+            # EOF: `printf 'rg …' >/dev/null | bash` runs nothing (Codex, on
+            # 9e4b857; probed).
+            continue
         command = shell.command_word(producer)
         if command is None:
             continue
