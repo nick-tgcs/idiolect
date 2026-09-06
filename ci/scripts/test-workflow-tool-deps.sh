@@ -1473,6 +1473,52 @@ YAML
 expect "a quoted delimiter keeps the continuation literal" 0 heredoc-continuation-literal \
     "All 1 workflow job(s)" "!::error::"
 
+# Codex, on 432effa: `-l` takes its value ATTACHED or not at all — `-l[MAX]` —
+# so a bare one consumes nothing and the word after it is the command. Probed,
+# and the same probe drew the line for its neighbours:
+#
+#   printf 'x\n' | xargs -l echo RAN     RAN x        (bare: nothing taken)
+#   printf 'a\nb\n' | xargs -l2 echo RAN  RAN a b      (attached)
+#   printf 'x\n' | xargs -L echo RAN     invalid number "echo"  (REQUIRED)
+#   printf 'x\n' | xargs -L 1 echo RAN   RAN x
+#
+# So three classes, not two: required, optional-if-attached, and none.
+write_workflow optional-value-bare ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -l rg -n TODO
+YAML
+expect "a bare optional-value option takes nothing" 1 optional-value-bare \
+    "build" "ripgrep"
+
+write_workflow optional-value-attached ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -l2 rg -n TODO
+YAML
+expect "the same option with its value attached" 1 optional-value-attached \
+    "build" "ripgrep"
+
+write_workflow required-value-separate ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -L 1 rg -n TODO
+YAML
+expect "-L still takes its value from the next word" 1 required-value-separate \
+    "build" "ripgrep"
+
+write_workflow optional-replacement ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs -i rg -n TODO {}
+YAML
+expect "a bare -i takes nothing either" 1 optional-replacement \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

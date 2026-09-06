@@ -182,7 +182,14 @@ WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 # `xargs -rn 1 rg …` is the same as `xargs -r -n 1 rg …`, and matching whole
 # tokens skipped `-rn` without consuming the `1` (Codex, on c1c9438).
 WRAPPER_LETTERS_WITH_ARGUMENT = {
-    "xargs": "InPLlsadE",
+    # `l`, `i` and `e` are absent deliberately: GNU spells them
+    # `-l[MAX-LINES]`, `-i[REPLACE]` and `-e[EOF]`, so a value must be ATTACHED
+    # and a bare one takes nothing — `xargs -l rg …` runs rg, while
+    # `xargs -L rg …` swallows it and reports `invalid number "rg"` (Codex, on
+    # 432effa; both probed). Leaving them out is the whole rule: an attached
+    # value is part of the same token, so nothing is consumed either way, and a
+    # second table for "optional" would only be able to disagree with this one.
+    "xargs": "InPLsadE",
     "timeout": "sk",
     "nice": "n",
     "ionice": "cnpPu",
