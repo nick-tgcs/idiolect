@@ -1618,6 +1618,76 @@ YAML
 expect "a quoted option still takes its value" 1 quoted-option-with-value \
     "build" "ripgrep"
 
+# ------------------------------------------- round twenty-three, all probed
+# Codex, on 92bf47b. `xargs --help rg` prints usage and exits — the option
+# ENDS the invocation, and reading past it invented a command.
+write_workflow terminal-option ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: echo crates | xargs --help rg
+YAML
+expect "an option that ends the invocation runs nothing" 0 terminal-option \
+    "All 1 workflow job(s)" "!::error::"
+
+# Two backslashes are ONE literal backslash, and the substitution after them is
+# still live: `echo \\$(rg …)` prints a backslash and rg's output. The lexer
+# says so — it sets `literal_dollar` for `\$` and not for `\\$` — and the
+# rejoin was asking about whole-word quoting instead.
+write_workflow even-backslashes ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo \\$(rg -n TODO crates)
+YAML
+expect "an even backslash run leaves the substitution live" 1 even-backslashes \
+    "build" "ripgrep"
+
+write_workflow even-backslashes-tick ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo \\`rg -n TODO crates`
+YAML
+expect "an even run leaves a backtick opener live too" 1 even-backslashes-tick \
+    "build" "ripgrep"
+
+# ...and the odd run still quotes what follows it.
+write_workflow odd-backslash ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          echo \$(rg -n TODO crates)
+YAML
+expect "an odd backslash run still quotes the dollar" 0 odd-backslash \
+    "All 1 workflow job(s)" "!::error::"
+
+# ANSI-C quoting: the lexer resolves `$'r'$'g'` and even `$'\x72g'` to rg, and
+# the cheap filter in front of it could not. Filters do not decide any more —
+# a workflow's own `run:` is always lexed.
+write_workflow ansi-c-name ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          $'r'$'g' -n TODO crates
+YAML
+expect "a name spelled in ANSI-C quoting" 1 ansi-c-name \
+    "build" "ripgrep"
+
+write_workflow ansi-c-hex ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          $'\x72g' -n TODO crates
+YAML
+expect "a name hidden in a hex escape" 1 ansi-c-hex \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

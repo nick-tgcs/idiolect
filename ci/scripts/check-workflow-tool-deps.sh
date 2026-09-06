@@ -171,6 +171,9 @@ SCRIPT_REFERENCE = re.compile(r"(?:\S*/)?(ci/scripts/[\w.-]+\.sh)")
 # `source x` and `. x` run a script in the current shell rather than a new one.
 SOURCING = {"source", "."}
 
+# Options that make a command print something and exit, whatever follows.
+TERMINAL_OPTIONS = frozenset({"--help", "--version", "--usage", "--show-limits"})
+
 # Commands whose ARGUMENT is the command that runs.
 WRAPPERS = {"xargs", "timeout", "nice", "ionice", "stdbuf", "nohup", "setsid"}
 
@@ -258,6 +261,13 @@ HEREDOC_OPENER = re.compile(r"""<<-?\s*([^\s;&|<>()]+)""")
 
 # What a shell removes on its way to a command name.
 QUOTING_CHARACTERS = re.compile(r"""[\\'"]""")
+
+# An ESCAPED backslash. Replacing each pair before looking for a backtick is
+# what makes the escape test count parity: `\\`rg …`` opens a substitution,
+# because the two backslashes are one literal backslash and the tick after them
+# is live (Codex, on 92bf47b). Replaced rather than removed, so nothing that
+# was apart closes up.
+PAIRED = re.compile(r"\\\\")
 
 # A backslash and the character it quotes, anywhere.
 ESCAPED = re.compile(r"\\.", re.S)
@@ -463,13 +473,16 @@ def substitutions_in(words, block):
         inner += shell.substitution_bodies(word.value)
 
     # An unquoted `$( … )` splits into `$` and `(` too, so it is read from the
-    # same rejoined line — from the UNQUOTED words only, since a quoted one is
-    # the per-word reader's business above, where the literal case is settled.
+    # same rejoined line — leaving out the words whose DOLLAR is literal, which
+    # is what the lexer already decided. Asking about whole-word quoting
+    # instead lost `echo \\$(rg …)`, where two backslashes are one literal
+    # backslash and the substitution after them still runs (Codex, on 92bf47b):
+    # the word is quoted, and its dollar is not literal.
     inner += shell.substitution_bodies(
         "".join(
             (" " if word.space_before else "") + word.value
             for word in words
-            if not word.quoted
+            if not word.literal_dollar
         )
     )
 
@@ -513,7 +526,7 @@ def substitutions_in(words, block):
     # can tell the nested substitution from the inert one (Codex, on d32dd1d).
     # What separates them is where they sit, and single quotes are the only
     # thing that stops a backtick: double quotes do not.
-    inner += ticked(outside_single_quotes(block))
+    inner += ticked(PAIRED.sub(MARKER * 2, outside_single_quotes(block)))
 
     for body in inner:
         found, referenced = analysed(body)
@@ -564,6 +577,11 @@ def analysed_command(words, block=""):
         position = at + 1
         while position < len(words):
             token = words[position].value
+            if token in TERMINAL_OPTIONS:
+                # `xargs --help rg` prints usage and exits: the option ENDS the
+                # invocation, and reading past it invented a command that never
+                # runs (Codex, on 92bf47b).
+                return packages, references
             if token.startswith("-"):
                 # `xargs -I '{}' rg …`: the replacement string is the OPTION's,
                 # and reading the first non-option word made it the command
@@ -703,16 +721,6 @@ def analysed(text):
     """(packages this shell text RUNS, the repo scripts it RUNS)."""
     packages = set()
     references = set()
-    # The quoting comes off before the filter looks. A name can be ASSEMBLED —
-    # `r\g`, `r"g"` and `'r'g` all run rg, and `ci/scripts/"x.sh"` names the
-    # same file — and the lexer behind this normalises every one of them, so a
-    # filter reading the raw line was narrower than the reader it stands in
-    # front of (Codex, on 07344b4). That is the same defect as excluding `/`
-    # from the boundary five rounds ago; removing the characters rather than
-    # widening a pattern fixes the class instead of the instance.
-    bare = QUOTING_CHARACTERS.sub("", text)
-    if not any(candidate.search(bare) for candidate in CANDIDATES) and not SCRIPT_REFERENCE.search(bare):
-        return packages, references
 
     for block, words in blocks_of(text):
         found, referenced = substitutions_in(words, block)
@@ -723,6 +731,29 @@ def analysed(text):
             packages |= found
             references |= referenced
     return packages, references
+
+
+def worth_lexing(text):
+    r"""Whether `text` could possibly name a tracked tool or a repo script.
+
+    A cost filter, and ONLY for script bodies. Lexing is what normalises
+    `r\g`, `r"g"` and `$'\x72g'` into `rg`, so a filter reading raw text is
+    narrower than the reader behind it and ends up deciding verdicts by itself
+    — which it did three times (Codex, on 07344b4 and again on 92bf47b). A
+    workflow's own `run:` is small, so it is always lexed and this is not asked
+    of it.
+
+    LIMITATION: a script body is still filtered, because lexing every one costs
+    minutes on this repository's own self-tests. The quoting characters come
+    off first, so an assembled name is still found; a name spelled in ANSI-C
+    quoting inside a SCRIPT would not be. Nothing here writes one, and the
+    alternative is a gate too slow to run.
+    """
+    bare = QUOTING_CHARACTERS.sub("", text)
+    return bool(
+        any(candidate.search(bare) for candidate in CANDIDATES)
+        or SCRIPT_REFERENCE.search(bare)
+    )
 
 
 def script_analysis(reference):
@@ -740,7 +771,7 @@ def script_analysis(reference):
         # script to the apt scanner, and re-reading it there would be a second
         # answer to "what is in this file".
         script_bodies[reference] = body
-        script_cache[reference] = analysed(body)
+        script_cache[reference] = analysed(body) if worth_lexing(body) else (set(), set())
     return script_cache[reference]
 
 
