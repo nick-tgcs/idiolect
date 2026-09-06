@@ -20,6 +20,20 @@
 # case being real: test-all.sh calls test-coverage-map.sh, so a job invoking
 # only test-all.sh still needs ripgrep.
 #
+# LIMITATION: a job's NEEDS are followed through the scripts it runs; its
+# INSTALLS are not. A script that installs its own tool is therefore reported
+# as a job that forgot it (Codex, on 6a4cc47) — a false red, which is the loud
+# direction and is fixed by naming the package in the workflow, where the other
+# 38 jobs already name theirs.
+#
+# It stays that way because the honest fix costs more than it buys, which was
+# measured rather than assumed: handing a script to the apt scanner takes over
+# thirty seconds for this repository's own self-test, and the cheap
+# alternative — pulling out the lines that look like installs — loses the very
+# context that makes the answer right, since a fixture install inside a heredoc
+# would then be credited as a real one. No script here installs anything, and a
+# false GREEN is the failure this gate exists to prevent.
+#
 # LIMITATION: a command carried by a VARIABLE — `S='rg …'; $S`, or
 # `bash -c "$S"` — is not followed. The scanner tracks assignments through
 # conditionals, subshells, functions and namerefs to answer the same question
@@ -48,7 +62,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Overridable so the self-test can point it at a tree of fixture scripts: what
+# a job installs may be installed by a SCRIPT it runs, and testing that needs
+# a script this repository does not have.
+REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 if [ "$#" -eq 0 ]; then
     set -- ".github/workflows"
@@ -239,6 +256,7 @@ MARKER = "\0"
 
 
 script_cache = {}
+script_bodies = {}
 
 
 def commands_in(words):
@@ -673,12 +691,16 @@ def script_analysis(reference):
             # A workflow naming a script that is not there is a different fault,
             # and one the job reports loudly at `bash:` the first time it runs.
             body = ""
+        # The text is kept as well as the verdict: the install side hands the
+        # script to the apt scanner, and re-reading it there would be a second
+        # answer to "what is in this file".
+        script_bodies[reference] = body
         script_cache[reference] = analysed(body)
     return script_cache[reference]
 
 
 def tools_used(text):
-    """Packages `text` needs, following the repo scripts it runs."""
+    """(packages `text` needs, the repo scripts it runs) — both transitive."""
     needed, queue = analysed(text)
     seen = set()
     while queue:
@@ -689,7 +711,7 @@ def tools_used(text):
         packages, references = script_analysis(reference)
         needed |= packages
         queue |= references - seen
-    return needed
+    return needed, seen
 
 
 def installed_packages(jobs):
@@ -777,13 +799,19 @@ for path in sys.argv[1:]:
 
 jobs_checked = len(jobs_found)
 failures = 0
+
+needed_by_job = {}
+for index, (path, job_name, job, _) in enumerate(jobs_found):
+    needed_by_job[index] = set()
+    for step in steps_of(job):
+        if isinstance(step, dict) and isinstance(step.get("run"), str):
+            needed, _followed = tools_used(step["run"])
+            needed_by_job[index] |= needed
+
 installed_by_job = installed_packages(jobs_found)
 
 for index, (path, job_name, job, _) in enumerate(jobs_found):
-    needed = set()
-    for step in steps_of(job):
-        if isinstance(step, dict) and isinstance(step.get("run"), str):
-            needed |= tools_used(step["run"])
+    needed = needed_by_job[index]
 
     for package in sorted(needed - installed_by_job[index]):
         print(

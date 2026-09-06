@@ -1362,6 +1362,85 @@ YAML
 expect "nice takes its adjustment attached" 1 attached-nice \
     "build" "ripgrep"
 
+# Codex, on 6a4cc47: a job's needs are followed through the scripts it runs and
+# its INSTALLS are not, so a script that installs its own tool is reported as a
+# job that forgot it. The asymmetry is real and this pins it as a LIMITATION
+# rather than a fix, because the fix was measured and costs more than it buys:
+# handing a script to the apt scanner takes over thirty seconds on this
+# repository's own self-test, and pulling out the install-looking LINES instead
+# loses the context that makes them right — a fixture install inside a heredoc
+# would be credited as a real one, which is a false green.
+#
+# The direction here is a false RED, fixed by naming the package in the
+# workflow like the other 38 jobs do. If this case ever fails, the limitation
+# has been fixed and the comment in the gate needs deleting with it.
+mkdir -p "$WORK/fixture-repo/ci/scripts"
+cat >"$WORK/fixture-repo/ci/scripts/installer.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+sudo apt-get install -y ripgrep
+rg -n TODO crates
+SCRIPT
+write_workflow script-installs ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/installer.sh
+YAML
+out="$(REPO_ROOT="$WORK/fixture-repo" "$CHECK" "$WORK/script-installs/ci.yml" 2>&1)"
+got=$?
+if [ "$got" -eq 0 ]; then
+    fail "the limitation above has been fixed — delete this case and the comment with it"
+elif ! printf '%s' "$out" | grep -qF "ripgrep"; then
+    fail "the script-install case failed for another reason: $out"
+else
+    ok "a script's own install is not credited (stated limitation)"
+fi
+
+# ...and the other half: a script that uses the tool without installing it is
+# still a finding, so the fix cannot simply credit every job.
+cat >"$WORK/fixture-repo/ci/scripts/user.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+rg -n TODO crates
+SCRIPT
+write_workflow script-uses ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash ci/scripts/user.sh
+YAML
+out="$(REPO_ROOT="$WORK/fixture-repo" "$CHECK" "$WORK/script-uses/ci.yml" 2>&1)"
+got=$?
+if [ "$got" -eq 0 ]; then
+    fail "a script using the tool with no install was accepted: $out"
+elif ! printf '%s' "$out" | grep -qF "ripgrep"; then
+    fail "the script-use case failed for another reason: $out"
+else
+    ok "a script that only uses the tool is still a finding"
+fi
+
+# Quoting a shell's own option does not stop it: `bash "-c" '…'` runs the
+# string. Fixed in the apt scanner, since the same reading would hide an
+# install written that way.
+write_workflow quoted-dash-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-c" 'rg -n TODO crates'
+YAML
+expect "a quoted -c still hands over a script" 1 quoted-dash-c \
+    "build" "ripgrep"
+
+write_workflow quoted-cluster-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash '-ec' 'rg -n TODO crates'
+YAML
+expect "a quoted cluster hands one over too" 1 quoted-cluster-c \
+    "build" "ripgrep"
+
 # ------------------------------------------------------- shapes that are not steps
 # A job that calls a reusable workflow has no `steps:` at all. Reading `.steps`
 # unguarded makes the gate crash on a real workflow.

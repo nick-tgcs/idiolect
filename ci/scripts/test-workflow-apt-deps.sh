@@ -6031,6 +6031,28 @@ YAML
 expect "the letters may come in either order" 1 cluster-c-first \
     "codex-no-such-package"
 
+# Quoting a shell's OPTION does not take its meaning away: `bash "-c" '…'`
+# runs the string, and so does `bash '-ec' '…'`. Checked against bash 5.2.21.
+# The quotes are the caller's shell's, and bash is handed `-c` either way —
+# the same rule the command NAME already followed here.
+write_workflow quoted_dash_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-c" 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted -c still hands over a script" 1 quoted_dash_c \
+    "codex-no-such-package"
+
+write_workflow quoted_cluster_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash '-ec' 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted cluster hands one over too" 1 quoted_cluster_c \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

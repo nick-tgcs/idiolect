@@ -166,8 +166,11 @@ def hands_over_a_script(word):
     """
     token = word.value
     return (
-        not word.quoted
-        and len(token) > 1
+        # No quoting guard: the quotes belong to the shell that READS the line,
+        # and bash is handed `-c` either way — `bash "-c" '…'` and
+        # `bash '-ec' '…'` both run the string, checked against 5.2.21. The
+        # command NAME above already followed this rule; the option did not.
+        len(token) > 1
         and token[0] == "-"
         and token[1] != "-"
         and "c" in token[1:]
