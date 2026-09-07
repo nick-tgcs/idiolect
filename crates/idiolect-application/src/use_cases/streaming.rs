@@ -14,7 +14,7 @@
 //!   take-level accumulators, the auto-stop clock, and the once-per-take error
 //!   de-duplication. The two edge-specific steps are **injected** — the
 //!   decode/translate via [`TakeTranscriber`] (the daemon binds
-//!   `transcribe_translated`; Android binds whisper on-device) and the live
+//!   `transcribe_translated`; Android binds its on-device engine) and the live
 //!   feedback via [`StreamObserver`] (the daemon pushes IPC; Android calls the
 //!   Kotlin callback). The capture-rate resampling and the per-frame VAD stay at
 //!   the edge and feed [`StreamingTake::ingest`] already-16 kHz-mono audio plus a
@@ -120,8 +120,8 @@ pub struct StreamingConfig {
 }
 
 /// The decode/translate step the live pipeline injects: 16 kHz mono samples in,
-/// text out. The daemon binds `transcribe_translated`; Android binds whisper
-/// on-device. The error carries a stable `code` so the orchestration can
+/// text out. The daemon binds `transcribe_translated`; Android binds its
+/// on-device engine. The error carries a stable `code` so the orchestration can
 /// de-duplicate the user-facing notification to once per take per cause.
 pub trait TakeTranscriber {
     fn transcribe(&mut self, samples_f32_mono: &[f32]) -> Result<String, TranscribeFailure>;

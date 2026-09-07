@@ -279,6 +279,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-portable-pr-
 
+      # Not in the runner image. Without it the check below returns 127, which
+      # its `if` reads as "no matches" — a green job that examined nothing.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Run interface leakage check
         run: bash ci/scripts/test-interface-no-backend-leakage.sh
 
@@ -311,6 +318,13 @@ jobs:
           key: ${{ runner.os }}-cargo-portable-pr-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-portable-pr-
+
+      # Not in the runner image. Without it the check below returns 127, which
+      # its `if` reads as "no matches" — a green job that examined nothing.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
 
       - name: Run real adapter dependency check
         run: bash ci/scripts/test-real-adapter-deps.sh
@@ -370,6 +384,16 @@ jobs:
 
       - name: Check workflow apt dependencies
         run: bash ci/scripts/check-workflow-apt-deps.sh
+
+      # The other half of the same question: the apt check asks whether the
+      # packages a job NAMES exist, this one asks whether the tools a job NEEDS
+      # are named. Both jobs it first reported had been green for months while
+      # their check silently examined nothing.
+      - name: Self-test the workflow tool check
+        run: bash ci/scripts/test-workflow-tool-deps.sh
+
+      - name: Check workflow tool dependencies
+        run: bash ci/scripts/check-workflow-tool-deps.sh
 
   # =========================================================================
   # DESKTOP APP CROSS-PLATFORM CHECK (idiolect-app on macOS)

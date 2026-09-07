@@ -476,8 +476,8 @@ impl MenuUseCase {
                 checked: translation.enabled,
             },
         });
-        // Only English works without an external translator (whisper's built-in
-        // task). Any other target with no command fails every snippet at
+        // Only English works without an external translator (the ASR engine's
+        // built-in task). Any other target with no command fails every snippet at
         // dictation time — say so HERE, before the user dictates into silence.
         if translation.enabled
             && translation.output_language != "en"
@@ -846,7 +846,8 @@ mod tests {
         #[test]
         fn no_warning_when_the_configuration_actually_works() {
             let workable = [
-                // English target: whisper translates in-engine, no command needed.
+                // English target: the ASR engine translates in-engine, so no
+                // command is needed.
                 TranslationConfig {
                     enabled: true,
                     input_language: "auto".to_owned(),
