@@ -50,7 +50,7 @@ http-body-util.workspace = true
 tempfile.workspace = true
 # An independent QR reader, so the pairing-QR round-trip test decodes what we encode
 # (default features off: we feed a greyscale buffer, not the `image` crate's types).
-rqrr = { version = "=0.10.1", default-features = false }
+rqrr = { version = "=0.11.0", default-features = false }
 # A pinning TLS *client* for the pairing-over-https integration test, mirroring the
 # Android X509TrustManager: trust the self-signed server iff the presented leaf's DER
 # SubjectPublicKeyInfo SHA-256 equals the pinned fingerprint. `x509-parser` pulls that
