@@ -71,7 +71,7 @@ unimplemented = "deny"
 num_cpus = "1.17"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-thiserror = "=2.0.20"
+thiserror = "=2.0.21"
 time = { version = "=0.3.55", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 uuid = { version = "=1.26.1", features = ["v4", "serde"] }
