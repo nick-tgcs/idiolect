@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The ubuntu-24.04 runner image does not ship ripgrep, and the checks below
+# read `rg` both ways round — `if rg ...` and `if ! rg ...`. Without this the
+# first kind silently finds nothing while the second fails with a message
+# about the coverage map, blaming the document for a missing tool.
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ripgrep (rg) is required by this check but is not installed" >&2
+  exit 1
+fi
+
 coverage_map="docs/quality/v1-coverage-map.md"
 acceptance_evidence="docs/quality/v1-acceptance-evidence.md"
 coverage_gate="ci/scripts/test-all.sh"
