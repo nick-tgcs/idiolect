@@ -82,7 +82,7 @@ opus = "=0.4.0"
 webrtc-vad = "=0.4.0"
 whisper-rs = "=0.16.0"
 toml = "=1.1.6"
-burn = { version = "=0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+burn = { version = "=0.22.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 burn-ndarray = { version = "=0.21.0", default-features = false, features = ["std"] }
 tempfile = "=3.27.0"
 # Desktop-only HTTP (the personal model/sync server). Not a dependency of the
