@@ -379,6 +379,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-portable-
 
+      # Not in the runner image. Without it the check below returns 127, which
+      # its `if` reads as "no matches" — a green job that examined nothing.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Run real adapter dependency check
         run: bash ci/scripts/test-real-adapter-deps.sh
 
@@ -412,6 +419,13 @@ jobs:
           key: ${{ runner.os }}-cargo-portable-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-portable-
+
+      # Not in the runner image. Without it the check below returns 127, which
+      # its `if` reads as "no matches" — a green job that examined nothing.
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
 
       - name: Run interface leakage check
         run: bash ci/scripts/test-interface-no-backend-leakage.sh

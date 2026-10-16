@@ -152,7 +152,7 @@ sudo apt-get install -y \
   libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev libglib2.0-dev \
   libasound2-dev libpulse-dev \
   dpkg-dev time \
-  python3-yaml
+  python3-yaml ripgrep
 
 # Optional: for scheduled checks
 cargo install cargo-audit cargo-outdated cargo-machete cargo-deny cargo-cyclonedx
