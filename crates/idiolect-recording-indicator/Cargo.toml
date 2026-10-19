@@ -20,7 +20,7 @@ path = "src/main.rs"
 # `default_fonts` is REQUIRED, not decorative: with `default-features = false`
 # egui embeds no font data at all, so every string lays out to zero size and the
 # overlay's elapsed-time caption renders as an empty pill. Silent — nothing warns.
-eframe = { version = "0.36", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
     "glow",
     "x11",
     "default_fonts",
