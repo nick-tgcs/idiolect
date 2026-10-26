@@ -21,7 +21,7 @@ trace = []
 idiolect-common = { path = "../../../idiolect-common" }
 idiolect-ipc = { path = "../../../idiolect-ipc" }
 idiolect-process = { path = "../../../idiolect-process" }
-zbus = { version = "5", optional = true, features = ["tokio"] }
+zbus = { version = "6", optional = true, features = ["tokio"] }
 tokio = { workspace = true, optional = true }
 # X11 focus capture/restore around the review dialog (only with the real engine).
 x11rb = { version = "0.14", optional = true }
@@ -37,6 +37,6 @@ tempfile = { workspace = true }
 idiolectd = { path = "../../../idiolectd" }
 idiolect-adapter-sqlite = { path = "../../../idiolect-adapter-sqlite" }
 idiolect-ports = { path = "../../../idiolect-ports" }
-zbus = { version = "5", features = ["tokio"] }
+zbus = { version = "6", features = ["tokio"] }
 tokio = { workspace = true }
 futures-util = "0.3"
