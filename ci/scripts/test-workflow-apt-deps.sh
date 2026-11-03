@@ -6008,6 +6008,167 @@ YAML
 expect "unset -n leaves the target still running" 1 nameref-unset-n-target-lives \
     "codex-no-such-package"
 
+# A cluster may hold BOTH an option that takes a word and the `-c` that hands
+# over a script: `bash -oc pipefail '…'` sets pipefail from the next word and
+# runs the one after it. Reading the word straight after the cluster took
+# `pipefail` for the script and left the install unexamined. Checked against
+# bash 5.2.21, which runs the same script for `-co` as for `-oc`.
+write_workflow cluster-with-c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -oc pipefail 'apt-get install -y codex-no-such-package'
+YAML
+expect "an option taking a word before -c does not become the script" 1 cluster-with-c \
+    "codex-no-such-package"
+
+write_workflow cluster-c-first ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -co pipefail 'apt-get install -y codex-no-such-package'
+YAML
+expect "the letters may come in either order" 1 cluster-c-first \
+    "codex-no-such-package"
+
+# Quoting a shell's OPTION does not take its meaning away: `bash "-c" '…'`
+# runs the string, and so does `bash '-ec' '…'`. Checked against bash 5.2.21.
+# The quotes are the caller's shell's, and bash is handed `-c` either way —
+# the same rule the command NAME already followed here.
+write_workflow quoted_dash_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-c" 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted -c still hands over a script" 1 quoted_dash_c \
+    "codex-no-such-package"
+
+write_workflow quoted_cluster_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash '-ec' 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted cluster hands one over too" 1 quoted_cluster_c \
+    "codex-no-such-package"
+
+# ...and an option that takes a VALUE keeps its meaning when quoted too:
+# `bash "-O" nullglob -c '…'` consumes nullglob and runs the string. Reading
+# the quoted `-O` as an ordinary word made `nullglob` look like the script.
+write_workflow quoted_option_with_value ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash "-O" nullglob -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a quoted option still takes its value" 1 quoted_option_with_value \
+    "codex-no-such-package"
+
+# `coproc` introduces a command the way `time` and `!` do — bash runs it
+# asynchronously and `help coproc` spells the syntax `coproc [NAME] command`.
+# Reading `coproc` as the command left the install unexamined. Both forms were
+# run against a proxy, reading the coprocess's own pipe to see the output.
+write_workflow coproc_simple ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc apt-get install -y codex-no-such-package
+YAML
+expect "coproc introduces a command" 1 coproc_simple \
+    "codex-no-such-package"
+
+# ...and with a NAME, where the command is inside the braces and the word after
+# `coproc` is the coprocess's name rather than anything that runs.
+write_workflow coproc_named ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: coproc FOO { apt-get install -y codex-no-such-package; }
+YAML
+expect "a named coproc runs what is in its braces" 1 coproc_named \
+    "codex-no-such-package"
+
+# `time [-p] pipeline`, and bash accepts a `--` as well. Both were run: each
+# form times the pipeline and runs it.
+write_workflow time_portable ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -p apt-get install -y codex-no-such-package
+YAML
+expect "time's own option is not the command" 1 time_portable \
+    "codex-no-such-package"
+
+# A redirection may be written among a shell's options, and the shell never
+# sees it: `bash </dev/null -c '…'` runs the string. Reading the redirect's
+# operand as the script FILE stopped the search and left the install
+# unexamined. Probed against bash 5.2.21.
+write_workflow redirect_before_options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash </dev/null -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a redirection among the options hides no script" 1 redirect_before_options \
+    "codex-no-such-package"
+
+# A number is a DESCRIPTOR only when it is unquoted and attached to the
+# operator. Detached, it is an operand: `bash 0 </dev/null -c '…'` reports
+# `bash: 0: No such file or directory` and runs no string at all, so reporting
+# the install in it is reporting one that never happens. Probed, plain and
+# quoted.
+# A real install rides along, because a workflow with NO packages at all trips
+# the gate's own "found nothing to check" guard — which is a different failure
+# and would hide this one.
+write_workflow detached_io_number ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: sudo apt-get install -y cmake
+      - run: bash 0 </dev/null -c 'apt-get install -y codex-no-such-package'
+YAML
+expect "a detached number is an operand, not a descriptor" 0 detached_io_number \
+    "All 1 apt package(s)" "!codex-no-such-package"
+
+# A redirection may sit between `-c` and its string, and the shell never sees
+# it: `bash -c </dev/null 'apt-get install …'` runs the install. Taking the
+# word straight after `-c` selected the operator instead. Probed.
+write_workflow redirect_inside_dash_c ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: bash -c </dev/null 'apt-get install -y codex-no-such-package'
+YAML
+expect "a redirection between -c and its script" 1 redirect_inside_dash_c \
+    "codex-no-such-package"
+
+# `--` ENDS `time`'s options, so what follows is the pipeline even when it
+# looks like one of them: `time -- -p rg` reports `-p: command not found`.
+# Skipping a second `-p` read the wrong word as the command. Probed.
+write_workflow time_separator_ends_options ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: |
+          sudo apt-get install -y cmake
+          time -- -p apt-get install -y codex-no-such-package
+YAML
+expect "-- ends time's options" 0 time_separator_ends_options \
+    "All 1 apt package(s)" "!codex-no-such-package"
+
+# An invocation prefix may stand between `time --` and the command it times:
+# `time -- command apt-get install …` installs. Ending the command position on
+# the prefix left the install unread. Probed.
+write_workflow time_separator_then_prefix ci.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - run: time -- command apt-get install -y codex-no-such-package
+YAML
+expect "a prefix after -- still leads to the command" 1 time_separator_then_prefix \
+    "codex-no-such-package"
+
 # ------------------------------------------------------------------------ done
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
