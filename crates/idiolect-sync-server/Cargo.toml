@@ -29,7 +29,7 @@ uuid.workspace = true
 sha2.workspace = true
 # Renders the one-time pairing code as a scannable QR for `--pair`. Encoder only — no
 # image/svg/pic features (we rasterise to forced-colour terminal half-blocks ourselves).
-qrcode = { version = "=0.14.1", default-features = false }
+qrcode = { version = "=0.15.0", default-features = false }
 # Percent-encodes the base URL into the pairing URI the QR carries (Android decodes it).
 percent-encoding = "=2.3.2"
 # Self-signed TLS for the pairing/sync/model transport. The server mints a persisted
